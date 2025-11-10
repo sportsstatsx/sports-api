@@ -5,7 +5,7 @@ from psycopg_pool import ConnectionPool
 import psycopg
 
 # ─────────────────────────────────────────────────────
-# 1) 환경 변수: DATABASE_URL
+# 1) ENV
 # ─────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -13,7 +13,7 @@ if not DATABASE_URL:
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────
-# 2) 커넥션 풀
+# 2) POOL
 # ─────────────────────────────────────────────────────
 pool = ConnectionPool(
     conninfo=DATABASE_URL,
@@ -23,7 +23,7 @@ pool = ConnectionPool(
 )
 
 # ─────────────────────────────────────────────────────
-# 3) 스키마 DDL
+# 3) DDL
 # ─────────────────────────────────────────────────────
 CREATE_TEAMS_SQL = """
 CREATE TABLE IF NOT EXISTS teams (
@@ -53,8 +53,30 @@ CREATE TABLE IF NOT EXISTS fixtures (
 );
 """
 
+# ✅ New: standings
+CREATE_STANDINGS_SQL = """
+CREATE TABLE IF NOT EXISTS standings (
+    id         BIGSERIAL PRIMARY KEY,
+    league_id  INTEGER NOT NULL,
+    season     TEXT    NOT NULL, -- 예: '2025-26'
+    team_name  TEXT    NOT NULL,
+    rank       INTEGER NOT NULL,
+    played     INTEGER NOT NULL,
+    win        INTEGER NOT NULL,
+    draw       INTEGER NOT NULL,
+    loss       INTEGER NOT NULL,
+    gf         INTEGER NOT NULL,
+    ga         INTEGER NOT NULL,
+    gd         INTEGER NOT NULL,
+    points     INTEGER NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_standings UNIQUE (league_id, season, team_name)
+);
+"""
+
 # ─────────────────────────────────────────────────────
-# 4) 시드 데이터 (idempotent)
+# 4) SEED
 # ─────────────────────────────────────────────────────
 SEED_TEAMS_SQL = """
 INSERT INTO teams (league_id, name, country, short_name) VALUES
@@ -72,14 +94,25 @@ INSERT INTO fixtures (league_id, match_date, home_team, away_team, home_score, a
 ON CONFLICT ON CONSTRAINT uq_fixture DO NOTHING;
 """
 
+# ✅ New: 간단 샘플 standings (EPL 39, 시즌 2025-26)
+SEED_STANDINGS_SQL = """
+INSERT INTO standings
+(league_id, season, team_name, rank, played, win, draw, loss, gf, ga, gd, points)
+VALUES
+(39, '2025-26', 'Manchester City', 1, 12, 9, 2, 1, 28, 10, 18, 29),
+(39, '2025-26', 'Arsenal',         2, 12, 9, 1, 2, 26, 12, 14, 28),
+(39, '2025-26', 'Liverpool',       3, 12, 8, 3, 1, 27, 14, 13, 27),
+(39, '2025-26', 'Chelsea',         8, 12, 5, 2, 5, 18, 16,  2, 17)
+ON CONFLICT ON CONSTRAINT uq_standings DO NOTHING;
+"""
+
 # ─────────────────────────────────────────────────────
-# 5) 스키마 정규화(마이그레이션): fixtures.date → fixtures.match_date
+# 5) 마이그레이션: fixtures.date → fixtures.match_date
 # ─────────────────────────────────────────────────────
 def normalize_schema(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
+            SELECT column_name FROM information_schema.columns
             WHERE table_name = 'fixtures'
         """)
         cols = {r[0] for r in cur.fetchall()}
@@ -89,17 +122,17 @@ def normalize_schema(conn):
             print("Renamed successfully.")
 
 # ─────────────────────────────────────────────────────
-# 6) 초기화 루틴
+# 6) INIT
 # ─────────────────────────────────────────────────────
 def init_db():
     print("Connecting to Postgres...")
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            print("Creating tables (teams, fixtures) if not exists...")
+            print("Creating tables (teams, fixtures, standings) if not exists...")
             cur.execute(CREATE_TEAMS_SQL)
             cur.execute(CREATE_FIXTURES_SQL)
+            cur.execute(CREATE_STANDINGS_SQL)
 
-        # 기존 컬럼명 사용 중이면 정규화
         normalize_schema(conn)
 
         with conn.cursor() as cur:
@@ -109,10 +142,13 @@ def init_db():
             print("Seeding sample fixtures...")
             cur.execute(SEED_FIXTURES_SQL)
 
+            print("Seeding standings...")
+            cur.execute(SEED_STANDINGS_SQL)
+
     print("✅ DB initialized and seeded.")
 
 # ─────────────────────────────────────────────────────
-# 7) 엔트리포인트
+# 7) MAIN
 # ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
