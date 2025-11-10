@@ -11,7 +11,7 @@ app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "0.7.0"
+SERVICE_VERSION = "0.8.0"
 API_KEY = os.getenv("API_KEY")  # Render 환경변수
 
 
@@ -26,14 +26,48 @@ def v(r, key, idx):
         return r[idx]
 
 
+def ok_response(payload: dict, http_status: int = 200):
+    body = {"ok": True}
+    body.update(payload or {})
+    return make_response(jsonify(body), http_status)
+
+
+def error_response(
+    code: str,
+    http_status: int,
+    message: str,
+    *,
+    detail: str | None = None,
+    hint: str | None = None,
+    fields: dict | None = None,
+):
+    return make_response(
+        jsonify(
+            {
+                "ok": False,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    **({"detail": detail} if detail else {}),
+                    **({"hint": hint} if hint else {}),
+                    **({"fields": fields} if fields else {}),
+                },
+            }
+        ),
+        http_status,
+    )
+
+
 def require_api_key():
     """간단한 API 키 인증 (헤더: X-API-KEY)."""
     if not API_KEY:
-        return False, ("API key not configured on server", 503)
+        return error_response(
+            "server_error", 503, "API key not configured on server"
+        )
     sent = request.headers.get("X-API-KEY")
     if not sent or sent != API_KEY:
-        return False, ("Unauthorized", 401)
-    return True, None
+        return error_response("unauthorized", 401, "Unauthorized")
+    return None  # OK
 
 
 def parse_pagination():
@@ -50,8 +84,8 @@ def parse_pagination():
 
 
 def parse_sort(allowed_columns, default_sort, default_order="asc"):
-    sort = request.args.get("sort", default_sort)
-    order = request.args.get("order", default_order).lower()
+    sort = request.args.get("sort", default=default_sort)
+    order = request.args.get("order", default=default_order).lower()
     if sort not in allowed_columns:
         sort = default_sort
     if order not in ("asc", "desc"):
@@ -61,32 +95,30 @@ def parse_sort(allowed_columns, default_sort, default_order="asc"):
 
 # -----------------------------
 # 캐시 유틸 (fixtures 전용)
-#   - ETag: 쿼리 파라미터 + max(updated_at) + total 로 계산
-#   - Last-Modified: max(updated_at)
 # -----------------------------
 def to_utc_dt(dtobj) -> datetime:
     if isinstance(dtobj, datetime):
         if dtobj.tzinfo is None:
             return dtobj.replace(tzinfo=timezone.utc)
         return dtobj.astimezone(timezone.utc)
-    # 문자열일 가능성은 적지만 방어적으로 처리
     return datetime.now(timezone.utc)
 
-def build_cache_keys(query_fingerprint: str, last_modified: datetime, total: int) -> tuple[str, str]:
+
+def build_cache_keys(query_fingerprint: str, last_modified: datetime, total: int):
     lm_utc = to_utc_dt(last_modified)
     etag_src = f"{query_fingerprint}|{int(lm_utc.timestamp())}|{total}"
     etag = 'W/"' + hashlib.md5(etag_src.encode("utf-8")).hexdigest() + '"'
     last_mod_http = format_datetime(lm_utc, usegmt=True)  # RFC1123
     return etag, last_mod_http
 
-def not_modified(if_none_match: str | None, if_modified_since: str | None,
-                 etag: str, last_mod_http: str) -> bool:
-    # 둘 중 하나라도 일치하면 304 처리(느슨한 정책)
+
+def not_modified(if_none_match: str | None, if_modified_since: str | None, etag: str, last_mod_http: str) -> bool:
     if if_none_match and if_none_match.strip() == etag:
         return True
     if if_modified_since and if_modified_since.strip() == last_mod_http:
         return True
     return False
+
 
 def with_cache_headers(resp, etag: str, last_mod_http: str, max_age: int = 30):
     resp.headers["ETag"] = etag
@@ -97,12 +129,12 @@ def with_cache_headers(resp, etag: str, last_mod_http: str, max_age: int = 30):
 
 @app.route("/")
 def root():
-    return "Hello from SportsStatsX API!"
+    return f"Hello from {SERVICE_NAME} API!"
 
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
+    return ok_response({"service": SERVICE_NAME, "version": SERVICE_VERSION})
 
 
 @app.route("/api/test-db")
@@ -112,15 +144,13 @@ def test_db():
         value = result[0] if isinstance(result, (tuple, list)) else (
             result.get("1") if isinstance(result, dict) else result
         )
-        return jsonify({"ok": True, "db": "connected", "result": value})
+        return ok_response({"db": "connected", "result": value})
     except Exception as e:
-        return jsonify({"ok": False, "db": "error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Database check failed", detail=str(e))
 
 
 # ======================================================
 # Fixtures (캐시 적용)
-#   GET /api/fixtures?league_id=39&date=YYYY-MM-DD&since=ISO8601
-#       &page=1&page_size=50&sort=match_date&order=asc
 # ======================================================
 @app.route("/api/fixtures")
 def get_fixtures():
@@ -129,7 +159,6 @@ def get_fixtures():
         on_date = request.args.get("date")   # YYYY-MM-DD
         since = request.args.get("since")    # ISO8601
 
-        # pagination + sort
         page, page_size, offset = parse_pagination()
         sort, order = parse_sort(
             allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
@@ -150,26 +179,23 @@ def get_fixtures():
             base_where += " AND updated_at >= %s"
             params.append(since)
 
-        # 캐시 키용 정보: total + max(updated_at)
         total_row = fetch_one(f"SELECT COUNT(*) FROM fixtures {base_where}", tuple(params))
         total_val = total_row[0] if isinstance(total_row, (tuple, list)) else (
             total_row.get("count") if isinstance(total_row, dict) else int(total_row)
         )
 
-        max_row = fetch_one(f"SELECT COALESCE(MAX(updated_at), NOW() AT TIME ZONE 'UTC') FROM fixtures {base_where}", tuple(params))
+        max_row = fetch_one(
+            f"SELECT COALESCE(MAX(updated_at), NOW() AT TIME ZONE 'UTC') FROM fixtures {base_where}",
+            tuple(params),
+        )
         max_updated = max_row[0] if isinstance(max_row, (tuple, list)) else list(max_row.values())[0]
 
         query_fingerprint = f"fixtures|league={league_id}|date={on_date}|since={since}|sort={sort}|order={order}|page={page}|size={page_size}"
         etag, last_mod_http = build_cache_keys(query_fingerprint, max_updated, int(total_val or 0))
 
-        # 조건부 요청 처리 (304)
-        if_none_match = request.headers.get("If-None-Match")
-        if_modified_since = request.headers.get("If-Modified-Since")
-        if not_modified(if_none_match, if_modified_since, etag, last_mod_http):
-            resp = make_response("", 304)
-            return with_cache_headers(resp, etag, last_mod_http)
+        if not_modified(request.headers.get("If-None-Match"), request.headers.get("If-Modified-Since"), etag, last_mod_http):
+            return with_cache_headers(make_response("", 304), etag, last_mod_http)
 
-        # 데이터 조회
         data_sql = f"""
             SELECT id, league_id, match_date, home_team, away_team,
                    home_score, away_score, updated_at
@@ -196,35 +222,33 @@ def get_fixtures():
 
         has_next = (page * page_size) < int(total_val or 0)
         payload = {
-            "ok": True,
             "page": page,
             "page_size": page_size,
             "total": int(total_val or 0),
             "has_next": has_next,
-            "fixtures": fixtures
+            "fixtures": fixtures,
         }
-        resp = make_response(jsonify(payload), 200)
-        return with_cache_headers(resp, etag, last_mod_http)
+        return with_cache_headers(ok_response(payload), etag, last_mod_http)
     except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Failed to fetch fixtures", detail=str(e))
 
 
 # ======================================================
 # Fixtures by Team (캐시 적용)
-#   GET /api/fixtures/by-team?league_id=39&team=Arsenal
-#       &date=YYYY-MM-DD&since=ISO8601&page=1&page_size=50
-#       &sort=match_date|updated_at|id|home_team|away_team  &order=asc|desc
 # ======================================================
 @app.route("/api/fixtures/by-team")
 def get_fixtures_by_team():
     try:
         league_id = request.args.get("league_id", type=int)
-        team = request.args.get("team")      # 정확 매칭
+        team = request.args.get("team")
         on_date = request.args.get("date")
         since = request.args.get("since")
 
         if not team:
-            return jsonify({"ok": False, "error": "bad_request", "detail": "team is required"}), 400
+            return error_response(
+                "bad_request", 400, "Missing required parameter",
+                fields={"team": "team parameter is required"}
+            )
 
         page, page_size, offset = parse_pagination()
         sort, order = parse_sort(
@@ -246,22 +270,21 @@ def get_fixtures_by_team():
             base_where += " AND updated_at >= %s"
             params.append(since)
 
-        # 캐시 키 요소
         total_row = fetch_one(f"SELECT COUNT(*) FROM fixtures {base_where}", tuple(params))
         total_val = total_row[0] if isinstance(total_row, (tuple, list)) else (
             total_row.get("count") if isinstance(total_row, dict) else int(total_row)
         )
-        max_row = fetch_one(f"SELECT COALESCE(MAX(updated_at), NOW() AT TIME ZONE 'UTC') FROM fixtures {base_where}", tuple(params))
+        max_row = fetch_one(
+            f"SELECT COALESCE(MAX(updated_at), NOW() AT TIME ZONE 'UTC') FROM fixtures {base_where}",
+            tuple(params),
+        )
         max_updated = max_row[0] if isinstance(max_row, (tuple, list)) else list(max_row.values())[0]
 
         query_fingerprint = f"fixtures_by_team|league={league_id}|team={team}|date={on_date}|since={since}|sort={sort}|order={order}|page={page}|size={page_size}"
         etag, last_mod_http = build_cache_keys(query_fingerprint, max_updated, int(total_val or 0))
 
-        if_none_match = request.headers.get("If-None-Match")
-        if_modified_since = request.headers.get("If-Modified-Since")
-        if not_modified(if_none_match, if_modified_since, etag, last_mod_http):
-            resp = make_response("", 304)
-            return with_cache_headers(resp, etag, last_mod_http)
+        if not_modified(request.headers.get("If-None-Match"), request.headers.get("If-Modified-Since"), etag, last_mod_http):
+            return with_cache_headers(make_response("", 304), etag, last_mod_http)
 
         data_sql = f"""
             SELECT id, league_id, match_date, home_team, away_team,
@@ -289,21 +312,19 @@ def get_fixtures_by_team():
 
         has_next = (page * page_size) < int(total_val or 0)
         payload = {
-            "ok": True,
             "page": page,
             "page_size": page_size,
             "total": int(total_val or 0),
             "has_next": has_next,
-            "fixtures": fixtures
+            "fixtures": fixtures,
         }
-        resp = make_response(jsonify(payload), 200)
-        return with_cache_headers(resp, etag, last_mod_http)
+        return with_cache_headers(ok_response(payload), etag, last_mod_http)
     except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Failed to fetch fixtures by team", detail=str(e))
 
 
 # ======================================================
-# Teams (그대로: 페이지네이션/정렬만)
+# Teams
 # ======================================================
 @app.route("/api/teams")
 def list_teams():
@@ -353,20 +374,16 @@ def list_teams():
         ]
 
         has_next = (page * page_size) < int(total_val or 0)
-        return jsonify({
-            "ok": True,
-            "page": page,
-            "page_size": page_size,
-            "total": int(total_val or 0),
-            "has_next": has_next,
-            "teams": teams
+        return ok_response({
+            "page": page, "page_size": page_size, "total": int(total_val or 0),
+            "has_next": has_next, "teams": teams
         })
     except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Failed to list teams", detail=str(e))
 
 
 # ======================================================
-# Standings (그대로: 페이지네이션/정렬만)
+# Standings
 # ======================================================
 @app.route("/api/standings")
 def list_standings():
@@ -424,16 +441,12 @@ def list_standings():
         ]
 
         has_next = (page * page_size) < int(total_val or 0)
-        return jsonify({
-            "ok": True,
-            "page": page,
-            "page_size": page_size,
-            "total": int(total_val or 0),
-            "has_next": has_next,
-            "standings": table
+        return ok_response({
+            "page": page, "page_size": page_size, "total": int(total_val or 0),
+            "has_next": has_next, "standings": table
         })
     except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Failed to list standings", detail=str(e))
 
 
 # ======================================================
@@ -441,10 +454,9 @@ def list_standings():
 # ======================================================
 @app.route("/api/fixtures/<int:fixture_id>", methods=["PATCH"])
 def update_fixture(fixture_id: int):
-    ok, err = require_api_key()
-    if not ok:
-        msg, code = err
-        return jsonify({"ok": False, "error": "unauthorized", "detail": msg}), code
+    auth_err = require_api_key()
+    if auth_err:
+        return auth_err
 
     try:
         payload = request.get_json(silent=True) or {}
@@ -459,14 +471,17 @@ def update_fixture(fixture_id: int):
             params.append(payload["away_score"])
 
         if not fields:
-            return jsonify({"ok": False, "error": "bad_request", "detail": "no fields to update"}), 400
+            return error_response(
+                "validation_error", 422, "No fields to update",
+                hint='Provide at least one of ["home_score","away_score"]'
+            )
 
         sql = f"UPDATE fixtures SET {', '.join(fields)} WHERE id = %s RETURNING id;"
         params.append(fixture_id)
 
         row = fetch_one(sql, tuple(params))
         if not row:
-            return jsonify({"ok": False, "error": "not_found"}), 404
+            return error_response("not_found", 404, "Fixture not found")
 
         fresh = fetch_one("""
             SELECT id, league_id, match_date, home_team, away_team, home_score, away_score, updated_at
@@ -483,9 +498,33 @@ def update_fixture(fixture_id: int):
             "away_score": v(fresh, "away_score", 6),
             "updated_at": str(v(fresh, "updated_at", 7)),
         }
-        return jsonify({"ok": True, "fixture": data})
+        return ok_response({"fixture": data})
     except Exception as e:
-        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+        return error_response("server_error", 500, "Failed to update fixture", detail=str(e))
+
+
+# -----------------------------
+# 전역 에러 핸들러
+# -----------------------------
+@app.errorhandler(400)
+def handle_400(err):
+    return error_response("bad_request", 400, "Bad request", detail=str(err))
+
+@app.errorhandler(401)
+def handle_401(err):
+    return error_response("unauthorized", 401, "Unauthorized")
+
+@app.errorhandler(404)
+def handle_404(err):
+    return error_response("not_found", 404, "Not found")
+
+@app.errorhandler(405)
+def handle_405(err):
+    return error_response("method_not_allowed", 405, "Method not allowed")
+
+@app.errorhandler(500)
+def handle_500(err):
+    return error_response("server_error", 500, "Internal server error", detail=str(err))
 
 
 if __name__ == "__main__":
