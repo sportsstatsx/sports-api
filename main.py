@@ -1,8 +1,7 @@
 from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import json
-import os
-import psycopg  # ✅ psycopg v3
+from db import fetch_all, fetch_one, execute
 
 app = Flask(__name__)
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
@@ -22,61 +21,80 @@ def home():
 
 @app.route("/health")
 def health():
-    return json_response({"ok": True, "service": "SportsStatsX", "version": "0.1.0"})
+    return json_response({"ok": True, "service": "SportsStatsX", "version": "0.2.0"})
 
-@app.route("/api/ping")
-def api_ping():
-    return json_response({"pong": True})
+# -------------------------------
+# DB 연결 확인
+# -------------------------------
+@app.route("/api/test-db")
+def api_test_db():
+    try:
+        row = fetch_one("SELECT 1 AS ok")
+        return json_response({"ok": True, "db": "connected", "result": row["ok"]})
+    except Exception as e:
+        return json_response({"ok": False, "error": str(e)}, 500)
 
+# -------------------------------
+# Fixtures (DB 기반)
+# GET /api/fixtures?league_id=39&date=2025-11-12
+# -------------------------------
 @app.route("/api/fixtures")
 def api_fixtures():
-    league_id = request.args.get("league_id")
-    date = request.args.get("date")
+    league_id = request.args.get("league_id", type=int)
+    date = request.args.get("date")  # YYYY-MM-DD
 
-    sample = [
-        {
-            "fixture_id": "FX12345",
-            "league_id": league_id or "39",
-            "date": date or "2025-11-12",
-            "kickoff_utc": "2025-11-12T19:00:00Z",
-            "home": "Team A",
-            "away": "Team B",
-            "status": "scheduled"
-        },
-        {
-            "fixture_id": "FX12346",
-            "league_id": league_id or "39",
-            "date": date or "2025-11-12",
-            "kickoff_utc": "2025-11-12T21:00:00Z",
-            "home": "Team C",
-            "away": "Team D",
-            "status": "scheduled"
-        },
-    ]
+    where = []
+    params = []
 
-    payload = {
+    if league_id is not None:
+        where.append("league_id = %s")
+        params.append(league_id)
+    if date:
+        where.append("date = %s")
+        params.append(date)
+
+    sql = "SELECT fixture_id, league_id, date, kickoff_utc, home, away, status FROM fixtures"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY kickoff_utc"
+
+    rows = fetch_all(sql, tuple(params))
+    return json_response({
         "ok": True,
-        "count": len(sample),
+        "count": len(rows),
         "filters": {"league_id": league_id, "date": date},
-        "fixtures": sample,
-    }
-    return json_response(payload)
+        "fixtures": rows
+    })
 
-# ✅ DB 연결 테스트 (psycopg v3)
-@app.route("/api/test-db")
-def test_db():
-    dsn = os.getenv("DATABASE_URL")  # Render Environment에 넣은 값
-    if not dsn:
-        return json_response({"ok": False, "error": "missing_DATABASE_URL"}, 500)
-    try:
-        # connect_timeout(초) 옵션으로 빠른 실패 유도
-        with psycopg.connect(dsn, connect_timeout=5) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                one = cur.fetchone()[0]
-        return json_response({"ok": True, "db": "connected", "result": int(one)})
-    except Exception as e:
-        return json_response({"ok": False, "error": "db_error", "detail": str(e)}, 500)
+# -------------------------------
+# 새 경기 추가 (옵션)
+# POST /api/fixtures  JSON body
+# -------------------------------
+@app.route("/api/fixtures", methods=["POST"])
+def api_add_fixture():
+    data = request.get_json(force=True)
+    required = ["fixture_id", "league_id", "date", "kickoff_utc", "home", "away", "status"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        return json_response({"ok": False, "error": f"missing fields: {missing}"}, 400)
+
+    execute(
+        """
+        INSERT INTO fixtures (fixture_id, league_id, date, kickoff_utc, home, away, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (fixture_id) DO NOTHING
+        """,
+        (
+            data["fixture_id"],
+            int(data["league_id"]),
+            data["date"],
+            data["kickoff_utc"],
+            data["home"],
+            data["away"],
+            data["status"],
+        ),
+    )
+    return json_response({"ok": True})
 
 @app.errorhandler(404)
 def not_found(_):
@@ -87,4 +105,6 @@ def server_error(e):
     return json_response({"ok": False, "error": "server_error", "detail": str(e)}, 500)
 
 if __name__ == "__main__":
+    # Render의 Start Command가 'python main.py'이므로 그대로.
+    # Flask의 내장 서버로 충분 (Starter 플랜)
     app.run(host="0.0.0.0", port=10000)
