@@ -2,13 +2,13 @@
 import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from db import fetch_all, fetch_one, execute  # db.py 헬퍼들 사용
+from db import fetch_all, fetch_one  # db.py 헬퍼 사용
 
 app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "0.5.0"
+SERVICE_VERSION = "0.6.0"
 API_KEY = os.getenv("API_KEY")  # Render 환경변수
 
 
@@ -23,12 +23,36 @@ def v(r, key, idx):
 def require_api_key():
     """간단한 API 키 인증 (헤더: X-API-KEY)."""
     if not API_KEY:
-        # 운영 안전을 위해, API_KEY가 설정되지 않았으면 503으로 막습니다.
         return False, ("API key not configured on server", 503)
     sent = request.headers.get("X-API-KEY")
     if not sent or sent != API_KEY:
         return False, ("Unauthorized", 401)
     return True, None
+
+
+# -----------------------------
+# 공통 유틸: 페이지네이션/정렬 파싱
+# -----------------------------
+def parse_pagination():
+    page = request.args.get("page", default=1, type=int)
+    page_size = request.args.get("page_size", default=50, type=int)
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 1
+    if page_size > 200:
+        page_size = 200
+    offset = (page - 1) * page_size
+    return page, page_size, offset
+
+def parse_sort(allowed_columns, default_sort, default_order="asc"):
+    sort = request.args.get("sort", default_sort)
+    order = request.args.get("order", default_order).lower()
+    if sort not in allowed_columns:
+        sort = default_sort
+    if order not in ("asc", "desc"):
+        order = default_order
+    return sort, order
 
 
 @app.route("/")
@@ -54,7 +78,8 @@ def test_db():
 
 
 # -------------------------------------------------------------------
-# Fixtures (GET with ?league_id=39&date=YYYY-MM-DD&since=ISO8601)
+# Fixtures (GET with ?league_id=39&date=YYYY-MM-DD&since=ISO8601
+#           &page=1&page_size=50&sort=match_date&order=asc)
 # -------------------------------------------------------------------
 @app.route("/api/fixtures")
 def get_fixtures():
@@ -62,30 +87,44 @@ def get_fixtures():
         league_id = request.args.get("league_id", type=int)
         on_date = request.args.get("date")   # YYYY-MM-DD
         since = request.args.get("since")    # ISO8601
-        limit = request.args.get("limit", default=50, type=int)
 
-        sql = """
-            SELECT id, league_id, match_date, home_team, away_team,
-                   home_score, away_score, updated_at
-            FROM fixtures
-            WHERE 1=1
-        """
+        # pagination + sort
+        page, page_size, offset = parse_pagination()
+        sort, order = parse_sort(
+            allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
+            default_sort="match_date",
+            default_order="asc",
+        )
+
+        base_where = "WHERE 1=1"
         params = []
 
         if league_id is not None:
-            sql += " AND league_id = %s"
+            base_where += " AND league_id = %s"
             params.append(league_id)
         if on_date:
-            sql += " AND match_date = %s"
+            base_where += " AND match_date = %s"
             params.append(on_date)
         if since:
-            sql += " AND updated_at >= %s"
+            base_where += " AND updated_at >= %s"
             params.append(since)
 
-        sql += " ORDER BY match_date, id LIMIT %s"
-        params.append(limit)
+        # total count
+        count_sql = f"SELECT COUNT(*) FROM fixtures {base_where}"
+        total = fetch_one(count_sql, tuple(params))
+        total_val = total[0] if isinstance(total, (tuple, list)) else (total.get("count") if isinstance(total, dict) else total)
 
-        rows = fetch_all(sql, tuple(params))
+        # page query
+        data_sql = f"""
+            SELECT id, league_id, match_date, home_team, away_team,
+                   home_score, away_score, updated_at
+            FROM fixtures
+            {base_where}
+            ORDER BY {sort} {order}, id ASC
+            LIMIT %s OFFSET %s
+        """
+        data_params = params + [page_size, offset]
+        rows = fetch_all(data_sql, tuple(data_params))
 
         fixtures = [
             {
@@ -101,50 +140,70 @@ def get_fixtures():
             for r in rows
         ]
 
-        return jsonify({"ok": True, "count": len(fixtures), "fixtures": fixtures})
+        has_next = (page * page_size) < int(total_val or 0)
+        return jsonify({
+            "ok": True,
+            "page": page,
+            "page_size": page_size,
+            "total": int(total_val or 0),
+            "has_next": has_next,
+            "fixtures": fixtures
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
 
 # -------------------------------------------------------------------
-# NEW: Fixtures by Team
-#   GET /api/fixtures/by-team?league_id=39&team=Arsenal&date=YYYY-MM-DD&since=ISO8601&limit=50
-#   - home_team 또는 away_team 중 하나라도 team과 일치하면 반환
+# Fixtures by Team
+#   GET /api/fixtures/by-team?league_id=39&team=Arsenal
+#       &date=YYYY-MM-DD&since=ISO8601&page=1&page_size=50
+#       &sort=match_date|updated_at|id|home_team|away_team  &order=asc|desc
 # -------------------------------------------------------------------
 @app.route("/api/fixtures/by-team")
 def get_fixtures_by_team():
     try:
         league_id = request.args.get("league_id", type=int)
-        team = request.args.get("team")      # 팀 이름(정확 매칭)
-        on_date = request.args.get("date")   # YYYY-MM-DD
-        since = request.args.get("since")    # ISO8601
-        limit = request.args.get("limit", default=50, type=int)
+        team = request.args.get("team")      # 정확 매칭
+        on_date = request.args.get("date")
+        since = request.args.get("since")
 
         if not team:
             return jsonify({"ok": False, "error": "bad_request", "detail": "team is required"}), 400
 
-        sql = """
-            SELECT id, league_id, match_date, home_team, away_team,
-                   home_score, away_score, updated_at
-            FROM fixtures
-            WHERE (home_team = %s OR away_team = %s)
-        """
+        page, page_size, offset = parse_pagination()
+        sort, order = parse_sort(
+            allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
+            default_sort="match_date",
+            default_order="asc",
+        )
+
+        base_where = "WHERE (home_team = %s OR away_team = %s)"
         params = [team, team]
 
         if league_id is not None:
-            sql += " AND league_id = %s"
+            base_where += " AND league_id = %s"
             params.append(league_id)
         if on_date:
-            sql += " AND match_date = %s"
+            base_where += " AND match_date = %s"
             params.append(on_date)
         if since:
-            sql += " AND updated_at >= %s"
+            base_where += " AND updated_at >= %s"
             params.append(since)
 
-        sql += " ORDER BY match_date, id LIMIT %s"
-        params.append(limit)
+        count_sql = f"SELECT COUNT(*) FROM fixtures {base_where}"
+        total = fetch_one(count_sql, tuple(params))
+        total_val = total[0] if isinstance(total, (tuple, list)) else (total.get("count") if isinstance(total, dict) else total)
 
-        rows = fetch_all(sql, tuple(params))
+        data_sql = f"""
+            SELECT id, league_id, match_date, home_team, away_team,
+                   home_score, away_score, updated_at
+            FROM fixtures
+            {base_where}
+            ORDER BY {sort} {order}, id ASC
+            LIMIT %s OFFSET %s
+        """
+        data_params = params + [page_size, offset]
+        rows = fetch_all(data_sql, tuple(data_params))
 
         fixtures = [
             {
@@ -159,39 +218,59 @@ def get_fixtures_by_team():
             }
             for r in rows
         ]
-        return jsonify({"ok": True, "count": len(fixtures), "fixtures": fixtures})
+
+        has_next = (page * page_size) < int(total_val or 0)
+        return jsonify({
+            "ok": True,
+            "page": page,
+            "page_size": page_size,
+            "total": int(total_val or 0),
+            "has_next": has_next,
+            "fixtures": fixtures
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
 
 # -------------------------------------------------------------------
-# Teams (GET /api/teams?league_id=39&q=ars&limit=50)
+# Teams (GET /api/teams?league_id=39&q=ars&page=1&page_size=50
+#        &sort=name|short_name|id|league_id &order=asc|desc)
 # -------------------------------------------------------------------
 @app.route("/api/teams")
 def list_teams():
     try:
         league_id = request.args.get("league_id", type=int)
         q = request.args.get("q")
-        limit = request.args.get("limit", default=50, type=int)
 
-        sql = """
-            SELECT id, league_id, name, country, short_name
-            FROM teams
-            WHERE 1=1
-        """
+        page, page_size, offset = parse_pagination()
+        sort, order = parse_sort(
+            allowed_columns={"name", "short_name", "id", "league_id"},
+            default_sort="name",
+            default_order="asc",
+        )
+
+        base_where = "WHERE 1=1"
         params = []
-
         if league_id is not None:
-            sql += " AND league_id = %s"
+            base_where += " AND league_id = %s"
             params.append(league_id)
         if q:
-            sql += " AND LOWER(name) LIKE LOWER(%s)"
+            base_where += " AND LOWER(name) LIKE LOWER(%s)"
             params.append(f"%{q}%")
 
-        sql += " ORDER BY name LIMIT %s"
-        params.append(limit)
+        count_sql = f"SELECT COUNT(*) FROM teams {base_where}"
+        total = fetch_one(count_sql, tuple(params))
+        total_val = total[0] if isinstance(total, (tuple, list)) else (total.get("count") if isinstance(total, dict) else total)
 
-        rows = fetch_all(sql, tuple(params))
+        data_sql = f"""
+            SELECT id, league_id, name, country, short_name
+            FROM teams
+            {base_where}
+            ORDER BY {sort} {order}, id ASC
+            LIMIT %s OFFSET %s
+        """
+        data_params = params + [page_size, offset]
+        rows = fetch_all(data_sql, tuple(data_params))
 
         teams = [
             {
@@ -204,40 +283,59 @@ def list_teams():
             for r in rows
         ]
 
-        return jsonify({"ok": True, "count": len(teams), "teams": teams})
+        has_next = (page * page_size) < int(total_val or 0)
+        return jsonify({
+            "ok": True,
+            "page": page,
+            "page_size": page_size,
+            "total": int(total_val or 0),
+            "has_next": has_next,
+            "teams": teams
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
 
 # -------------------------------------------------------------------
-# Standings (GET /api/standings?league_id=39&season=2025-26)
+# Standings (GET /api/standings?league_id=39&season=2025-26
+#            &page=1&page_size=50&sort=rank|points|team_name|id  &order=asc|desc)
 # -------------------------------------------------------------------
 @app.route("/api/standings")
 def list_standings():
     try:
         league_id = request.args.get("league_id", type=int)
         season = request.args.get("season")
-        limit = request.args.get("limit", default=50, type=int)
 
-        sql = """
+        page, page_size, offset = parse_pagination()
+        sort, order = parse_sort(
+            allowed_columns={"rank", "points", "team_name", "league_id"},
+            default_sort="rank",
+            default_order="asc",
+        )
+
+        base_where = "WHERE 1=1"
+        params = []
+        if league_id is not None:
+            base_where += " AND league_id = %s"
+            params.append(league_id)
+        if season:
+            base_where += " AND season = %s"
+            params.append(season)
+
+        count_sql = f"SELECT COUNT(*) FROM standings {base_where}"
+        total = fetch_one(count_sql, tuple(params))
+        total_val = total[0] if isinstance(total, (tuple, list)) else (total.get("count") if isinstance(total, dict) else total)
+
+        data_sql = f"""
             SELECT league_id, season, team_name, rank,
                    played, win, draw, loss, gf, ga, gd, points
             FROM standings
-            WHERE 1=1
+            {base_where}
+            ORDER BY {sort} {order}, rank ASC
+            LIMIT %s OFFSET %s
         """
-        params = []
-
-        if league_id is not None:
-            sql += " AND league_id = %s"
-            params.append(league_id)
-        if season:
-            sql += " AND season = %s"
-            params.append(season)
-
-        sql += " ORDER BY season DESC, rank ASC LIMIT %s"
-        params.append(limit)
-
-        rows = fetch_all(sql, tuple(params))
+        data_params = params + [page_size, offset]
+        rows = fetch_all(data_sql, tuple(data_params))
 
         table = [
             {
@@ -257,14 +355,22 @@ def list_standings():
             for r in rows
         ]
 
-        return jsonify({"ok": True, "count": len(table), "standings": table})
+        has_next = (page * page_size) < int(total_val or 0)
+        return jsonify({
+            "ok": True,
+            "page": page,
+            "page_size": page_size,
+            "total": int(total_val or 0),
+            "has_next": has_next,
+            "standings": table
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
 
 # -------------------------------------------------------------------
 # Write: PATCH /api/fixtures/<id>  (보호: X-API-KEY)
-# Body(JSON): {"home_score": 1, "away_score": 2}  둘 중 일부만 보내도 됨
+# Body(JSON): {"home_score": 1, "away_score": 2}
 # -------------------------------------------------------------------
 @app.route("/api/fixtures/<int:fixture_id>", methods=["PATCH"])
 def update_fixture(fixture_id: int):
@@ -295,7 +401,6 @@ def update_fixture(fixture_id: int):
         if not row:
             return jsonify({"ok": False, "error": "not_found"}), 404
 
-        # 갱신된 행 반환
         fresh = fetch_one("""
             SELECT id, league_id, match_date, home_team, away_team, home_score, away_score, updated_at
             FROM fixtures WHERE id = %s
