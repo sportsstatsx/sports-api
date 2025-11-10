@@ -1,13 +1,15 @@
 # main.py
+import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from db import fetch_all, fetch_one  # db.py 헬퍼 사용
+from db import fetch_all, fetch_one, execute  # db.py 헬퍼들 사용
 
 app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "0.3.2"
+SERVICE_VERSION = "0.4.0"
+API_KEY = os.getenv("API_KEY")  # Render 환경변수로 설정
 
 
 def v(r, key, idx):
@@ -16,6 +18,17 @@ def v(r, key, idx):
         return r[key]
     except Exception:
         return r[idx]
+
+
+def require_api_key():
+    """간단한 API 키 인증 (헤더: X-API-KEY)."""
+    if not API_KEY:
+        # 운영 안전을 위해, API_KEY가 설정되지 않았으면 503으로 막습니다.
+        return False, ("API key not configured on server", 503)
+    sent = request.headers.get("X-API-KEY")
+    if not sent or sent != API_KEY:
+        return False, ("Unauthorized", 401)
+    return True, None
 
 
 @app.route("/")
@@ -41,14 +54,14 @@ def test_db():
 
 
 # -------------------------------------------------------------------
-# Fixtures (with ?league_id=39&since=2025-11-01T00:00:00Z)
+# Fixtures (GET with ?league_id=39&date=YYYY-MM-DD&since=ISO8601)
 # -------------------------------------------------------------------
 @app.route("/api/fixtures")
 def get_fixtures():
     try:
         league_id = request.args.get("league_id", type=int)
-        on_date = request.args.get("date")  # YYYY-MM-DD
-        since = request.args.get("since")  # ISO8601
+        on_date = request.args.get("date")   # YYYY-MM-DD
+        since = request.args.get("since")    # ISO8601
         limit = request.args.get("limit", default=50, type=int)
 
         sql = """
@@ -187,6 +200,60 @@ def list_standings():
         ]
 
         return jsonify({"ok": True, "count": len(table), "standings": table})
+    except Exception as e:
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+
+
+# -------------------------------------------------------------------
+# Write: PATCH /api/fixtures/<id>  (보호: X-API-KEY)
+# Body(JSON): {"home_score": 1, "away_score": 2}  둘 중 일부만 보내도 됨
+# -------------------------------------------------------------------
+@app.route("/api/fixtures/<int:fixture_id>", methods=["PATCH"])
+def update_fixture(fixture_id: int):
+    ok, err = require_api_key()
+    if not ok:
+        msg, code = err
+        return jsonify({"ok": False, "error": "unauthorized", "detail": msg}), code
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        fields = []
+        params = []
+
+        if "home_score" in payload:
+            fields.append("home_score = %s")
+            params.append(payload["home_score"])
+        if "away_score" in payload:
+            fields.append("away_score = %s")
+            params.append(payload["away_score"])
+
+        if not fields:
+            return jsonify({"ok": False, "error": "bad_request", "detail": "no fields to update"}), 400
+
+        sql = f"UPDATE fixtures SET {', '.join(fields)} WHERE id = %s RETURNING id;"
+        params.append(fixture_id)
+
+        row = fetch_one(sql, tuple(params))
+        if not row:
+            return jsonify({"ok": False, "error": "not_found"}), 404
+
+        # 갱신된 행 반환
+        fresh = fetch_one("""
+            SELECT id, league_id, match_date, home_team, away_team, home_score, away_score, updated_at
+            FROM fixtures WHERE id = %s
+        """, (fixture_id,))
+
+        data = {
+            "id": v(fresh, "id", 0),
+            "league_id": v(fresh, "league_id", 1),
+            "match_date": str(v(fresh, "match_date", 2)),
+            "home_team": v(fresh, "home_team", 3),
+            "away_team": v(fresh, "away_team", 4),
+            "home_score": v(fresh, "home_score", 5),
+            "away_score": v(fresh, "away_score", 6),
+            "updated_at": str(v(fresh, "updated_at", 7)),
+        }
+        return jsonify({"ok": True, "fixture": data})
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
