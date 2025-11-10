@@ -8,32 +8,30 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from email.utils import format_datetime
-from flask import Flask, jsonify, request, make_response, g
+from flask import Flask, jsonify, request, make_response, g, Response
 from flask_cors import CORS
-from db import fetch_all, fetch_one  # db.py 헬퍼 사용
+from db import fetch_all, fetch_one  # db.py helpers
 
 # ─────────────────────────────────────────────────────
-# 앱/설정
+# App / Settings
 # ─────────────────────────────────────────────────────
 app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "1.1.0"
 
-API_KEY = os.getenv("API_KEY")  # Render 환경변수
+API_KEY = os.getenv("API_KEY")  # set in Render Environment
 LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "0.25"))  # 0.0~1.0
-# 업로드/본문 최대 크기(Flask 자체 차단) - 256KB
-app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 256 * 1024  # 256KB per request
 
-# 점수 합리 범위
 MIN_SCORE, MAX_SCORE = 0, 99
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")  # JSON 한 줄 로그
+logging.basicConfig(level=logging.INFO, format="%(message)s")  # JSON line logs
 
 
 # ─────────────────────────────────────────────────────
-# 로깅 & 코릴레이션 ID
+# Logging / Correlation
 # ─────────────────────────────────────────────────────
 def _rand_float():
     return (uuid.uuid4().int % 10_000_000) / 10_000_000.0
@@ -48,18 +46,16 @@ def _client_ip() -> str:
     return request.headers.get("X-Forwarded-For", request.remote_addr or "")
 
 def _req_id() -> str:
-    incoming = request.headers.get("X-Request-ID")
-    return incoming if incoming else str(uuid.uuid4())
+    rid = request.headers.get("X-Request-ID")
+    return rid if rid else str(uuid.uuid4())
 
 @app.before_request
 def _before():
     g._ts = time.time()
     g._req_id = _req_id()
-    # 지나치게 큰 Content-Length 조기 차단(프록시가 헤더를 안 줄 수도 있으니 best-effort)
     cl = request.headers.get("Content-Length")
     if cl and cl.isdigit() and int(cl) > app.config["MAX_CONTENT_LENGTH"]:
         return error_response("payload_too_large", 413, "Request payload too large")
-    # 요청 로그(샘플링, 민감헤더 제외)
     if _should_sample():
         safe_headers = {k: v for k, v in request.headers.items() if k.lower() not in {"authorization", "x-api-key"}}
         try:
@@ -95,7 +91,7 @@ def _after(resp):
 
 
 # ─────────────────────────────────────────────────────
-# 공통 유틸/검증
+# Common helpers / validation
 # ─────────────────────────────────────────────────────
 def v(r, key, idx):
     try:
@@ -130,7 +126,7 @@ def require_api_key():
     sent = request.headers.get("X-API-KEY")
     if not sent or sent != API_KEY:
         return error_response("unauthorized", 401, "Unauthorized")
-    return None  # OK
+    return None
 
 def parse_pagination():
     page = request.args.get("page", default=1, type=int)
@@ -148,7 +144,6 @@ def parse_sort(allowed_columns, default_sort, default_order="asc"):
     if order not in ("asc", "desc"): order = default_order
     return sort, order
 
-# 날짜(YYYY-MM-DD) 검증
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def validate_date_str(val: str) -> bool:
     if not val or not DATE_RE.match(val): return False
@@ -158,26 +153,20 @@ def validate_date_str(val: str) -> bool:
     except Exception:
         return False
 
-# ISO8601 대략 검증 (updated_at 필터)
 ISO_MIN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+\-]\d{2}:\d{2})?$")
 def validate_iso8601(val: str) -> bool:
     return bool(val and ISO_MIN_RE.match(val))
 
-# 시즌(예: 2025-26)
 SEASON_RE = re.compile(r"^\d{4}-\d{2}$")
 def validate_season(val: str) -> bool:
     return bool(val and SEASON_RE.match(val))
 
-# 팀명 제한(길이/문자)
 def validate_team_name(val: str) -> bool:
     if not val or len(val) > 64:
         return False
-    # 허용: 글자/숫자/공백/대시/점/아포스트로피
     return bool(re.match(r"^[\w\s\-\.\']+$", val, flags=re.UNICODE))
 
-# PATCH 바디 크기/타입 검증
 def get_safe_json():
-    # Content-Length 없이 들어오는 경우 대비: raw bytes 길이 검사(최대 64KB)
     raw = request.get_data(cache=False, as_text=False)
     if raw and len(raw) > 64 * 1024:
         raise ValueError("payload too large (>64KB)")
@@ -190,7 +179,7 @@ def get_safe_json():
 
 
 # ─────────────────────────────────────────────────────
-# 캐시 유틸 (fixtures 전용)
+# Cache helpers
 # ─────────────────────────────────────────────────────
 def to_utc_dt(dtobj) -> datetime:
     if isinstance(dtobj, datetime):
@@ -219,7 +208,7 @@ def with_cache_headers(resp, etag: str, last_mod_http: str, max_age: int = 30):
 
 
 # ─────────────────────────────────────────────────────
-# 기본 엔드포인트
+# Base endpoints
 # ─────────────────────────────────────────────────────
 @app.route("/")
 def root():
@@ -240,7 +229,7 @@ def test_db():
 
 
 # ─────────────────────────────────────────────────────
-# Fixtures (캐시 + 페이지네이션/정렬 + 입력 검증)
+# Fixtures
 # ─────────────────────────────────────────────────────
 @app.route("/api/fixtures")
 def get_fixtures():
@@ -249,7 +238,6 @@ def get_fixtures():
         on_date = request.args.get("date")
         since = request.args.get("since")
 
-        # 입력 검증
         fields_err = {}
         if on_date and not validate_date_str(on_date):
             fields_err["date"] = "format must be YYYY-MM-DD"
@@ -259,8 +247,10 @@ def get_fixtures():
             return error_response("validation_error", 422, "Invalid query parameters", fields=fields_err)
 
         page, page_size, offset = parse_pagination()
-        sort, order = parse_sort(allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
-                                 default_sort="match_date", default_order="asc")
+        sort, order = parse_sort(
+            allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
+            default_sort="match_date", default_order="asc"
+        )
 
         base_where, params = "WHERE 1=1", []
         if league_id is not None: base_where += " AND league_id = %s"; params.append(league_id)
@@ -309,7 +299,6 @@ def get_fixtures():
         return error_response("server_error", 500, "Failed to fetch fixtures", detail=str(e))
 
 
-# 팀별 Fixtures
 @app.route("/api/fixtures/by-team")
 def get_fixtures_by_team():
     try:
@@ -331,8 +320,10 @@ def get_fixtures_by_team():
             return error_response("validation_error", 422, "Invalid query parameters", fields=fields_err)
 
         page, page_size, offset = parse_pagination()
-        sort, order = parse_sort(allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
-                                 default_sort="match_date", default_order="asc")
+        sort, order = parse_sort(
+            allowed_columns={"match_date", "id", "updated_at", "home_team", "away_team", "league_id"},
+            default_sort="match_date", default_order="asc"
+        )
 
         base_where, params = "WHERE (home_team = %s OR away_team = %s)", [team, team]
         if league_id is not None: base_where += " AND league_id = %s"; params.append(league_id)
@@ -431,9 +422,9 @@ def list_standings():
         league_id = request.args.get("league_id", type=int)
         season = request.args.get("season")
 
-        # 간단 시즌 형식 검증
         if season and not validate_season(season):
-            return error_response("validation_error", 422, "Invalid season format", fields={"season": "format must be YYYY-YY (e.g., 2025-26)"})
+            return error_response("validation_error", 422, "Invalid season format",
+                                  fields={"season": "format must be YYYY-YY (e.g., 2025-26)"})
 
         page, page_size, offset = parse_pagination()
         sort, order = parse_sort(allowed_columns={"rank", "points", "team_name", "league_id"},
@@ -479,7 +470,7 @@ def list_standings():
         return error_response("server_error", 500, "Failed to list standings", detail=str(e))
 
 
-# PATCH (보호 + 입력 검증 강화)
+# PATCH (protected)
 @app.route("/api/fixtures/<int:fixture_id>", methods=["PATCH"])
 def update_fixture(fixture_id: int):
     auth_err = require_api_key()
@@ -510,7 +501,8 @@ def update_fixture(fixture_id: int):
         if fields_err:
             return error_response("validation_error", 422, "Invalid fields", fields=fields_err)
         if not fields:
-            return error_response("validation_error", 422, "No fields to update", hint='Provide at least one of ["home_score","away_score"]')
+            return error_response("validation_error", 422, "No fields to update",
+                                  hint='Provide at least one of ["home_score","away_score"]')
 
         row = fetch_one(f"UPDATE fixtures SET {', '.join(fields)} WHERE id = %s RETURNING id;", tuple(params + [fixture_id]))
         if not row:
@@ -535,7 +527,191 @@ def update_fixture(fixture_id: int):
         return error_response("server_error", 500, "Failed to update fixture", detail=str(e))
 
 
-# 전역 에러 핸들러
+# ─────────────────────────────────────────────────────
+# OpenAPI spec & Docs
+# ─────────────────────────────────────────────────────
+def openapi_spec() -> dict:
+    return {
+        "openapi": "3.0.3",
+        "info": {
+            "title": f"{SERVICE_NAME} API",
+            "version": SERVICE_VERSION,
+            "description": "Sports fixtures / teams / standings for SportsStatsX.",
+        },
+        "servers": [{"url": "https://sports-api-8vlh.onrender.com"}],
+        "components": {
+            "securitySchemes": {
+                "ApiKeyHeader": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-API-KEY",
+                }
+            },
+            "schemas": {
+                "Fixture": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "league_id": {"type": "integer"},
+                        "match_date": {"type": "string", "format": "date"},
+                        "home_team": {"type": "string"},
+                        "away_team": {"type": "string"},
+                        "home_score": {"type": "integer", "nullable": True},
+                        "away_score": {"type": "integer", "nullable": True},
+                        "updated_at": {"type": "string"},
+                    },
+                },
+                "Team": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "league_id": {"type": "integer"},
+                        "name": {"type": "string"},
+                        "country": {"type": "string"},
+                        "short_name": {"type": "string"},
+                    },
+                },
+                "Standing": {
+                    "type": "object",
+                    "properties": {
+                        "league_id": {"type": "integer"},
+                        "season": {"type": "string"},
+                        "team_name": {"type": "string"},
+                        "rank": {"type": "integer"},
+                        "played": {"type": "integer"},
+                        "win": {"type": "integer"},
+                        "draw": {"type": "integer"},
+                        "loss": {"type": "integer"},
+                        "gf": {"type": "integer"},
+                        "ga": {"type": "integer"},
+                        "gd": {"type": "integer"},
+                        "points": {"type": "integer"},
+                    },
+                },
+            },
+        },
+        "paths": {
+            "/health": {
+                "get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}
+            },
+            "/api/fixtures": {
+                "get": {
+                    "summary": "List fixtures",
+                    "parameters": [
+                        {"name": "league_id", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "date", "in": "query", "schema": {"type": "string", "format": "date"}},
+                        {"name": "since", "in": "query", "schema": {"type": "string", "format": "date-time"}},
+                        {"name": "sort", "in": "query", "schema": {"type": "string"}},
+                        {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"]}},
+                        {"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}},
+                        {"name": "page_size", "in": "query", "schema": {"type": "integer", "maximum": 200}},
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/api/fixtures/by-team": {
+                "get": {
+                    "summary": "List fixtures by team",
+                    "parameters": [
+                        {"name": "team", "in": "query", "required": True, "schema": {"type": "string"}},
+                        {"name": "league_id", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "date", "in": "query", "schema": {"type": "string", "format": "date"}},
+                        {"name": "since", "in": "query", "schema": {"type": "string", "format": "date-time"}},
+                        {"name": "page", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "page_size", "in": "query", "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/api/teams": {
+                "get": {
+                    "summary": "List teams",
+                    "parameters": [
+                        {"name": "league_id", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "q", "in": "query", "schema": {"type": "string"}},
+                        {"name": "sort", "in": "query", "schema": {"type": "string"}},
+                        {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"]}},
+                        {"name": "page", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "page_size", "in": "query", "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/api/standings": {
+                "get": {
+                    "summary": "List standings",
+                    "parameters": [
+                        {"name": "league_id", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "season", "in": "query", "schema": {"type": "string"}},
+                        {"name": "sort", "in": "query", "schema": {"type": "string"}},
+                        {"name": "order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"]}},
+                        {"name": "page", "in": "query", "schema": {"type": "integer"}},
+                        {"name": "page_size", "in": "query", "schema": {"type": "integer"}},
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
+            "/api/fixtures/{id}": {
+                "patch": {
+                    "summary": "Update a fixture score",
+                    "security": [{"ApiKeyHeader": []}],
+                    "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "home_score": {"type": "integer", "minimum": 0, "maximum": 99},
+                                        "away_score": {"type": "integer", "minimum": 0, "maximum": 99},
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "Updated"}, "401": {"description": "Unauthorized"}},
+                }
+            },
+        },
+    }
+
+@app.route("/openapi.json")
+def openapi_json():
+    spec = openapi_spec()
+    return Response(json.dumps(spec, ensure_ascii=False), mimetype="application/json")
+
+# 간단한 Swagger UI (CDN)
+@app.route("/docs")
+def docs():
+    return Response(f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>{SERVICE_NAME} API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+    <style> body {{ margin:0; }} #topbar {{ display:none; }}</style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({{
+        url: '/openapi.json',
+        dom_id: '#swagger-ui',
+        presets: [SwaggerUIBundle.presets.apis],
+        layout: 'BaseLayout'
+      }});
+    </script>
+  </body>
+</html>
+""", mimetype="text/html")
+
+
+# ─────────────────────────────────────────────────────
+# Error handlers
+# ─────────────────────────────────────────────────────
 @app.errorhandler(400)
 def handle_400(err): return error_response("bad_request", 400, "Bad request", detail=str(err))
 
@@ -548,7 +724,7 @@ def handle_404(err): return error_response("not_found", 404, "Not found")
 @app.errorhandler(405)
 def handle_405(err): return error_response("method_not_allowed", 405, "Method not allowed")
 
-@app.errorhandler(413)  # payload too large
+@app.errorhandler(413)
 def handle_413(err): return error_response("payload_too_large", 413, "Request payload too large")
 
 @app.errorhandler(500)
