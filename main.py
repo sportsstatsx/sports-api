@@ -1,17 +1,21 @@
 # main.py
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from db import fetch_all, fetch_one  # db.py의 헬퍼 사용
+from db import fetch_all, fetch_one  # db.py 헬퍼 사용
 
 app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "0.3.0"
+SERVICE_VERSION = "0.3.1"
 
-# -----------------------------
-# 기본 엔드포인트
-# -----------------------------
+def v(r, key, idx):
+    """row가 dict/mapping이든 tuple이든 안전하게 값을 꺼낸다."""
+    try:
+        return r[key]
+    except Exception:
+        return r[idx]
+
 @app.route("/")
 def root():
     return "Hello from SportsStatsX API!"
@@ -24,14 +28,13 @@ def health():
 def test_db():
     try:
         result = fetch_one("SELECT 1;")
-        value = result[0] if isinstance(result, (tuple, list)) else result
+        value = result[0] if isinstance(result, (tuple, list)) else (result.get("1") if isinstance(result, dict) else result)
         return jsonify({"ok": True, "db": "connected", "result": value})
     except Exception as e:
         return jsonify({"ok": False, "db": "error", "detail": str(e)}), 500
 
 # -----------------------------
 # Fixtures
-#   GET /api/fixtures?league_id=39&date=2025-11-12
 # -----------------------------
 @app.route("/api/fixtures")
 def get_fixtures():
@@ -50,7 +53,6 @@ def get_fixtures():
         if league_id is not None:
             sql += " AND league_id = %s"
             params.append(league_id)
-
         if on_date:
             sql += " AND match_date = %s"
             params.append(on_date)
@@ -59,15 +61,16 @@ def get_fixtures():
         params.append(limit)
 
         rows = fetch_all(sql, tuple(params))
+
         fixtures = [
             {
-                "id": r[0],
-                "league_id": r[1],
-                "match_date": str(r[2]),
-                "home_team": r[3],
-                "away_team": r[4],
-                "home_score": r[5],
-                "away_score": r[6],
+                "id":          v(r, "id", 0),
+                "league_id":   v(r, "league_id", 1),
+                "match_date":  str(v(r, "match_date", 2)),
+                "home_team":   v(r, "home_team", 3),
+                "away_team":   v(r, "away_team", 4),
+                "home_score":  v(r, "home_score", 5),
+                "away_score":  v(r, "away_score", 6),
             } for r in rows
         ]
         return jsonify({"ok": True, "count": len(fixtures), "fixtures": fixtures})
@@ -82,7 +85,7 @@ def get_fixtures():
 def list_teams():
     try:
         league_id = request.args.get("league_id", type=int)
-        q         = request.args.get("q")      # 부분 검색(이름)
+        q         = request.args.get("q")
         limit     = request.args.get("limit", default=50, type=int)
 
         sql = """
@@ -95,7 +98,6 @@ def list_teams():
         if league_id is not None:
             sql += " AND league_id = %s"
             params.append(league_id)
-
         if q:
             sql += " AND LOWER(name) LIKE LOWER(%s)"
             params.append(f"%{q}%")
@@ -104,13 +106,14 @@ def list_teams():
         params.append(limit)
 
         rows = fetch_all(sql, tuple(params))
+
         teams = [
             {
-                "id": r[0],
-                "league_id": r[1],
-                "name": r[2],
-                "country": r[3],
-                "short_name": r[4],
+                "id":         v(r, "id", 0),
+                "league_id":  v(r, "league_id", 1),
+                "name":       v(r, "name", 2),
+                "country":    v(r, "country", 3),
+                "short_name": v(r, "short_name", 4),
             } for r in rows
         ]
         return jsonify({"ok": True, "count": len(teams), "teams": teams})
@@ -125,7 +128,7 @@ def list_teams():
 def list_standings():
     try:
         league_id = request.args.get("league_id", type=int)
-        season    = request.args.get("season")  # 예: '2025-26'
+        season    = request.args.get("season")
         limit     = request.args.get("limit", default=50, type=int)
 
         sql = """
@@ -138,7 +141,6 @@ def list_standings():
         if league_id is not None:
             sql += " AND league_id = %s"
             params.append(league_id)
-
         if season:
             sql += " AND season = %s"
             params.append(season)
@@ -147,29 +149,26 @@ def list_standings():
         params.append(limit)
 
         rows = fetch_all(sql, tuple(params))
+
         table = [
             {
-                "league_id": r[0],
-                "season": r[1],
-                "team_name": r[2],
-                "rank": r[3],
-                "played": r[4],
-                "win": r[5],
-                "draw": r[6],
-                "loss": r[7],
-                "gf": r[8],
-                "ga": r[9],
-                "gd": r[10],
-                "points": r[11],
+                "league_id": v(r, "league_id", 0),
+                "season":    v(r, "season", 1),
+                "team_name": v(r, "team_name", 2),
+                "rank":      v(r, "rank", 3),
+                "played":    v(r, "played", 4),
+                "win":       v(r, "win", 5),
+                "draw":      v(r, "draw", 6),
+                "loss":      v(r, "loss", 7),
+                "gf":        v(r, "gf", 8),
+                "ga":        v(r, "ga", 9),
+                "gd":        v(r, "gd", 10),
+                "points":    v(r, "points", 11),
             } for r in rows
         ]
         return jsonify({"ok": True, "count": len(table), "standings": table})
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
 
-
-# -----------------------------
-# 로컬 실행
-# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
