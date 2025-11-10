@@ -23,7 +23,7 @@ pool = ConnectionPool(
 )
 
 # ─────────────────────────────────────────────────────
-# 3) DDL
+# 3) DDL (테이블)
 # ─────────────────────────────────────────────────────
 CREATE_TEAMS_SQL = """
 CREATE TABLE IF NOT EXISTS teams (
@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS fixtures (
 );
 """
 
-# ✅ New: standings
 CREATE_STANDINGS_SQL = """
 CREATE TABLE IF NOT EXISTS standings (
     id         BIGSERIAL PRIMARY KEY,
@@ -76,7 +75,73 @@ CREATE TABLE IF NOT EXISTS standings (
 """
 
 # ─────────────────────────────────────────────────────
-# 4) SEED
+# 4) DDL (트리거 함수 + 트리거)
+#   - 어떤 테이블이든 updated_at 컬럼이 있으면 UPDATE 시 NOW()로 갱신
+# ─────────────────────────────────────────────────────
+CREATE_TRIGGER_FUNCTION_SQL = """
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+CREATE_TRIGGERS_SQL = [
+    # teams
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_teams_updated_at'
+      ) THEN
+        CREATE TRIGGER trg_teams_updated_at
+        BEFORE UPDATE ON teams
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      END IF;
+    END$$;
+    """,
+    # fixtures
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_fixtures_updated_at'
+      ) THEN
+        CREATE TRIGGER trg_fixtures_updated_at
+        BEFORE UPDATE ON fixtures
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      END IF;
+    END$$;
+    """,
+    # standings
+    """
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trg_standings_updated_at'
+      ) THEN
+        CREATE TRIGGER trg_standings_updated_at
+        BEFORE UPDATE ON standings
+        FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+      END IF;
+    END$$;
+    """,
+]
+
+# ─────────────────────────────────────────────────────
+# 5) 인덱스
+# ─────────────────────────────────────────────────────
+CREATE_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_league_date ON fixtures (league_id, match_date);",
+    "CREATE INDEX IF NOT EXISTS idx_fixtures_updated_at ON fixtures (updated_at);",
+    "CREATE INDEX IF NOT EXISTS idx_teams_league_name ON teams (league_id, name);",
+    "CREATE INDEX IF NOT EXISTS idx_standings_league_season_rank ON standings (league_id, season, rank);",
+]
+
+# ─────────────────────────────────────────────────────
+# 6) SEED
 # ─────────────────────────────────────────────────────
 SEED_TEAMS_SQL = """
 INSERT INTO teams (league_id, name, country, short_name) VALUES
@@ -94,7 +159,6 @@ INSERT INTO fixtures (league_id, match_date, home_team, away_team, home_score, a
 ON CONFLICT ON CONSTRAINT uq_fixture DO NOTHING;
 """
 
-# ✅ New: 간단 샘플 standings (EPL 39, 시즌 2025-26)
 SEED_STANDINGS_SQL = """
 INSERT INTO standings
 (league_id, season, team_name, rank, played, win, draw, loss, gf, ga, gd, points)
@@ -107,7 +171,7 @@ ON CONFLICT ON CONSTRAINT uq_standings DO NOTHING;
 """
 
 # ─────────────────────────────────────────────────────
-# 5) 마이그레이션: fixtures.date → fixtures.match_date
+# 7) 마이그레이션: fixtures.date → fixtures.match_date
 # ─────────────────────────────────────────────────────
 def normalize_schema(conn):
     with conn.cursor() as cur:
@@ -122,7 +186,7 @@ def normalize_schema(conn):
             print("Renamed successfully.")
 
 # ─────────────────────────────────────────────────────
-# 6) INIT
+# 8) INIT
 # ─────────────────────────────────────────────────────
 def init_db():
     print("Connecting to Postgres...")
@@ -133,22 +197,36 @@ def init_db():
             cur.execute(CREATE_FIXTURES_SQL)
             cur.execute(CREATE_STANDINGS_SQL)
 
+        # 마이그레이션 (필요 시)
         normalize_schema(conn)
 
+        # 트리거 함수 및 트리거
+        with conn.cursor() as cur:
+            print("Creating trigger function set_updated_at()...")
+            cur.execute(CREATE_TRIGGER_FUNCTION_SQL)
+            print("Ensuring updated_at triggers exist on tables...")
+            for sql in CREATE_TRIGGERS_SQL:
+                cur.execute(sql)
+
+        # 인덱스
+        with conn.cursor() as cur:
+            print("Creating indexes (if not exists)...")
+            for sql in CREATE_INDEXES_SQL:
+                cur.execute(sql)
+
+        # 시드
         with conn.cursor() as cur:
             print("Seeding teams...")
             cur.execute(SEED_TEAMS_SQL)
-
-            print("Seeding sample fixtures...")
+            print("Seeding fixtures...")
             cur.execute(SEED_FIXTURES_SQL)
-
             print("Seeding standings...")
             cur.execute(SEED_STANDINGS_SQL)
 
     print("✅ DB initialized and seeded.")
 
 # ─────────────────────────────────────────────────────
-# 7) MAIN
+# 9) MAIN
 # ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
