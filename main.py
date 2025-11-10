@@ -10,5 +10,10 @@ def home():
 def health():
     return jsonify(ok=True, service="SportsStatsX", version="0.1.0")
 
+# 👉 새로 추가
+@app.route("/api/ping")
+def api_ping():
+    return jsonify(pong=True)
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
