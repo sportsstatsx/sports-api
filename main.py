@@ -1,9 +1,20 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
+import json
 
 app = Flask(__name__)
-# CORS: 앱에서 호출할 수 있게 /api/* 경로 전체 허용 (필요 시 도메인 제한 예정)
+# JSON 포맷 설정
+app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True   # 들여쓰기
+app.config["JSON_SORT_KEYS"] = False               # 키 순서 유지
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+def json_response(payload: dict, status: int = 200) -> Response:
+    """항상 같은 순서/들여쓰기로 응답"""
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),  # pretty print
+        status=status,
+        mimetype="application/json",
+    )
 
 @app.route("/")
 def home():
@@ -11,20 +22,17 @@ def home():
 
 @app.route("/health")
 def health():
-    return jsonify(ok=True, service="SportsStatsX", version="0.1.0")
+    return json_response({"ok": True, "service": "SportsStatsX", "version": "0.1.0"})
 
 @app.route("/api/ping")
 def api_ping():
-    return jsonify(pong=True)
+    return json_response({"pong": True})
 
-# ---- 새로 추가: /api/fixtures 스텁 ----
-# 사용법: /api/fixtures?league_id=39&date=2025-11-12 (ISO yyyy-mm-dd 권장)
 @app.route("/api/fixtures")
 def api_fixtures():
     league_id = request.args.get("league_id")
     date = request.args.get("date")
 
-    # 가짜 데이터(스텁): 앱 연동 용도. DB 붙인 뒤 실제 데이터로 교체 예정.
     sample = [
         {
             "fixture_id": "FX12345",
@@ -46,21 +54,22 @@ def api_fixtures():
         },
     ]
 
-    return jsonify(
-        ok=True,
-        count=len(sample),
-        filters={"league_id": league_id, "date": date},
-        fixtures=sample
-    )
+    # ✅ 항상 동일한 키 순서( ok → count → filters → fixtures )
+    payload = {
+        "ok": True,
+        "count": len(sample),
+        "filters": {"league_id": league_id, "date": date},
+        "fixtures": sample,
+    }
+    return json_response(payload)
 
-# 404/500도 JSON으로
 @app.errorhandler(404)
 def not_found(_):
-    return jsonify(ok=False, error="not_found"), 404
+    return json_response({"ok": False, "error": "not_found"}, 404)
 
 @app.errorhandler(500)
 def server_error(e):
-    return jsonify(ok=False, error="server_error", detail=str(e)), 500
+    return json_response({"ok": False, "error": "server_error", "detail": str(e)}, 500)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
