@@ -18,12 +18,17 @@ from db import fetch_all, fetch_one  # db.py helpers
 app = Flask(__name__)
 CORS(app)
 
-SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "1.1.0"
+SERVICE_NAME = os.getenv("SERVICE_NAME", "SportsStatsX")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.2.0")  # <- bump
+APP_ENV = os.getenv("APP_ENV", "production")
 
-API_KEY = os.getenv("API_KEY")  # set in Render Environment
+# 🔐 API 키 롤오버: 둘 중 하나라도 일치하면 허용
+API_KEY_PRIMARY = os.getenv("API_KEY_PRIMARY")  # 필수 권장
+API_KEY_BACKUP = os.getenv("API_KEY_BACKUP")    # 회전/교체용(선택)
+
 LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "0.25"))  # 0.0~1.0
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024  # 256KB per request
+START_TS = time.time()
 
 MIN_SCORE, MAX_SCORE = 0, 99
 
@@ -120,11 +125,15 @@ def error_response(code: str, http_status: int, message: str, *, detail: str | N
     resp.headers["X-Request-ID"] = getattr(g, "_req_id", "")
     return resp
 
+def _api_keys():
+    return [k for k in (API_KEY_PRIMARY, API_KEY_BACKUP) if k]
+
 def require_api_key():
-    if not API_KEY:
-        return error_response("server_error", 503, "API key not configured on server")
+    keys = _api_keys()
+    if not keys:
+        return error_response("server_error", 503, "API keys not configured on server")
     sent = request.headers.get("X-API-KEY")
-    if not sent or sent != API_KEY:
+    if not sent or sent not in keys:
         return error_response("unauthorized", 401, "Unauthorized")
     return None
 
@@ -216,7 +225,13 @@ def root():
 
 @app.route("/health")
 def health():
-    return ok_response({"service": SERVICE_NAME, "version": SERVICE_VERSION})
+    uptime_sec = int(time.time() - START_TS)
+    return ok_response({
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "env": APP_ENV,
+        "uptime_sec": uptime_sec
+    })
 
 @app.route("/api/test-db")
 def test_db():
@@ -591,9 +606,7 @@ def openapi_spec() -> dict:
             },
         },
         "paths": {
-            "/health": {
-                "get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}
-            },
+            "/health": {"get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}},
             "/api/fixtures": {
                 "get": {
                     "summary": "List fixtures",
@@ -725,7 +738,7 @@ def handle_404(err): return error_response("not_found", 404, "Not found")
 def handle_405(err): return error_response("method_not_allowed", 405, "Method not allowed")
 
 @app.errorhandler(413)
-def handle_413(err): return error_response("payload_too_large", 413, "Request payload too large")
+def handle_413(err): return error_response("payload_too_large", 413, "Payload too large")
 
 @app.errorhandler(500)
 def handle_500(err): return error_response("server_error", 500, "Internal server error", detail=str(err))
