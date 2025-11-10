@@ -1,12 +1,11 @@
 # init_db.py
 import os
 import sys
-from datetime import date
 from psycopg_pool import ConnectionPool
 import psycopg
 
 # ─────────────────────────────────────────────────────
-# 1) 환경 변수에서 DATABASE_URL 읽기
+# 1) 환경 변수: DATABASE_URL
 # ─────────────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -14,10 +13,8 @@ if not DATABASE_URL:
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────
-# 2) 커넥션 풀 생성 (psycopg_pool)
-#    - Render Postgres는 sslmode=require 사용 권장
+# 2) 커넥션 풀
 # ─────────────────────────────────────────────────────
-# DATABASE_URL에 이미 sslmode=require가 포함돼 있으면 그대로 사용됩니다.
 pool = ConnectionPool(
     conninfo=DATABASE_URL,
     min_size=1,
@@ -26,10 +23,22 @@ pool = ConnectionPool(
 )
 
 # ─────────────────────────────────────────────────────
-# 3) 스키마 생성 + 시드 함수
-#    - 여러 번 실행해도 안전하도록 IF NOT EXISTS / ON CONFLICT DO NOTHING 사용
+# 3) 스키마 DDL
 # ─────────────────────────────────────────────────────
-CREATE_TABLE_SQL = """
+CREATE_TEAMS_SQL = """
+CREATE TABLE IF NOT EXISTS teams (
+    id         BIGSERIAL PRIMARY KEY,
+    league_id  INTEGER NOT NULL,
+    name       TEXT    NOT NULL,
+    country    TEXT,
+    short_name TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_team UNIQUE (league_id, name)
+);
+"""
+
+CREATE_FIXTURES_SQL = """
 CREATE TABLE IF NOT EXISTS fixtures (
     id            BIGSERIAL PRIMARY KEY,
     league_id     INTEGER NOT NULL,
@@ -44,40 +53,72 @@ CREATE TABLE IF NOT EXISTS fixtures (
 );
 """
 
-# 샘플: 프리미어리그(39) 2경기
-SEED_SQL = """
-INSERT INTO fixtures (league_id, match_date, home_team, away_team, home_score, away_score)
-VALUES
-    (39, DATE '2025-11-12', 'Arsenal',   'Chelsea', NULL, NULL),
-    (39, DATE '2025-11-12', 'Liverpool', 'Manchester City', NULL, NULL)
+# ─────────────────────────────────────────────────────
+# 4) 시드 데이터 (idempotent)
+# ─────────────────────────────────────────────────────
+SEED_TEAMS_SQL = """
+INSERT INTO teams (league_id, name, country, short_name) VALUES
+    (39, 'Arsenal',           'England', 'ARS'),
+    (39, 'Chelsea',           'England', 'CHE'),
+    (39, 'Liverpool',         'England', 'LIV'),
+    (39, 'Manchester City',   'England', 'MCI')
+ON CONFLICT ON CONSTRAINT uq_team DO NOTHING;
+"""
+
+SEED_FIXTURES_SQL = """
+INSERT INTO fixtures (league_id, match_date, home_team, away_team, home_score, away_score) VALUES
+    (39, DATE '2025-11-12', 'Arsenal',           'Chelsea',           NULL, NULL),
+    (39, DATE '2025-11-12', 'Liverpool',         'Manchester City',   NULL, NULL)
 ON CONFLICT ON CONSTRAINT uq_fixture DO NOTHING;
 """
 
+# ─────────────────────────────────────────────────────
+# 5) 스키마 정규화(마이그레이션): fixtures.date → fixtures.match_date
+# ─────────────────────────────────────────────────────
+def normalize_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'fixtures'
+        """)
+        cols = {r[0] for r in cur.fetchall()}
+        if "date" in cols and "match_date" not in cols:
+            print("Renaming column fixtures.date -> fixtures.match_date ...")
+            cur.execute("ALTER TABLE fixtures RENAME COLUMN date TO match_date;")
+            print("Renamed successfully.")
+
+# ─────────────────────────────────────────────────────
+# 6) 초기화 루틴
+# ─────────────────────────────────────────────────────
 def init_db():
     print("Connecting to Postgres...")
     with pool.connection() as conn:
-        # autocommit 보장 (DDL에 필요)
-        conn.execute(psycopg.sql.SQL("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"))
         with conn.cursor() as cur:
-            print("Creating tables if not exists...")
-            cur.execute(CREATE_TABLE_SQL)
+            print("Creating tables (teams, fixtures) if not exists...")
+            cur.execute(CREATE_TEAMS_SQL)
+            cur.execute(CREATE_FIXTURES_SQL)
+
+        # 기존 컬럼명 사용 중이면 정규화
+        normalize_schema(conn)
+
+        with conn.cursor() as cur:
+            print("Seeding teams...")
+            cur.execute(SEED_TEAMS_SQL)
 
             print("Seeding sample fixtures...")
-            cur.execute(SEED_SQL)
+            cur.execute(SEED_FIXTURES_SQL)
 
     print("✅ DB initialized and seeded.")
 
 # ─────────────────────────────────────────────────────
-# 4) 메인 실행부
-#    - pool.close()를 보장하여 스레드 종료 경고 제거
+# 7) 엔트리포인트
 # ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
         init_db()
     finally:
         try:
-            # 스레드 풀 정리 (경고 방지)
             pool.close()
         except Exception:
-            # 혹시 모를 예외는 무시 (초기화는 이미 완료됨)
             pass
