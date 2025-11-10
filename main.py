@@ -8,8 +8,8 @@ app = Flask(__name__)
 CORS(app)
 
 SERVICE_NAME = "SportsStatsX"
-SERVICE_VERSION = "0.4.0"
-API_KEY = os.getenv("API_KEY")  # Render 환경변수로 설정
+SERVICE_VERSION = "0.5.0"
+API_KEY = os.getenv("API_KEY")  # Render 환경변수
 
 
 def v(r, key, idx):
@@ -101,6 +101,64 @@ def get_fixtures():
             for r in rows
         ]
 
+        return jsonify({"ok": True, "count": len(fixtures), "fixtures": fixtures})
+    except Exception as e:
+        return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
+
+
+# -------------------------------------------------------------------
+# NEW: Fixtures by Team
+#   GET /api/fixtures/by-team?league_id=39&team=Arsenal&date=YYYY-MM-DD&since=ISO8601&limit=50
+#   - home_team 또는 away_team 중 하나라도 team과 일치하면 반환
+# -------------------------------------------------------------------
+@app.route("/api/fixtures/by-team")
+def get_fixtures_by_team():
+    try:
+        league_id = request.args.get("league_id", type=int)
+        team = request.args.get("team")      # 팀 이름(정확 매칭)
+        on_date = request.args.get("date")   # YYYY-MM-DD
+        since = request.args.get("since")    # ISO8601
+        limit = request.args.get("limit", default=50, type=int)
+
+        if not team:
+            return jsonify({"ok": False, "error": "bad_request", "detail": "team is required"}), 400
+
+        sql = """
+            SELECT id, league_id, match_date, home_team, away_team,
+                   home_score, away_score, updated_at
+            FROM fixtures
+            WHERE (home_team = %s OR away_team = %s)
+        """
+        params = [team, team]
+
+        if league_id is not None:
+            sql += " AND league_id = %s"
+            params.append(league_id)
+        if on_date:
+            sql += " AND match_date = %s"
+            params.append(on_date)
+        if since:
+            sql += " AND updated_at >= %s"
+            params.append(since)
+
+        sql += " ORDER BY match_date, id LIMIT %s"
+        params.append(limit)
+
+        rows = fetch_all(sql, tuple(params))
+
+        fixtures = [
+            {
+                "id": v(r, "id", 0),
+                "league_id": v(r, "league_id", 1),
+                "match_date": str(v(r, "match_date", 2)),
+                "home_team": v(r, "home_team", 3),
+                "away_team": v(r, "away_team", 4),
+                "home_score": v(r, "home_score", 5),
+                "away_score": v(r, "away_score", 6),
+                "updated_at": str(v(r, "updated_at", 7)),
+            }
+            for r in rows
+        ]
         return jsonify({"ok": True, "count": len(fixtures), "fixtures": fixtures})
     except Exception as e:
         return jsonify({"ok": False, "error": "server_error", "detail": str(e)}), 500
