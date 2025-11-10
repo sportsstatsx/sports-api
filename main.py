@@ -1,14 +1,14 @@
-# main.py  v1.3.0  — SportsStatsX API
+# main.py  v1.4.0  — SportsStatsX API
 import os
 import json
 import time
 import math
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Dict, Tuple
 
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -17,48 +17,66 @@ from psycopg_pool import ConnectionPool
 # Config (환경변수)
 # ─────────────────────────────────────────
 SERVICE_NAME = os.getenv("SERVICE_NAME", "SportsStatsX")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.3.0")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.4.0")
 APP_ENV = os.getenv("APP_ENV", "production")
 
-API_KEY = os.getenv("API_KEY", "")  # 단일 키 사용
+API_KEY = os.getenv("API_KEY", "")  # 단일 키
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# 레이트 리밋 설정(분당 허용, 버스트)
+# 레이트 리밋 설정
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 RATE_LIMIT_BURST   = int(os.getenv("RATE_LIMIT_BURST", "30"))
-# 헤더/본문 로그 샘플링(0.0~1.0)
-LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "0.25"))
+LOG_SAMPLE_RATE    = float(os.getenv("LOG_SAMPLE_RATE", "0.25"))
 
-# 캐시 기본 max-age
+# DB statement timeout (ms)
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "3000"))
+
+# 기본 캐시
 DEFAULT_MAX_AGE = 30
 
 # ─────────────────────────────────────────
 # Flask & DB
 # ─────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}, r"/health": {"origins": "*"}, r"/docs": {"origins": "*"}, r"/openapi.json": {"origins": "*"}})
+CORS(app, resources={
+    r"/api/*": {"origins": "*"},
+    r"/health": {"origins": "*"},
+    r"/docs": {"origins": "*"},
+    r"/openapi.json": {"origins": "*"},
+    r"/metrics": {"origins": "*"},
+})
 
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, timeout=10)
 
 # ─────────────────────────────────────────
-# 유틸: 요청 ID & 로깅(샘플)
+# Observability (metrics)
 # ─────────────────────────────────────────
-def now_utc():
-    return datetime.now(timezone.utc)
+metrics = {
+    "start_ts": time.time(),
+    "req_total": 0,
+    "resp_2xx": 0,
+    "resp_4xx": 0,
+    "resp_5xx": 0,
+    "rate_limited": 0,
+    "path_counts": {},   # {"/api/fixtures": 123, ...}
+}
 
-def should_sample() -> bool:
-    try:
-        return (math.floor(time.time() * 1000) % int(1/LOG_SAMPLE_RATE)) == 0 if 0 < LOG_SAMPLE_RATE < 1 else LOG_SAMPLE_RATE >= 1.0
-    except Exception:
-        return False
+def _metrics_incr_path(path: str):
+    metrics["path_counts"][path] = metrics["path_counts"].get(path, 0) + 1
 
+# ─────────────────────────────────────────
+# 유틸: 요청 ID & 로깅(샘플) & 응답시간
+# ─────────────────────────────────────────
 @app.before_request
-def attach_request_id():
+def attach_request_meta():
     rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.environ["x_request_id"] = rid
+    request.environ["__t0"] = time.perf_counter()
+    metrics["req_total"] += 1
+    _metrics_incr_path(request.path)
 
 @app.after_request
 def add_common_headers(resp: Response):
@@ -66,27 +84,34 @@ def add_common_headers(resp: Response):
     rid = request.environ.get("x_request_id")
     if rid:
         resp.headers["X-Request-ID"] = rid
-    # Caching: OK 응답에만 기본 max-age 적용 (개별 핸들러에서 덮어쓸 수 있음)
+    # Response time
+    t0 = request.environ.get("__t0")
+    if t0 is not None:
+        resp.headers["X-Response-Time"] = f"{int((time.perf_counter()-t0)*1000)}"
+    # Cache header (개별 핸들러에서 ETag/Last-Modified 설정 가능)
     if 200 <= resp.status_code < 300 and "Cache-Control" not in resp.headers:
         resp.headers["Cache-Control"] = f"public, max-age={DEFAULT_MAX_AGE}"
+    # Metrics by status
+    if   200 <= resp.status_code < 300: metrics["resp_2xx"] += 1
+    elif 400 <= resp.status_code < 500:
+        metrics["resp_4xx"] += 1
+        if resp.status_code == 429:
+            metrics["rate_limited"] += 1
+    else: metrics["resp_5xx"] += 1
     return resp
 
 # ─────────────────────────────────────────
 # 레이트 리밋(인메모리 토큰 버킷: ip+path)
 # ─────────────────────────────────────────
-# key: (ip, route), value: dict(tokens, last_refill_ts)
 _rate_buckets: Dict[Tuple[str, str], Dict[str, float]] = {}
 
 def _client_key() -> Tuple[str, str]:
     ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "0.0.0.0"
-    # 라우트는 메서드까지 포함하면 과도하게 쪼개질 수 있어 메서드는 포함하지 않음
-    route = request.path
-    return (ip, route)
+    return (ip, request.path)
 
 def _refill(bucket: Dict[str, float], rate_per_min: int):
     now_ts = time.time()
     last = bucket.get("last", now_ts)
-    # 분당 rate → 초당 rate
     per_sec = rate_per_min / 60.0
     tokens = bucket.get("tokens", RATE_LIMIT_BURST)
     tokens = min(RATE_LIMIT_BURST, tokens + (now_ts - last) * per_sec)
@@ -98,15 +123,11 @@ def rate_limited(f):
     def wrapper(*args, **kwargs):
         if RATE_LIMIT_PER_MIN <= 0:
             return f(*args, **kwargs)
-
         key = _client_key()
         bucket = _rate_buckets.setdefault(key, {"tokens": float(RATE_LIMIT_BURST), "last": time.time()})
         _refill(bucket, RATE_LIMIT_PER_MIN)
-
-        # 1 요청 = 1 토큰
         if bucket["tokens"] >= 1.0:
             bucket["tokens"] -= 1.0
-            # 헤더에 남은 토큰/리셋 힌트
             resp: Response = f(*args, **kwargs)
             reset_sec = max(0, int(60 - (time.time() - bucket["last"])))
             try:
@@ -120,11 +141,7 @@ def rate_limited(f):
             reset_sec = max(0, int(60 - (time.time() - bucket["last"])))
             return jsonify({
                 "ok": False,
-                "error": {
-                    "code": "rate_limited",
-                    "message": "Too Many Requests",
-                    "retry_after_sec": reset_sec
-                }
+                "error": {"code": "rate_limited", "message": "Too Many Requests", "retry_after_sec": reset_sec}
             }), 429
     return wrapper
 
@@ -141,9 +158,9 @@ def require_api_key(f):
     return wrapper
 
 # ─────────────────────────────────────────
-# 헬스
+# 헬스 & 메트릭스
 # ─────────────────────────────────────────
-@app.route("/health")
+@app.get("/health")
 @rate_limited
 def health():
     return jsonify({
@@ -154,11 +171,48 @@ def health():
         "uptime_sec": int(time.time() - ps_start_ts)
     })
 
+@app.get("/metrics")
+@rate_limited
+def get_metrics():
+    up = {
+        "ok": True,
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "env": APP_ENV,
+        "since": int(metrics["start_ts"]),
+        "uptime_sec": int(time.time() - metrics["start_ts"]),
+        "requests": {
+            "total": metrics["req_total"],
+            "2xx": metrics["resp_2xx"],
+            "4xx": metrics["resp_4xx"],
+            "5xx": metrics["resp_5xx"],
+            "rate_limited": metrics["rate_limited"],
+        },
+        "paths": metrics["path_counts"],
+        "rate_limit": {
+            "per_min": RATE_LIMIT_PER_MIN,
+            "burst": RATE_LIMIT_BURST
+        }
+    }
+    return jsonify(up)
+
 # ─────────────────────────────────────────
-# DB helpers
+# DB helpers  (각 쿼리에 statement_timeout 적용)
 # ─────────────────────────────────────────
+def _set_statement_timeout(conn):
+    try:
+        # psycopg3는 connection.execute 가능
+        conn.execute(f"SET LOCAL statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+    except Exception:
+        # 일부 드라이버 구성에서 LOCAL이 먹히지 않으면 세션 단위로라도 설정
+        try:
+            conn.execute(f"SET statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
+        except Exception:
+            pass
+
 def fetch_all(sql: str, params: tuple = ()):
     with pool.connection() as conn:
+        _set_statement_timeout(conn)
         with conn.cursor() as cur:
             cur.execute(sql, params)
             cols = [c[0] for c in cur.description]
@@ -166,6 +220,7 @@ def fetch_all(sql: str, params: tuple = ()):
 
 def fetch_one(sql: str, params: tuple = ()):
     with pool.connection() as conn:
+        _set_statement_timeout(conn)
         with conn.cursor() as cur:
             cur.execute(sql, params)
             row = cur.fetchone()
@@ -176,25 +231,23 @@ def fetch_one(sql: str, params: tuple = ()):
 
 def execute(sql: str, params: tuple = ()):
     with pool.connection() as conn:
+        _set_statement_timeout(conn)
         with conn.cursor() as cur:
             cur.execute(sql, params)
             conn.commit()
             return cur.rowcount
 
 # ─────────────────────────────────────────
-# OpenAPI & Swagger
+# OpenAPI & Swagger (간결 버전)
 # ─────────────────────────────────────────
 OPENAPI = {
     "openapi": "3.0.3",
     "info": {"title": f"{SERVICE_NAME} API", "version": SERVICE_VERSION, "description": "Sports fixtures / teams / standings for SportsStatsX."},
     "servers": [{"url": "https://sports-api-8vlh.onrender.com"}],
-    "components": {
-        "securitySchemes": {
-            "ApiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-KEY"}
-        }
-    },
+    "components": {"securitySchemes": {"ApiKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-KEY"}}},
     "paths": {
         "/health": {"get": {"summary": "Health check", "responses": {"200": {"description": "OK"}}}},
+        "/metrics": {"get": {"summary": "Service metrics (JSON)", "responses": {"200": {"description": "OK"}}}},
         "/api/fixtures": {"get": {"summary": "List fixtures", "parameters": [
             {"name": "league_id", "in": "query", "schema": {"type": "integer"}},
             {"name": "date", "in": "query", "schema": {"type": "string", "format": "date"}},
@@ -233,17 +286,12 @@ def openapi_json():
 
 SWAGGER_HTML = """<!doctype html>
 <html>
-<head>
-<meta charset="utf-8"/>
-<title>SportsStatsX API Docs</title>
-<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
-</head>
-<body>
-<div id="swagger"></div>
+<head><meta charset="utf-8"/><title>SportsStatsX API Docs</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css"></head>
+<body><div id="swagger"></div>
 <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
 <script>window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger'});</script>
-</body>
-</html>"""
+</body></html>"""
 
 @app.get("/docs")
 def docs():
@@ -275,21 +323,15 @@ def list_fixtures():
     date_str  = request.args.get("date")
     page      = max(1, request.args.get("page", default=1, type=int))
     page_size = max(1, min(100, request.args.get("page_size", default=50, type=int)))
-    since     = request.args.get("since")  # RFC3339 or ISO string
+    since     = request.args.get("since")
 
-    where = []
-    params = []
-
-    if league_id:
-        where.append("league_id = %s"); params.append(league_id)
+    where, params = [], []
+    if league_id: where.append("league_id = %s"); params.append(league_id)
     if date_str:
         d = parse_date(date_str)
-        if not d:
-            return error_400({"date": "format must be YYYY-MM-DD"})
+        if not d: return error_400({"date": "format must be YYYY-MM-DD"})
         where.append("match_date = %s"); params.append(d)
-
     if since:
-        # updated_at >= since
         where.append("updated_at >= %s"); params.append(since)
 
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
@@ -305,7 +347,6 @@ def list_fixtures():
         LIMIT %s OFFSET %s
     """, tuple(params + [page_size, offset]))
 
-    # ETag 기반 캐시
     etag_seed = json.dumps(rows, default=str)
     etag = f'W/"{hash(etag_seed)}"'
     if request.headers.get("If-None-Match") == etag:
@@ -314,8 +355,13 @@ def list_fixtures():
     resp = jsonify({"ok": True, "fixtures": rows, "total": total, "page": page, "page_size": page_size, "has_next": (offset + page_size) < total})
     resp.headers["ETag"] = etag
     if rows:
-        # Last-Modified: 최대 updated_at
-        lm = max(datetime.fromisoformat(r["updated_at"]) if isinstance(r["updated_at"], str) else r["updated_at"] for r in rows)
+        # 문자열/datetime 섞임 대비
+        def _to_dt(x):
+            if isinstance(x, str):
+                try: return datetime.fromisoformat(x.replace("Z",""))
+                except Exception: return datetime.utcnow()
+            return x
+        lm = max(_to_dt(r["updated_at"]) for r in rows)
         resp.headers["Last-Modified"] = lm.strftime("%a, %d %b %Y %H:%M:%S GMT")
     return resp
 
@@ -382,7 +428,7 @@ def update_fixture(fx_id: int):
     try:
         payload = request.get_json(force=True, silent=False)
     except Exception as e:
-        return jsonify({"ok": False, "error": {"code": "validation_error", "message": "Invalid JSON body", "detail": f"invalid json: {e}"}}), 422
+        return jsonify({"ok": False, "error": {"code": "validation_error", "message": "Invalid JSON body", "detail": f"invalid json: {e}"}},), 422
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": {"code": "validation_error", "message": "Invalid JSON body"}},), 422
 
