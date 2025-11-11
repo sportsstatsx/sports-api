@@ -1,7 +1,8 @@
-# main.py  v1.6.0 — SportsStatsX API
-# - Prometheus 표준 /metrics 추가 (prometheus_client)
-# - 기존 JSON /metrics 는 /metrics_json 으로 이동
-# - 요청 카운트/지연/429 등 계측 자동화
+# main.py  v1.6.1 — SportsStatsX API
+# - Prometheus 표준 /metrics 유지 (prometheus_client)
+# - 기존 커스텀 텍스트 /metrics_prom 유지
+# - 요청 카운트/지연/429/예외 카운트 계측
+# - Grafana/Prometheus 룰과 라벨 스키마 정합성 강화
 
 import os
 import json
@@ -17,7 +18,7 @@ from flask_cors import CORS
 from psycopg_pool import ConnectionPool
 
 # ─────────────────────────────────────────
-# NEW: Prometheus client
+# Prometheus client
 # ─────────────────────────────────────────
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
@@ -25,7 +26,7 @@ from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTEN
 # Config
 # ─────────────────────────────────────────
 SERVICE_NAME = os.getenv("SERVICE_NAME", "SportsStatsX")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.6.0")  # bumped
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.6.1")  # bumped
 APP_ENV = os.getenv("APP_ENV", "production")
 
 API_KEY = os.getenv("API_KEY", "")
@@ -49,9 +50,9 @@ CORS(app, resources={
     r"/health": {"origins": "*"},
     r"/docs": {"origins": "*"},
     r"/openapi.json": {"origins": "*"},
-    r"/metrics": {"origins": "*"},       # Prometheus scrape
-    r"/metrics_prom": {"origins": "*"},  # legacy text metrics
-    r"/metrics_json": {"origins": "*"},  # moved from /metrics
+    r"/metrics": {"origins": "*"},       # Prometheus scrape (표준)
+    r"/metrics_prom": {"origins": "*"},  # 커스텀 텍스트
+    r"/metrics_json": {"origins": "*"},  # 레거시 JSON
 })
 
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, timeout=10)
@@ -72,9 +73,9 @@ def _metrics_incr_path(path: str):
     metrics["path_counts"][path] = metrics["path_counts"].get(path, 0) + 1
 
 # ─────────────────────────────────────────
-# NEW: Prometheus metric objects
+# Prometheus metric objects
 # ─────────────────────────────────────────
-# 라벨의 카디널리티를 과도하게 키우지 않기 위해 path는 request.path 사용(본 API는 고정 경로 위주)
+# NOTE: path는 정적 경로만 사용(동적 세그먼트가 생기면 정규화 필요)
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests",
@@ -85,13 +86,18 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "http_request_duration_seconds",
     "Request latency (seconds)",
     ["method", "path"],
-    # 일반적인 웹 API 지연 분포 버킷
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13)
 )
 
 RATE_LIMITED_TOTAL = Counter(
     "http_requests_rate_limited_total",
     "Total number of 429 responses"
+)
+
+EXCEPTIONS_TOTAL = Counter(
+    "exceptions_total",
+    "Unhandled exceptions count",
+    ["path"]
 )
 
 UPTIME_SECONDS = Gauge(
@@ -131,7 +137,7 @@ def _before():
     request.environ["x_request_id"] = rid
     request.environ["__t0"] = time.perf_counter()
 
-    # 내부/Prometheus 경로는 별도 처리 (계측은 하되 카운트 증가만)
+    # 내부/Prometheus 경로도 카운트(트래픽 관찰용)
     metrics["req_total"] += 1
     _metrics_incr_path(request.path)
 
@@ -152,11 +158,9 @@ def _after(resp: Response):
     t0 = request.environ.get("__t0")
     dur_s = (time.perf_counter() - t0) if t0 else None
     if dur_s is not None:
-        # 응답헤더(ms) + Prometheus 지연 관측(s)
         resp.headers["X-Response-Time"] = str(int(dur_s * 1000))
         HTTP_REQUEST_DURATION_SECONDS.labels(request.method, request.path).observe(dur_s)
 
-    # 상태별 카운팅(내부/레거시도 유지)
     sc = resp.status_code
     if 200 <= sc < 300:
         metrics["resp_2xx"] += 1
@@ -168,10 +172,9 @@ def _after(resp: Response):
     else:
         metrics["resp_5xx"] += 1
 
-    # Prometheus 카운터
     HTTP_REQUESTS_TOTAL.labels(request.method, request.path, str(sc)).inc()
 
-    # 캐시 헤더 기본값
+    # 캐시 헤더 기본값(성공 응답만)
     if 200 <= sc < 300 and "Cache-Control" not in resp.headers:
         resp.headers["Cache-Control"] = f"public, max-age={DEFAULT_MAX_AGE}"
 
@@ -183,6 +186,17 @@ def _after(resp: Response):
         "ip": _client_ip(),
     })
     return resp
+
+# 전역 예외 핸들러(500 발생 시 계측)
+@app.errorhandler(Exception)
+def _handle_exception(e):
+    try:
+        EXCEPTIONS_TOTAL.labels(path=(request.path or "unknown")).inc()
+    except Exception:
+        pass
+    # 필요시 상세 로깅
+    # app.logger.exception("Unhandled exception")
+    return jsonify({"ok": False, "error": "internal-error"}), 500
 
 # ─────────────────────────────────────────
 # Rate Limiter
@@ -213,7 +227,7 @@ def rate_limited(f):
     return wrapper
 
 # ─────────────────────────────────────────
-# Auth (현재는 X-API-KEY 헤더 비교 — 필요시 활성화)
+# Auth (옵션)
 # ─────────────────────────────────────────
 def require_api_key(f):
     @wraps(f)
@@ -269,7 +283,7 @@ def health():
         "uptime_sec": int(time.time() - metrics["start_ts"])
     })
 
-# 기존 JSON /metrics → /metrics_json 으로 이동
+# 레거시 JSON 메트릭
 @app.get("/metrics_json")
 @rate_limited
 def get_metrics_json():
@@ -283,14 +297,13 @@ def get_metrics_json():
         "requests": metrics
     })
 
-# NEW: Prometheus 표준 텍스트 포맷 (/metrics) — rate limit 금지
+# Prometheus 표준 텍스트 포맷 — rate limit 제외
 @app.get("/metrics")
 def metrics_prometheus():
-    # 기본 registry의 모든 metric 노출
     data = generate_latest()
     return Response(data, mimetype=CONTENT_TYPE_LATEST)
 
-# 유지: 커스텀 텍스트 포맷 (/metrics_prom)
+# 커스텀 텍스트 포맷(레거시 시각화 용)
 def _line_help(name, text): return f"# HELP {name} {text}\n"
 def _line_type(name, typ):  return f"# TYPE {name} {typ}\n"
 def _line_sample(name, value, labels=None):
