@@ -1,21 +1,22 @@
-# main.py  v1.5.0 — SportsStatsX API (structured logs + metrics + rate limit + timeouts)
+# main.py  v1.5.1 — SportsStatsX API (structured logs + metrics + rate limit + Prometheus exposition)
 import os
 import json
 import time
 import uuid
 from datetime import datetime
 from functools import wraps
-from typing import Dict, Tuple
+from typing import Dict
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from psycopg_pool import ConnectionPool
+from collections import defaultdict
 
 # ─────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────
 SERVICE_NAME = os.getenv("SERVICE_NAME", "SportsStatsX")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.5.0")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.5.1")  # bumped
 APP_ENV = os.getenv("APP_ENV", "production")
 
 API_KEY = os.getenv("API_KEY", "")
@@ -40,12 +41,13 @@ CORS(app, resources={
     r"/docs": {"origins": "*"},
     r"/openapi.json": {"origins": "*"},
     r"/metrics": {"origins": "*"},
+    r"/metrics_prom": {"origins": "*"},
 })
 
 pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, timeout=10)
 
 # ─────────────────────────────────────────
-# Metrics
+# Metrics state
 # ─────────────────────────────────────────
 metrics = {
     "start_ts": time.time(),
@@ -54,7 +56,7 @@ metrics = {
     "resp_4xx": 0,
     "resp_5xx": 0,
     "rate_limited": 0,
-    "path_counts": {},
+    "path_counts": {},  # path -> count
 }
 def _metrics_incr_path(path: str):
     metrics["path_counts"][path] = metrics["path_counts"].get(path, 0) + 1
@@ -127,7 +129,6 @@ def _after(resp: Response):
 # ─────────────────────────────────────────
 # Rate Limiter
 # ─────────────────────────────────────────
-from collections import defaultdict
 rate_state: Dict[str, Dict[str, float]] = defaultdict(lambda: {"tokens": RATE_LIMIT_BURST, "last": time.time()})
 
 def rate_limited(f):
@@ -150,7 +151,7 @@ def rate_limited(f):
     return wrapper
 
 # ─────────────────────────────────────────
-# Auth
+# Auth (현재는 X-API-KEY 헤더 비교 — 필요시 활성화)
 # ─────────────────────────────────────────
 def require_api_key(f):
     @wraps(f)
@@ -219,6 +220,50 @@ def get_metrics():
         "uptime_sec": int(time.time() - metrics["start_ts"]),
         "requests": metrics
     })
+
+# ── NEW: Prometheus 텍스트 포맷 노출 (/metrics_prom)
+def _line_help(name, text): return f"# HELP {name} {text}\n"
+def _line_type(name, typ):  return f"# TYPE {name} {typ}\n"
+def _line_sample(name, value, labels=None):
+    if labels:
+        pairs = ",".join(f'{k}="{v}"' for k, v in labels.items())
+        return f"{name}{{{pairs}}} {value}\n"
+    return f"{name} {value}\n"
+
+@app.get("/metrics_prom")
+def metrics_prom():
+    # 텍스트 생성
+    out = []
+    # 총 요청수
+    out.append(_line_help("sportsstatsx_requests_total", "Total requests since start"))
+    out.append(_line_type("sportsstatsx_requests_total", "counter"))
+    out.append(_line_sample("sportsstatsx_requests_total", metrics["req_total"]))
+
+    # 응답 클래스별
+    out.append(_line_help("sportsstatsx_responses_count", "Response counts by class"))
+    out.append(_line_type("sportsstatsx_responses_count", "counter"))
+    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_2xx"], {"class":"2xx"}))
+    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_4xx"], {"class":"4xx"}))
+    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_5xx"], {"class":"5xx"}))
+
+    # 레이트리밋
+    out.append(_line_help("sportsstatsx_rate_limited", "Total 429 responses"))
+    out.append(_line_type("sportsstatsx_rate_limited", "counter"))
+    out.append(_line_sample("sportsstatsx_rate_limited", metrics["rate_limited"]))
+
+    # 경로별 카운트
+    out.append(_line_help("sportsstatsx_path_requests_total", "Requests per path"))
+    out.append(_line_type("sportsstatsx_path_requests_total", "counter"))
+    for p, c in sorted(metrics["path_counts"].items()):
+        out.append(_line_sample("sportsstatsx_path_requests_total", c, {"path": p}))
+
+    # 업타임
+    out.append(_line_help("sportsstatsx_uptime_seconds", "Uptime in seconds"))
+    out.append(_line_type("sportsstatsx_uptime_seconds", "gauge"))
+    out.append(_line_sample("sportsstatsx_uptime_seconds", int(time.time() - metrics["start_ts"])))
+
+    body = "".join(out)
+    return Response(body, mimetype="text/plain; charset=utf-8")
 
 @app.get("/api/fixtures")
 @rate_limited
