@@ -275,7 +275,7 @@ def root():
 
 @app.get("/health")
 def health_plain():
-    # plain text "ok" with 200 OK (Blackbox http_2xx_strict 가 본문 'ok' 검증)
+    # plain text "ok" with 200 OK
     return Response("ok", status=200, mimetype="text/plain")
 
 
@@ -359,6 +359,7 @@ def list_fixtures():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
