@@ -275,13 +275,16 @@ def root():
 
 @app.get("/health")
 def health():
+    # 🚨 임시로 에러 상태를 반환하여 알람 테스트
     return jsonify({
-        "ok": True,
+        "ok": False,
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
         "env": APP_ENV,
-        "uptime_sec": int(time.time() - metrics["start_ts"])
-    })
+        "uptime_sec": int(time.time()) - metrics["start_ts"],
+        "error": "intentional test failure"
+    }), 500  # <== 상태코드 500 으로 설정
+
 
 # 레거시 JSON 메트릭
 @app.get("/metrics_json")
@@ -363,3 +366,4 @@ def list_fixtures():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
