@@ -273,15 +273,19 @@ def fetch_one(sql: str, params: tuple = ()):
 def root():
     return "Hello from SportsStatsX API!"
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
+    """
+    Blackbox strict probe용 Health Check
+    무조건 200 OK + 간단한 JSON 반환
+    """
     return jsonify({
-        "ok": True,
+        "status": "ok",
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
         "env": APP_ENV,
         "uptime_sec": int(time.time()) - metrics["start_ts"]
-    })
+    }), 200
 
 
 # 레거시 JSON 메트릭
@@ -364,5 +368,6 @@ def list_fixtures():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
