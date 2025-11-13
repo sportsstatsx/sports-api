@@ -1,8 +1,7 @@
-# main.py  v1.6.1 — SportsStatsX API
-# - Prometheus 표준 /metrics 유지 (prometheus_client)
-# - 기존 커스텀 텍스트 /metrics_prom 유지
+# main.py  v1.6.2 — SportsStatsX API
+# - Prometheus 표준 /metrics
+# - 커스텀 텍스트 /metrics_prom (레거시용)
 # - 요청 카운트/지연/429/예외 카운트 계측
-# - Grafana/Prometheus 룰과 라벨 스키마 정합성 강화
 
 import os
 import json
@@ -25,9 +24,6 @@ from prometheus_client import (
 )
 
 from db import fetch_all, fetch_one, execute
-from src.metrics_instrumentation import (
-    instrument_app,
-)
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -88,7 +84,11 @@ _ip_buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"ts": 0, "cnt": 0}
 
 
 def _client_ip() -> str:
-    return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown"
+    return (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.remote_addr
+        or "unknown"
+    )
 
 
 def rate_limited(f):
@@ -222,10 +222,9 @@ def health():
 
 
 # ─────────────────────────────────────────
-# 예제 API: fixtures 조회 (Postgres matches/teams/leagues 기반)
+# 레거시용 /metrics_prom (간단한 자체 포맷)
 # ─────────────────────────────────────────
 
-# 레거시 커스텀 텍스트 /metrics_prom용 메트릭 집계용
 metrics = {
     "start_ts": time.time(),
     "req_total": 0,
@@ -236,9 +235,6 @@ metrics = {
     "path_counts": defaultdict(int),
 }
 
-# Flask용 계측(instrument_app)은 기존 코드 유지
-instrument_app(app, service_name=SERVICE_NAME, service_version=SERVICE_VERSION)
-
 
 @app.before_request
 def _before_for_legacy_metrics():
@@ -246,9 +242,14 @@ def _before_for_legacy_metrics():
     metrics["path_counts"][request.path] += 1
 
 
-# 커스텀 텍스트 포맷(레거시 시각화 용)
-def _line_help(name, text): return f"# HELP {name} {text}\n"
-def _line_type(name, typ):  return f"# TYPE {name} {typ}\n"
+def _line_help(name, text):
+    return f"# HELP {name} {text}\n"
+
+
+def _line_type(name, typ):
+    return f"# TYPE {name} {typ}\n"
+
+
 def _line_sample(name, value, labels=None):
     if labels:
         pairs = ",".join(f'{k}="{v}"' for k, v in labels.items())
@@ -265,9 +266,15 @@ def metrics_prom():
 
     out.append(_line_help("sportsstatsx_responses_count", "Response counts by class"))
     out.append(_line_type("sportsstatsx_responses_count", "counter"))
-    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_2xx"], {"class": "2xx"}))
-    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_4xx"], {"class": "4xx"}))
-    out.append(_line_sample("sportsstatsx_responses_count", metrics["resp_5xx"], {"class": "5xx"}))
+    out.append(
+        _line_sample("sportsstatsx_responses_count", metrics["resp_2xx"], {"class": "2xx"})
+    )
+    out.append(
+        _line_sample("sportsstatsx_responses_count", metrics["resp_4xx"], {"class": "4xx"})
+    )
+    out.append(
+        _line_sample("sportsstatsx_responses_count", metrics["resp_5xx"], {"class": "5xx"})
+    )
 
     out.append(_line_help("sportsstatsx_rate_limited", "Total 429 responses"))
     out.append(_line_type("sportsstatsx_rate_limited", "counter"))
@@ -280,18 +287,26 @@ def metrics_prom():
 
     out.append(_line_help("sportsstatsx_uptime_seconds", "Uptime in seconds"))
     out.append(_line_type("sportsstatsx_uptime_seconds", "gauge"))
-    out.append(_line_sample("sportsstatsx_uptime_seconds", int(time.time() - metrics["start_ts"])))
+    out.append(
+        _line_sample(
+            "sportsstatsx_uptime_seconds", int(time.time() - metrics["start_ts"])
+        )
+    )
 
     body = "".join(out)
     return Response(body, mimetype="text/plain; charset=utf-8")
 
 
+# ─────────────────────────────────────────
+# fixtures API (Postgres matches/teams/leagues 기반)
+# ─────────────────────────────────────────
+
 @app.get("/api/fixtures")
 @rate_limited
 def list_fixtures():
     """
-    football.db 에서 옮겨온 matches / teams / leagues 테이블을 기준으로
-    홈 화면 매치 리스트용 간단한 API.
+    Postgres의 matches / teams / leagues 테이블을 기반으로
+    홈 화면 매치 리스트용 데이터를 반환.
 
     쿼리 파라미터:
       - league_id: 리그 ID (예: 39)
@@ -350,4 +365,5 @@ def list_fixtures():
 
 
 if __name__ == "__main__":
+    import time as _time  # perf_counter 충돌 피하기 위해 별칭
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
