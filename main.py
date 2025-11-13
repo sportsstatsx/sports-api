@@ -14,140 +14,144 @@ from typing import Dict
 from collections import defaultdict
 
 from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
-from psycopg_pool import ConnectionPool
+from werkzeug.exceptions import HTTPException
+
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
+
+from db import fetch_all, fetch_one, execute
+from src.metrics_instrumentation import (
+    instrument_app,
+)
 
 # ─────────────────────────────────────────
-# Prometheus client
+# 환경 변수 / 기본 설정
 # ─────────────────────────────────────────
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+SERVICE_NAME = os.getenv("SERVICE_NAME", "sportsstatsx-api")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
+APP_ENV = os.getenv("APP_ENV", "prod")
+
+LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "1.0"))  # 0.0 ~ 1.0
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 
 # ─────────────────────────────────────────
-# Config
+# Flask 앱 생성
 # ─────────────────────────────────────────
-SERVICE_NAME = os.getenv("SERVICE_NAME", "SportsStatsX")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.6.1")  # bumped
-APP_ENV = os.getenv("APP_ENV", "production")
 
-API_KEY = os.getenv("API_KEY", "")
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
-RATE_LIMIT_BURST   = int(os.getenv("RATE_LIMIT_BURST", "30"))
-LOG_SAMPLE_RATE    = float(os.getenv("LOG_SAMPLE_RATE", "0.25"))
-DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "3000"))
-DEFAULT_MAX_AGE = 30
-
-# ─────────────────────────────────────────
-# App / DB
-# ─────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={
-    r"/api/*": {"origins": "*"},
-    r"/health": {"origins": "*"},
-    r"/docs": {"origins": "*"},
-    r"/openapi.json": {"origins": "*"},
-    r"/metrics": {"origins": "*"},       # Prometheus scrape (표준)
-    r"/metrics_prom": {"origins": "*"},  # 커스텀 텍스트
-    r"/metrics_json": {"origins": "*"},  # 레거시 JSON
-})
-
-pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, timeout=10)
 
 # ─────────────────────────────────────────
-# In-memory metrics (legacy JSON + custom text)
+# Prometheus 지표 정의 (표준 /metrics 용)
 # ─────────────────────────────────────────
-metrics = {
-    "start_ts": time.time(),
-    "req_total": 0,
-    "resp_2xx": 0,
-    "resp_4xx": 0,
-    "resp_5xx": 0,
-    "rate_limited": 0,
-    "path_counts": {},  # path -> count
-}
-def _metrics_incr_path(path: str):
-    metrics["path_counts"][path] = metrics["path_counts"].get(path, 0) + 1
 
-# ─────────────────────────────────────────
-# Prometheus metric objects
-# ─────────────────────────────────────────
-# NOTE: path는 정적 경로만 사용(동적 세그먼트가 생기면 정규화 필요)
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
     "Total HTTP requests",
-    ["method", "path", "status"]
+    ["method", "path", "status"],
 )
 
 HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "http_request_duration_seconds",
-    "Request latency (seconds)",
+    "HTTP request latency in seconds",
     ["method", "path"],
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13)
+)
+
+HTTP_EXCEPTIONS_TOTAL = Counter(
+    "http_exceptions_total",
+    "Total exceptions",
+    ["type", "path"],
 )
 
 RATE_LIMITED_TOTAL = Counter(
-    "http_requests_rate_limited_total",
-    "Total number of 429 responses"
-)
-
-EXCEPTIONS_TOTAL = Counter(
-    "exceptions_total",
-    "Unhandled exceptions count",
-    ["path"]
+    "http_rate_limited_total",
+    "Total rate limited responses (429)",
 )
 
 UPTIME_SECONDS = Gauge(
-    "sportsstatsx_uptime_seconds",
-    "Uptime in seconds"
+    "process_uptime_seconds",
+    "Process uptime in seconds",
 )
 
-# ─────────────────────────────────────────
-# Helpers: logging
-# ─────────────────────────────────────────
-def _now_iso():
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-
-def _client_ip():
-    return (request.headers.get("CF-Connecting-IP")
-            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.remote_addr
-            or "")
-
-def _maybe_log(payload: dict):
-    try:
-        import random
-        if random.random() <= LOG_SAMPLE_RATE:
-            print(json.dumps(payload, ensure_ascii=False), flush=True)
-    except Exception:
-        pass
+START_TS = time.time()
 
 # ─────────────────────────────────────────
-# Request lifecycle hooks
+# 간단한 레이트 리미터 (IP 기준 분당 요청 수)
 # ─────────────────────────────────────────
+
+_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"ts": 0, "cnt": 0})
+
+
+def _client_ip() -> str:
+    return request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or "unknown"
+
+
+def rate_limited(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        ip = _client_ip()
+        now = int(time.time())
+        bucket = _ip_buckets[ip]
+
+        if now - bucket["ts"] >= 60:
+            bucket["ts"] = now
+            bucket["cnt"] = 0
+
+        bucket["cnt"] += 1
+        if bucket["cnt"] > RATE_LIMIT_PER_MINUTE:
+            RATE_LIMITED_TOTAL.inc()
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+        return f(*args, **kwargs)
+
+    return wrapper
+
+
+# ─────────────────────────────────────────
+# 요청/응답 로깅 (샘플링)
+# ─────────────────────────────────────────
+
+def log_json(level: str, msg: str, **kwargs):
+    if LOG_SAMPLE_RATE <= 0:
+        return
+    if LOG_SAMPLE_RATE < 1.0:
+        if uuid.uuid4().int % 1000 > int(LOG_SAMPLE_RATE * 1000):
+            return
+
+    base = {
+        "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        "level": level,
+        "msg": msg,
+        "svc": SERVICE_NAME,
+        "ver": SERVICE_VERSION,
+        "env": APP_ENV,
+    }
+    base.update(kwargs)
+    print(json.dumps(base, ensure_ascii=False))
+
+
 @app.before_request
 def _before():
-    # uptime 지속 갱신
-    UPTIME_SECONDS.set(int(time.time() - metrics["start_ts"]))
-
+    request.environ["__t0"] = time.perf_counter()
     rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.environ["x_request_id"] = rid
-    request.environ["__t0"] = time.perf_counter()
 
-    # 내부/Prometheus 경로도 카운트(트래픽 관찰용)
-    metrics["req_total"] += 1
-    _metrics_incr_path(request.path)
+    log_json(
+        "INFO",
+        "request",
+        rid=rid,
+        method=request.method,
+        path=request.path,
+        query=request.query_string.decode("utf-8") if request.query_string else "",
+        ip=_client_ip(),
+        ua=request.headers.get("User-Agent", ""),
+    )
 
-    _maybe_log({
-        "t": "req", "ts": _now_iso(), "service": SERVICE_NAME,
-        "ver": SERVICE_VERSION, "env": APP_ENV,
-        "request_id": rid, "method": request.method,
-        "path": request.path, "query": request.query_string.decode("utf-8") if request.query_string else "",
-        "ip": _client_ip(), "ua": request.headers.get("User-Agent", ""),
-    })
 
 @app.after_request
 def _after(resp: Response):
@@ -163,141 +167,84 @@ def _after(resp: Response):
 
     sc = resp.status_code
     if 200 <= sc < 300:
-        metrics["resp_2xx"] += 1
+        pass
     elif 400 <= sc < 500:
-        metrics["resp_4xx"] += 1
         if sc == 429:
-            metrics["rate_limited"] += 1
             RATE_LIMITED_TOTAL.inc()
     else:
-        metrics["resp_5xx"] += 1
+        pass
 
     HTTP_REQUESTS_TOTAL.labels(request.method, request.path, str(sc)).inc()
 
-    # 캐시 헤더 기본값(성공 응답만)
-    if 200 <= sc < 300 and "Cache-Control" not in resp.headers:
-        resp.headers["Cache-Control"] = f"public, max-age={DEFAULT_MAX_AGE}"
-
-    _maybe_log({
-        "t": "resp", "ts": _now_iso(), "service": SERVICE_NAME,
-        "ver": SERVICE_VERSION, "env": APP_ENV,
-        "status": sc, "path": request.path,
-        "dur_ms": int(dur_s * 1000) if dur_s is not None else None,
-        "ip": _client_ip(),
-    })
+    log_json(
+        "INFO",
+        "response",
+        rid=rid,
+        method=request.method,
+        path=request.path,
+        status=sc,
+        dur_ms=int(dur_s * 1000) if dur_s is not None else None,
+    )
     return resp
 
-# 전역 예외 핸들러(500 발생 시 계측)
+
 @app.errorhandler(Exception)
-def _handle_exception(e):
-    try:
-        EXCEPTIONS_TOTAL.labels(path=(request.path or "unknown")).inc()
-    except Exception:
-        pass
-    # 필요시 상세 로깅
-    # app.logger.exception("Unhandled exception")
-    return jsonify({"ok": False, "error": "internal-error"}), 500
+def _handle_error(e: Exception):
+    if isinstance(e, HTTPException):
+        HTTP_EXCEPTIONS_TOTAL.labels(type(e).__name__, request.path).inc()
+        return e
+
+    HTTP_EXCEPTIONS_TOTAL.labels(type(e).__name__, request.path).inc()
+    log_json("ERROR", "unhandled_exception", err=str(e), path=request.path)
+    return jsonify({"ok": False, "error": "internal_error"}), 500
+
 
 # ─────────────────────────────────────────
-# Rate Limiter
+# Prometheus /metrics (표준 포맷)
 # ─────────────────────────────────────────
-rate_state: Dict[str, Dict[str, float]] = defaultdict(lambda: {"tokens": RATE_LIMIT_BURST, "last": time.time()})
 
-def rate_limited(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        # 메트릭/헬스는 무조건 통과 (Prometheus scrape 방해 금지)
-        if request.path in ("/metrics", "/metrics_prom", "/health"):
-            return f(*args, **kwargs)
+@app.get("/metrics")
+def metrics_endpoint():
+    UPTIME_SECONDS.set(time.time() - START_TS)
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
-        ip = _client_ip() or "unknown"
-        bucket = rate_state[ip]
-        now = time.time()
-        elapsed = now - bucket["last"]
-        bucket["tokens"] = min(RATE_LIMIT_BURST, bucket["tokens"] + elapsed * (RATE_LIMIT_PER_MIN / 60))
-        bucket["last"] = now
-        if bucket["tokens"] < 1:
-            reset_sec = max(0, int(60 - (time.time() - bucket["last"])))
-            return jsonify({
-                "ok": False,
-                "error": {"code": "rate_limited", "message": "Too Many Requests", "retry_after_sec": reset_sec}
-            }), 429
-        bucket["tokens"] -= 1
-        return f(*args, **kwargs)
-    return wrapper
 
 # ─────────────────────────────────────────
-# Auth (옵션)
+# Health check
 # ─────────────────────────────────────────
-def require_api_key(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        client_key = request.headers.get("X-API-KEY", "")
-        if not API_KEY or client_key != API_KEY:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-        return f(*args, **kwargs)
-    return wrapper
-
-# ─────────────────────────────────────────
-# DB helpers
-# ─────────────────────────────────────────
-def _set_statement_timeout(conn):
-    try:
-        conn.execute(f"SET LOCAL statement_timeout = {DB_STATEMENT_TIMEOUT_MS}")
-    except Exception:
-        pass
-
-def fetch_all(sql: str, params: tuple = ()):
-    with pool.connection() as conn:
-        _set_statement_timeout(conn)
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-def fetch_one(sql: str, params: tuple = ()):
-    with pool.connection() as conn:
-        _set_statement_timeout(conn)
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
-            if not row:
-                return None
-            cols = [c[0] for c in cur.description]
-            return dict(zip(cols, row))
-
-# ─────────────────────────────────────────
-# API Endpoints
-# ─────────────────────────────────────────
-@app.get("/")
-def root():
-    return "Hello from SportsStatsX API!"
 
 @app.get("/health")
-def health_plain():
-    # plain text "ok" with 200 OK
-    return Response("ok", status=200, mimetype="text/plain")
+def health():
+    row = fetch_one("SELECT 1 AS ok")
+    if not row or row["ok"] != 1:
+        return jsonify({"ok": False}), 500
+    return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
 
 
-# 레거시 JSON 메트릭
-@app.get("/metrics_json")
-@rate_limited
-def get_metrics_json():
-    return jsonify({
-        "ok": True,
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "env": APP_ENV,
-        "since": int(metrics["start_ts"]),
-        "uptime_sec": int(time.time() - metrics["start_ts"]),
-        "requests": metrics
-    })
+# ─────────────────────────────────────────
+# 예제 API: fixtures 조회 (Postgres matches/teams/leagues 기반)
+# ─────────────────────────────────────────
 
-# Prometheus 표준 텍스트 포맷 — rate limit 제외
-@app.get("/metrics")
-def metrics_prometheus():
-    data = generate_latest()
-    return Response(data, mimetype=CONTENT_TYPE_LATEST)
+# 레거시 커스텀 텍스트 /metrics_prom용 메트릭 집계용
+metrics = {
+    "start_ts": time.time(),
+    "req_total": 0,
+    "resp_2xx": 0,
+    "resp_4xx": 0,
+    "resp_5xx": 0,
+    "rate_limited": 0,
+    "path_counts": defaultdict(int),
+}
+
+# Flask용 계측(instrument_app)은 기존 코드 유지
+instrument_app(app, service_name=SERVICE_NAME, service_version=SERVICE_VERSION)
+
+
+@app.before_request
+def _before_for_legacy_metrics():
+    metrics["req_total"] += 1
+    metrics["path_counts"][request.path] += 1
+
 
 # 커스텀 텍스트 포맷(레거시 시각화 용)
 def _line_help(name, text): return f"# HELP {name} {text}\n"
@@ -307,6 +254,7 @@ def _line_sample(name, value, labels=None):
         pairs = ",".join(f'{k}="{v}"' for k, v in labels.items())
         return f"{name}{{{pairs}}} {value}\n"
     return f"{name} {value}\n"
+
 
 @app.get("/metrics_prom")
 def metrics_prom():
@@ -337,31 +285,69 @@ def metrics_prom():
     body = "".join(out)
     return Response(body, mimetype="text/plain; charset=utf-8")
 
+
 @app.get("/api/fixtures")
 @rate_limited
 def list_fixtures():
+    """
+    football.db 에서 옮겨온 matches / teams / leagues 테이블을 기준으로
+    홈 화면 매치 리스트용 간단한 API.
+
+    쿼리 파라미터:
+      - league_id: 리그 ID (예: 39)
+      - date: 'YYYY-MM-DD' 형식 날짜 (옵션)
+      - page, page_size: 페이징
+    """
     league_id = request.args.get("league_id", type=int)
-    date_str  = request.args.get("date")
-    page      = max(1, request.args.get("page", default=1, type=int))
+    date_str = request.args.get("date")  # 'YYYY-MM-DD'
+    page = max(1, request.args.get("page", default=1, type=int))
     page_size = max(1, min(100, request.args.get("page_size", default=50, type=int)))
 
-    where, params = [], []
-    if league_id: where.append("league_id = %s"); params.append(league_id)
-    if date_str:  where.append("match_date = %s"); params.append(date_str)
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    where_parts = []
+    params = []
 
-    rows = fetch_all(f"""
-        SELECT id, league_id, match_date, home_team, away_team, home_score, away_score, updated_at
-        FROM fixtures {where_sql} ORDER BY id ASC LIMIT %s OFFSET %s
-    """, tuple(params + [page_size, (page - 1) * page_size]))
+    if league_id is not None:
+        where_parts.append("m.league_id = %s")
+        params.append(league_id)
 
+    # date_utc TEXT 에서 앞 10글자(YYYY-MM-DD)만 잘라서 비교
+    if date_str:
+        where_parts.append("SUBSTRING(m.date_utc FROM 1 FOR 10) = %s")
+        params.append(date_str)
+
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+    sql = f"""
+        SELECT
+            m.fixture_id,
+            m.league_id,
+            l.name AS league_name,
+            m.season,
+            m.date_utc,
+            SUBSTRING(m.date_utc FROM 1 FOR 10) AS match_date,
+            SUBSTRING(m.date_utc FROM 12 FOR 8) AS match_time_utc,
+            m.status,
+            m.status_group,
+            m.home_id,
+            th.name AS home_name,
+            m.away_id,
+            ta.name AS away_name,
+            m.home_ft,
+            m.away_ft
+        FROM matches m
+        JOIN leagues l ON l.id = m.league_id
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
+        {where_sql}
+        ORDER BY m.date_utc ASC
+        LIMIT %s OFFSET %s
+    """
+
+    params.extend([page_size, (page - 1) * page_size])
+
+    rows = fetch_all(sql, tuple(params))
     return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-
-
-
-
-
