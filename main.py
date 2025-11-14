@@ -14,11 +14,7 @@ from collections import defaultdict
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
-
-from prometheus_client import (
-    Counter,
-    Histogram,
-    Gauge,
+...
     generate_latest,
     CONTENT_TYPE_LATEST,
 )
@@ -32,6 +28,31 @@ from db import fetch_all, fetch_one, execute
 SERVICE_NAME = os.getenv("SERVICE_NAME", "sportsstatsx-api")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 APP_ENV = os.getenv("APP_ENV", "prod")
+
+# 허용 리그 목록 (Render 환경변수에서 읽기)
+# 예: LIVE_LEAGUES="39,40,140,141"
+_RAW_LIVE_LEAGUES = (
+    os.getenv("live-league")
+    or os.getenv("LIVE_LEAGUES")
+    or os.getenv("LIVE_LEAGUE")
+    or ""
+)
+
+def _parse_allowed_league_ids(raw: str):
+    ids = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.append(int(part))
+        except ValueError:
+            # 숫자로 변환 안 되는 값은 무시
+            continue
+    # 중복 제거 + 정렬
+    return sorted(set(ids))
+
+ALLOWED_LEAGUE_IDS = _parse_allowed_league_ids(_RAW_LIVE_LEAGUES)
 
 LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "1.0"))  # 0.0 ~ 1.0
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
@@ -54,19 +75,20 @@ HTTP_REQUESTS_TOTAL = Counter(
 
 HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "http_request_duration_seconds",
-    "HTTP request latency in seconds",
+    "HTTP request duration in seconds",
     ["method", "path"],
 )
 
-HTTP_EXCEPTIONS_TOTAL = Counter(
-    "http_exceptions_total",
-    "Total exceptions",
-    ["type", "path"],
+HTTP_REQUEST_EXCEPTIONS_TOTAL = Counter(
+    "http_request_exceptions_total",
+    "Total HTTP exceptions",
+    ["type"],
 )
 
-RATE_LIMITED_TOTAL = Counter(
-    "http_rate_limited_total",
-    "Total rate limited responses (429)",
+HTTP_429_TOTAL = Counter(
+    "http_429_total",
+    "Total HTTP 429 responses (rate limited)",
+    ["ip", "path"],
 )
 
 UPTIME_SECONDS = Gauge(
@@ -80,76 +102,78 @@ START_TS = time.time()
 # 간단한 레이트 리미터 (IP 기준 분당 요청 수)
 # ─────────────────────────────────────────
 
-_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"ts": 0, "cnt": 0})
+_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(
+    lambda: {"ts": 0, "count": 0}
+)
+
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "60"))  # 분당 허용 버스트
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
 
 
-def _client_ip() -> str:
-    return (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or request.remote_addr
-        or "unknown"
-    )
+def _rate_limit_key() -> str:
+    """IP 기준 rate-limit key"""
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if not ip:
+        ip = request.remote_addr or "unknown"
+    return ip
 
 
-def rate_limited(f):
-    @wraps(f)
+def check_rate_limit() -> bool:
+    """분당 요청 수가 RATE_LIMIT_PER_MIN 이상이면 False"""
+    ip = _rate_limit_key()
+    now = int(time.time())
+    bucket = _ip_buckets[ip]
+
+    if now - bucket["ts"] >= 60:
+        bucket["ts"] = now
+        bucket["count"] = 0
+
+    bucket["count"] += 1
+    if bucket["count"] > RATE_LIMIT_PER_MIN:
+        HTTP_429_TOTAL.labels(ip=ip, path=request.path).inc()
+        return False
+    return True
+
+
+def rate_limited(fn):
+    @wraps(fn)
     def wrapper(*args, **kwargs):
-        ip = _client_ip()
-        now = int(time.time())
-        bucket = _ip_buckets[ip]
-
-        if now - bucket["ts"] >= 60:
-            bucket["ts"] = now
-            bucket["cnt"] = 0
-
-        bucket["cnt"] += 1
-        if bucket["cnt"] > RATE_LIMIT_PER_MINUTE:
-            RATE_LIMITED_TOTAL.inc()
+        if not check_rate_limit():
             return jsonify({"ok": False, "error": "rate_limited"}), 429
-
-        return f(*args, **kwargs)
+        return fn(*args, **kwargs)
 
     return wrapper
 
 
 # ─────────────────────────────────────────
-# 요청/응답 로깅 (샘플링)
+# 요청/응답 로깅 + metrics 계측용 미들웨어
 # ─────────────────────────────────────────
 
-def log_json(level: str, msg: str, **kwargs):
-    if LOG_SAMPLE_RATE <= 0:
-        return
-    if LOG_SAMPLE_RATE < 1.0:
-        if uuid.uuid4().int % 1000 > int(LOG_SAMPLE_RATE * 1000):
-            return
-
-    base = {
-        "ts": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-        "level": level,
-        "msg": msg,
-        "svc": SERVICE_NAME,
-        "ver": SERVICE_VERSION,
-        "env": APP_ENV,
-    }
-    base.update(kwargs)
-    print(json.dumps(base, ensure_ascii=False))
+def _client_ip() -> str:
+    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return ip or (request.remote_addr or "unknown")
 
 
 @app.before_request
 def _before():
     request.environ["__t0"] = time.perf_counter()
-    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    request.environ["x_request_id"] = rid
+    # 샘플링 비율에 따라 일부 요청만 로깅
+    if LOG_SAMPLE_RATE <= 0:
+        return
+    if LOG_SAMPLE_RATE < 1.0:
+        if uuid.uuid4().int % 10_000 > int(LOG_SAMPLE_RATE * 10_000):
+            return
 
-    log_json(
-        "INFO",
-        "request",
-        rid=rid,
-        method=request.method,
-        path=request.path,
-        query=request.query_string.decode("utf-8") if request.query_string else "",
-        ip=_client_ip(),
-        ua=request.headers.get("User-Agent", ""),
+    request_id = str(uuid.uuid4())
+    request.environ["x_request_id"] = request_id
+
+    app.logger.info(
+        "[REQ] %s %s ip=%s ua=%s rid=%s",
+        request.method,
+        request.path,
+        _client_ip(),
+        request.headers.get("User-Agent", ""),
+        request_id,
     )
 
 
@@ -160,131 +184,98 @@ def _after(resp: Response):
         resp.headers["X-Request-ID"] = rid
 
     t0 = request.environ.get("__t0")
-    dur_s = (time.perf_counter() - t0) if t0 else None
-    if dur_s is not None:
-        resp.headers["X-Response-Time"] = str(int(dur_s * 1000))
-        HTTP_REQUEST_DURATION_SECONDS.labels(request.method, request.path).observe(dur_s)
+    if t0:
+        dur = time.perf_counter() - t0
+        HTTP_REQUEST_DURATION_SECONDS.labels(
+            method=request.method,
+            path=request.path,
+        ).observe(dur)
 
-    sc = resp.status_code
-    if 200 <= sc < 300:
-        pass
-    elif 400 <= sc < 500:
-        if sc == 429:
-            RATE_LIMITED_TOTAL.inc()
-    else:
-        pass
-
-    HTTP_REQUESTS_TOTAL.labels(request.method, request.path, str(sc)).inc()
-
-    log_json(
-        "INFO",
-        "response",
-        rid=rid,
+    HTTP_REQUESTS_TOTAL.labels(
         method=request.method,
         path=request.path,
-        status=sc,
-        dur_ms=int(dur_s * 1000) if dur_s is not None else None,
-    )
+        status=resp.status_code,
+    ).inc()
+
     return resp
 
 
 @app.errorhandler(Exception)
-def _handle_error(e: Exception):
+def handle_exception(e):
     if isinstance(e, HTTPException):
-        HTTP_EXCEPTIONS_TOTAL.labels(type(e).__name__, request.path).inc()
+        HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
         return e
 
-    HTTP_EXCEPTIONS_TOTAL.labels(type(e).__name__, request.path).inc()
-    log_json("ERROR", "unhandled_exception", err=str(e), path=request.path)
+    HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
+    app.logger.exception("Unhandled exception: %s", e)
     return jsonify({"ok": False, "error": "internal_error"}), 500
 
 
 # ─────────────────────────────────────────
-# Prometheus /metrics (표준 포맷)
+# /metrics  (Prometheus 표준 포맷)
 # ─────────────────────────────────────────
 
 @app.get("/metrics")
-def metrics_endpoint():
+def metrics():
     UPTIME_SECONDS.set(time.time() - START_TS)
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 
 # ─────────────────────────────────────────
-# Health check
+# /metrics_prom  (텍스트 포맷, 레거시용)
 # ─────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    row = fetch_one("SELECT 1 AS ok")
-    if not row or row["ok"] != 1:
-        return jsonify({"ok": False}), 500
-    return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
-
-
-# ─────────────────────────────────────────
-# 레거시용 /metrics_prom (간단한 자체 포맷)
-# ─────────────────────────────────────────
-
-metrics = {
-    "start_ts": time.time(),
-    "req_total": 0,
-    "resp_2xx": 0,
-    "resp_4xx": 0,
-    "resp_5xx": 0,
-    "rate_limited": 0,
-    "path_counts": defaultdict(int),
-}
-
-
-@app.before_request
-def _before_for_legacy_metrics():
-    metrics["req_total"] += 1
-    metrics["path_counts"][request.path] += 1
-
-
-def _line_help(name, text):
-    return f"# HELP {name} {text}\n"
-
-
-def _line_type(name, typ):
-    return f"# TYPE {name} {typ}\n"
-
-
-def _line_sample(name, value, labels=None):
-    if labels:
-        pairs = ",".join(f'{k}="{v}"' for k, v in labels.items())
-        return f"{name}{{{pairs}}} {value}\n"
-    return f"{name} {value}\n"
-
 
 @app.get("/metrics_prom")
 def metrics_prom():
+    # Prometheus 텍스트 포맷에 맞는 라인들을 구성
+    # (이전 버전 호환용, 필요한 최소한만 유지)
+    metrics = {
+        "start_ts": START_TS,
+        "uptime": time.time() - START_TS,
+    }
+
+    # HTTP 요청 카운트/429/예외/지연 등의 일부 지표를 단순 합산해 텍스트로 노출
     out = []
-    out.append(_line_help("sportsstatsx_requests_total", "Total requests since start"))
-    out.append(_line_type("sportsstatsx_requests_total", "counter"))
-    out.append(_line_sample("sportsstatsx_requests_total", metrics["req_total"]))
 
-    out.append(_line_help("sportsstatsx_responses_count", "Response counts by class"))
-    out.append(_line_type("sportsstatsx_responses_count", "counter"))
+    def _line_help(name, desc):
+        return f"# HELP {name} {desc}\n"
+
+    def _line_type(name, typ):
+        return f"# TYPE {name} {typ}\n"
+
+    def _line_sample(name, value, labels=None):
+        if labels:
+            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
+            return f'{name}{{{label_str}}} {value}\n'
+        return f"{name} {value}\n"
+
+    # http_requests_total
+    out.append(_line_help("sportsstatsx_http_requests_total", "Total HTTP requests"))
+    out.append(_line_type("sportsstatsx_http_requests_total", "counter"))
+    for (m, p, s), c in HTTP_REQUESTS_TOTAL._metrics.items():
+        out.append(
+            _line_sample(
+                "sportsstatsx_http_requests_total",
+                c._value.get(),
+                {"method": m, "path": p, "status": s},
+            )
+        )
+
+    # http_429_total
     out.append(
-        _line_sample("sportsstatsx_responses_count", metrics["resp_2xx"], {"class": "2xx"})
+        _line_help("sportsstatsx_http_429_total", "Total rate limited responses (429)")
     )
-    out.append(
-        _line_sample("sportsstatsx_responses_count", metrics["resp_4xx"], {"class": "4xx"})
-    )
-    out.append(
-        _line_sample("sportsstatsx_responses_count", metrics["resp_5xx"], {"class": "5xx"})
-    )
+    out.append(_line_type("sportsstatsx_http_429_total", "counter"))
+    for (ip, path), c in HTTP_429_TOTAL._metrics.items():
+        out.append(
+            _line_sample(
+                "sportsstatsx_http_429_total",
+                c._value.get(),
+                {"ip": ip, "path": path},
+            )
+        )
 
-    out.append(_line_help("sportsstatsx_rate_limited", "Total 429 responses"))
-    out.append(_line_type("sportsstatsx_rate_limited", "counter"))
-    out.append(_line_sample("sportsstatsx_rate_limited", metrics["rate_limited"]))
-
-    out.append(_line_help("sportsstatsx_path_requests_total", "Requests per path"))
-    out.append(_line_type("sportsstatsx_path_requests_total", "counter"))
-    for p, c in sorted(metrics["path_counts"].items()):
-        out.append(_line_sample("sportsstatsx_path_requests_total", c, {"path": p}))
-
+    # uptime
     out.append(_line_help("sportsstatsx_uptime_seconds", "Uptime in seconds"))
     out.append(_line_type("sportsstatsx_uptime_seconds", "gauge"))
     out.append(
@@ -294,11 +285,28 @@ def metrics_prom():
     )
 
     body = "".join(out)
-    return Response(body, mimetype="text/plain; charset=utf-8")
+
+    return Response(body, mimetype="text/plain; version=0.0.4")
 
 
 # ─────────────────────────────────────────
-# fixtures API (Postgres matches/teams/leagues 기반)
+# 헬스 체크
+# ─────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    try:
+        row = fetch_one("SELECT 1 AS ok")
+        if not row or row.get("ok") != 1:
+            raise RuntimeError("DB check failed")
+        return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
+    except Exception as e:
+        app.logger.exception("Health check failed: %s", e)
+        return jsonify({"ok": False, "error": "db_unavailable"}), 500
+
+
+# ─────────────────────────────────────────
+# 홈 화면: fixtures 리스트
 # ─────────────────────────────────────────
 
 @app.get("/api/fixtures")
@@ -329,6 +337,12 @@ def list_fixtures():
     if date_str:
         where_parts.append("SUBSTRING(m.date_utc FROM 1 FOR 10) = %s")
         params.append(date_str)
+
+    # 환경에서 허용된 리그만 필터링 (설정되어 있을 때만 적용)
+    if ALLOWED_LEAGUE_IDS:
+        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
+        where_parts.append(f"m.league_id IN ({placeholders})")
+        params.extend(ALLOWED_LEAGUE_IDS)
 
     where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
 
