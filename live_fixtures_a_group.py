@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -8,6 +9,7 @@ from live_fixtures_common import API_KEY, map_status_group
 
 
 BASE_URL = "https://v3.football.api-sports.io/fixtures"
+EVENTS_URL = "https://v3.football.api-sports.io/fixtures/events"
 
 
 def _get_headers() -> Dict[str, str]:
@@ -49,6 +51,34 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
         fixtures.append(item)
 
     return fixtures
+
+
+def fetch_events_from_api(fixture_id: int) -> List[Dict[str, Any]]:
+    """
+    특정 경기(fixture_id)에 대한 이벤트 리스트를 Api-Football에서 가져온다.
+
+    - endpoint: /fixtures/events
+    - params:
+        fixture: fixture_id
+    """
+    headers = _get_headers()
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(EVENTS_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+
+    data = resp.json()
+    results = data.get("response", []) or []
+
+    # Api-Football 응답 구조 상, response 가 곧 이벤트 리스트
+    events: List[Dict[str, Any]] = []
+    for ev in results:
+        if isinstance(ev, dict):
+            events.append(ev)
+
+    return events
 
 
 def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -143,18 +173,17 @@ def upsert_match_row(
     """
     A그룹: matches 테이블 upsert 구현.
 
-    가정한 기본 컬럼(필요하면 나중에 스키마에 맞게 수정):
-      - fixture_id (PK)
-      - league_id
-      - season
-      - date_utc
-      - status
-      - status_group
-      - home_team_id
-      - away_team_id
-      - goals_home
-      - goals_away
-      - winner   : 'HOME' / 'AWAY' / 'DRAW' / NULL
+    matches 스키마:
+      fixture_id   INTEGER PK
+      league_id    INTEGER NOT NULL
+      season       INTEGER NOT NULL
+      date_utc     TEXT    NOT NULL
+      status       TEXT    NOT NULL
+      status_group TEXT    NOT NULL
+      home_id      INTEGER NOT NULL
+      away_id      INTEGER NOT NULL
+      home_ft      INTEGER
+      away_ft      INTEGER
     """
     basic = _extract_fixture_basic(fixture)
     if basic is None:
@@ -182,25 +211,6 @@ def upsert_match_row(
     goals_home = goals_block.get("home")
     goals_away = goals_block.get("away")
 
-    # winner 판정 (Api-Football 구조 기반)
-    home_winner_flag = home_team.get("winner")
-    away_winner_flag = away_team.get("winner")
-
-    winner: Optional[str]
-    if home_winner_flag:
-        winner = "HOME"
-    elif away_winner_flag:
-        winner = "AWAY"
-    elif (
-        goals_home is not None
-        and goals_away is not None
-        and goals_home == goals_away
-        and status_group in ("FINISHED", "AFTER")
-    ):
-        winner = "DRAW"
-    else:
-        winner = None
-
     execute(
         """
         INSERT INTO matches (
@@ -210,24 +220,22 @@ def upsert_match_row(
             date_utc,
             status,
             status_group,
-            home_team_id,
-            away_team_id,
-            goals_home,
-            goals_away,
-            winner
+            home_id,
+            away_id,
+            home_ft,
+            away_ft
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id    = EXCLUDED.league_id,
             season       = EXCLUDED.season,
             date_utc     = EXCLUDED.date_utc,
             status       = EXCLUDED.status,
             status_group = EXCLUDED.status_group,
-            home_team_id = EXCLUDED.home_team_id,
-            away_team_id = EXCLUDED.away_team_id,
-            goals_home   = EXCLUDED.goals_home,
-            goals_away   = EXCLUDED.goals_away,
-            winner       = EXCLUDED.winner
+            home_id      = EXCLUDED.home_id,
+            away_id      = EXCLUDED.away_id,
+            home_ft      = EXCLUDED.home_ft,
+            away_ft      = EXCLUDED.away_ft
         """,
         (
             fixture_id,
@@ -240,7 +248,6 @@ def upsert_match_row(
             away_team_id,
             goals_home,
             goals_away,
-            winner,
         ),
     )
 
@@ -250,26 +257,91 @@ def upsert_match_events(
     events: List[Dict[str, Any]],
 ) -> None:
     """
-    A그룹: match_events 테이블 upsert 틀.
+    A그룹: match_events 테이블 upsert 구현.
 
-    TODO:
-      - /fixtures/events endpoint 응답(events 리스트)을 받아서
-        타임라인 형태로 match_events 에 적재.
+    match_events 스키마:
+      id               BIGSERIAL PK
+      fixture_id       INTEGER NOT NULL
+      team_id          INTEGER
+      player_id        INTEGER
+      type             TEXT    NOT NULL
+      detail           TEXT
+      minute           INTEGER NOT NULL
+      extra            INTEGER DEFAULT 0
+      assist_player_id INTEGER
+      assist_name      TEXT
+      player_in_id     INTEGER
+      player_in_name   TEXT
     """
-    # for ev in events:
-    #     event_id = ...
-    #     time_minute = ...
-    #     team_id = ...
-    #     player_id = ...
-    #     type = ...
-    #     detail = ...
-    #
-    #     execute(
-    #         "INSERT INTO match_events (...) VALUES (...) "
-    #         "ON CONFLICT (...) DO UPDATE SET ...",
-    #         (...,),
-    #     )
-    return
+    # 기존 이벤트 삭제 후 새로 입력(단순/안전)
+    execute(
+        "DELETE FROM match_events WHERE fixture_id = %s",
+        (fixture_id,),
+    )
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+
+        time_block = ev.get("time") or {}
+        minute = time_block.get("elapsed")
+        if minute is None:
+            # 분 정보 없으면 저장하지 않음
+            continue
+        extra = time_block.get("extra") or 0
+
+        team_block = ev.get("team") or {}
+        team_id = team_block.get("id")
+
+        player_block = ev.get("player") or {}
+        player_id = player_block.get("id")
+
+        assist_block = ev.get("assist") or {}
+        assist_player_id = assist_block.get("id")
+        assist_name = assist_block.get("name")
+
+        type_ = ev.get("type") or ""
+        detail = ev.get("detail")
+
+        # 교체 이벤트의 경우, assist 를 교체된 선수(들어오는 선수)로 쓰는 패턴이 많아서
+        # type 이 subst 계열이면 player_in_* 컬럼에도 옮겨담아 둔다.
+        player_in_id: Optional[int] = None
+        player_in_name: Optional[str] = None
+        if type_.lower() == "subst":
+            player_in_id = assist_player_id
+            player_in_name = assist_name
+
+        execute(
+            """
+            INSERT INTO match_events (
+                fixture_id,
+                team_id,
+                player_id,
+                type,
+                detail,
+                minute,
+                extra,
+                assist_player_id,
+                assist_name,
+                player_in_id,
+                player_in_name
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                fixture_id,
+                team_id,
+                player_id,
+                type_,
+                detail,
+                minute,
+                extra,
+                assist_player_id,
+                assist_name,
+                player_in_id,
+                player_in_name,
+            ),
+        )
 
 
 def upsert_match_events_raw(
@@ -277,20 +349,24 @@ def upsert_match_events_raw(
     events: List[Dict[str, Any]],
 ) -> None:
     """
-    A그룹: match_events_raw 테이블 upsert 틀.
+    A그룹: match_events_raw 테이블 upsert 구현.
 
-    TODO:
-      - Api-Football 이벤트 원본 JSON 을 거의 그대로 저장해서
-        나중에 재가공/디버깅에 사용할 수 있게 한다.
+    match_events_raw 스키마:
+      fixture_id INTEGER PK
+      data_json  TEXT NOT NULL
     """
-    # import json
-    #
-    # execute(
-    #     "INSERT INTO match_events_raw (fixture_id, payload_json, created_at) "
-    #     "VALUES (%s, %s, NOW())",
-    #     (fixture_id, json.dumps(events)),
-    # )
-    return
+    execute(
+        """
+        INSERT INTO match_events_raw (fixture_id, data_json)
+        VALUES (%s, %s)
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            data_json = EXCLUDED.data_json
+        """,
+        (
+            fixture_id,
+            json.dumps(events),
+        ),
+    )
 
 
 def upsert_match_lineups(
@@ -300,21 +376,13 @@ def upsert_match_lineups(
     """
     A그룹: match_lineups 테이블 upsert 틀.
 
-    TODO:
-      - /fixtures/lineups endpoint 응답(lineups 리스트)을 받아서
-        팀별 선발/벤치/포메이션 정보를 match_lineups 에 저장.
+    match_lineups 스키마:
+      fixture_id  INTEGER NOT NULL
+      team_id     INTEGER NOT NULL
+      data_json   TEXT    NOT NULL
+      updated_utc TEXT
     """
-    # for lineup in lineups:
-    #     team_id = ...
-    #     formation = ...
-    #     coach_id = ...
-    #     ...
-    #
-    #     execute(
-    #         "INSERT INTO match_lineups (...) VALUES (...) "
-    #         "ON CONFLICT (...) DO UPDATE SET ...",
-    #         (...,),
-    #     )
+    # TODO: /fixtures/lineups 응답 구조에 맞춰 구현 예정
     return
 
 
@@ -325,21 +393,13 @@ def upsert_match_team_stats(
     """
     A그룹: match_team_stats 테이블 upsert 틀.
 
-    TODO:
-      - /fixtures/statistics endpoint 응답(team 통계 리스트)을 받아서
-        팀 단위 슈팅/점유율/코너킥 등 누적 통계를 저장.
+    match_team_stats 스키마:
+      fixture_id INTEGER NOT NULL
+      team_id    INTEGER NOT NULL
+      name       TEXT    NOT NULL
+      value      TEXT
     """
-    # for s in stats:
-    #     team_id = ...
-    #     shots_on = ...
-    #     possession = ...
-    #     ...
-    #
-    #     execute(
-    #         "INSERT INTO match_team_stats (...) VALUES (...) "
-    #         "ON CONFLICT (...) DO UPDATE SET ...",
-    #         (...,),
-    #     )
+    # TODO: /fixtures/statistics 응답 구조에 맞춰 구현 예정
     return
 
 
@@ -350,22 +410,12 @@ def upsert_match_player_stats(
     """
     A그룹: match_player_stats 테이블 upsert 틀.
 
-    TODO:
-      - /fixtures/players endpoint 응답(선수별 스탯 리스트)을 받아서
-        선수 단위 슈팅/패스/카드/평점 등을 저장.
+    match_player_stats 스키마:
+      fixture_id INTEGER NOT NULL
+      player_id  INTEGER NOT NULL
+      data_json  TEXT    NOT NULL
     """
-    # for row in players_stats:
-    #     player_id = ...
-    #     team_id = ...
-    #     minutes = ...
-    #     rating = ...
-    #     ...
-    #
-    #     execute(
-    #         "INSERT INTO match_player_stats (...) VALUES (...) "
-    #         "ON CONFLICT (...) DO UPDATE SET ...",
-    #         (...,),
-    #     )
+    # TODO: /fixtures/players 응답 구조에 맞춰 구현 예정
     return
 
 
@@ -376,18 +426,9 @@ def upsert_predictions(
     """
     A그룹: predictions 테이블 upsert 틀.
 
-    TODO:
-      - /predictions endpoint 응답을 받아서
-        승무패 확률, 스코어 예측, O/U 예측 등을 저장.
+    predictions 스키마:
+      fixture_id INTEGER PK
+      data_json  TEXT NOT NULL
     """
-    # home_win_prob = ...
-    # draw_prob = ...
-    # away_win_prob = ...
-    # ...
-    #
-    # execute(
-    #     "INSERT INTO predictions (...) VALUES (...) "
-    #     "ON CONFLICT (fixture_id) DO UPDATE SET ...",
-    #     (...,),
-    # )
+    # TODO: /predictions 응답 구조에 맞춰 구현 예정
     return
