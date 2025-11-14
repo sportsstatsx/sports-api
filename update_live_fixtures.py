@@ -13,6 +13,7 @@ from live_fixtures_common import (
 from live_fixtures_a_group import (
     fetch_fixtures_from_api,
     upsert_fixture_row,
+    upsert_match_row,
 )
 from live_fixtures_b_group import (
     update_static_data_prematch_for_league,
@@ -74,11 +75,13 @@ def main() -> None:
             print(f"    응답 경기 수: {len(fixtures)}")
 
             for row in fixtures:
-                # A그룹: 라이브 핵심( fixtures/matches )
-                upsert_fixture_row(row)
+                # A그룹: 라이브 핵심( fixtures / matches )
+                # season 은 None 으로 넘기면, 내부에서 Api-Football 응답의 season 을 fallback 으로 사용
+                upsert_fixture_row(row, lid, None)
+                upsert_match_row(row, lid, None)
                 total_updated += 1
 
-            # B그룹: standings (지금은 standings만, 나중에 확장)
+            # B그룹: standings 등 정적 데이터 (지금은 standings만, 나중에 확장)
             if is_today and static_phase == "PREMATCH":
                 update_static_data_prematch_for_league(lid, target_date)
             elif is_today and static_phase == "POSTMATCH":
