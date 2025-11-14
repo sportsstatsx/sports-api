@@ -14,7 +14,11 @@ from collections import defaultdict
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
-...
+
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
     generate_latest,
     CONTENT_TYPE_LATEST,
 )
@@ -38,6 +42,7 @@ _RAW_LIVE_LEAGUES = (
     or ""
 )
 
+
 def _parse_allowed_league_ids(raw: str):
     ids = []
     for part in raw.replace(";", ",").split(","):
@@ -51,6 +56,7 @@ def _parse_allowed_league_ids(raw: str):
             continue
     # 중복 제거 + 정렬
     return sorted(set(ids))
+
 
 ALLOWED_LEAGUE_IDS = _parse_allowed_league_ids(_RAW_LIVE_LEAGUES)
 
@@ -85,10 +91,9 @@ HTTP_REQUEST_EXCEPTIONS_TOTAL = Counter(
     ["type"],
 )
 
-HTTP_429_TOTAL = Counter(
-    "http_429_total",
-    "Total HTTP 429 responses (rate limited)",
-    ["ip", "path"],
+RATE_LIMITED_TOTAL = Counter(
+    "http_rate_limited_total",
+    "Total rate limited responses (429)",
 )
 
 UPTIME_SECONDS = Gauge(
@@ -102,89 +107,79 @@ START_TS = time.time()
 # 간단한 레이트 리미터 (IP 기준 분당 요청 수)
 # ─────────────────────────────────────────
 
-_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(
-    lambda: {"ts": 0, "count": 0}
-)
-
-RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "60"))  # 분당 허용 버스트
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
+_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"ts": 0, "cnt": 0})
 
 
-def _rate_limit_key() -> str:
-    """IP 기준 rate-limit key"""
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-    if not ip:
-        ip = request.remote_addr or "unknown"
-    return ip
+def _client_ip() -> str:
+    return (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.remote_addr
+        or "unknown"
+    )
 
 
 def check_rate_limit() -> bool:
-    """분당 요청 수가 RATE_LIMIT_PER_MIN 이상이면 False"""
-    ip = _rate_limit_key()
+    """분당 요청 수가 RATE_LIMIT_PER_MINUTE 이상이면 False"""
+    ip = _client_ip()
     now = int(time.time())
     bucket = _ip_buckets[ip]
 
     if now - bucket["ts"] >= 60:
         bucket["ts"] = now
-        bucket["count"] = 0
+        bucket["cnt"] = 0
 
-    bucket["count"] += 1
-    if bucket["count"] > RATE_LIMIT_PER_MIN:
-        HTTP_429_TOTAL.labels(ip=ip, path=request.path).inc()
+    bucket["cnt"] += 1
+    if bucket["cnt"] > RATE_LIMIT_PER_MINUTE:
+        RATE_LIMITED_TOTAL.inc()
         return False
     return True
 
 
-def rate_limited(fn):
-    @wraps(fn)
+def rate_limited(f):
+    @wraps(f)
     def wrapper(*args, **kwargs):
         if not check_rate_limit():
             return jsonify({"ok": False, "error": "rate_limited"}), 429
-        return fn(*args, **kwargs)
+
+        return f(*args, **kwargs)
 
     return wrapper
 
 
 # ─────────────────────────────────────────
-# 요청/응답 로깅 + metrics 계측용 미들웨어
+# 요청/응답 로깅 (샘플링)
 # ─────────────────────────────────────────
 
-def _client_ip() -> str:
-    ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-    return ip or (request.remote_addr or "unknown")
-
-
-@app.before_request
-def _before():
-    request.environ["__t0"] = time.perf_counter()
-    # 샘플링 비율에 따라 일부 요청만 로깅
+def log_json(level: str, msg: str, **kwargs):
     if LOG_SAMPLE_RATE <= 0:
         return
     if LOG_SAMPLE_RATE < 1.0:
         if uuid.uuid4().int % 10_000 > int(LOG_SAMPLE_RATE * 10_000):
             return
 
-    request_id = str(uuid.uuid4())
-    request.environ["x_request_id"] = request_id
+    payload = {
+        "level": level,
+        "ts": datetime.utcnow().isoformat(),
+        "msg": msg,
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "ip": _client_ip(),
+        "path": request.path,
+        "method": request.method,
+    }
+    payload.update(kwargs)
+    print(json.dumps(payload, ensure_ascii=False))
 
-    app.logger.info(
-        "[REQ] %s %s ip=%s ua=%s rid=%s",
-        request.method,
-        request.path,
-        _client_ip(),
-        request.headers.get("User-Agent", ""),
-        request_id,
-    )
+
+@app.before_request
+def _before():
+    request.environ["__t0"] = time.perf_counter()
 
 
 @app.after_request
 def _after(resp: Response):
-    rid = request.environ.get("x_request_id")
-    if rid:
-        resp.headers["X-Request-ID"] = rid
-
     t0 = request.environ.get("__t0")
-    if t0:
+    if t0 is not None:
         dur = time.perf_counter() - t0
         HTTP_REQUEST_DURATION_SECONDS.labels(
             method=request.method,
@@ -207,7 +202,7 @@ def handle_exception(e):
         return e
 
     HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
-    app.logger.exception("Unhandled exception: %s", e)
+    log_json("error", "Unhandled exception", error=str(e))
     return jsonify({"ok": False, "error": "internal_error"}), 500
 
 
@@ -227,65 +222,53 @@ def metrics():
 
 @app.get("/metrics_prom")
 def metrics_prom():
-    # Prometheus 텍스트 포맷에 맞는 라인들을 구성
-    # (이전 버전 호환용, 필요한 최소한만 유지)
-    metrics = {
-        "start_ts": START_TS,
-        "uptime": time.time() - START_TS,
-    }
+    lines = []
 
-    # HTTP 요청 카운트/429/예외/지연 등의 일부 지표를 단순 합산해 텍스트로 노출
-    out = []
+    lines.append("# HELP http_requests_total Total HTTP requests")
+    lines.append("# TYPE http_requests_total counter")
+    for labels, metric in HTTP_REQUESTS_TOTAL._metrics.items():
+        method, path, status = labels
+        value = metric._value.get()
+        lines.append(
+            f'http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
+        )
 
-    def _line_help(name, desc):
-        return f"# HELP {name} {desc}\n"
-
-    def _line_type(name, typ):
-        return f"# TYPE {name} {typ}\n"
-
-    def _line_sample(name, value, labels=None):
-        if labels:
-            label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            return f'{name}{{{label_str}}} {value}\n'
-        return f"{name} {value}\n"
-
-    # http_requests_total
-    out.append(_line_help("sportsstatsx_http_requests_total", "Total HTTP requests"))
-    out.append(_line_type("sportsstatsx_http_requests_total", "counter"))
-    for (m, p, s), c in HTTP_REQUESTS_TOTAL._metrics.items():
-        out.append(
-            _line_sample(
-                "sportsstatsx_http_requests_total",
-                c._value.get(),
-                {"method": m, "path": p, "status": s},
+    lines.append("# HELP http_request_duration_seconds HTTP request duration in seconds")
+    lines.append("# TYPE http_request_duration_seconds histogram")
+    for labels, metric in HTTP_REQUEST_DURATION_SECONDS._metrics.items():
+        method, path = labels
+        buckets = metric._buckets
+        sum_v = metric._sum.get()
+        count_v = metric._count.get()
+        for le, v in buckets.items():
+            lines.append(
+                f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {v}'
             )
+        lines.append(
+            f'http_request_duration_seconds_sum{{method="{method}",path="{path}"}} {sum_v}'
+        )
+        lines.append(
+            f'http_request_duration_seconds_count{{method="{method}",path="{path}"}} {count_v}'
         )
 
-    # http_429_total
-    out.append(
-        _line_help("sportsstatsx_http_429_total", "Total rate limited responses (429)")
-    )
-    out.append(_line_type("sportsstatsx_http_429_total", "counter"))
-    for (ip, path), c in HTTP_429_TOTAL._metrics.items():
-        out.append(
-            _line_sample(
-                "sportsstatsx_http_429_total",
-                c._value.get(),
-                {"ip": ip, "path": path},
-            )
-        )
+    lines.append("# HELP http_exceptions_total Total HTTP exceptions")
+    lines.append("# TYPE http_exceptions_total counter")
+    for labels, metric in HTTP_REQUEST_EXCEPTIONS_TOTAL._metrics.items():
+        (etype,) = labels
+        value = metric._value.get()
+        lines.append(f'http_exceptions_total{{type="{etype}"}} {value}')
 
-    # uptime
-    out.append(_line_help("sportsstatsx_uptime_seconds", "Uptime in seconds"))
-    out.append(_line_type("sportsstatsx_uptime_seconds", "gauge"))
-    out.append(
-        _line_sample(
-            "sportsstatsx_uptime_seconds", int(time.time() - metrics["start_ts"])
-        )
-    )
+    lines.append("# HELP http_rate_limited_total Total rate limited responses (429)")
+    lines.append("# TYPE http_rate_limited_total counter")
+    for _, metric in RATE_LIMITED_TOTAL._metrics.items():
+        value = metric._value.get()
+        lines.append(f"http_rate_limited_total {value}")
 
-    body = "".join(out)
+    lines.append("# HELP process_uptime_seconds Process uptime in seconds")
+    lines.append("# TYPE process_uptime_seconds gauge")
+    lines.append(f"process_uptime_seconds {time.time() - START_TS}")
 
+    body = "\n".join(lines) + "\n"
     return Response(body, mimetype="text/plain; version=0.0.4")
 
 
@@ -301,7 +284,7 @@ def health():
             raise RuntimeError("DB check failed")
         return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
     except Exception as e:
-        app.logger.exception("Health check failed: %s", e)
+        log_json("error", "Health check failed", error=str(e))
         return jsonify({"ok": False, "error": "db_unavailable"}), 500
 
 
