@@ -394,7 +394,7 @@ def api_home_leagues():
     if not date_str:
         return jsonify({"ok": False, "error": "missing_date"}), 400
 
-    rows = get_home_leagues_for_date(date_str)
+    rows = get_home_leagues(date_str)
     return jsonify({"ok": True, "rows": rows})
 
 
@@ -447,4 +447,5 @@ def api_home_prev_matchday():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
