@@ -1,7 +1,4 @@
-# main.py  v1.6.2 — SportsStatsX API
-# - Prometheus 표준 /metrics
-# - 커스텀 텍스트 /metrics_prom (레거시용)
-# - 요청 카운트/지연/429/예외 카운트 계측
+# main.py  — SportsStatsX API
 
 import os
 import json
@@ -64,14 +61,10 @@ LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "1.0"))  # 0.0 ~ 1.0
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 
 # ─────────────────────────────────────────
-# Flask 앱 생성
+# Flask 앱 / Prometheus 메트릭
 # ─────────────────────────────────────────
 
 app = Flask(__name__)
-
-# ─────────────────────────────────────────
-# Prometheus 지표 정의 (표준 /metrics 용)
-# ─────────────────────────────────────────
 
 HTTP_REQUESTS_TOTAL = Counter(
     "http_requests_total",
@@ -104,7 +97,7 @@ UPTIME_SECONDS = Gauge(
 START_TS = time.time()
 
 # ─────────────────────────────────────────
-# 간단한 레이트 리미터 (IP 기준 분당 요청 수)
+# 레이트 리미터
 # ─────────────────────────────────────────
 
 _ip_buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"ts": 0, "cnt": 0})
@@ -140,14 +133,14 @@ def rate_limited(f):
     def wrapper(*args, **kwargs):
         if not check_rate_limit():
             return jsonify({"ok": False, "error": "rate_limited"}), 429
-
+            # 429: Too Many Requests
         return f(*args, **kwargs)
 
     return wrapper
 
 
 # ─────────────────────────────────────────
-# 요청/응답 로깅 (샘플링)
+# 요청 로깅 / 에러 처리
 # ─────────────────────────────────────────
 
 def log_json(level: str, msg: str, **kwargs):
@@ -207,7 +200,7 @@ def handle_exception(e):
 
 
 # ─────────────────────────────────────────
-# /metrics  (Prometheus 표준 포맷)
+# /metrics  (Prometheus)
 # ─────────────────────────────────────────
 
 @app.get("/metrics")
@@ -215,10 +208,6 @@ def metrics():
     UPTIME_SECONDS.set(time.time() - START_TS)
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
-
-# ─────────────────────────────────────────
-# /metrics_prom  (텍스트 포맷, 레거시용)
-# ─────────────────────────────────────────
 
 @app.get("/metrics_prom")
 def metrics_prom():
@@ -289,20 +278,19 @@ def health():
 
 
 # ─────────────────────────────────────────
-# 홈 화면: fixtures 리스트
+# 홈 화면: fixtures 리스트 (이미 적용된 버전)
 # ─────────────────────────────────────────
 
 @app.get("/api/fixtures")
 @rate_limited
 def list_fixtures():
     """
-    Postgres의 matches / teams / leagues 테이블을 기반으로
-    홈 화면 매치 리스트용 데이터를 반환.
+    홈 화면 매치 리스트용 데이터.
 
-    쿼리 파라미터:
-      - league_id: 리그 ID (예: 39)
-      - date: 'YYYY-MM-DD' 형식 날짜 (옵션)
-      - page, page_size: 페이징
+    query:
+      - league_id: >0 이면 해당 리그만, 0/없음이면 전체 허용 리그
+      - date: yyyy-MM-dd
+      - page, page_size
     """
     league_id = request.args.get("league_id", type=int)
     date_str = request.args.get("date")  # 'YYYY-MM-DD'
@@ -312,16 +300,16 @@ def list_fixtures():
     where_parts = []
     params = []
 
+    # league_id > 0 일 때만 리그 필터 적용
     if league_id is not None and league_id > 0:
         where_parts.append("m.league_id = %s")
         params.append(league_id)
 
-    # date_utc TEXT 에서 앞 10글자(YYYY-MM-DD)만 잘라서 비교
     if date_str:
         where_parts.append("SUBSTRING(m.date_utc FROM 1 FOR 10) = %s")
         params.append(date_str)
 
-    # 환경에서 허용된 리그만 필터링 (설정되어 있을 때만 적용)
+    # 허용된 리그만
     if ALLOWED_LEAGUE_IDS:
         placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
         where_parts.append(f"m.league_id IN ({placeholders})")
@@ -361,7 +349,194 @@ def list_fixtures():
     return jsonify({"ok": True, "rows": rows, "count": len(rows)})
 
 
-if __name__ == "__main__":
-    import time as _time  # perf_counter 충돌 피하기 위해 별칭
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+# ─────────────────────────────────────────
+# 홈: 상단 리그 탭용 API
+# ─────────────────────────────────────────
 
+@app.get("/api/home/leagues")
+@rate_limited
+def home_leagues():
+    """
+    상단 탭용: 오늘(또는 지정된 날짜)에 경기 있는 리그 목록.
+
+    query:
+      - date: yyyy-MM-dd (없으면 오늘 UTC 기준)
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) = %s"]
+    params = [date_str]
+
+    if ALLOWED_LEAGUE_IDS:
+        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
+        where_parts.append(f"m.league_id IN ({placeholders})")
+        params.extend(ALLOWED_LEAGUE_IDS)
+
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT
+            m.league_id,
+            l.name AS league_name,
+            COUNT(*) AS match_count
+        FROM matches m
+        JOIN leagues l ON l.id = m.league_id
+        {where_sql}
+        GROUP BY m.league_id, l.name
+        ORDER BY l.name ASC
+    """
+
+    rows = fetch_all(sql, tuple(params))
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+
+# ─────────────────────────────────────────
+# 홈: 리그 디렉터리(바텀시트) API
+# ─────────────────────────────────────────
+
+@app.get("/api/home/league_directory")
+@rate_limited
+def home_league_directory():
+    """
+    리그 선택 바텀시트용: 전체 지원 리그 + 오늘 경기 수.
+
+    query:
+      - date: yyyy-MM-dd (없으면 오늘)
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    where_parts = []
+    params = []
+
+    # 허용된 리그만 대상으로
+    if ALLOWED_LEAGUE_IDS:
+        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
+        where_parts.append(f"l.id IN ({placeholders})")
+        params.extend(ALLOWED_LEAGUE_IDS)
+
+    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+
+    sql = f"""
+        SELECT
+            l.id AS league_id,
+            l.name AS league_name,
+            l.country AS country,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN SUBSTRING(m.date_utc FROM 1 FOR 10) = %s THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            ) AS today_count
+        FROM leagues l
+        LEFT JOIN matches m ON m.league_id = l.id
+        {where_sql}
+        GROUP BY l.id, l.name, l.country
+        ORDER BY l.name ASC
+    """
+
+    # today_count 쪽에 날짜 파라미터 하나 더 필요
+    params_with_date = list(params)
+    params_with_date.insert(0, date_str)
+
+    rows = fetch_all(sql, tuple(params_with_date))
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+
+# ─────────────────────────────────────────
+# 홈: 다음 / 이전 매치데이 API
+# ─────────────────────────────────────────
+
+@app.get("/api/home/next_matchday")
+@rate_limited
+def next_matchday():
+    """
+    지정 날짜 이후(포함) 첫 번째 매치데이.
+
+    query:
+      - date: yyyy-MM-dd (필수)
+      - league_id: >0 이면 그 리그만, 0/없음이면 전체
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"ok": False, "error": "date_required"}), 400
+
+    league_id = request.args.get("league_id", type=int)
+
+    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) >= %s"]
+    params = [date_str]
+
+    if league_id is not None and league_id > 0:
+        where_parts.append("m.league_id = %s")
+        params.append(league_id)
+
+    if ALLOWED_LEAGUE_IDS:
+        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
+        where_parts.append(f"m.league_id IN ({placeholders})")
+        params.extend(ALLOWED_LEAGUE_IDS)
+
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT MIN(SUBSTRING(m.date_utc FROM 1 FOR 10)) AS next_date
+        FROM matches m
+        {where_sql}
+    """
+
+    row = fetch_one(sql, tuple(params))
+    return jsonify({"ok": True, "date": row.get("next_date") if row else None})
+
+
+@app.get("/api/home/prev_matchday")
+@rate_limited
+def prev_matchday():
+    """
+    지정 날짜 이전 마지막 매치데이.
+
+    query:
+      - date: yyyy-MM-dd (필수)
+      - league_id: >0 이면 그 리그만, 0/없음이면 전체
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"ok": False, "error": "date_required"}), 400
+
+    league_id = request.args.get("league_id", type=int)
+
+    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) < %s"]
+    params = [date_str]
+
+    if league_id is not None and league_id > 0:
+        where_parts.append("m.league_id = %s")
+        params.append(league_id)
+
+    if ALLOWED_LEAGUE_IDS:
+        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
+        where_parts.append(f"m.league_id IN ({placeholders})")
+        params.extend(ALLOWED_LEAGUE_IDS)
+
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT MAX(SUBSTRING(m.date_utc FROM 1 FOR 10)) AS prev_date
+        FROM matches m
+        {where_sql}
+    """
+
+    row = fetch_one(sql, tuple(params))
+    return jsonify({"ok": True, "date": row.get("prev_date") if row else None})
+
+
+# ─────────────────────────────────────────
+# 메인
+# ─────────────────────────────────────────
+
+if __name__ == "__main__":
+    import time as _time  # perf_counter 충돌 방지용 별칭
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
