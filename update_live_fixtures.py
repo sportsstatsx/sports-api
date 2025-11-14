@@ -1,8 +1,7 @@
 import os
 import sys
-import time
 import datetime as dt
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 
 import requests
 
@@ -13,7 +12,14 @@ API_KEY = os.environ.get("APIFOOTBALL_KEY")
 LIVE_LEAGUES_ENV = os.environ.get("LIVE_LEAGUES", "")
 
 
+# ─────────────────────────────────────
+#  공통 유틸
+# ─────────────────────────────────────
+
 def parse_live_leagues(env_val: str) -> List[int]:
+    """
+    LIVE_LEAGUES 환경변수("39,140,141") 등을 정수 리스트로 파싱.
+    """
     ids: List[int] = []
     for part in env_val.replace(" ", "").split(","):
         if not part:
@@ -32,7 +38,7 @@ def get_target_date() -> str:
     """
     if len(sys.argv) >= 2:
         return sys.argv[1]
-    # utcnow() 경고 제거: timezone-aware 로 바꿈
+    # timezone-aware UTC now
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
 
@@ -82,9 +88,14 @@ def map_status_group(short_code: str) -> str:
     return "UPCOMING"
 
 
+# ─────────────────────────────────────
+#  Api-Football: fixtures (A그룹 - 라이브 핵심)
+# ─────────────────────────────────────
+
 def fetch_fixtures_from_api(league_id: int, date_str: str):
     """
     Api-Football v3 에서 특정 리그 + 날짜 경기를 가져온다.
+    /fixtures?league={league_id}&date={YYYY-MM-DD}
     """
     if not API_KEY:
         raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
@@ -110,6 +121,7 @@ def fetch_fixtures_from_api(league_id: int, date_str: str):
 def upsert_fixture_row(row: Dict[str, Any]):
     """
     Api-Football 한 경기 정보를 Postgres matches/fixtures 테이블에 upsert.
+    (A그룹: 라이브 핵심 - 스코어/상태/킥오프 시간)
     """
     fixture = row.get("fixture", {})
     league = row.get("league", {})
@@ -198,9 +210,8 @@ def upsert_fixture_row(row: Dict[str, Any]):
 
 
 # ─────────────────────────────────────
-#  시간 창 기반 호출 여부 판단 로직
+#  시간 창 기반 호출 여부 판단 (A그룹 용)
 # ─────────────────────────────────────
-
 
 def _parse_kickoff_to_utc(value: Any) -> dt.datetime | None:
     """
@@ -235,6 +246,9 @@ def _match_needs_update(row: Dict[str, Any], now: dt.datetime) -> bool:
     """
     한 경기(row)가 지금 시점에서 Api-Football 업데이트가 필요한지 여부.
 
+    🔵 A그룹(라이브 중심: matches/fixtures, 나중에 events/lineups/stats/odds 등)의
+       '언제'를 정의하는 핵심 규칙.
+
     규칙(분 단위 Δt = kickoff - now):
 
       - UPCOMING:
@@ -248,7 +262,6 @@ def _match_needs_update(row: Dict[str, Any], now: dt.datetime) -> bool:
 
       - FINISHED:
           * 킥오프 기준 ±10분 안쪽(대략 경기 직후/전후)만 한 번 더 보정
-            (너가 말한 '종료 1번'을 대충 맞추는 용도)
     """
     kickoff = _parse_kickoff_to_utc(row.get("date_utc"))
     if kickoff is None:
@@ -272,7 +285,7 @@ def _match_needs_update(row: Dict[str, Any], now: dt.datetime) -> bool:
 
     if sg == "FINISHED":
         # 킥오프 기준으로 너무 오래된 경기는 굳이 다시 안 부름
-        # (여기선 대략 10분 이내만 한 번 더 보정)
+        # (대략 10분 이내만 한 번 더 보정)
         if -10 <= diff_minutes <= 10:
             return True
         return False
@@ -284,7 +297,7 @@ def _match_needs_update(row: Dict[str, Any], now: dt.datetime) -> bool:
 def should_call_league_today(league_id: int, date_str: str, now: dt.datetime) -> bool:
     """
     오늘(date_str) 기준으로, 해당 리그에
-    '지금 업데이트가 필요한 경기'가 하나라도 있으면 True.
+    '지금 A그룹(라이브 데이터) 업데이트가 필요한 경기'가 하나라도 있으면 True.
     """
     rows = fetch_all(
         """
@@ -311,9 +324,96 @@ def should_call_league_today(league_id: int, date_str: str, now: dt.datetime) ->
 
 
 # ─────────────────────────────────────
-#  메인 루프
+#  B그룹(느리게 바뀌는 애들) - 언제 호출할지 판단
+#   - 킥오프 1시간 전 (PREMATCH) 1번
+#   - 경기 종료 직후 (POSTMATCH) 1번
 # ─────────────────────────────────────
 
+def _detect_static_phase_for_league(
+    league_id: int,
+    date_str: str,
+    now: dt.datetime,
+) -> Optional[str]:
+    """
+    B그룹(standings, squads, players, injuries, transfers, team_season_stats, toplists, venues 등)을
+    언제 호출할지 결정.
+
+    반환값:
+      - "PREMATCH"  : 킥오프 59~61분 구간에 해당하는 UPCOMING 경기 존재
+      - "POSTMATCH" : 킥오프 기준 -10 ~ +10분 구간에 해당하는 FINISHED 경기 존재
+      - None        : 아직/더 이상 B그룹 호출할 타이밍 아님
+    """
+    rows = fetch_all(
+        """
+        SELECT
+            fixture_id,
+            date_utc,
+            status_group
+        FROM matches
+        WHERE league_id = %s
+          AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
+        """,
+        (league_id, date_str),
+    )
+
+    if not rows:
+        return None
+
+    for r in rows:
+        kickoff = _parse_kickoff_to_utc(r.get("date_utc"))
+        if kickoff is None:
+            continue
+
+        sg = (r.get("status_group") or "").upper()
+        diff_minutes = (kickoff - now).total_seconds() / 60.0
+
+        # PREMATCH: 킥오프 59~61분 전
+        if sg == "UPCOMING" and 59 <= diff_minutes <= 61:
+            return "PREMATCH"
+
+        # POSTMATCH: 킥오프 기준 -10~+10분 (경기 종료 직후 근처)
+        if sg == "FINISHED" and -10 <= diff_minutes <= 10:
+            return "POSTMATCH"
+
+    return None
+
+
+# ─────────────────────────────────────
+#  B그룹 실제 갱신 함수 (현재는 stub, 나중에 하나씩 구현)
+# ─────────────────────────────────────
+
+def update_static_data_prematch_for_league(league_id: int, date_str: str):
+    """
+    B그룹 데이터(standings, team_season_stats, squads, players, injuries, transfers,
+    toplists, venues 등)를 '킥오프 1시간 전' 타이밍에 1회 갱신하는 자리.
+
+    ⚠️ 지금은 스케줄만 잡아두는 단계라 stub 으로 로그만 남김.
+    실제 구현할 때는:
+      - 해당 league_id + season 에 대해
+      - /standings, /players/squads, /injuries, /transfers, /teams/statistics, /topscorers 등
+        Api-Football endpoint를 호출해서
+      - Postgres 테이블에 upsert 하는 로직을 이 함수 내부에 추가하면 됨.
+    """
+    print(f"    [STATIC PREMATCH] league={league_id}, date={date_str} (stub)")
+
+
+def update_static_data_postmatch_for_league(league_id: int, date_str: str):
+    """
+    B그룹 데이터(standings, team_season_stats, toplists 등)를
+    '경기 종료 직후(킥오프 기준 ±10분)' 타이밍에 1회 갱신하는 자리.
+
+    ⚠️ 지금은 스케줄만 잡아두는 단계라 stub 으로 로그만 남김.
+    실제 구현할 때는:
+      - 오늘 종료된 경기들의 league_id + season 을 기준으로
+      - /standings, /teams/statistics, /topscorers 등을 다시 한 번 호출해서
+      - 시즌 순위/시즌 스탯/득점 순위 등을 최종 반영하도록 구현.
+    """
+    print(f"    [STATIC POSTMATCH] league={league_id}, date={date_str} (stub)")
+
+
+# ─────────────────────────────────────
+#  메인 루프
+# ─────────────────────────────────────
 
 def main():
     target_date = get_target_date()
@@ -336,29 +436,53 @@ def main():
 
     for lid in live_leagues:
         try:
-            # 오늘 날짜일 때만 '시간 창' 로직 적용
+            static_phase: Optional[str] = None
+
+            # 오늘 날짜일 때만 "시간 창" 로직 적용 (라이브 + B그룹 스케줄)
             if is_today:
+                # A그룹(라이브 데이터) 필요 여부 체크
                 if not should_call_league_today(lid, target_date, now):
-                    print(
-                        f"  - league {lid}: 지금 업데이트가 필요한 경기가 없어 Api 호출 스킵"
-                    )
-                    continue
+                    # B그룹(정적 데이터) 타이밍도 동시에 오는 경우가 있을 수 있으므로,
+                    # 먼저 스케줄을 한번 확인해본다.
+                    static_phase = _detect_static_phase_for_league(lid, target_date, now)
+                    if static_phase is None:
+                        print(
+                            f"  - league {lid}: 지금 업데이트가 필요한 경기가 없어 "
+                            f"Api 호출 스킵 (A/B 모두 해당 없음)"
+                        )
+                        continue
+                    else:
+                        # A그룹 스킵이더라도, B그룹(프리매치/포스트매치)만 호출할 수도 있음
+                        print(
+                            f"  - league {lid}: A그룹은 필요 없지만 "
+                            f"static_phase={static_phase} → B그룹만 처리"
+                        )
                 else:
                     print(
-                        f"  - league {lid}: 시간 창 조건 만족 → Api-Football 호출"
+                        f"  - league {lid}: 시간 창 조건 만족 → Api-Football 호출 (A그룹)"
                     )
+                    # A그룹 호출과 별개로 B그룹 스케줄도 같이 확인
+                    static_phase = _detect_static_phase_for_league(lid, target_date, now)
             else:
                 # 과거/미래 특정 날짜 수동 실행 시에는 항상 호출 (백필용)
                 print(
                     f"  - league {lid}: date={target_date} (today 아님) → 전체 백필 호출"
                 )
 
+            # A/B 그룹 중 어느 쪽이든 작업할 필요가 있는 상태에서만 fixtures 호출
             fixtures = fetch_fixtures_from_api(lid, target_date)
             print(f"    응답 경기 수: {len(fixtures)}")
 
             for row in fixtures:
+                # A그룹: 라이브 핵심 fixtures/matches upsert
                 upsert_fixture_row(row)
                 total_updated += 1
+
+            # B그룹: 느리게 바뀌는 데이터 - PRE/POST 두 타이밍만 1회씩
+            if is_today and static_phase == "PREMATCH":
+                update_static_data_prematch_for_league(lid, target_date)
+            elif is_today and static_phase == "POSTMATCH":
+                update_static_data_postmatch_for_league(lid, target_date)
 
         except Exception as e:
             print(f"  ! league {lid} 처리 중 에러: {e}", file=sys.stderr)
