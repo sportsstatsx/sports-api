@@ -11,6 +11,8 @@ from live_fixtures_common import API_KEY, map_status_group, now_utc
 BASE_URL = "https://v3.football.api-sports.io/fixtures"
 EVENTS_URL = "https://v3.football.api-sports.io/fixtures/events"
 LINEUPS_URL = "https://v3.football.api-sports.io/fixtures/lineups"
+STATS_URL = "https://v3.football.api-sports.io/fixtures/statistics"
+PLAYERS_URL = "https://v3.football.api-sports.io/fixtures/players"
 
 
 def _get_headers() -> Dict[str, str]:
@@ -110,6 +112,87 @@ def fetch_lineups_from_api(fixture_id: int) -> List[Dict[str, Any]]:
     return lineups
 
 
+def fetch_team_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
+    """
+    특정 경기(fixture_id)에 대한 팀 통계 리스트를 Api-Football에서 가져온다.
+
+    - endpoint: /fixtures/statistics
+    - params:
+        fixture: fixture_id
+
+    응답 예시(대략):
+      response: [
+        {
+          "team": {"id": 33, ...},
+          "statistics": [
+            {"type": "Shots on Goal", "value": 5},
+            ...
+          ]
+        },
+        { ... 원정 팀 ... }
+      ]
+    """
+    headers = _get_headers()
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(STATS_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+
+    data = resp.json()
+    results = data.get("response", []) or []
+
+    stats: List[Dict[str, Any]] = []
+    for row in results:
+        if isinstance(row, dict):
+            stats.append(row)
+
+    return stats
+
+
+def fetch_player_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
+    """
+    특정 경기(fixture_id)에 대한 선수별 스탯 리스트를 Api-Football에서 가져온다.
+
+    - endpoint: /fixtures/players
+    - params:
+        fixture: fixture_id
+
+    응답 예시(대략):
+      response: [
+        {
+          "team": {...},
+          "players": [
+            {
+              "player": {...},
+              "statistics": [...]
+            },
+            ...
+          ]
+        },
+        ...
+      ]
+    """
+    headers = _get_headers()
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(PLAYERS_URL, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+
+    data = resp.json()
+    results = data.get("response", []) or []
+
+    players_stats: List[Dict[str, Any]] = []
+    for row in results:
+        if isinstance(row, dict):
+            players_stats.append(row)
+
+    return players_stats
+
+
 def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Api-Football fixture 응답에서 DB에 저장할 기본 필드만 뽑는다.
@@ -190,7 +273,7 @@ def upsert_fixture_row(
 
 
 # ─────────────────────────────────────────
-# A그룹 나머지 스키마용 upsert 구현/틀
+# A그룹 나머지 스키마용 upsert 구현
 # ─────────────────────────────────────────
 
 
@@ -448,7 +531,7 @@ def upsert_match_team_stats(
     stats: List[Dict[str, Any]],
 ) -> None:
     """
-    A그룹: match_team_stats 테이블 upsert 틀.
+    A그룹: match_team_stats 테이블 upsert 구현.
 
     match_team_stats 스키마:
       fixture_id INTEGER NOT NULL
@@ -456,8 +539,48 @@ def upsert_match_team_stats(
       name       TEXT    NOT NULL
       value      TEXT
     """
-    # TODO: /fixtures/statistics 응답 구조에 맞춰 구현 예정
-    return
+    # 한 경기 팀 통계를 통째로 다시 덮어쓴다.
+    execute(
+        "DELETE FROM match_team_stats WHERE fixture_id = %s",
+        (fixture_id,),
+    )
+
+    for row in stats:
+        if not isinstance(row, dict):
+            continue
+
+        team_block = row.get("team") or {}
+        team_id = team_block.get("id")
+        if team_id is None:
+            continue
+
+        stat_list = row.get("statistics") or []
+        for s in stat_list:
+            if not isinstance(s, dict):
+                continue
+            name = s.get("type")
+            if not name:
+                continue
+            value = s.get("value")
+            # NULL 도 허용되지만, 문자열로 캐스팅해서 저장해도 무방
+            value_str = None
+            if value is not None:
+                value_str = str(value)
+
+            execute(
+                """
+                INSERT INTO match_team_stats (fixture_id, team_id, name, value)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (fixture_id, team_id, name) DO UPDATE SET
+                    value = EXCLUDED.value
+                """,
+                (
+                    fixture_id,
+                    team_id,
+                    name,
+                    value_str,
+                ),
+            )
 
 
 def upsert_match_player_stats(
@@ -465,15 +588,45 @@ def upsert_match_player_stats(
     players_stats: List[Dict[str, Any]],
 ) -> None:
     """
-    A그룹: match_player_stats 테이블 upsert 틀.
+    A그룹: match_player_stats 테이블 upsert 구현.
 
     match_player_stats 스키마:
       fixture_id INTEGER NOT NULL
       player_id  INTEGER NOT NULL
       data_json  TEXT    NOT NULL
     """
-    # TODO: /fixtures/players 응답 구조에 맞춰 구현 예정
-    return
+    # 한 경기 선수 스탯을 통째로 다시 덮어쓴다.
+    execute(
+        "DELETE FROM match_player_stats WHERE fixture_id = %s",
+        (fixture_id,),
+    )
+
+    for team_block in players_stats:
+        if not isinstance(team_block, dict):
+            continue
+
+        players_list = team_block.get("players") or []
+        for p in players_list:
+            if not isinstance(p, dict):
+                continue
+            player_info = p.get("player") or {}
+            player_id = player_info.get("id")
+            if player_id is None:
+                continue
+
+            execute(
+                """
+                INSERT INTO match_player_stats (fixture_id, player_id, data_json)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (fixture_id, player_id) DO UPDATE SET
+                    data_json = EXCLUDED.data_json
+                """,
+                (
+                    fixture_id,
+                    player_id,
+                    json.dumps(p),
+                ),
+            )
 
 
 def upsert_predictions(
