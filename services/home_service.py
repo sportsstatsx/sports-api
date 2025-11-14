@@ -1,192 +1,213 @@
+# services/home_service.py
+
 import os
-from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Mapping
 
 from db import fetch_all, fetch_one
 
-
 # ─────────────────────────────────────────
-# 허용 리그 설정 (API-Football 대상 리그)
-# main.py 와 동일한 규칙으로 환경변수 파싱
+# 홈 탭에서 사용할 리그 목록 설정
+# ─────────────────────────────────────────
+#
+# HOME_LEAGUES 가 있으면 우선 사용하고,
+# 없으면 LIVE_LEAGUES 를 fallback 으로 사용.
+#
+# 예:
+#   HOME_LEAGUES="39,40,140,141"
+#   LIVE_LEAGUES="39,40,140,141,78,79,..."
 # ─────────────────────────────────────────
 
-_RAW_LIVE_LEAGUES = (
-    os.getenv("live-league")
+_RAW_HOME_LEAGUES = (
+    os.getenv("HOME_LEAGUES")
+    or os.getenv("home-leagues")
     or os.getenv("LIVE_LEAGUES")
-    or os.getenv("LIVE_LEAGUE")
+    or os.getenv("live-league")
     or ""
 )
 
 
-def _parse_allowed_league_ids(raw: str) -> List[int]:
+def _parse_ids(env_val: str) -> List[int]:
     ids: List[int] = []
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
+    for part in env_val.replace(" ", "").split(","):
         if not part:
             continue
         try:
             ids.append(int(part))
         except ValueError:
             continue
-    # 중복 제거 + 정렬
-    return sorted(set(ids))
+    return ids
 
 
-ALLOWED_LEAGUE_IDS: List[int] = _parse_allowed_league_ids(_RAW_LIVE_LEAGUES)
+HOME_LEAGUE_IDS: List[int] = _parse_ids(_RAW_HOME_LEAGUES)
 
 
-def _normalize_date(date_str: Optional[str]) -> str:
-    """
-    date_str 가 None/빈 문자열이면 UTC 오늘 날짜(YYYY-MM-DD)로 대체.
-    """
-    if not date_str:
-        return datetime.utcnow().strftime("%Y-%m-%d")
-    return date_str
+def _has_home_filter() -> bool:
+    return len(HOME_LEAGUE_IDS) > 0
 
 
 # ─────────────────────────────────────────
-# 홈: 상단 리그 탭용 서비스
+# 1) 홈 상단: 날짜별 리그별 경기 수 목록
+#    /api/home/leagues  에서 사용
 # ─────────────────────────────────────────
 
-def get_home_leagues(date_str: Optional[str]) -> List[dict]:
+def get_home_leagues_for_date(date_str: str) -> List[Dict[str, Any]]:
     """
-    상단 탭용: 오늘(또는 지정된 날짜)에 경기 있는 리그 목록.
+    주어진 날짜(YYYY-MM-DD)에 대해,
+    홈 탭 상단에 보여줄 "리그별 매치 수" 리스트를 반환.
+
+    반환 예시:
+    [
+      {
+        "league_id": 39,
+        "league_name": "Premier League",
+        "country": "England",
+        "match_count": 8
+      },
+      ...
+    ]
     """
-    date_str = _normalize_date(date_str)
+    params: List[Any] = [date_str]
+    where_extra = ""
 
-    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) = %s"]
-    params: List[object] = [date_str]
+    if _has_home_filter():
+        # 특정 리그만 보여주고 싶을 때 필터
+        where_extra = " AND m.league_id = ANY(%s)"
+        params.append(HOME_LEAGUE_IDS)
 
-    if ALLOWED_LEAGUE_IDS:
-        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
-        where_parts.append(f"m.league_id IN ({placeholders})")
-        params.extend(ALLOWED_LEAGUE_IDS)
-
-    where_sql = "WHERE " + " AND ".join(where_parts)
-
-    sql = f"""
+    rows = fetch_all(
+        f"""
         SELECT
             m.league_id,
-            l.name AS league_name,
+            l.name   AS league_name,
+            COALESCE(l.country, '') AS country,
             COUNT(*) AS match_count
         FROM matches m
-        JOIN leagues l ON l.id = m.league_id
-        {where_sql}
-        GROUP BY m.league_id, l.name
-        ORDER BY l.name ASC
-    """
+        JOIN leagues l
+          ON l.id = m.league_id
+        WHERE SUBSTRING(m.date_utc FROM 1 FOR 10) = %s
+        {where_extra}
+        GROUP BY m.league_id, l.name, l.country
+        ORDER BY country, league_name
+        """,
+        params,
+    )
 
-    return fetch_all(sql, tuple(params))
+    return rows
 
 
 # ─────────────────────────────────────────
-# 홈: 리그 디렉터리 (전체 리그 + 오늘 경기 수)
+# 2) 홈 하단: 국가별 리그 디렉터리
+#    /api/home/league_directory  에서 사용
 # ─────────────────────────────────────────
 
-def get_home_league_directory(date_str: Optional[str]) -> List[dict]:
+def get_home_league_directory() -> List[Dict[str, Any]]:
     """
-    리그 선택 바텀시트용: 전체 지원 리그 + 오늘 경기 수.
+    홈 탭 하단에 보여줄 '국가별 리그 디렉터리' 용 데이터.
+
+    반환 예시:
+    [
+      {
+        "country": "England",
+        "league_id": 39,
+        "league_name": "Premier League"
+      },
+      ...
+    ]
     """
-    date_str = _normalize_date(date_str)
+    params: List[Any] = []
+    where_extra = ""
 
-    where_parts: List[str] = []
-    params: List[object] = []
+    if _has_home_filter():
+        where_extra = "WHERE l.id = ANY(%s)"
+        params.append(HOME_LEAGUE_IDS)
 
-    # 허용된 리그만 대상으로
-    if ALLOWED_LEAGUE_IDS:
-        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
-        where_parts.append(f"l.id IN ({placeholders})")
-        params.extend(ALLOWED_LEAGUE_IDS)
-
-    where_sql = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-
-    sql = f"""
+    rows = fetch_all(
+        f"""
         SELECT
-            l.id AS league_id,
-            l.name AS league_name,
-            l.country AS country,
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN SUBSTRING(m.date_utc FROM 1 FOR 10) = %s THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
-            ) AS today_count
+            COALESCE(l.country, '') AS country,
+            l.id   AS league_id,
+            l.name AS league_name
         FROM leagues l
-        LEFT JOIN matches m ON m.league_id = l.id
-        {where_sql}
-        GROUP BY l.id, l.name, l.country
-        ORDER BY l.name ASC
-    """
+        {where_extra}
+        ORDER BY country, league_name
+        """,
+        params,
+    )
 
-    # today_count 계산용 날짜 파라미터를 맨 앞에 추가
-    params_with_date: List[object] = list(params)
-    params_with_date.insert(0, date_str)
-
-    return fetch_all(sql, tuple(params_with_date))
+    return rows
 
 
 # ─────────────────────────────────────────
-# 홈: 다음 / 이전 매치데이
+# 3) 다음 매치데이 찾기
+#    /api/home/next_matchday  에서 사용
 # ─────────────────────────────────────────
 
-def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
+def get_next_matchday(date_str: str) -> Optional[Dict[str, Any]]:
     """
-    지정 날짜 이후(포함) 첫 번째 매치데이 날짜 문자열 반환 (없으면 None).
+    주어진 날짜 이후에 '경기가 있는 가장 가까운 날짜'를 찾는다.
+
+    반환 예시:
+      {"next_date": "2025-01-17"}
+
+    없으면 None.
     """
-    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) >= %s"]
-    params: List[object] = [date_str]
+    params: List[Any] = [date_str]
+    where_extra = ""
 
-    if league_id is not None and league_id > 0:
-        where_parts.append("m.league_id = %s")
-        params.append(league_id)
+    if _has_home_filter():
+        where_extra = " AND m.league_id = ANY(%s)"
+        params.append(HOME_LEAGUE_IDS)
 
-    if ALLOWED_LEAGUE_IDS:
-        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
-        where_parts.append(f"m.league_id IN ({placeholders})")
-        params.extend(ALLOWED_LEAGUE_IDS)
-
-    where_sql = "WHERE " + " AND ".join(where_parts)
-
-    sql = f"""
-        SELECT MIN(SUBSTRING(m.date_utc FROM 1 FOR 10)) AS next_date
+    row = fetch_one(
+        f"""
+        SELECT
+            SUBSTRING(m.date_utc FROM 1 FOR 10) AS next_date
         FROM matches m
-        {where_sql}
+        WHERE SUBSTRING(m.date_utc FROM 1 FOR 10) > %s
+        {where_extra}
+        GROUP BY SUBSTRING(m.date_utc FROM 1 FOR 10)
+        ORDER BY next_date ASC
+        LIMIT 1
+        """,
+        params,
+    )
+
+    return row
+
+
+# ─────────────────────────────────────────
+# 4) 이전 매치데이 찾기
+#    /api/home/prev_matchday  에서 사용
+# ─────────────────────────────────────────
+
+def get_prev_matchday(date_str: str) -> Optional[Dict[str, Any]]:
     """
+    주어진 날짜 이전에 '경기가 있는 가장 가까운 날짜'를 찾는다.
 
-    row = fetch_one(sql, tuple(params))
-    if not row:
-        return None
-    return row.get("next_date")
+    반환 예시:
+      {"prev_date": "2024-12-30"}
 
-
-def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
+    없으면 None.
     """
-    지정 날짜 이전 마지막 매치데이 날짜 문자열 반환 (없으면 None).
-    """
-    where_parts = ["SUBSTRING(m.date_utc FROM 1 FOR 10) < %s"]
-    params: List[object] = [date_str]
+    params: List[Any] = [date_str]
+    where_extra = ""
 
-    if league_id is not None and league_id > 0:
-        where_parts.append("m.league_id = %s")
-        params.append(league_id)
+    if _has_home_filter():
+        where_extra = " AND m.league_id = ANY(%s)"
+        params.append(HOME_LEAGUE_IDS)
 
-    if ALLOWED_LEAGUE_IDS:
-        placeholders = ",".join(["%s"] * len(ALLOWED_LEAGUE_IDS))
-        where_parts.append(f"m.league_id IN ({placeholders})")
-        params.extend(ALLOWED_LEAGUE_IDS)
-
-    where_sql = "WHERE " + " AND ".join(where_parts)
-
-    sql = f"""
-        SELECT MAX(SUBSTRING(m.date_utc FROM 1 FOR 10)) AS prev_date
+    row = fetch_one(
+        f"""
+        SELECT
+            SUBSTRING(m.date_utc FROM 1 FOR 10) AS prev_date
         FROM matches m
-        {where_sql}
-    """
+        WHERE SUBSTRING(m.date_utc FROM 1 FOR 10) < %s
+        {where_extra}
+        GROUP BY SUBSTRING(m.date_utc FROM 1 FOR 10)
+        ORDER BY prev_date DESC
+        LIMIT 1
+        """,
+        params,
+    )
 
-    row = fetch_one(sql, tuple(params))
-    if not row:
-        return None
-    return row.get("prev_date")
+    return row
