@@ -1,4 +1,3 @@
-from datetime import datetime
 from typing import Optional
 
 from flask import Blueprint, request, jsonify
@@ -20,7 +19,7 @@ home_bp = Blueprint("home", __name__, url_prefix="/api/home")
 @home_bp.get("/leagues")
 def home_leagues():
     """
-    상단 탭용: 오늘(또는 지정된 날짜)에 경기 있는 리그 목록.
+    상단 탭용: 지정 날짜에 경기 있는 리그 목록.
 
     query:
       - date: yyyy-MM-dd (없으면 오늘 UTC 기준)
@@ -31,13 +30,13 @@ def home_leagues():
 
 
 # ─────────────────────────────────────────
-# 홈: 리그 디렉터리 (전체 리그 + 오늘 경기 수)
+# 홈: 리그 디렉터리 (전체 리그 + 해당 날짜 경기 수)
 # ─────────────────────────────────────────
 
 @home_bp.get("/league_directory")
 def home_league_directory():
     """
-    리그 선택 바텀시트용: 전체 지원 리그 + 오늘 경기 수.
+    리그 선택 바텀시트용: 지원 리그 + 해당 날짜 경기 수.
 
     query:
       - date: yyyy-MM-dd (없으면 오늘)
@@ -49,9 +48,11 @@ def home_league_directory():
 
 # ─────────────────────────────────────────
 # 홈: 다음 / 이전 매치데이 API
+#   - 옛 경로(/matchday/next, /matchday/prev)도 같이 지원
 # ─────────────────────────────────────────
 
 @home_bp.get("/next_matchday")
+@home_bp.get("/matchday/next")
 def next_matchday():
     """
     지정 날짜 이후(포함) 첫 번째 매치데이.
@@ -70,9 +71,10 @@ def next_matchday():
 
 
 @home_bp.get("/prev_matchday")
+@home_bp.get("/matchday/prev")
 def prev_matchday():
     """
-    지정 날짜 이전 마지막 매치데이.
+    지정 날짜 이전(포함) 마지막 매치데이.
 
     query:
       - date: yyyy-MM-dd (필수)
