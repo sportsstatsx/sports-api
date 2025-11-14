@@ -12,8 +12,11 @@ from live_fixtures_common import (
 )
 from live_fixtures_a_group import (
     fetch_fixtures_from_api,
+    fetch_events_from_api,
     upsert_fixture_row,
     upsert_match_row,
+    upsert_match_events,
+    upsert_match_events_raw,
 )
 from live_fixtures_b_group import (
     update_static_data_prematch_for_league,
@@ -43,6 +46,7 @@ def main() -> None:
     for lid in live_leagues:
         try:
             static_phase: Optional[str] = None
+            a_group_active: bool = False
 
             if is_today:
                 # A그룹(라이브) 필요 여부
@@ -60,15 +64,18 @@ def main() -> None:
                             f"  - league {lid}: A그룹은 필요 없지만 "
                             f"static_phase={static_phase} → B그룹만 처리"
                         )
+                        a_group_active = False
                 else:
                     print(
                         f"  - league {lid}: 시간 창 조건 만족 → Api-Football 호출 (A그룹)"
                     )
                     static_phase = detect_static_phase_for_league(lid, target_date, now)
+                    a_group_active = True
             else:
                 print(
                     f"  - league {lid}: date={target_date} (today 아님) → 전체 백필 호출"
                 )
+                a_group_active = True  # 백필 시에는 A그룹 데이터도 같이 채움
 
             # A/B 그룹 중 하나라도 필요하면 fixtures 호출
             fixtures = fetch_fixtures_from_api(lid, target_date)
@@ -80,6 +87,28 @@ def main() -> None:
                 upsert_fixture_row(row, lid, None)
                 upsert_match_row(row, lid, None)
                 total_updated += 1
+
+                # A그룹이 활성화된 경우에만 이벤트 정보까지 수집
+                if a_group_active:
+                    fixture_block = row.get("fixture") or {}
+                    fid = fixture_block.get("id")
+                    if not fid:
+                        continue
+
+                    try:
+                        events = fetch_events_from_api(fid)
+                    except Exception as e:
+                        print(
+                            f"    ! fixture {fid}: events 호출 중 에러: {e}",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    if not events:
+                        continue
+
+                    upsert_match_events(fid, events)
+                    upsert_match_events_raw(fid, events)
 
             # B그룹: standings 등 정적 데이터 (지금은 standings만, 나중에 확장)
             if is_today and static_phase == "PREMATCH":
