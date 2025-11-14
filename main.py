@@ -20,10 +20,12 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
-from db import get_connection, fetch_one, fetch_all
-from metrics_instrumentation import (
-    instrument_db_connection,
-    instrument_flask_app,
+from db import fetch_all, fetch_one, execute
+from services.home_service import (
+    get_home_leagues_for_date,
+    get_home_league_directory,
+    get_next_matchday,
+    get_prev_matchday,
 )
 
 # ─────────────────────────────────────────
@@ -35,19 +37,11 @@ SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 APP_ENV = os.getenv("APP_ENV", "prod")
 
 LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "1.0"))
-
 API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))
 
 START_TS = time.time()
 
 app = Flask(__name__)
-
-# Flask 인스트루먼트 (요청별 메트릭 자동 수집)
-instrument_flask_app(app)
-
-# DB 연결 (Prometheus 인스트루먼트 포함)
-conn = get_connection()
-instrument_db_connection(conn)
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -99,7 +93,7 @@ def _client_ip() -> str:
 
 
 def check_rate_limit() -> bool:
-    """분당 요청 수가 RATE_LIMIT_PER_MINUTE 이상이면 False"""
+    """분당 요청 수가 API_RATE_LIMIT_PER_MINUTE 이상이면 False."""
     ip = _client_ip()
     now = int(time.time())
     bucket = _ip_buckets[ip]
@@ -131,7 +125,7 @@ def rate_limited(fn):
 
 
 # ─────────────────────────────────────────
-# 요청 로깅 / 에러 처리
+# JSON 로깅 / 에러 처리
 # ─────────────────────────────────────────
 
 def log_json(level: str, msg: str, **kwargs):
@@ -197,7 +191,7 @@ def handle_exception(e):
 @app.get("/")
 def root():
     """
-    브라우저에서 바로 확인할 수 있는 간단한 상태 체크용 엔드포인트.
+    브라우저에서 바로 확인할 수 있는 간단 상태 체크.
     실제 모니터링은 /health, /metrics 를 기준으로 하고,
     이 엔드포인트는 사람/브라우저 확인용이다.
     """
@@ -212,7 +206,7 @@ def root():
 
 
 # ─────────────────────────────────────────
-# /metrics  (Prometheus)
+# /metrics  (Prometheus 기본 메트릭)
 # ─────────────────────────────────────────
 
 @app.get("/metrics")
@@ -224,8 +218,9 @@ def metrics():
 @app.get("/metrics_prom")
 def metrics_prom():
     """
-    Prometheus 기본 메트릭 중 자주 보는 것들을 조금 더 읽기 좋은 텍스트 형식으로 내려주는 엔드포인트.
-    내부 구조가 바뀌어도 전체 500을 내지 않도록, 각 섹션을 try/except 로 감싸서 부분 실패만 기록한다.
+    Prometheus 기본 메트릭에서 자주 보는 것만 뽑아서
+    조금 더 읽기 좋은 포맷으로 내려주는 엔드포인트.
+    내부 구조가 바뀌어도 전체 500을 내지 않도록, 각 섹션을 try/except 로 감싼다.
     """
     lines = []
 
@@ -275,20 +270,22 @@ def metrics_prom():
             error=str(e),
         )
 
-    # http_exceptions_total
+    # http_request_exceptions_total
     try:
-        lines.append("# HELP http_exceptions_total Total HTTP exceptions")
-        lines.append("# TYPE http_exceptions_total counter")
+        lines.append("# HELP http_request_exceptions_total Total HTTP exceptions")
+        lines.append("# TYPE http_request_exceptions_total counter")
         metrics_map = getattr(HTTP_REQUEST_EXCEPTIONS_TOTAL, "_metrics", None)
         if metrics_map:
             for labels, metric in metrics_map.items():
                 (etype,) = labels
                 value = metric._value.get()
-                lines.append(f'http_exceptions_total{{type="{etype}"}} {value}')
+                lines.append(
+                    f'http_request_exceptions_total{{type="{etype}"}} {value}'
+                )
     except Exception as e:
         log_json(
             "error",
-            "metrics_prom http_exceptions_total error",
+            "metrics_prom http_request_exceptions_total error",
             error=str(e),
         )
 
@@ -318,7 +315,7 @@ def metrics_prom():
 
 
 # ─────────────────────────────────────────
-# 헬스 체크
+# 헬스 체크 (/health)
 # ─────────────────────────────────────────
 
 @app.get("/health")
@@ -327,14 +324,16 @@ def health():
         row = fetch_one("SELECT 1 AS ok")
         if not row or row.get("ok") != 1:
             raise RuntimeError("DB check failed")
-        return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
+        return jsonify(
+            {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION}
+        )
     except Exception as e:
         log_json("error", "Health check failed", error=str(e))
         return jsonify({"ok": False, "error": "db_unavailable"}), 500
 
 
 # ─────────────────────────────────────────
-# 홈 화면: fixtures 리스트 (이미 적용된 버전)
+# 홈 화면: fixtures 리스트 (/api/fixtures)
 # ─────────────────────────────────────────
 
 @app.get("/api/fixtures")
@@ -380,15 +379,8 @@ def list_fixtures():
 
 
 # ─────────────────────────────────────────
-# 홈 화면: “리그 탭용” API — services/home_service.py 연동
+# 홈 화면: 리그 탭용 API (services/home_service.py 연동)
 # ─────────────────────────────────────────
-
-from services.home_service import (
-    get_home_leagues_for_date,
-    get_home_league_directory,
-    get_next_matchday,
-    get_prev_matchday,
-)
 
 @app.get("/api/home/leagues")
 @rate_limited
@@ -454,5 +446,4 @@ def api_home_prev_matchday():
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    import time as _time  # perf_counter 충돌 방지용 별칭
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
