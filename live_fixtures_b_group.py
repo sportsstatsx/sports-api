@@ -105,7 +105,7 @@ def upsert_standings(
     standings 테이블 upsert.
     """
     if not rows:
-        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킵")
+        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킱")
         return
 
     now_iso = now_utc().isoformat()
@@ -211,6 +211,127 @@ def update_standings_for_league(
             f"    [standings {phase}] league={league_id}, season={season} 처리 중 에러: {e}",
             file=sys.stderr,
         )
+
+
+# ─────────────────────────────────────
+#  team_season_stats
+# ─────────────────────────────────────
+
+def fetch_team_statistics_from_api(
+    league_id: int,
+    season: int,
+    team_id: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Api-Football /teams/statistics 호출.
+    https://v3.football.api-sports.io/teams/statistics?league={league}&season={season}&team={team_id}
+
+    응답 전체(response 객체)를 그대로 반환한다.
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/teams/statistics"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": season,
+        "team": team_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    resp_obj = data.get("response")
+    if not resp_obj:
+        return None
+
+    # /teams/statistics 는 response 가 dict 1개 형태
+    return resp_obj
+
+
+def upsert_team_season_stats(
+    league_id: int,
+    season: int,
+    team_id: int,
+    stats_data: Dict[str, Any],
+    phase: str,
+) -> None:
+    """
+    team_season_stats (
+        league_id INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        team_id   INTEGER NOT NULL,
+        name      TEXT    NOT NULL,
+        value     TEXT,
+        PRIMARY KEY (league_id, season, team_id, name)
+    )
+
+    우선은 전체 statistics JSON 을 name='full_json' 한 줄로 저장한다.
+    (나중에 원하면 세부 필드별로 쪼개는 형태로 리팩터링 가능)
+    """
+    json_str = json.dumps(stats_data)
+
+    execute(
+        """
+        INSERT INTO team_season_stats (
+            league_id,
+            season,
+            team_id,
+            name,
+            value
+        )
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (league_id, season, team_id, name) DO UPDATE SET
+            value = EXCLUDED.value
+        """,
+        (league_id, season, team_id, "full_json", json_str),
+    )
+
+
+def update_team_season_stats_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    해당 리그 + 시즌의 모든 팀에 대해 /teams/statistics 를 호출하여
+    team_season_stats 테이블(full_json) 을 갱신.
+    """
+    team_ids = _get_team_ids_for_league_season(league_id, season)
+    if not team_ids:
+        print(
+            f"    [team_season_stats {phase}] league={league_id}, season={season}: "
+            f"team_ids 비어있음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [team_season_stats {phase}] league={league_id}, season={season}: "
+        f"{len(team_ids)}개 팀에 대해 팀 시즌 스탯 갱신"
+    )
+
+    updated = 0
+    for tid in team_ids:
+        try:
+            stats = fetch_team_statistics_from_api(league_id, season, tid)
+            if not stats:
+                continue
+            upsert_team_season_stats(league_id, season, tid, stats, phase)
+            updated += 1
+        except Exception as e:
+            print(
+                f"      [team_season_stats {phase}] team_id={tid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+    print(
+        f"    [team_season_stats {phase}] league={league_id}, season={season}: "
+        f"{updated}개 팀 upsert"
+    )
 
 
 # ─────────────────────────────────────
@@ -479,8 +600,6 @@ def upsert_prediction(
         (fixture_id, json_str),
     )
 
-    # 굳이 로그를 fixture 단위로 다 찍지는 않고, 상위에서 개수만 찍는다.
-
 
 def update_predictions_for_league(
     league_id: int,
@@ -723,7 +842,7 @@ def update_static_data_prematch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(standings + squads + injuries + predictions + odds)를
+    B그룹 데이터(standings + team_season_stats + squads + injuries + predictions + odds)를
     '킥오프 1시간 전' 구간에서 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -739,16 +858,19 @@ def update_static_data_prematch_for_league(
     # 1) standings
     update_standings_for_league(league_id, season, date_str, phase="PREMATCH")
 
-    # 2) squads
+    # 2) team_season_stats
+    update_team_season_stats_for_league(league_id, season, phase="PREMATCH")
+
+    # 3) squads
     update_squads_for_league(league_id, season, phase="PREMATCH")
 
-    # 3) injuries
+    # 4) injuries
     update_injuries_for_league(league_id, season, phase="PREMATCH")
 
-    # 4) predictions
+    # 5) predictions
     update_predictions_for_league(league_id, date_str, phase="PREMATCH")
 
-    # 5) odds + odds_history
+    # 6) odds + odds_history
     update_odds_for_league(league_id, date_str, phase="PREMATCH")
 
 
@@ -757,7 +879,7 @@ def update_static_data_postmatch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(standings + squads + injuries + predictions + odds)를
+    B그룹 데이터(standings + team_season_stats + squads + injuries + predictions + odds)를
     '경기 종료 직후' 구간에서 한 번 더 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -773,14 +895,17 @@ def update_static_data_postmatch_for_league(
     # 1) standings
     update_standings_for_league(league_id, season, date_str, phase="POSTMATCH")
 
-    # 2) squads
+    # 2) team_season_stats
+    update_team_season_stats_for_league(league_id, season, phase="POSTMATCH")
+
+    # 3) squads
     update_squads_for_league(league_id, season, phase="POSTMATCH")
 
-    # 3) injuries
+    # 4) injuries
     update_injuries_for_league(league_id, season, phase="POSTMATCH")
 
-    # 4) predictions
+    # 5) predictions
     update_predictions_for_league(league_id, date_str, phase="POSTMATCH")
 
-    # 5) odds + odds_history
+    # 6) odds + odds_history
     update_odds_for_league(league_id, date_str, phase="POSTMATCH")
