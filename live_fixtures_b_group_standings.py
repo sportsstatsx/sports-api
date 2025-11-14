@@ -1,15 +1,65 @@
 import sys
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from db import execute
+from db import execute, fetch_all
 from live_fixtures_common import (
     API_KEY,
     now_utc,
     resolve_league_season_for_date,
 )
 
+
+# ─────────────────────────────────────
+#  공통 유틸: 리그의 팀 리스트 가져오기
+# ─────────────────────────────────────
+
+def _get_team_ids_for_league_season(
+    league_id: int,
+    season: int,
+) -> List[int]:
+    """
+    standings → matches 순으로 team_id 목록을 가져온다.
+
+    1) standings 에 데이터가 있으면 거기서 DISTINCT team_id
+    2) 없으면 matches 에서 home/away 합쳐서 DISTINCT team_id
+    """
+    # 1) standings 기준
+    rows = fetch_all(
+        """
+        SELECT DISTINCT team_id
+        FROM standings
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+    if rows:
+        return [r["team_id"] for r in rows if r.get("team_id") is not None]
+
+    # 2) standings 가 비었으면 matches 기준
+    rows = fetch_all(
+        """
+        SELECT DISTINCT team_id FROM (
+            SELECT home_id AS team_id
+            FROM matches
+            WHERE league_id = %s AND season = %s
+            UNION
+            SELECT away_id AS team_id
+            FROM matches
+            WHERE league_id = %s AND season = %s
+        ) t
+        """,
+        (league_id, season, league_id, season),
+    )
+    return [r["team_id"] for r in rows if r.get("team_id") is not None]
+
+
+# ─────────────────────────────────────
+#  standings (기존 구현)
+# ─────────────────────────────────────
 
 def fetch_standings_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
     """
@@ -160,6 +210,7 @@ def upsert_standings(
 
 def update_standings_for_league(
     league_id: int,
+    season: int,
     date_str: str,
     phase: str,
 ) -> None:
@@ -167,14 +218,6 @@ def update_standings_for_league(
     PREMATCH / POSTMATCH 타이밍에서 standings 를 갱신.
     phase: "PREMATCH" 또는 "POSTMATCH"
     """
-    season = resolve_league_season_for_date(league_id, date_str)
-    if season is None:
-        print(
-            f"    [standings {phase}] league={league_id}, date={date_str}: "
-            f"matches 에서 season 을 찾지 못해 스킵"
-        )
-        return
-
     print(
         f"    [standings {phase}] league={league_id}, season={season}, "
         f"date={date_str} → Api-Football 호출"
@@ -190,17 +233,135 @@ def update_standings_for_league(
         )
 
 
+# ─────────────────────────────────────
+#  squads (새로 추가)
+# ─────────────────────────────────────
+
+def fetch_squad_from_api(team_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Api-Football Squads 엔드포인트 호출.
+    https://v3.football.api-sports.io/players/squads?team={team_id}
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/players/squads"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "team": team_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    resp_list = data.get("response") or []
+    if not resp_list:
+        return None
+
+    # 일반적으로 team 1개만 응답이므로 첫 번째만 사용
+    return resp_list[0]
+
+
+def upsert_squad(
+    team_id: int,
+    season: int,
+    squad_data: Dict[str, Any],
+) -> None:
+    """
+    squads (
+        team_id   INTEGER,
+        season    INTEGER,
+        data_json JSONB NOT NULL,
+        PRIMARY KEY (team_id, season)
+    )
+    """
+    # JSONB 컬럼이지만, text → jsonb 캐스팅되도록 문자열로 넣어줌
+    json_str = json.dumps(squad_data)
+
+    execute(
+        """
+        INSERT INTO squads (
+            team_id,
+            season,
+            data_json
+        )
+        VALUES (%s, %s, %s)
+        ON CONFLICT (team_id, season) DO UPDATE SET
+            data_json = EXCLUDED.data_json
+        """,
+        (team_id, season, json_str),
+    )
+
+
+def update_squads_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    해당 리그 + 시즌의 모든 팀에 대해 스쿼드 정보를 갱신.
+    phase: "PREMATCH" / "POSTMATCH" (로그용)
+    """
+    team_ids = _get_team_ids_for_league_season(league_id, season)
+    if not team_ids:
+        print(
+            f"    [squads {phase}] league={league_id}, season={season}: team_ids 비어있음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [squads {phase}] league={league_id}, season={season}: "
+        f"{len(team_ids)}개 팀에 대해 스쿼드 갱신"
+    )
+
+    for tid in team_ids:
+        try:
+            data = fetch_squad_from_api(tid)
+            if not data:
+                print(
+                    f"      [squads {phase}] team={tid}: 응답 없음 → 스킵"
+                )
+                continue
+
+            upsert_squad(tid, season, data)
+        except Exception as e:
+            print(
+                f"      [squads {phase}] team={tid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
+#  B그룹 진입점: PREMATCH / POSTMATCH
+#   (update_live_fixtures.py 에서 호출)
+# ─────────────────────────────────────
+
 def update_static_data_prematch_for_league(
     league_id: int,
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(현재는 standings만)를 '킥오프 1시간 전'에 갱신.
-    이후 team_season_stats, squads, players, injuries, transfers, toplists, venues 도
-    이 함수 내부에 순서대로 추가 예정.
+    B그룹 데이터(지금은 standings + squads)를
+    '킥오프 1시간 전' 구간에서 갱신.
     """
-    print(f"    [STATIC PREMATCH] league={league_id}, date={date_str}")
-    update_standings_for_league(league_id, date_str, phase="PREMATCH")
+    season = resolve_league_season_for_date(league_id, date_str)
+    if season is None:
+        print(
+            f"    [STATIC PREMATCH] league={league_id}, date={date_str}: "
+            f"matches 에서 season 을 찾지 못해 B그룹 전체 스킵"
+        )
+        return
+
+    print(f"    [STATIC PREMATCH] league={league_id}, season={season}, date={date_str}")
+
+    # 1) standings
+    update_standings_for_league(league_id, season, date_str, phase="PREMATCH")
+
+    # 2) squads
+    update_squads_for_league(league_id, season, phase="PREMATCH")
 
 
 def update_static_data_postmatch_for_league(
@@ -208,8 +369,21 @@ def update_static_data_postmatch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(현재는 standings만)를 '경기 종료 직후'에 갱신.
-    이후 team_season_stats, toplists 등도 이 함수에 추가 예정.
+    B그룹 데이터(지금은 standings + squads)를
+    '경기 종료 직후' 구간에서 한 번 더 갱신.
     """
-    print(f"    [STATIC POSTMATCH] league={league_id}, date={date_str}")
-    update_standings_for_league(league_id, date_str, phase="POSTMATCH")
+    season = resolve_league_season_for_date(league_id, date_str)
+    if season is None:
+        print(
+            f"    [STATIC POSTMATCH] league={league_id}, date={date_str}: "
+            f"matches 에서 season 을 찾지 못해 B그룹 전체 스킵"
+        )
+        return
+
+    print(f"    [STATIC POSTMATCH] league={league_id}, season={season}, date={date_str}")
+
+    # 1) standings
+    update_standings_for_league(league_id, season, date_str, phase="POSTMATCH")
+
+    # 2) squads
+    update_squads_for_league(league_id, season, phase="POSTMATCH")
