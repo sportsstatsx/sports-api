@@ -22,7 +22,7 @@ from prometheus_client import (
 
 from db import fetch_all, fetch_one, execute
 from services.home_service import (
-    get_home_leagues_for_date,
+    get_home_leagues,
     get_home_league_directory,
     get_next_matchday,
     get_prev_matchday,
@@ -447,3 +447,4 @@ def api_home_prev_matchday():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
