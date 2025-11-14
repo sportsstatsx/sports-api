@@ -14,7 +14,7 @@ from live_fixtures_a_group import (
     fetch_fixtures_from_api,
     upsert_fixture_row,
 )
-from live_fixtures_b_group_standings import (
+from live_fixtures_b_group import (
     update_static_data_prematch_for_league,
     update_static_data_postmatch_for_league,
 )
