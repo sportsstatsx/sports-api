@@ -14,11 +14,15 @@ from live_fixtures_a_group import (
     fetch_fixtures_from_api,
     fetch_events_from_api,
     fetch_lineups_from_api,
+    fetch_team_stats_from_api,
+    fetch_player_stats_from_api,
     upsert_fixture_row,
     upsert_match_row,
     upsert_match_events,
     upsert_match_events_raw,
     upsert_match_lineups,
+    upsert_match_team_stats,
+    upsert_match_player_stats,
 )
 from live_fixtures_b_group import (
     update_static_data_prematch_for_league,
@@ -125,6 +129,32 @@ def main() -> None:
 
                 if lineups:
                     upsert_match_lineups(fid, lineups)
+
+                # 팀 통계
+                try:
+                    stats = fetch_team_stats_from_api(fid)
+                except Exception as e:
+                    print(
+                        f"    ! fixture {fid}: statistics 호출 중 에러: {e}",
+                        file=sys.stderr,
+                    )
+                    stats = []
+
+                if stats:
+                    upsert_match_team_stats(fid, stats)
+
+                # 선수 통계
+                try:
+                    players_stats = fetch_player_stats_from_api(fid)
+                except Exception as e:
+                    print(
+                        f"    ! fixture {fid}: players 호출 중 에러: {e}",
+                        file=sys.stderr,
+                    )
+                    players_stats = []
+
+                if players_stats:
+                    upsert_match_player_stats(fid, players_stats)
 
             # B그룹: standings 등 정적 데이터 (지금은 standings만, 나중에 확장)
             if is_today and static_phase == "PREMATCH":
