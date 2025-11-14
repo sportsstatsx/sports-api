@@ -5,11 +5,12 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from db import execute
-from live_fixtures_common import API_KEY, map_status_group
+from live_fixtures_common import API_KEY, map_status_group, now_utc
 
 
 BASE_URL = "https://v3.football.api-sports.io/fixtures"
 EVENTS_URL = "https://v3.football.api-sports.io/fixtures/events"
+LINEUPS_URL = "https://v3.football.api-sports.io/fixtures/lineups"
 
 
 def _get_headers() -> Dict[str, str]:
@@ -72,13 +73,41 @@ def fetch_events_from_api(fixture_id: int) -> List[Dict[str, Any]]:
     data = resp.json()
     results = data.get("response", []) or []
 
-    # Api-Football 응답 구조 상, response 가 곧 이벤트 리스트
     events: List[Dict[str, Any]] = []
     for ev in results:
         if isinstance(ev, dict):
             events.append(ev)
 
     return events
+
+
+def fetch_lineups_from_api(fixture_id: int) -> List[Dict[str, Any]]:
+    """
+    특정 경기(fixture_id)에 대한 라인업 리스트를 Api-Football에서 가져온다.
+
+    - endpoint: /fixtures/lineups
+    - params:
+        fixture: fixture_id
+
+    일반적으로 팀당 1개씩(홈/원정) 라인업이 들어온다.
+    """
+    headers = _get_headers()
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(LINEUPS_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+
+    data = resp.json()
+    results = data.get("response", []) or []
+
+    lineups: List[Dict[str, Any]] = []
+    for row in results:
+        if isinstance(row, dict):
+            lineups.append(row)
+
+    return lineups
 
 
 def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -303,8 +332,6 @@ def upsert_match_events(
         type_ = ev.get("type") or ""
         detail = ev.get("detail")
 
-        # 교체 이벤트의 경우, assist 를 교체된 선수(들어오는 선수)로 쓰는 패턴이 많아서
-        # type 이 subst 계열이면 player_in_* 컬럼에도 옮겨담아 둔다.
         player_in_id: Optional[int] = None
         player_in_name: Optional[str] = None
         if type_.lower() == "subst":
@@ -374,7 +401,7 @@ def upsert_match_lineups(
     lineups: List[Dict[str, Any]],
 ) -> None:
     """
-    A그룹: match_lineups 테이블 upsert 틀.
+    A그룹: match_lineups 테이블 upsert 구현.
 
     match_lineups 스키마:
       fixture_id  INTEGER NOT NULL
@@ -382,8 +409,38 @@ def upsert_match_lineups(
       data_json   TEXT    NOT NULL
       updated_utc TEXT
     """
-    # TODO: /fixtures/lineups 응답 구조에 맞춰 구현 예정
-    return
+    # 한 경기 라인업 전체를 다시 덮어쓴다.
+    execute(
+        "DELETE FROM match_lineups WHERE fixture_id = %s",
+        (fixture_id,),
+    )
+
+    updated_utc = now_utc().isoformat()
+
+    for row in lineups:
+        if not isinstance(row, dict):
+            continue
+
+        team_block = row.get("team") or {}
+        team_id = team_block.get("id")
+        if team_id is None:
+            continue
+
+        execute(
+            """
+            INSERT INTO match_lineups (fixture_id, team_id, data_json, updated_utc)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (fixture_id, team_id) DO UPDATE SET
+                data_json   = EXCLUDED.data_json,
+                updated_utc = EXCLUDED.updated_utc
+            """,
+            (
+                fixture_id,
+                team_id,
+                json.dumps(row),
+                updated_utc,
+            ),
+        )
 
 
 def upsert_match_team_stats(
