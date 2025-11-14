@@ -312,7 +312,7 @@ def list_fixtures():
     where_parts = []
     params = []
 
-    if league_id is not None:
+    if league_id is not None and league_id > 0:
         where_parts.append("m.league_id = %s")
         params.append(league_id)
 
@@ -364,3 +364,4 @@ def list_fixtures():
 if __name__ == "__main__":
     import time as _time  # perf_counter 충돌 피하기 위해 별칭
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
