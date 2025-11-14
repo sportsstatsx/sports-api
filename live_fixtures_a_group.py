@@ -131,8 +131,7 @@ def upsert_fixture_row(
 
 
 # ─────────────────────────────────────────
-# A그룹 나머지 스키마용 upsert “틀”들
-# (지금은 아직 사용하지 않고, 이후 단계에서 하나씩 구현 예정)
+# A그룹 나머지 스키마용 upsert 구현/틀
 # ─────────────────────────────────────────
 
 
@@ -142,29 +141,108 @@ def upsert_match_row(
     season: Optional[int],
 ) -> None:
     """
-    A그룹: matches 테이블 upsert 틀.
+    A그룹: matches 테이블 upsert 구현.
 
-    TODO:
-      - fixture["fixture"], fixture["teams"], fixture["goals"] 등에서
-        홈/원정 팀, 스코어, 승패/무, 킥오프 시간 등을 추출해서
-        matches 테이블에 INSERT/UPDATE 하도록 구현할 예정.
+    가정한 기본 컬럼(필요하면 나중에 스키마에 맞게 수정):
+      - fixture_id (PK)
+      - league_id
+      - season
+      - date_utc
+      - status
+      - status_group
+      - home_team_id
+      - away_team_id
+      - goals_home
+      - goals_away
+      - winner   : 'HOME' / 'AWAY' / 'DRAW' / NULL
     """
-    # basic = _extract_fixture_basic(fixture)
-    # if basic is None:
-    #     return
-    #
-    # fixture_id = basic["fixture_id"]
-    # home_team_id = ...
-    # away_team_id = ...
-    # goals_home = ...
-    # goals_away = ...
-    #
-    # execute(
-    #     "... INSERT INTO matches (...) VALUES (...) "
-    #     "ON CONFLICT (fixture_id) DO UPDATE SET ...",
-    #     (...,),
-    # )
-    return
+    basic = _extract_fixture_basic(fixture)
+    if basic is None:
+        return
+
+    fixture_id = basic["fixture_id"]
+
+    # 상위에서 전달한 league_id / season 이 우선
+    league_id = league_id or basic["league_id"]
+    if season is None:
+        season = basic["season"]
+
+    date_utc = basic["date_utc"]
+    status_short = basic["status"]
+    status_group = basic["status_group"]
+
+    teams_block = fixture.get("teams") or {}
+    home_team = teams_block.get("home") or {}
+    away_team = teams_block.get("away") or {}
+
+    home_team_id = home_team.get("id")
+    away_team_id = away_team.get("id")
+
+    goals_block = fixture.get("goals") or {}
+    goals_home = goals_block.get("home")
+    goals_away = goals_block.get("away")
+
+    # winner 판정 (Api-Football 구조 기반)
+    home_winner_flag = home_team.get("winner")
+    away_winner_flag = away_team.get("winner")
+
+    winner: Optional[str]
+    if home_winner_flag:
+        winner = "HOME"
+    elif away_winner_flag:
+        winner = "AWAY"
+    elif (
+        goals_home is not None
+        and goals_away is not None
+        and goals_home == goals_away
+        and status_group in ("FINISHED", "AFTER")
+    ):
+        winner = "DRAW"
+    else:
+        winner = None
+
+    execute(
+        """
+        INSERT INTO matches (
+            fixture_id,
+            league_id,
+            season,
+            date_utc,
+            status,
+            status_group,
+            home_team_id,
+            away_team_id,
+            goals_home,
+            goals_away,
+            winner
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            league_id    = EXCLUDED.league_id,
+            season       = EXCLUDED.season,
+            date_utc     = EXCLUDED.date_utc,
+            status       = EXCLUDED.status,
+            status_group = EXCLUDED.status_group,
+            home_team_id = EXCLUDED.home_team_id,
+            away_team_id = EXCLUDED.away_team_id,
+            goals_home   = EXCLUDED.goals_home,
+            goals_away   = EXCLUDED.goals_away,
+            winner       = EXCLUDED.winner
+        """,
+        (
+            fixture_id,
+            league_id,
+            season,
+            date_utc,
+            status_short,
+            status_group,
+            home_team_id,
+            away_team_id,
+            goals_home,
+            goals_away,
+            winner,
+        ),
+    )
 
 
 def upsert_match_events(
@@ -205,6 +283,8 @@ def upsert_match_events_raw(
       - Api-Football 이벤트 원본 JSON 을 거의 그대로 저장해서
         나중에 재가공/디버깅에 사용할 수 있게 한다.
     """
+    # import json
+    #
     # execute(
     #     "INSERT INTO match_events_raw (fixture_id, payload_json, created_at) "
     #     "VALUES (%s, %s, NOW())",
