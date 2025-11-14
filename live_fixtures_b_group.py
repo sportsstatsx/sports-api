@@ -103,26 +103,6 @@ def upsert_standings(
 ) -> None:
     """
     standings 테이블 upsert.
-
-    standings (
-        league_id     integer not null,
-        season        integer not null,
-        group_name    text    not null default 'Overall',
-        rank          integer not null,
-        team_id       integer not null,
-        points        integer,
-        goals_diff    integer,
-        played        integer,
-        win           integer,
-        draw          integer,
-        lose          integer,
-        goals_for     integer,
-        goals_against integer,
-        form          text,
-        updated_utc   text,
-        description   text,
-        PRIMARY KEY (league_id, season, group_name, team_id)
-    )
     """
     if not rows:
         print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킵")
@@ -145,8 +125,8 @@ def upsert_standings(
         goals_diff = row.get("goalsDiff")
         played = stats_all.get("played")
         win = stats_all.get("win")
-        draw = row.get("draw")
-        lose = row.get("lose")
+        draw = stats_all.get("draw")
+        lose = stats_all.get("lose")
         goals_for = goals.get("for")
         goals_against = goals.get("against")
         form = row.get("form")
@@ -334,6 +314,117 @@ def update_squads_for_league(
 
 
 # ─────────────────────────────────────
+#  injuries (새로 추가)
+# ─────────────────────────────────────
+
+def fetch_injuries_from_api(
+    league_id: int,
+    season: int,
+) -> List[Dict[str, Any]]:
+    """
+    Api-Football /injuries 호출.
+    https://v3.football.api-sports.io/injuries?league={league_id}&season={season}
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/injuries"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": season,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    return data.get("response") or []
+
+
+def upsert_injuries(
+    league_id: int,
+    season: int,
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    injuries (
+        player_id INTEGER NOT NULL,
+        team_id   INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        data_json TEXT    NOT NULL,
+        PRIMARY KEY (player_id, team_id, season)
+    )
+    """
+    if not rows:
+        print(
+            f"    [injuries {phase}] league={league_id}, season={season}: 응답 0 rows → 스킵"
+        )
+        return
+
+    count = 0
+    for row in rows:
+        player = row.get("player") or {}
+        team = row.get("team") or {}
+        league_obj = row.get("league") or {}
+
+        player_id = player.get("id")
+        team_id = team.get("id")
+        # 응답에 season 이 있으면 우선 사용, 없으면 인자로 받은 season 사용
+        row_season = league_obj.get("season") or season
+
+        if player_id is None or team_id is None or row_season is None:
+            continue
+
+        json_str = json.dumps(row)
+
+        execute(
+            """
+            INSERT INTO injuries (
+                player_id,
+                team_id,
+                season,
+                data_json
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (player_id, team_id, season) DO UPDATE SET
+                data_json = EXCLUDED.data_json
+            """,
+            (player_id, team_id, row_season, json_str),
+        )
+        count += 1
+
+    print(
+        f"    [injuries {phase}] league={league_id}, season={season}: "
+        f"{count} rows upsert"
+    )
+
+
+def update_injuries_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    PREMATCH / POSTMATCH 타이밍에서 부상 정보를 갱신.
+    """
+    print(
+        f"    [injuries {phase}] league={league_id}, season={season} → Api-Football 호출"
+    )
+    try:
+        rows = fetch_injuries_from_api(league_id, season)
+        upsert_injuries(league_id, season, rows, phase)
+    except Exception as e:
+        print(
+            f"    [injuries {phase}] league={league_id}, season={season} 처리 중 에러: {e}",
+            file=sys.stderr,
+        )
+
+
+# ─────────────────────────────────────
 #  B그룹 진입점: PREMATCH / POSTMATCH
 #   (update_live_fixtures.py 에서 호출)
 # ─────────────────────────────────────
@@ -343,7 +434,7 @@ def update_static_data_prematch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(지금은 standings + squads)를
+    B그룹 데이터(현재: standings + squads + injuries)를
     '킥오프 1시간 전' 구간에서 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -362,13 +453,16 @@ def update_static_data_prematch_for_league(
     # 2) squads
     update_squads_for_league(league_id, season, phase="PREMATCH")
 
+    # 3) injuries
+    update_injuries_for_league(league_id, season, phase="PREMATCH")
+
 
 def update_static_data_postmatch_for_league(
     league_id: int,
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(지금은 standings + squads)를
+    B그룹 데이터(현재: standings + squads + injuries)를
     '경기 종료 직후' 구간에서 한 번 더 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -386,3 +480,6 @@ def update_static_data_postmatch_for_league(
 
     # 2) squads
     update_squads_for_league(league_id, season, phase="POSTMATCH")
+
+    # 3) injuries
+    update_injuries_for_league(league_id, season, phase="POSTMATCH")
