@@ -58,7 +58,7 @@ def _get_team_ids_for_league_season(
 
 
 # ─────────────────────────────────────
-#  standings (기존 구현)
+#  standings
 # ─────────────────────────────────────
 
 def fetch_standings_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
@@ -145,8 +145,8 @@ def upsert_standings(
         goals_diff = row.get("goalsDiff")
         played = stats_all.get("played")
         win = stats_all.get("win")
-        draw = stats_all.get("draw")
-        lose = stats_all.get("lose")
+        draw = row.get("draw")
+        lose = row.get("lose")
         goals_for = goals.get("for")
         goals_against = goals.get("against")
         form = row.get("form")
@@ -234,7 +234,7 @@ def update_standings_for_league(
 
 
 # ─────────────────────────────────────
-#  squads (새로 추가)
+#  squads
 # ─────────────────────────────────────
 
 def fetch_squad_from_api(team_id: int) -> Optional[Dict[str, Any]]:
@@ -278,7 +278,6 @@ def upsert_squad(
         PRIMARY KEY (team_id, season)
     )
     """
-    # JSONB 컬럼이지만, text → jsonb 캐스팅되도록 문자열로 넣어줌
     json_str = json.dumps(squad_data)
 
     execute(
