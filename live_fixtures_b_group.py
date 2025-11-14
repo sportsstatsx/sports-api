@@ -105,7 +105,7 @@ def upsert_standings(
     standings 테이블 upsert.
     """
     if not rows:
-        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킱")
+        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킵")
         return
 
     now_iso = now_utc().isoformat()
@@ -254,7 +254,7 @@ def upsert_squad(
     squads (
         team_id   INTEGER,
         season    INTEGER,
-        data_json JSONB NOT NULL,
+        data_json TEXT NOT NULL,
         PRIMARY KEY (team_id, season)
     )
     """
@@ -425,37 +425,12 @@ def update_injuries_for_league(
 
 
 # ─────────────────────────────────────
-#  predictions (B그룹에 추가)
+#  predictions
 # ─────────────────────────────────────
 
-def _get_upcoming_fixture_ids_for_league_date(
-    league_id: int,
-    date_str: str,
-) -> List[int]:
+def fetch_prediction_for_fixture(fixture_id: int) -> Optional[Dict[str, Any]]:
     """
-    해당 리그 + 날짜의 UPCOMING 경기 fixture_id 목록을 가져온다.
-    (matches 테이블 기준)
-    """
-    rows = fetch_all(
-        """
-        SELECT fixture_id
-        FROM matches
-        WHERE league_id = %s
-          AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
-          AND status_group = 'UPCOMING'
-        """,
-        (league_id, date_str),
-    )
-    return [r["fixture_id"] for r in rows if r.get("fixture_id") is not None]
-
-
-def fetch_predictions_from_api(fixture_id: int) -> List[Dict[str, Any]]:
-    """
-    Api-Football /predictions 호출.
-    https://v3.football.api-sports.io/predictions?fixture={fixture_id}
-
-    응답 전체(response 배열)를 그대로 반환해서
-    DB에는 JSON 문자열로 통째로 저장한다.
+    /predictions?fixture={fixture_id} 호출해서 첫 번째 응답을 반환.
     """
     if not API_KEY:
         raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
@@ -472,22 +447,24 @@ def fetch_predictions_from_api(fixture_id: int) -> List[Dict[str, Any]]:
     resp.raise_for_status()
     data = resp.json()
 
-    return data.get("response") or []
+    resp_list = data.get("response") or []
+    if not resp_list:
+        return None
+    return resp_list[0]
 
 
-def upsert_predictions(
+def upsert_prediction(
     fixture_id: int,
-    prediction_list: List[Dict[str, Any]],
+    prediction: Dict[str, Any],
+    phase: str,
 ) -> None:
     """
     predictions (
-        fixture_id INTEGER NOT NULL PRIMARY KEY,
-        data_json  TEXT    NOT NULL
+        fixture_id INTEGER PRIMARY KEY,
+        data_json  TEXT NOT NULL
     )
-
-    한 경기당 response 전체를 JSON 문자열로 저장한다.
     """
-    json_str = json.dumps(prediction_list)
+    json_str = json.dumps(prediction)
 
     execute(
         """
@@ -502,43 +479,238 @@ def upsert_predictions(
         (fixture_id, json_str),
     )
 
+    # 굳이 로그를 fixture 단위로 다 찍지는 않고, 상위에서 개수만 찍는다.
 
-def update_predictions_for_league_prematch(
+
+def update_predictions_for_league(
     league_id: int,
-    season: int,
     date_str: str,
+    phase: str,
 ) -> None:
     """
-    PREMATCH 타이밍에 해당 리그 + 날짜의 UPCOMING 경기들에 대해
-    predictions 를 한 번씩 갱신한다.
+    해당 리그 + 날짜의 모든 경기 fixture_id 에 대해 predictions 를 갱신.
     """
-    fixture_ids = _get_upcoming_fixture_ids_for_league_date(league_id, date_str)
+    rows = fetch_all(
+        """
+        SELECT fixture_id
+        FROM matches
+        WHERE league_id = %s
+          AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
+        """,
+        (league_id, date_str),
+    )
+
+    fixture_ids = [r["fixture_id"] for r in rows if r.get("fixture_id") is not None]
     if not fixture_ids:
         print(
-            f"    [predictions PREMATCH] league={league_id}, season={season}, "
-            f"date={date_str}: UPCOMING 경기 없음 → 스킵"
+            f"    [predictions {phase}] league={league_id}, date={date_str}: "
+            f"해당 날짜 경기 없음 → 스킵"
         )
         return
 
     print(
-        f"    [predictions PREMATCH] league={league_id}, season={season}, "
-        f"date={date_str}: {len(fixture_ids)}경기에 대해 예측 갱신"
+        f"    [predictions {phase}] league={league_id}, date={date_str}: "
+        f"{len(fixture_ids)}개 경기 예측 갱신"
     )
 
+    updated = 0
     for fid in fixture_ids:
         try:
-            resp_list = fetch_predictions_from_api(fid)
-            if not resp_list:
-                print(
-                    f"      [predictions PREMATCH] fixture={fid}: 응답 없음 → 스킵"
-                )
+            pred = fetch_prediction_for_fixture(fid)
+            if not pred:
                 continue
-            upsert_predictions(fid, resp_list)
+            upsert_prediction(fid, pred, phase)
+            updated += 1
         except Exception as e:
             print(
-                f"      [predictions PREMATCH] fixture={fid} 처리 중 에러: {e}",
+                f"      [predictions {phase}] fixture_id={fid} 처리 중 에러: {e}",
                 file=sys.stderr,
             )
+
+    print(
+        f"    [predictions {phase}] league={league_id}, date={date_str}: "
+        f"{updated}개 fixture upsert"
+    )
+
+
+# ─────────────────────────────────────
+#  odds + odds_history
+# ─────────────────────────────────────
+
+def fetch_odds_for_fixture(fixture_id: int) -> Optional[Dict[str, Any]]:
+    """
+    /odds?fixture={fixture_id} 호출해서 첫 번째 응답을 반환.
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/odds"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    resp_list = data.get("response") or []
+    if not resp_list:
+        return None
+    return resp_list[0]
+
+
+def upsert_odds_and_history(
+    fixture_id: int,
+    odds_payload: Dict[str, Any],
+    phase: str,
+) -> None:
+    """
+    odds / odds_history 두 테이블을 동시에 갱신.
+
+    - odds         : (fixture_id, bookmaker, market, selection) 단위로 upsert
+    - odds_history : 매번 INSERT 하여 스냅샷 누적
+    """
+    updated_at = odds_payload.get("update")
+    bookmakers = odds_payload.get("bookmakers") or []
+
+    count = 0
+
+    for bm in bookmakers:
+        bookmaker_name = bm.get("name") or str(bm.get("id") or "")
+        bets = bm.get("bets") or []
+
+        for bet in bets:
+            market = bet.get("name") or str(bet.get("id") or "")
+            values = bet.get("values") or []
+
+            for v in values:
+                selection = v.get("value")
+                odd = v.get("odd")
+
+                data_json = json.dumps({
+                    "fixture_id": fixture_id,
+                    "bookmaker": bookmaker_name,
+                    "market": market,
+                    "selection": selection,
+                    "odd": odd,
+                    "updated_at": updated_at,
+                    "raw": v,
+                })
+
+                # odds (현재 값 유지용)
+                execute(
+                    """
+                    INSERT INTO odds (
+                        fixture_id,
+                        bookmaker,
+                        market,
+                        selection,
+                        odd,
+                        updated_at,
+                        data_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (fixture_id, bookmaker, market, selection) DO UPDATE SET
+                        odd        = EXCLUDED.odd,
+                        updated_at = EXCLUDED.updated_at,
+                        data_json  = EXCLUDED.data_json
+                    """,
+                    (
+                        fixture_id,
+                        bookmaker_name,
+                        market,
+                        selection,
+                        odd,
+                        updated_at,
+                        data_json,
+                    ),
+                )
+
+                # odds_history (스냅샷 누적)
+                execute(
+                    """
+                    INSERT INTO odds_history (
+                        fixture_id,
+                        bookmaker,
+                        market,
+                        selection,
+                        odd,
+                        updated_at,
+                        data_json
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        fixture_id,
+                        bookmaker_name,
+                        market,
+                        selection,
+                        odd,
+                        updated_at,
+                        data_json,
+                    ),
+                )
+
+                count += 1
+
+    print(
+        f"    [odds {phase}] fixture_id={fixture_id}: {count} rows (odds/odds_history) 처리"
+    )
+
+
+def update_odds_for_league(
+    league_id: int,
+    date_str: str,
+    phase: str,
+) -> None:
+    """
+    해당 리그 + 날짜의 모든 경기 fixture_id 에 대해
+    odds / odds_history 를 갱신.
+    """
+    rows = fetch_all(
+        """
+        SELECT fixture_id
+        FROM matches
+        WHERE league_id = %s
+          AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
+        """,
+        (league_id, date_str),
+    )
+
+    fixture_ids = [r["fixture_id"] for r in rows if r.get("fixture_id") is not None]
+    if not fixture_ids:
+        print(
+            f"    [odds {phase}] league={league_id}, date={date_str}: "
+            f"해당 날짜 경기 없음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [odds {phase}] league={league_id}, date={date_str}: "
+        f"{len(fixture_ids)}개 경기 배당 갱신"
+    )
+
+    handled = 0
+    for fid in fixture_ids:
+        try:
+            payload = fetch_odds_for_fixture(fid)
+            if not payload:
+                continue
+            upsert_odds_and_history(fid, payload, phase)
+            handled += 1
+        except Exception as e:
+            print(
+                f"      [odds {phase}] fixture_id={fid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+    print(
+        f"    [odds {phase}] league={league_id}, date={date_str}: "
+        f"{handled}개 fixture 처리 완료"
+    )
 
 
 # ─────────────────────────────────────
@@ -551,7 +723,7 @@ def update_static_data_prematch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(현재: standings + squads + injuries + predictions)를
+    B그룹 데이터(standings + squads + injuries + predictions + odds)를
     '킥오프 1시간 전' 구간에서 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -573,8 +745,11 @@ def update_static_data_prematch_for_league(
     # 3) injuries
     update_injuries_for_league(league_id, season, phase="PREMATCH")
 
-    # 4) predictions (해당 날짜 UPCOMING 경기들)
-    update_predictions_for_league_prematch(league_id, season, date_str)
+    # 4) predictions
+    update_predictions_for_league(league_id, date_str, phase="PREMATCH")
+
+    # 5) odds + odds_history
+    update_odds_for_league(league_id, date_str, phase="PREMATCH")
 
 
 def update_static_data_postmatch_for_league(
@@ -582,9 +757,8 @@ def update_static_data_postmatch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(현재: standings + squads + injuries)를
+    B그룹 데이터(standings + squads + injuries + predictions + odds)를
     '경기 종료 직후' 구간에서 한 번 더 갱신.
-    (predictions 는 경기 전 데이터 성격이라 POSTMATCH 에서는 호출하지 않음)
     """
     season = resolve_league_season_for_date(league_id, date_str)
     if season is None:
@@ -604,3 +778,9 @@ def update_static_data_postmatch_for_league(
 
     # 3) injuries
     update_injuries_for_league(league_id, season, phase="POSTMATCH")
+
+    # 4) predictions
+    update_predictions_for_league(league_id, date_str, phase="POSTMATCH")
+
+    # 5) odds + odds_history
+    update_odds_for_league(league_id, date_str, phase="POSTMATCH")
