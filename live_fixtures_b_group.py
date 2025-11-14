@@ -105,7 +105,7 @@ def upsert_standings(
     standings 테이블 upsert.
     """
     if not rows:
-        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킵")
+        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킱")
         return
 
     now_iso = now_utc().isoformat()
@@ -314,7 +314,7 @@ def update_squads_for_league(
 
 
 # ─────────────────────────────────────
-#  injuries (새로 추가)
+#  injuries
 # ─────────────────────────────────────
 
 def fetch_injuries_from_api(
@@ -425,6 +425,123 @@ def update_injuries_for_league(
 
 
 # ─────────────────────────────────────
+#  predictions (B그룹에 추가)
+# ─────────────────────────────────────
+
+def _get_upcoming_fixture_ids_for_league_date(
+    league_id: int,
+    date_str: str,
+) -> List[int]:
+    """
+    해당 리그 + 날짜의 UPCOMING 경기 fixture_id 목록을 가져온다.
+    (matches 테이블 기준)
+    """
+    rows = fetch_all(
+        """
+        SELECT fixture_id
+        FROM matches
+        WHERE league_id = %s
+          AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
+          AND status_group = 'UPCOMING'
+        """,
+        (league_id, date_str),
+    )
+    return [r["fixture_id"] for r in rows if r.get("fixture_id") is not None]
+
+
+def fetch_predictions_from_api(fixture_id: int) -> List[Dict[str, Any]]:
+    """
+    Api-Football /predictions 호출.
+    https://v3.football.api-sports.io/predictions?fixture={fixture_id}
+
+    응답 전체(response 배열)를 그대로 반환해서
+    DB에는 JSON 문자열로 통째로 저장한다.
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/predictions"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "fixture": fixture_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    return data.get("response") or []
+
+
+def upsert_predictions(
+    fixture_id: int,
+    prediction_list: List[Dict[str, Any]],
+) -> None:
+    """
+    predictions (
+        fixture_id INTEGER NOT NULL PRIMARY KEY,
+        data_json  TEXT    NOT NULL
+    )
+
+    한 경기당 response 전체를 JSON 문자열로 저장한다.
+    """
+    json_str = json.dumps(prediction_list)
+
+    execute(
+        """
+        INSERT INTO predictions (
+            fixture_id,
+            data_json
+        )
+        VALUES (%s, %s)
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            data_json = EXCLUDED.data_json
+        """,
+        (fixture_id, json_str),
+    )
+
+
+def update_predictions_for_league_prematch(
+    league_id: int,
+    season: int,
+    date_str: str,
+) -> None:
+    """
+    PREMATCH 타이밍에 해당 리그 + 날짜의 UPCOMING 경기들에 대해
+    predictions 를 한 번씩 갱신한다.
+    """
+    fixture_ids = _get_upcoming_fixture_ids_for_league_date(league_id, date_str)
+    if not fixture_ids:
+        print(
+            f"    [predictions PREMATCH] league={league_id}, season={season}, "
+            f"date={date_str}: UPCOMING 경기 없음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [predictions PREMATCH] league={league_id}, season={season}, "
+        f"date={date_str}: {len(fixture_ids)}경기에 대해 예측 갱신"
+    )
+
+    for fid in fixture_ids:
+        try:
+            resp_list = fetch_predictions_from_api(fid)
+            if not resp_list:
+                print(
+                    f"      [predictions PREMATCH] fixture={fid}: 응답 없음 → 스킵"
+                )
+                continue
+            upsert_predictions(fid, resp_list)
+        except Exception as e:
+            print(
+                f"      [predictions PREMATCH] fixture={fid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
 #  B그룹 진입점: PREMATCH / POSTMATCH
 #   (update_live_fixtures.py 에서 호출)
 # ─────────────────────────────────────
@@ -434,7 +551,7 @@ def update_static_data_prematch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(현재: standings + squads + injuries)를
+    B그룹 데이터(현재: standings + squads + injuries + predictions)를
     '킥오프 1시간 전' 구간에서 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
@@ -456,6 +573,9 @@ def update_static_data_prematch_for_league(
     # 3) injuries
     update_injuries_for_league(league_id, season, phase="PREMATCH")
 
+    # 4) predictions (해당 날짜 UPCOMING 경기들)
+    update_predictions_for_league_prematch(league_id, season, date_str)
+
 
 def update_static_data_postmatch_for_league(
     league_id: int,
@@ -464,6 +584,7 @@ def update_static_data_postmatch_for_league(
     """
     B그룹 데이터(현재: standings + squads + injuries)를
     '경기 종료 직후' 구간에서 한 번 더 갱신.
+    (predictions 는 경기 전 데이터 성격이라 POSTMATCH 에서는 호출하지 않음)
     """
     season = resolve_league_season_for_date(league_id, date_str)
     if season is None:
