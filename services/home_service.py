@@ -182,5 +182,56 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
     if not rows:
         return None
 
+    # ─────────────────────────────────────
+#  4) 팀 시즌 스탯 (team_season_stats)
+#     /api/team_season_stats 에서 사용
+# ─────────────────────────────────────
+
+def get_team_season_stats(team_id: int, league_id: int):
+    """
+    team_season_stats 테이블에서
+    (league_id, team_id) 에 해당하는 가장 최신 season 한 줄을 가져온다.
+
+    반환 예시:
+      {
+        "league_id": 39,
+        "season": 2025,
+        "team_id": 42,
+        "name": "full_json",
+        "value": { ... 원본 JSON ... }
+      }
+    """
+
+    rows = fetch_all(
+        """
+        SELECT
+            league_id,
+            season,
+            team_id,
+            name,
+            value
+        FROM team_season_stats
+        WHERE league_id = %s
+          AND team_id   = %s
+        ORDER BY season DESC
+        LIMIT 1
+        """,
+        (league_id, team_id),
+    )
+
+    if not rows:
+        return None
+
+    row = rows[0]
+
+    return {
+        "league_id": row["league_id"],
+        "season": row["season"],
+        "team_id": row["team_id"],
+        "name": row.get("name"),
+        "value": row["value"],  # JSONB → 파이썬 dict 로 나옴
+    }
+
+
     match_date = rows[0]["match_date"]
     return str(match_date)
