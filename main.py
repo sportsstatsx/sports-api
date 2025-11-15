@@ -355,20 +355,28 @@ def health():
 def list_fixtures():
     """
     홈 화면 기본 경기 리스트
-    기존 SQLite 쿼리를 Postgres 로 변환
+
+    league_id:
+      - 생략 또는 0 → 모든 리그
+      - 그 외      → 해당 리그만
     """
     league_id = request.args.get("league_id", type=int)
     date_str = request.args.get("date")  # YYYY-MM-DD
     page = request.args.get("page", 1, type=int)
     page_size = request.args.get("page_size", 50, type=int)
 
-    if not league_id or not date_str:
-        return jsonify({"ok": False, "error": "missing_params"}), 400
+    # 날짜는 무조건 필요
+    if not date_str:
+        return jsonify({"ok": False, "error": "missing_date"}), 400
+
+    # 0 은 "전체 리그" 의미로 처리
+    if league_id == 0:
+        league_id = None
 
     offset = (page - 1) * page_size
 
-    rows = fetch_all(
-        """
+    # 기본적으로 날짜 필터만
+    sql = """
         SELECT
             m.fixture_id,
             m.league_id,
@@ -381,14 +389,19 @@ def list_fixtures():
             m.home_ft,
             m.away_ft
         FROM matches m
-        WHERE m.league_id = %s
-          AND SUBSTRING(m.date_utc FROM 1 FOR 10) = %s
-        ORDER BY m.date_utc ASC
-        LIMIT %s OFFSET %s
-        """,
-        (league_id, date_str, page_size, offset),
-    )
+        WHERE SUBSTRING(m.date_utc FROM 1 FOR 10) = %s
+    """
+    params = [date_str]
 
+    # league_id 가 주어졌으면 추가 필터
+    if league_id is not None:
+        sql += " AND m.league_id = %s"
+        params.append(league_id)
+
+    sql += " ORDER BY m.date_utc ASC LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
+
+    rows = fetch_all(sql, tuple(params))
     return jsonify({"ok": True, "rows": rows})
 
 
@@ -464,3 +477,4 @@ def api_home_prev_matchday():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
