@@ -1,5 +1,3 @@
-# main.py  — SportsStatsX API
-
 import os
 import json
 import time
@@ -27,8 +25,9 @@ from services.home_service import (
     get_next_matchday,
     get_prev_matchday,
     get_team_season_stats,
-    get_team_info,  # 👈 추가
+    get_team_info,
 )
+from routers.home_router import home_bp  # 👈 홈 라우터 블루프린트 등록
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -44,6 +43,7 @@ API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))
 START_TS = time.time()
 
 app = Flask(__name__)
+app.register_blueprint(home_bp)  # 👈 /api/home/* 라우트는 전부 여기서 등록
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -192,11 +192,6 @@ def handle_exception(e):
 
 @app.get("/")
 def root():
-    """
-    브라우저에서 바로 확인할 수 있는 간단 상태 체크.
-    실제 모니터링은 /health, /metrics 를 기준으로 하고,
-    이 엔드포인트는 사람/브라우저 확인용이다.
-    """
     return jsonify(
         {
             "ok": True,
@@ -219,11 +214,6 @@ def metrics():
 
 @app.get("/metrics_prom")
 def metrics_prom():
-    """
-    Prometheus 기본 메트릭에서 자주 보는 것만 뽑아서
-    조금 더 읽기 좋은 포맷으로 내려주는 엔드포인트.
-    내부 구조가 바뀌어도 전체 500을 내지 않도록, 각 섹션을 try/except 로 감싼다.
-    """
     lines = []
 
     # http_requests_total
@@ -241,7 +231,7 @@ def metrics_prom():
     except Exception as e:
         log_json("error", "metrics_prom http_requests_total error", error=str(e))
 
-    # http_request_duration_seconds (Histogram)
+    # http_request_duration_seconds
     try:
         lines.append(
             "# HELP http_request_duration_seconds HTTP request duration in seconds"
@@ -304,7 +294,7 @@ def metrics_prom():
             error=str(e),
         )
 
-    # http_rate_limited_total (unlabelled counter)
+    # http_rate_limited_total
     try:
         lines.append(
             "# HELP http_rate_limited_total Total rate limited responses (429)"
@@ -354,9 +344,6 @@ def health():
 @app.get("/api/fixtures")
 @rate_limited
 def list_fixtures():
-    """
-    홈 화면 기본 경기 리스트
-    """
     league_id = request.args.get("league_id", type=int)
     date_str = request.args.get("date")  # YYYY-MM-DD
     page = request.args.get("page", 1, type=int)
@@ -382,11 +369,9 @@ def list_fixtures():
             m.away_id,
             m.home_ft,
             m.away_ft,
-            -- 리그 정보
             l.name      AS league_name,
             l.logo      AS league_logo,
             l.country   AS league_country,
-            -- 홈/원정 팀 정보
             th.name     AS home_name,
             th.logo     AS home_logo,
             ta.name     AS away_name,
@@ -414,13 +399,12 @@ def list_fixtures():
 
 
 # ─────────────────────────────────────────
+# 팀 시즌 스탯 (/api/team_season_stats)
+# ─────────────────────────────────────────
 
 @app.get("/api/team_season_stats")
 @rate_limited
 def api_team_season_stats():
-    """
-    팀 시즌 스탯 원본 JSON을 그대로 돌려주는 단순 엔드포인트.
-    """
     team_id = request.args.get("team_id", type=int)
     league_id = request.args.get("league_id", type=int)
 
@@ -432,71 +416,6 @@ def api_team_season_stats():
         return jsonify({"ok": False, "error": "not_found"}), 404
 
     return jsonify({"ok": True, "row": row})
-
-
-# ─────────────────────────────────────────
-# 홈 화면: 리그 탭용 / 디렉터리 / 매치데이 / 팀 정보 API
-# ─────────────────────────────────────────
-
-@app.get("/api/home/leagues")
-@rate_limited
-def api_home_leagues():
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    rows = get_home_leagues(date_str)
-    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
-
-
-@app.get("/api/home/league_directory")
-@rate_limited
-def api_home_league_directory():
-    date_str = request.args.get("date")
-    rows = get_home_league_directory(date_str)
-    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
-
-
-@app.get("/api/home/next_matchday")
-@rate_limited
-def api_home_next_matchday():
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    league_id = request.args.get("league_id", type=int)
-    next_date = get_next_matchday(date_str, league_id)
-    return jsonify({"ok": True, "date": next_date})
-
-
-@app.get("/api/home/prev_matchday")
-@rate_limited
-def api_home_prev_matchday():
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    league_id = request.args.get("league_id", type=int)
-    prev_date = get_prev_matchday(date_str, league_id)
-    return jsonify({"ok": True, "date": prev_date})
-
-
-@app.get("/api/home/team_info")
-@rate_limited
-def api_home_team_info():
-    """
-    팀 이름/국가/로고 조회용
-      /api/home/team_info?team_id=42
-    """
-    team_id = request.args.get("team_id", type=int)
-    if not team_id:
-        return jsonify({"ok": False, "error": "team_id_required"}), 400
-
-    team = get_team_info(team_id)
-    if team is None:
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    return jsonify({"ok": True, "team": team})
 
 
 # ─────────────────────────────────────────
