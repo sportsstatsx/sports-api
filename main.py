@@ -375,7 +375,8 @@ def list_fixtures():
 
     offset = (page - 1) * page_size
 
-    # 기본적으로 날짜 필터만
+    # matches + leagues + teams 를 JOIN 해서
+    # 앱에서 기대하는 필드들을 모두 내려준다.
     sql = """
         SELECT
             m.fixture_id,
@@ -387,9 +388,24 @@ def list_fixtures():
             m.home_id,
             m.away_id,
             m.home_ft,
-            m.away_ft
+            m.away_ft,
+            -- 리그 정보
+            l.name      AS league_name,
+            l.logo      AS league_logo,
+            l.country   AS league_country,
+            -- 홈/원정 팀 정보
+            th.name     AS home_name,
+            th.logo     AS home_logo,
+            ta.name     AS away_name,
+            ta.logo     AS away_logo
         FROM matches m
-        WHERE SUBSTRING(m.date_utc FROM 1 FOR 10) = %s
+        JOIN leagues l
+          ON l.id = m.league_id
+        JOIN teams th
+          ON th.id = m.home_id
+        JOIN teams ta
+          ON ta.id = m.away_id
+        WHERE DATE(m.date_utc) = %s
     """
     params = [date_str]
 
@@ -477,4 +493,5 @@ def api_home_prev_matchday():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
