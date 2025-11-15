@@ -33,13 +33,6 @@ def _normalize_date(date_str: Optional[str]) -> str:
 def get_home_leagues(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
     상단 탭용: 해당 날짜에 '경기가 있는 리그' 만 반환.
-
-    반환 컬럼:
-      - country
-      - league_id
-      - league_name
-      - logo
-      - match_count
     """
     d = _normalize_date(date_str)
 
@@ -72,13 +65,6 @@ def get_home_leagues(date_str: Optional[str]) -> List[Dict[str, Any]]:
 def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
     리그 선택 바텀시트용: "전체 지원 리그" + 해당 날짜 경기 수.
-
-    반환 컬럼:
-      - country
-      - league_id
-      - league_name
-      - logo
-      - match_count (없으면 0)
     """
     d = _normalize_date(date_str)
 
@@ -111,8 +97,6 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
 
 # ─────────────────────────────────────
 #  3) 다음 / 이전 매치데이
-#     /api/home/next_matchday
-#     /api/home/prev_matchday
 # ─────────────────────────────────────
 
 def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
@@ -181,7 +165,6 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 
 # ─────────────────────────────────────
 #  4) 팀 시즌 스탯 (team_season_stats)
-#     /api/team_season_stats 에서 사용
 # ─────────────────────────────────────
 
 def get_team_season_stats(team_id: int, league_id: int):
@@ -216,20 +199,17 @@ def get_team_season_stats(team_id: int, league_id: int):
         "season": row["season"],
         "team_id": row["team_id"],
         "name": row.get("name"),
-        "value": row["value"],  # JSONB → 파이썬 dict 또는 TEXT
+        "value": row["value"],
     }
 
 
 # ─────────────────────────────────────
-#  5) 팀 정보 (팀 이름/국가/로고)
-#     /api/home/team_info 에서 사용
+#  5) 팀 정보 (teams 테이블)
 # ─────────────────────────────────────
 
 def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
     """
     teams 테이블에서 단일 팀 정보 조회.
-    반환:
-      { "id": 42, "name": "...", "country": "...", "logo": "..." }
     """
     rows = fetch_all(
         """
