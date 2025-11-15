@@ -301,47 +301,37 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         total_block = shots.get("total") or {}
         on_block = shots.get("on") or {}
 
-        # API-Football 구조 상 total 키가 없을 수도 있으므로
-        # home + away 합으로 보정
+        # ⚠ total 필드가 없으면 home+away 합으로 보정
         st_home = total_block.get("home") or 0
         st_away = total_block.get("away") or 0
-        st_total = total_block.get("total") or 0
-        if not st_total:
-            st_total = (st_home or 0) + (st_away or 0)
+        st_total = total_block.get("total") or (st_home or 0) + (st_away or 0)
 
         so_home = on_block.get("home") or 0
         so_away = on_block.get("away") or 0
-        so_total = on_block.get("total") or 0
-        if not so_total:
-            so_total = (so_home or 0) + (so_away or 0)
+        so_total = on_block.get("total") or (so_home or 0) + (so_away or 0)
 
         def fmt_avg(n, m):
             v = safe_div(n, m)
-            # 숫자로 내려주고, 클라이언트에서 포맷팅 (소수 자리수 등) 처리
+            # 숫자로 내려주고, 클라이언트에서 포맷 (소수점 자리수 등)
             return round(v, 2) if v > 0 else 0.0
 
         def fmt_pct(n, d):
             v = safe_div(n, d)
             return int(round(v * 100)) if v > 0 else 0
 
-        # 이미 값이 있다면 덮어쓰지 않고, 없으면 새로 채움
-        insights.setdefault(
-            "shots_per_match",
-            {
-                "total": fmt_avg(st_total, matches_total),
-                "home": fmt_avg(st_home, matches_home or matches_total),
-                "away": fmt_avg(st_away, matches_away or matches_total),
-            },
-        )
+        # ❌ setdefault 지우고, 항상 덮어쓰기
+        insights["shots_per_match"] = {
+            "total": fmt_avg(st_total, matches_total),
+            "home": fmt_avg(st_home, matches_home or matches_total),
+            "away": fmt_avg(st_away, matches_away or matches_total),
+        }
 
-        insights.setdefault(
-            "shots_on_target_pct",
-            {
-                "total": fmt_pct(so_total, st_total),
-                "home": fmt_pct(so_home, st_home),
-                "away": fmt_pct(so_away, st_away),
-            },
-        )
+        insights["shots_on_target_pct"] = {
+            "total": fmt_pct(so_total, st_total),
+            "home": fmt_pct(so_home, st_home),
+            "away": fmt_pct(so_away, st_away),
+        }
+
 
     # ─────────────────────────────────────────
     # Outcome & Totals / Result Combos용 고급 지표
