@@ -172,7 +172,9 @@ def _find_matchday(date_str: str, league_id: Optional[int], *, direction: str) -
     norm_date = _normalize_date(date_str)
 
     params: List[Any] = [norm_date]
-    where_parts: List[str] = ["m.date_utc::date >= %s" if direction == "next" else "m.date_utc::date <= %s"]
+    where_parts: List[str] = [
+        "m.date_utc::date >= %s" if direction == "next" else "m.date_utc::date <= %s"
+    ]
 
     if league_id and league_id > 0:
         where_parts.append("m.league_id = %s")
@@ -223,6 +225,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
     여기서 일부 고급 지표(insights_overall.*)가 추가/보정된다.
     (예: shots_per_match, shots_on_target_pct)
+
+    ⚠️ shots 필드가 full_json 안에 없거나 null 인 경우,
+       match_team_stats 테이블을 이용해서 경기별 통계를 합산해서 계산한다.
     """
     rows = fetch_all(
         """
@@ -245,6 +250,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         return None
 
     row = rows[0]
+    season = row["season"]
 
     # value 컬럼(JSONB 혹은 TEXT)을 파이썬 dict 로 정규화
     raw_value = row["value"]
@@ -285,27 +291,18 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         return num_f / float(den)
 
     # ─────────────────────────────────────────
-    # Shots / Shots on Target 기반 고급 지표
-    #   - 경기당 슈팅 수 (shots_per_match)
-    #   - 슈팅 대비 유효슈팅 비율 (shots_on_target_pct)
+    # ① full_json 안에 shots 필드가 있을 때 → 그대로 사용
     # ─────────────────────────────────────────
     shots = stats.get("shots") or {}
     if isinstance(shots, dict) and matches_total > 0:
         total_block = shots.get("total") or {}
         on_block = shots.get("on") or {}
 
-        # total 이 없으면 home+away 로 보정
-        st_total = total_block.get("total")
-        if not st_total:
-            st_total = (total_block.get("home") or 0) + (total_block.get("away") or 0)
-
+        st_total = total_block.get("total") or 0
         st_home = total_block.get("home") or 0
         st_away = total_block.get("away") or 0
 
-        so_total = on_block.get("total")
-        if not so_total:
-            so_total = (on_block.get("home") or 0) + (on_block.get("away") or 0)
-
+        so_total = on_block.get("total") or 0
         so_home = on_block.get("home") or 0
         so_away = on_block.get("away") or 0
 
@@ -318,18 +315,125 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
             v = safe_div(n, d)
             return int(round(v * 100)) if v > 0 else 0
 
-        # ✅ 무조건 덮어쓰기 (setdefault 사용 X)
-        insights["shots_per_match"] = {
-            "total": fmt_avg(st_total, matches_total),
-            "home": fmt_avg(st_home, matches_home or matches_total),
-            "away": fmt_avg(st_away, matches_away or matches_total),
-        }
+        # 이미 값이 있다면 덮어쓰지 않고, 없으면 새로 채움
+        insights.setdefault(
+            "shots_per_match",
+            {
+                "total": fmt_avg(st_total, matches_total),
+                "home": fmt_avg(st_home, matches_home or matches_total),
+                "away": fmt_avg(st_away, matches_away or matches_total),
+            },
+        )
 
-        insights["shots_on_target_pct"] = {
-            "total": fmt_pct(so_total, st_total),
-            "home": fmt_pct(so_home, st_home),
-            "away": fmt_pct(so_away, st_away),
-        }
+        insights.setdefault(
+            "shots_on_target_pct",
+            {
+                "total": fmt_pct(so_total, st_total),
+                "home": fmt_pct(so_home, st_home),
+                "away": fmt_pct(so_away, st_away),
+            },
+        )
+
+    else:
+        # ─────────────────────────────────────────
+        # ② full_json 안에 shots 가 없거나 null 인 경우
+        #    → match_team_stats + matches 를 이용해서 직접 계산
+        # ─────────────────────────────────────────
+        agg_rows = fetch_all(
+            """
+            SELECT
+                m.fixture_id,
+                m.home_id,
+                m.away_id,
+                MAX(
+                    CASE
+                        WHEN mts.name = 'Total Shots'
+                        THEN COALESCE(NULLIF(mts.value, '')::int, 0)
+                        ELSE 0
+                    END
+                ) AS total_shots,
+                MAX(
+                    CASE
+                        WHEN mts.name = 'Shots on Goal'
+                        THEN COALESCE(NULLIF(mts.value, '')::int, 0)
+                        ELSE 0
+                    END
+                ) AS shots_on_goal
+            FROM matches m
+            JOIN match_team_stats mts
+              ON mts.fixture_id = m.fixture_id
+             AND mts.team_id   = %s
+            WHERE m.league_id    = %s
+              AND m.season       = %s
+              AND m.status_group = 'FINISHED'
+            GROUP BY m.fixture_id, m.home_id, m.away_id
+            """,
+            (team_id, league_id, season),
+        )
+
+        if agg_rows:
+            home_matches = 0
+            away_matches = 0
+
+            total_shots_total = 0
+            total_shots_home = 0
+            total_shots_away = 0
+
+            on_goal_total = 0
+            on_goal_home = 0
+            on_goal_away = 0
+
+            for r in agg_rows:
+                fixture_total = r["total_shots"] or 0
+                fixture_on = r["shots_on_goal"] or 0
+
+                is_home = r["home_id"] == team_id
+                is_away = r["away_id"] == team_id
+
+                if is_home:
+                    home_matches += 1
+                    total_shots_home += fixture_total
+                    on_goal_home += fixture_on
+                elif is_away:
+                    away_matches += 1
+                    total_shots_away += fixture_total
+                    on_goal_away += fixture_on
+                else:
+                    # 이 팀이 아닌 행이면 스킵
+                    continue
+
+                total_shots_total += fixture_total
+                on_goal_total += fixture_on
+
+            # fixtures.played 가 0 이면, match_team_stats 기준으로 보정
+            eff_total = matches_total or (home_matches + away_matches)
+            eff_home = matches_home or (home_matches or eff_total)
+            eff_away = matches_away or (away_matches or eff_total)
+
+            def fmt_avg2(n, m):
+                v = safe_div(n, m)
+                return round(v, 2) if v > 0 else 0.0
+
+            def fmt_pct2(n, d):
+                v = safe_div(n, d)
+                return int(round(v * 100)) if v > 0 else 0
+
+            insights["shots_per_match"] = {
+                "total": fmt_avg2(total_shots_total, eff_total),
+                "home": fmt_avg2(total_shots_home, eff_home),
+                "away": fmt_avg2(total_shots_away, eff_away),
+            }
+
+            insights["shots_on_target_pct"] = {
+                "total": fmt_pct2(on_goal_total, total_shots_total),
+                "home": fmt_pct2(on_goal_home, total_shots_home),
+                "away": fmt_pct2(on_goal_away, total_shots_away),
+            }
+
+    # ─────────────────────────────────────────
+    # 필요시 다른 고급 지표도 여기에서 추가/보정 가능
+    # (예: xG 기반 효율, 득점 분포 기반 지표 등)
+    # ─────────────────────────────────────────
 
     # ─────────────────────────────────────────
     # 최종 반환 – value 에 stats(dict)를 넣어서 반환
