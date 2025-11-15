@@ -105,7 +105,7 @@ def upsert_standings(
     standings 테이블 upsert.
     """
     if not rows:
-        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킱")
+        print(f"    [standings] league={league_id}, season={season}: 응답 0 rows → 스킵")
         return
 
     now_iso = now_utc().isoformat()
@@ -833,6 +833,756 @@ def update_odds_for_league(
 
 
 # ─────────────────────────────────────
+#  NEW: leagues
+# ─────────────────────────────────────
+
+def fetch_league_from_api(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    """
+    Api-Football /leagues 호출.
+    해당 league_id + season 의 리그 정보를 1개 가져온다.
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/leagues"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "id": league_id,
+        "season": season,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    resp_list = data.get("response") or []
+    if not resp_list:
+        return None
+    return resp_list[0]
+
+
+def upsert_league(row: Dict[str, Any]) -> None:
+    """
+    leagues (
+        id      INTEGER PRIMARY KEY,
+        name    TEXT NOT NULL,
+        country TEXT,
+        logo    TEXT
+    )
+    """
+    league_obj = row.get("league") or {}
+    country_obj = row.get("country") or {}
+
+    lid = league_obj.get("id")
+    name = league_obj.get("name")
+    logo = league_obj.get("logo")
+    country = country_obj.get("name")
+
+    if lid is None or name is None:
+        return
+
+    execute(
+        """
+        INSERT INTO leagues (
+            id,
+            name,
+            country,
+            logo
+        )
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            name    = EXCLUDED.name,
+            country = EXCLUDED.country,
+            logo    = EXCLUDED.logo
+        """,
+        (lid, name, country, logo),
+    )
+
+
+def update_league_info_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    B그룹에서 리그 기본 정보(leagues 테이블)를 갱신.
+    """
+    print(
+        f"    [leagues {phase}] league={league_id}, season={season} → Api-Football 호출"
+    )
+    try:
+        row = fetch_league_from_api(league_id, season)
+        if not row:
+            print(f"    [leagues {phase}] league={league_id}: 응답 없음 → 스킵")
+            return
+        upsert_league(row)
+    except Exception as e:
+        print(
+            f"    [leagues {phase}] league={league_id}, season={season} 처리 중 에러: {e}",
+            file=sys.stderr,
+        )
+
+
+# ─────────────────────────────────────
+#  NEW: teams + venues
+# ─────────────────────────────────────
+
+def fetch_teams_and_venues_from_api(
+    league_id: int,
+    season: int,
+) -> List[Dict[str, Any]]:
+    """
+    /teams?league={league_id}&season={season}
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/teams"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": season,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response") or []
+
+
+def upsert_teams_and_venues(
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    teams (
+        id      INTEGER PRIMARY KEY,
+        name    TEXT NOT NULL,
+        country TEXT,
+        logo    TEXT
+    )
+
+    venues (
+        venue_id  INTEGER PRIMARY KEY,
+        data_json TEXT NOT NULL
+    )
+    """
+    for row in rows:
+        team = row.get("team") or {}
+        venue = row.get("venue") or {}
+
+        tid = team.get("id")
+        tname = team.get("name")
+        tcountry = team.get("country")
+        tlogo = team.get("logo")
+
+        if tid is not None and tname:
+            execute(
+                """
+                INSERT INTO teams (
+                    id,
+                    name,
+                    country,
+                    logo
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    name    = EXCLUDED.name,
+                    country = EXCLUDED.country,
+                    logo    = EXCLUDED.logo
+                """,
+                (tid, tname, tcountry, tlogo),
+            )
+
+        venue_id = venue.get("id")
+        if venue_id is not None:
+            json_str = json.dumps(venue)
+            execute(
+                """
+                INSERT INTO venues (
+                    venue_id,
+                    data_json
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (venue_id) DO UPDATE SET
+                    data_json = EXCLUDED.data_json
+                """,
+                (venue_id, json_str),
+            )
+
+
+def update_teams_and_venues_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌에 속한 팀/구장 정보 갱신.
+    """
+    print(
+        f"    [teams/venues {phase}] league={league_id}, season={season} → Api-Football 호출"
+    )
+    try:
+        rows = fetch_teams_and_venues_from_api(league_id, season)
+        print(
+            f"    [teams/venues {phase}] league={league_id}, season={season}: teams={len(rows)}"
+        )
+        upsert_teams_and_venues(rows, phase)
+    except Exception as e:
+        print(
+            f"    [teams/venues {phase}] league={league_id}, season={season} 처리 중 에러: {e}",
+            file=sys.stderr,
+        )
+
+
+# ─────────────────────────────────────
+#  NEW: players
+# ─────────────────────────────────────
+
+def fetch_players_for_team_from_api(
+    league_id: int,
+    season: int,
+    team_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    /players?league,season,team 에 대해 페이지네이션 처리.
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/players"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+
+    all_rows: List[Dict[str, Any]] = []
+    page = 1
+    max_pages = 10  # 안전빵 상한
+
+    while page <= max_pages:
+        params = {
+            "league": league_id,
+            "season": season,
+            "team": team_id,
+            "page": page,
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        resp_list = data.get("response") or []
+        if not resp_list:
+            break
+
+        all_rows.extend(resp_list)
+
+        paging = data.get("paging") or {}
+        total_pages = paging.get("total") or 1
+        if page >= total_pages:
+            break
+        page += 1
+
+    return all_rows
+
+
+def upsert_players_for_team(
+    team_id: int,
+    season: int,
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    players (
+        player_id INTEGER NOT NULL,
+        team_id   INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        data_json TEXT    NOT NULL,
+        PRIMARY KEY (player_id, team_id, season)
+    )
+    """
+    if not rows:
+        return
+
+    count = 0
+    for row in rows:
+        player = row.get("player") or {}
+        player_id = player.get("id")
+        if player_id is None:
+            continue
+
+        json_str = json.dumps(row)
+        execute(
+            """
+            INSERT INTO players (
+                player_id,
+                team_id,
+                season,
+                data_json
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (player_id, team_id, season) DO UPDATE SET
+                data_json = EXCLUDED.data_json
+            """,
+            (player_id, team_id, season, json_str),
+        )
+        count += 1
+
+    print(
+        f"    [players {phase}] team_id={team_id}, season={season}: {count} rows upsert"
+    )
+
+
+def update_players_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌 모든 팀에 대해 선수 정보 갱신.
+    """
+    team_ids = _get_team_ids_for_league_season(league_id, season)
+    if not team_ids:
+        print(
+            f"    [players {phase}] league={league_id}, season={season}: team_ids 비어있음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [players {phase}] league={league_id}, season={season}: "
+        f"{len(team_ids)}개 팀 선수 정보 갱신"
+    )
+
+    for tid in team_ids:
+        try:
+            rows = fetch_players_for_team_from_api(league_id, season, tid)
+            if not rows:
+                continue
+            upsert_players_for_team(tid, season, rows, phase)
+        except Exception as e:
+            print(
+                f"      [players {phase}] team_id={tid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
+#  NEW: coaches
+# ─────────────────────────────────────
+
+def fetch_coaches_for_team_from_api(team_id: int) -> List[Dict[str, Any]]:
+    """
+    /coachs?team={team_id} (API-Football 기준 엔드포인트 이름이 coachs).
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/coachs"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "team": team_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response") or []
+
+
+def upsert_coaches_for_team(
+    team_id: int,
+    season: int,
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    coaches (
+        coach_id  INTEGER NOT NULL,
+        team_id   INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        data_json TEXT    NOT NULL,
+        PRIMARY KEY (coach_id, team_id, season)
+    )
+    """
+    if not rows:
+        return
+
+    count = 0
+    for row in rows:
+        coach = row.get("coach") or {}
+        coach_id = coach.get("id")
+        if coach_id is None:
+            continue
+
+        json_str = json.dumps(row)
+        execute(
+            """
+            INSERT INTO coaches (
+                coach_id,
+                team_id,
+                season,
+                data_json
+            )
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (coach_id, team_id, season) DO UPDATE SET
+                data_json = EXCLUDED.data_json
+            """,
+            (coach_id, team_id, season, json_str),
+        )
+        count += 1
+
+    print(
+        f"    [coaches {phase}] team_id={team_id}, season={season}: {count} rows upsert"
+    )
+
+
+def update_coaches_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌 팀들의 감독 정보 갱신.
+    """
+    team_ids = _get_team_ids_for_league_season(league_id, season)
+    if not team_ids:
+        print(
+            f"    [coaches {phase}] league={league_id}, season={season}: team_ids 비어있음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [coaches {phase}] league={league_id}, season={season}: "
+        f"{len(team_ids)}개 팀 감독 정보 갱신"
+    )
+
+    for tid in team_ids:
+        try:
+            rows = fetch_coaches_for_team_from_api(tid)
+            if not rows:
+                continue
+            upsert_coaches_for_team(tid, season, rows, phase)
+        except Exception as e:
+            print(
+                f"      [coaches {phase}] team_id={tid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
+#  NEW: transfers
+# ─────────────────────────────────────
+
+def fetch_transfers_for_team_from_api(team_id: int) -> List[Dict[str, Any]]:
+    """
+    /transfers?team={team_id}
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/transfers"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "team": team_id,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response") or []
+
+
+def upsert_transfers_for_team(
+    season: int,
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    transfers (
+        player_id INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        data_json TEXT    NOT NULL,
+        PRIMARY KEY (player_id, season)
+    )
+
+    여기서는 팀 기준으로 받아온 전체 row 를 시즌별로 저장한다.
+    """
+    if not rows:
+        return
+
+    count = 0
+    for row in rows:
+        player = row.get("player") or {}
+        player_id = player.get("id")
+        if player_id is None:
+            continue
+
+        json_str = json.dumps(row)
+        execute(
+            """
+            INSERT INTO transfers (
+                player_id,
+                season,
+                data_json
+            )
+            VALUES (%s, %s, %s)
+            ON CONFLICT (player_id, season) DO UPDATE SET
+                data_json = EXCLUDED.data_json
+            """,
+            (player_id, season, json_str),
+        )
+        count += 1
+
+    print(
+        f"    [transfers {phase}] season={season}: {count} rows upsert"
+    )
+
+
+def update_transfers_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌 팀들의 이적 정보 갱신.
+    """
+    team_ids = _get_team_ids_for_league_season(league_id, season)
+    if not team_ids:
+        print(
+            f"    [transfers {phase}] league={league_id}, season={season}: team_ids 비어있음 → 스킵"
+        )
+        return
+
+    print(
+        f"    [transfers {phase}] league={league_id}, season={season}: "
+        f"{len(team_ids)}개 팀 이적 정보 갱신"
+    )
+
+    for tid in team_ids:
+        try:
+            rows = fetch_transfers_for_team_from_api(tid)
+            if not rows:
+                continue
+            upsert_transfers_for_team(season, rows, phase)
+        except Exception as e:
+            print(
+                f"      [transfers {phase}] team_id={tid} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
+#  NEW: rounds
+# ─────────────────────────────────────
+
+def fetch_rounds_from_api(
+    league_id: int,
+    season: int,
+) -> List[str]:
+    """
+    /fixtures/rounds?league={league_id}&season={season}&type=all
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    url = "https://v3.football.api-sports.io/fixtures/rounds"
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": season,
+        "type": "all",
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response") or []
+
+
+def upsert_rounds(
+    league_id: int,
+    season: int,
+    rounds_list: List[str],
+    phase: str,
+) -> None:
+    """
+    rounds (
+        league_id INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        round     TEXT    NOT NULL,
+        PRIMARY KEY (league_id, season, round)
+    )
+    """
+    if not rounds_list:
+        return
+
+    count = 0
+    for rname in rounds_list:
+        execute(
+            """
+            INSERT INTO rounds (
+                league_id,
+                season,
+                round
+            )
+            VALUES (%s, %s, %s)
+            ON CONFLICT (league_id, season, round) DO NOTHING
+            """,
+            (league_id, season, rname),
+        )
+        count += 1
+
+    print(
+        f"    [rounds {phase}] league={league_id}, season={season}: {count} rounds upsert"
+    )
+
+
+def update_rounds_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌의 전체 라운드 목록 갱신.
+    """
+    print(
+        f"    [rounds {phase}] league={league_id}, season={season} → Api-Football 호출"
+    )
+    try:
+        rounds_list = fetch_rounds_from_api(league_id, season)
+        upsert_rounds(league_id, season, rounds_list, phase)
+    except Exception as e:
+        print(
+            f"    [rounds {phase}] league={league_id}, season={season} 처리 중 에러: {e}",
+            file=sys.stderr,
+        )
+
+
+# ─────────────────────────────────────
+#  NEW: toplists (득점왕/도움왕/카드)
+# ─────────────────────────────────────
+
+def fetch_toplist_from_api(
+    league_id: int,
+    season: int,
+    kind: str,
+) -> List[Dict[str, Any]]:
+    """
+    kind 에 따라 다른 엔드포인트 호출:
+      - topscorers → /players/topscorers
+      - topassists → /players/topassists
+      - topcards  → /players/topcards
+    """
+    if not API_KEY:
+        raise RuntimeError("APIFOOTBALL_KEY env 가 설정되어 있지 않습니다.")
+
+    base = "https://v3.football.api-sports.io"
+    if kind == "topscorers":
+        path = "/players/topscorers"
+    elif kind == "topassists":
+        path = "/players/topassists"
+    elif kind == "topcards":
+        path = "/players/topcards"
+    else:
+        raise ValueError(f"unknown toplist kind: {kind}")
+
+    url = base + path
+    headers = {
+        "x-apisports-key": API_KEY,
+    }
+    params = {
+        "league": league_id,
+        "season": season,
+    }
+
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("response") or []
+
+
+def upsert_toplist(
+    league_id: int,
+    season: int,
+    kind: str,
+    rows: List[Dict[str, Any]],
+    phase: str,
+) -> None:
+    """
+    toplists (
+        league_id INTEGER NOT NULL,
+        season    INTEGER NOT NULL,
+        kind      TEXT    NOT NULL,
+        rank      INTEGER NOT NULL,
+        data_json TEXT    NOT NULL,
+        PRIMARY KEY (league_id, season, kind, rank)
+    )
+    """
+    if not rows:
+        return
+
+    count = 0
+    rank = 1
+    for row in rows:
+        json_str = json.dumps(row)
+        execute(
+            """
+            INSERT INTO toplists (
+                league_id,
+                season,
+                kind,
+                rank,
+                data_json
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (league_id, season, kind, rank) DO UPDATE SET
+                data_json = EXCLUDED.data_json
+            """,
+            (league_id, season, kind, rank, json_str),
+        )
+        count += 1
+        rank += 1
+
+    print(
+        f"    [toplists {phase}] league={league_id}, season={season}, kind={kind}: "
+        f"{count} rows upsert"
+    )
+
+
+def update_toplists_for_league(
+    league_id: int,
+    season: int,
+    phase: str,
+) -> None:
+    """
+    리그 + 시즌 득점/도움/카드 랭킹 갱신.
+    """
+    kinds = ["topscorers", "topassists", "topcards"]
+
+    for kind in kinds:
+        print(
+            f"    [toplists {phase}] league={league_id}, season={season}, kind={kind} → Api-Football 호출"
+        )
+        try:
+            rows = fetch_toplist_from_api(league_id, season, kind)
+            upsert_toplist(league_id, season, kind, rows, phase)
+        except Exception as e:
+            print(
+                f"    [toplists {phase}] league={league_id}, season={season}, kind={kind} 처리 중 에러: {e}",
+                file=sys.stderr,
+            )
+
+
+# ─────────────────────────────────────
 #  B그룹 진입점: PREMATCH / POSTMATCH
 #   (update_live_fixtures.py 에서 호출)
 # ─────────────────────────────────────
@@ -842,8 +1592,21 @@ def update_static_data_prematch_for_league(
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(standings + team_season_stats + squads + injuries + predictions + odds)를
-    '킥오프 1시간 전' 구간에서 갱신.
+    B그룹 데이터 전체(PREMATCH):
+      - standings
+      - team_season_stats
+      - squads
+      - injuries
+      - predictions
+      - odds (+ odds_history)
+      - leagues
+      - teams
+      - venues
+      - players
+      - coaches
+      - transfers
+      - rounds
+      - toplists
     """
     season = resolve_league_season_for_date(league_id, date_str)
     if season is None:
@@ -854,6 +1617,9 @@ def update_static_data_prematch_for_league(
         return
 
     print(f"    [STATIC PREMATCH] league={league_id}, season={season}, date={date_str}")
+
+    # 0) 리그 기본정보
+    update_league_info_for_league(league_id, season, phase="PREMATCH")
 
     # 1) standings
     update_standings_for_league(league_id, season, date_str, phase="PREMATCH")
@@ -873,14 +1639,32 @@ def update_static_data_prematch_for_league(
     # 6) odds + odds_history
     update_odds_for_league(league_id, date_str, phase="PREMATCH")
 
+    # 7) teams + venues
+    update_teams_and_venues_for_league(league_id, season, phase="PREMATCH")
+
+    # 8) players
+    update_players_for_league(league_id, season, phase="PREMATCH")
+
+    # 9) coaches
+    update_coaches_for_league(league_id, season, phase="PREMATCH")
+
+    # 10) transfers
+    update_transfers_for_league(league_id, season, phase="PREMATCH")
+
+    # 11) rounds
+    update_rounds_for_league(league_id, season, phase="PREMATCH")
+
+    # 12) toplists
+    update_toplists_for_league(league_id, season, phase="PREMATCH")
+
 
 def update_static_data_postmatch_for_league(
     league_id: int,
     date_str: str,
 ) -> None:
     """
-    B그룹 데이터(standings + team_season_stats + squads + injuries + predictions + odds)를
-    '경기 종료 직후' 구간에서 한 번 더 갱신.
+    B그룹 데이터 전체(POSTMATCH):
+      PREMATCH와 동일 세트 한 번 더 갱신.
     """
     season = resolve_league_season_for_date(league_id, date_str)
     if season is None:
@@ -891,6 +1675,9 @@ def update_static_data_postmatch_for_league(
         return
 
     print(f"    [STATIC POSTMATCH] league={league_id}, season={season}, date={date_str}")
+
+    # 0) 리그 기본정보
+    update_league_info_for_league(league_id, season, phase="POSTMATCH")
 
     # 1) standings
     update_standings_for_league(league_id, season, date_str, phase="POSTMATCH")
@@ -909,3 +1696,21 @@ def update_static_data_postmatch_for_league(
 
     # 6) odds + odds_history
     update_odds_for_league(league_id, date_str, phase="POSTMATCH")
+
+    # 7) teams + venues
+    update_teams_and_venues_for_league(league_id, season, phase="POSTMATCH")
+
+    # 8) players
+    update_players_for_league(league_id, season, phase="POSTMATCH")
+
+    # 9) coaches
+    update_coaches_for_league(league_id, season, phase="POSTMATCH")
+
+    # 10) transfers
+    update_transfers_for_league(league_id, season, phase="POSTMATCH")
+
+    # 11) rounds
+    update_rounds_for_league(league_id, season, phase="POSTMATCH")
+
+    # 12) toplists
+    update_toplists_for_league(league_id, season, phase="POSTMATCH")
