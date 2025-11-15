@@ -21,7 +21,12 @@ from prometheus_client import (
 )
 
 from db import fetch_all, fetch_one, execute
-from home_router import home_bp  # ✅ 홈 관련 라우터 블루프린트
+from services.home_service import (
+    get_home_leagues,
+    get_home_league_directory,
+    get_next_matchday,
+    get_prev_matchday,
+)
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -37,9 +42,6 @@ API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))
 START_TS = time.time()
 
 app = Flask(__name__)
-
-# ✅ 홈 블루프린트 등록
-app.register_blueprint(home_bp)
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -230,15 +232,14 @@ def metrics_prom():
         if metrics_map:
             for labels, metric in metrics_map.items():
                 method, path, status = labels
-                value_obj = getattr(metric, "_value", None)
-                value = value_obj.get() if value_obj and hasattr(value_obj, "get") else 0
+                value = metric._value.get()
                 lines.append(
                     f'http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
                 )
     except Exception as e:
         log_json("error", "metrics_prom http_requests_total error", error=str(e))
 
-    # http_request_duration_seconds
+    # http_request_duration_seconds (Histogram)  ← 내부 필드 없을 수도 있으니 방어적으로
     try:
         lines.append(
             "# HELP http_request_duration_seconds HTTP request duration in seconds"
@@ -250,43 +251,26 @@ def metrics_prom():
                 method, path = labels
                 buckets = getattr(metric, "_buckets", {}) or {}
 
-                # sum
                 sum_obj = getattr(metric, "_sum", None)
-                sum_v = (
-                    sum_obj.get()
-                    if sum_obj is not None and hasattr(sum_obj, "get")
-                    else 0.0
-                )
+                if hasattr(sum_obj, "get"):
+                    sum_v = sum_obj.get()
+                else:
+                    sum_v = 0
 
-                # count (새 버전에서 _count 가 없을 수 있으므로 안전하게 처리)
                 count_obj = getattr(metric, "_count", None)
-                if count_obj is not None and hasattr(count_obj, "get"):
+                if hasattr(count_obj, "get"):
                     count_v = count_obj.get()
                 else:
-                    # fallback: 마지막 버킷(+Inf) 값 또는 모든 버킷 합
-                    if buckets:
-                        try:
-                            last_val = list(buckets.values())[-1]
-                            count_v = (
-                                last_val.get()
-                                if hasattr(last_val, "get")
-                                else float(last_val)
-                            )
-                        except Exception:
-                            count_v = sum(
-                                (v.get() if hasattr(v, "get") else float(v))
-                                for v in buckets.values()
-                            )
-                    else:
-                        count_v = 0.0
+                    # _count 가 없으면 버킷의 마지막 값을 count 로 사용 (대략적인 fallback)
+                    try:
+                        count_v = float(list(buckets.values())[-1]) if buckets else 0
+                    except Exception:
+                        count_v = 0
 
-                # buckets 출력
                 for le, v in buckets.items():
-                    bucket_val = v.get() if hasattr(v, "get") else v
                     lines.append(
-                        f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {bucket_val}'
+                        f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {v}'
                     )
-
                 lines.append(
                     f'http_request_duration_seconds_sum{{method="{method}",path="{path}"}} {sum_v}'
                 )
@@ -308,8 +292,7 @@ def metrics_prom():
         if metrics_map:
             for labels, metric in metrics_map.items():
                 (etype,) = labels
-                value_obj = getattr(metric, "_value", None)
-                value = value_obj.get() if value_obj and hasattr(value_obj, "get") else 0
+                value = metric._value.get()
                 lines.append(
                     f'http_request_exceptions_total{{type="{etype}"}} {value}'
                 )
@@ -327,10 +310,8 @@ def metrics_prom():
         )
         lines.append("# TYPE http_rate_limited_total counter")
         value_obj = getattr(RATE_LIMITED_TOTAL, "_value", None)
-        if value_obj is not None and hasattr(value_obj, "get"):
+        if value_obj is not None:
             lines.append(f"http_rate_limited_total {value_obj.get()}")
-        else:
-            lines.append("http_rate_limited_total 0")
     except Exception as e:
         log_json(
             "error",
@@ -409,6 +390,72 @@ def list_fixtures():
     )
 
     return jsonify({"ok": True, "rows": rows})
+
+
+# ─────────────────────────────────────────
+# 홈 화면: 리그 탭용 / 디렉터리 / 매치데이 API
+# ─────────────────────────────────────────
+
+@app.get("/api/home/leagues")
+@rate_limited
+def api_home_leagues():
+    """
+    홈 탭 상단 “리그별 매치수” 리스트
+      /api/home/leagues?date=2025-11-15
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"ok": False, "error": "missing_date"}), 400
+
+    rows = get_home_leagues(date_str)
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+
+@app.get("/api/home/league_directory")
+@rate_limited
+def api_home_league_directory():
+    """
+    리그 선택 바텀시트용: 전체 지원 리그 + 오늘 경기 수.
+      /api/home/league_directory?date=2025-11-15
+    """
+    date_str = request.args.get("date")
+    # date 없으면 서비스 쪽에서 "오늘"로 처리해도 되고, None 으로 넘겨도 됨
+    rows = get_home_league_directory(date_str)
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
+
+
+@app.get("/api/home/next_matchday")
+@rate_limited
+def api_home_next_matchday():
+    """
+    지정 날짜 이후(포함) 첫 번째 매치데이.
+      /api/home/next_matchday?date=2025-11-15
+      /api/home/next_matchday?date=2025-11-15&league_id=39
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"ok": False, "error": "missing_date"}), 400
+
+    league_id = request.args.get("league_id", type=int)
+    next_date = get_next_matchday(date_str, league_id)
+    return jsonify({"ok": True, "date": next_date})
+
+
+@app.get("/api/home/prev_matchday")
+@rate_limited
+def api_home_prev_matchday():
+    """
+    지정 날짜 이전 마지막 매치데이.
+      /api/home/prev_matchday?date=2025-11-15
+      /api/home/prev_matchday?date=2025-11-15&league_id=39
+    """
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"ok": False, "error": "missing_date"}), 400
+
+    league_id = request.args.get("league_id", type=int)
+    prev_date = get_prev_matchday(date_str, league_id)
+    return jsonify({"ok": True, "date": prev_date})
 
 
 # ─────────────────────────────────────────
