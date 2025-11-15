@@ -1,9 +1,8 @@
-# services/home_service.py
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import json
 
 from db import fetch_all
 
@@ -18,7 +17,6 @@ def _normalize_date(date_str: Optional[str]) -> str:
     항상 'YYYY-MM-DD' 문자열을 리턴.
     """
     if date_str:
-        # 이미 yyyy-MM-dd 로 들어온다고 가정하지만, 혹시 몰라서 파싱 한 번 함
         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
         return dt.isoformat()
 
@@ -62,7 +60,6 @@ def get_home_leagues(date_str: Optional[str]) -> List[Dict[str, Any]]:
         (d,),
     )
 
-    # fetch_all 이 dict 리스트를 반환한다고 가정
     return rows
 
 
@@ -84,8 +81,6 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
     d = _normalize_date(date_str)
 
-    # leagues 전체를 기준으로 LEFT JOIN 해서
-    # DB에 존재하는 리그는 모두 나오도록 구성
     rows = fetch_all(
         """
         WITH match_counts AS (
@@ -105,8 +100,6 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
         FROM leagues l
         LEFT JOIN match_counts mc
           ON mc.league_id = l.id
-        -- 실제로 한 번이라도 matches 에 등장한 리그만 보고 싶으면 아래 WHERE 사용
-        -- WHERE l.id IN (SELECT DISTINCT league_id FROM matches)
         ORDER BY l.country, l.name
         """,
         (d,),
@@ -150,7 +143,6 @@ def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
         return None
 
     match_date = rows[0]["match_date"]
-    # match_date 가 date 객체이든 문자열이든 str() 하면 YYYY-MM-DD 형태가 나옴
     return str(match_date)
 
 
@@ -473,12 +465,24 @@ def get_team_season_stats(team_id: int, league_id: int):
     league_id_db = row["league_id"]
     season_db = row["season"]
     team_id_db = row["team_id"]
-    value = row["value"]  # JSONB → 파이썬 dict 로 나옴 (psycopg 기준)
+
+    raw_value = row.get("value")
+
+    # TEXT 컬럼로 저장된 JSON 문자열 → dict 로 파싱
+    if isinstance(raw_value, dict):
+        value: Dict[str, Any] = raw_value
+    elif isinstance(raw_value, str) and raw_value.strip():
+        try:
+            value = json.loads(raw_value)
+        except Exception:
+            value = {}
+    else:
+        value = {}
 
     if not isinstance(value, dict):
         value = {}
 
-    # 서버에서 matches 테이블을 보고 고급 지표 계산
+    # 서버에서 matches 테이블 기준 고급 지표 계산
     insights = _compute_overall_insights(
         league_id=league_id_db,
         season=season_db,
@@ -486,7 +490,7 @@ def get_team_season_stats(team_id: int, league_id: int):
     )
 
     if insights:
-        # value 안에 insights_overall 블록으로 주입
+        # value 안에 insights_overall 블록으로 머지
         existing = value.get("insights_overall") or {}
         if isinstance(existing, dict):
             merged = {**existing, **insights}
@@ -501,6 +505,7 @@ def get_team_season_stats(team_id: int, league_id: int):
         "name": row.get("name"),
         "value": value,
     }
+
 
 # ─────────────────────────────────────
 #  6) 팀 정보 (teams 테이블)
