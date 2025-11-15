@@ -21,12 +21,7 @@ from prometheus_client import (
 )
 
 from db import fetch_all, fetch_one, execute
-from services.home_service import (
-    get_home_leagues,
-    get_home_league_directory,
-    get_next_matchday,
-    get_prev_matchday,
-)
+from home_router import home_bp  # ✅ 홈 관련 라우터 블루프린트
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -42,6 +37,9 @@ API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))
 START_TS = time.time()
 
 app = Flask(__name__)
+
+# ✅ 홈 블루프린트 등록
+app.register_blueprint(home_bp)
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -232,7 +230,8 @@ def metrics_prom():
         if metrics_map:
             for labels, metric in metrics_map.items():
                 method, path, status = labels
-                value = metric._value.get()
+                value_obj = getattr(metric, "_value", None)
+                value = value_obj.get() if value_obj and hasattr(value_obj, "get") else 0
                 lines.append(
                     f'http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
                 )
@@ -250,13 +249,44 @@ def metrics_prom():
             for labels, metric in metrics_map.items():
                 method, path = labels
                 buckets = getattr(metric, "_buckets", {}) or {}
-                sum_v = getattr(metric, "_sum").get()
-                count_v = getattr(metric, "_count").get()
 
+                # sum
+                sum_obj = getattr(metric, "_sum", None)
+                sum_v = (
+                    sum_obj.get()
+                    if sum_obj is not None and hasattr(sum_obj, "get")
+                    else 0.0
+                )
+
+                # count (새 버전에서 _count 가 없을 수 있으므로 안전하게 처리)
+                count_obj = getattr(metric, "_count", None)
+                if count_obj is not None and hasattr(count_obj, "get"):
+                    count_v = count_obj.get()
+                else:
+                    # fallback: 마지막 버킷(+Inf) 값 또는 모든 버킷 합
+                    if buckets:
+                        try:
+                            last_val = list(buckets.values())[-1]
+                            count_v = (
+                                last_val.get()
+                                if hasattr(last_val, "get")
+                                else float(last_val)
+                            )
+                        except Exception:
+                            count_v = sum(
+                                (v.get() if hasattr(v, "get") else float(v))
+                                for v in buckets.values()
+                            )
+                    else:
+                        count_v = 0.0
+
+                # buckets 출력
                 for le, v in buckets.items():
+                    bucket_val = v.get() if hasattr(v, "get") else v
                     lines.append(
-                        f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {v}'
+                        f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {bucket_val}'
                     )
+
                 lines.append(
                     f'http_request_duration_seconds_sum{{method="{method}",path="{path}"}} {sum_v}'
                 )
@@ -278,7 +308,8 @@ def metrics_prom():
         if metrics_map:
             for labels, metric in metrics_map.items():
                 (etype,) = labels
-                value = metric._value.get()
+                value_obj = getattr(metric, "_value", None)
+                value = value_obj.get() if value_obj and hasattr(value_obj, "get") else 0
                 lines.append(
                     f'http_request_exceptions_total{{type="{etype}"}} {value}'
                 )
@@ -296,8 +327,10 @@ def metrics_prom():
         )
         lines.append("# TYPE http_rate_limited_total counter")
         value_obj = getattr(RATE_LIMITED_TOTAL, "_value", None)
-        if value_obj is not None:
+        if value_obj is not None and hasattr(value_obj, "get"):
             lines.append(f"http_rate_limited_total {value_obj.get()}")
+        else:
+            lines.append("http_rate_limited_total 0")
     except Exception as e:
         log_json(
             "error",
@@ -379,73 +412,8 @@ def list_fixtures():
 
 
 # ─────────────────────────────────────────
-# 홈 화면: 리그 탭용 API (services/home_service.py 연동)
-# ─────────────────────────────────────────
-
-@app.get("/api/home/leagues")
-@rate_limited
-def api_home_leagues():
-    """
-    홈 탭 상단 “리그별 매치수” 리스트
-    예시:
-      /api/home/leagues?date=2025-01-01
-    """
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    rows = get_home_leagues(date_str)
-    return jsonify({"ok": True, "rows": rows})
-
-
-@app.get("/api/home/league_directory")
-@rate_limited
-def api_home_league_directory():
-    """
-    홈 탭 하단 “국가별 리그 디렉터리”
-      /api/home/league_directory
-    """
-    rows = get_home_league_directory()
-    return jsonify({"ok": True, "rows": rows})
-
-
-@app.get("/api/home/next_matchday")
-@rate_limited
-def api_home_next_matchday():
-    """
-    현재 날짜 이후, 가장 가까운 '경기 있는 날짜'를 찾는 API
-
-      /api/home/next_matchday?date=2025-01-01
-    """
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    row = get_next_matchday(date_str)
-    return jsonify({"ok": True, "date": row.get("next_date") if row else None})
-
-
-@app.get("/api/home/prev_matchday")
-@rate_limited
-def api_home_prev_matchday():
-    """
-    현재 날짜 이전, 가장 가까운 '경기 있는 날짜'를 찾는 API
-
-      /api/home/prev_matchday?date=2025-01-01
-    """
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
-
-    row = get_prev_matchday(date_str)
-    return jsonify({"ok": True, "date": row.get("prev_date") if row else None})
-
-
-# ─────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-
