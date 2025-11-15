@@ -18,7 +18,6 @@ def _normalize_date(date_str: Optional[str]) -> str:
     항상 'YYYY-MM-DD' 문자열을 리턴.
     """
     if date_str:
-        # 이미 yyyy-MM-dd 로 들어온다고 가정하지만, 혹시 몰라서 파싱 한 번 함
         dt = datetime.strptime(date_str, "%Y-%m-%d").date()
         return dt.isoformat()
 
@@ -62,7 +61,6 @@ def get_home_leagues(date_str: Optional[str]) -> List[Dict[str, Any]]:
         (d,),
     )
 
-    # fetch_all 이 dict 리스트를 반환한다고 가정
     return rows
 
 
@@ -84,8 +82,6 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
     d = _normalize_date(date_str)
 
-    # leagues 전체를 기준으로 LEFT JOIN 해서
-    # DB에 존재하는 리그는 모두 나오도록 구성
     rows = fetch_all(
         """
         WITH match_counts AS (
@@ -105,8 +101,6 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
         FROM leagues l
         LEFT JOIN match_counts mc
           ON mc.league_id = l.id
-        -- 실제로 한 번이라도 matches 에 등장한 리그만 보고 싶으면 아래 WHERE 사용
-        -- WHERE l.id IN (SELECT DISTINCT league_id FROM matches)
         ORDER BY l.country, l.name
         """,
         (d,),
@@ -150,7 +144,6 @@ def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
         return None
 
     match_date = rows[0]["match_date"]
-    # match_date 가 date 객체이든 문자열이든 str() 하면 YYYY-MM-DD 형태가 나옴
     return str(match_date)
 
 
@@ -182,7 +175,11 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
     if not rows:
         return None
 
-    # ─────────────────────────────────────
+    match_date = rows[0]["match_date"]
+    return str(match_date)
+
+
+# ─────────────────────────────────────
 #  4) 팀 시즌 스탯 (team_season_stats)
 #     /api/team_season_stats 에서 사용
 # ─────────────────────────────────────
@@ -191,17 +188,7 @@ def get_team_season_stats(team_id: int, league_id: int):
     """
     team_season_stats 테이블에서
     (league_id, team_id) 에 해당하는 가장 최신 season 한 줄을 가져온다.
-
-    반환 예시:
-      {
-        "league_id": 39,
-        "season": 2025,
-        "team_id": 42,
-        "name": "full_json",
-        "value": { ... 원본 JSON ... }
-      }
     """
-
     rows = fetch_all(
         """
         SELECT
@@ -229,9 +216,34 @@ def get_team_season_stats(team_id: int, league_id: int):
         "season": row["season"],
         "team_id": row["team_id"],
         "name": row.get("name"),
-        "value": row["value"],  # JSONB → 파이썬 dict 로 나옴
+        "value": row["value"],  # JSONB → 파이썬 dict 또는 TEXT
     }
 
 
-    match_date = rows[0]["match_date"]
-    return str(match_date)
+# ─────────────────────────────────────
+#  5) 팀 정보 (팀 이름/국가/로고)
+#     /api/home/team_info 에서 사용
+# ─────────────────────────────────────
+
+def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
+    """
+    teams 테이블에서 단일 팀 정보 조회.
+    반환:
+      { "id": 42, "name": "...", "country": "...", "logo": "..." }
+    """
+    rows = fetch_all(
+        """
+        SELECT
+            id,
+            name,
+            country,
+            logo
+        FROM teams
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (team_id,),
+    )
+    if not rows:
+        return None
+    return rows[0]
