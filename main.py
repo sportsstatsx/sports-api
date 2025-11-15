@@ -26,6 +26,7 @@ from services.home_service import (
     get_home_league_directory,
     get_next_matchday,
     get_prev_matchday,
+    get_team_season_stats,
 )
 
 # ─────────────────────────────────────────
@@ -422,6 +423,43 @@ def list_fixtures():
 
 
 # ─────────────────────────────────────────
+
+@app.get("/api/team_season_stats")
+@rate_limited
+def api_team_season_stats():
+    """
+    팀 시즌 스탯 원본 JSON을 그대로 돌려주는 단순 엔드포인트.
+
+    쿼리 파라미터:
+      - team_id (필수, int)
+      - league_id (필수, int)
+
+    응답:
+      200 OK: { "ok": true, "row": { ... } }
+      400   : { "ok": false, "error": "missing_params" }
+      404   : { "ok": false, "error": "not_found" }
+    """
+    team_id = request.args.get("team_id", type=int)
+    league_id = request.args.get("league_id", type=int)
+
+    if not team_id or not league_id:
+        return jsonify({"ok": False, "error": "missing_params"}), 400
+
+    row = get_team_season_stats(team_id=team_id, league_id=league_id)
+    if row is None:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+
+    # value 가 이미 dict 이라면 jsonify 가 알아서 JSON 으로 변환해줌
+    return jsonify(
+        {
+            "ok": True,
+            "row": row,
+        }
+    )
+
+
+
+# ─────────────────────────────────────────
 # 홈 화면: 리그 탭용 / 디렉터리 / 매치데이 API
 # ─────────────────────────────────────────
 
@@ -493,5 +531,6 @@ def api_home_prev_matchday():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
