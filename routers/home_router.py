@@ -7,6 +7,7 @@ from services.home_service import (
     get_home_league_directory,
     get_next_matchday,
     get_prev_matchday,
+    get_team_info,
 )
 
 home_bp = Blueprint("home", __name__, url_prefix="/api/home")
@@ -36,7 +37,7 @@ def home_leagues():
 @home_bp.get("/league_directory")
 def home_league_directory():
     """
-    리그 선택 바텀시트용: 전체 지원 리그 + 오늘 경기 수.
+    리그 선택 바텀시트용: 전체 지원 리그 + 해당 날짜 경기 수.
 
     query:
       - date: yyyy-MM-dd (없으면 오늘)
@@ -50,7 +51,6 @@ def home_league_directory():
 # 홈: 다음 / 이전 매치데이 API
 # ─────────────────────────────────────────
 
-# 둘 다 지원: /matchday/next, /next_matchday
 @home_bp.get("/matchday/next")
 @home_bp.get("/next_matchday")
 def next_matchday():
@@ -70,7 +70,6 @@ def next_matchday():
     return jsonify({"ok": True, "date": next_date})
 
 
-# 둘 다 지원: /matchday/prev, /prev_matchday
 @home_bp.get("/matchday/prev")
 @home_bp.get("/prev_matchday")
 def prev_matchday():
@@ -88,3 +87,26 @@ def prev_matchday():
     league_id: Optional[int] = request.args.get("league_id", type=int)
     prev_date = get_prev_matchday(date_str, league_id)
     return jsonify({"ok": True, "date": prev_date})
+
+
+# ─────────────────────────────────────────
+# 홈: 팀 정보 (이름/국가/로고)
+# ─────────────────────────────────────────
+
+@home_bp.get("/team_info")
+def home_team_info():
+    """
+    팀 이름/국가/로고 조회용.
+
+    query:
+      - team_id: 팀 ID (필수)
+    """
+    team_id: Optional[int] = request.args.get("team_id", type=int)
+    if not team_id:
+        return jsonify({"ok": False, "error": "team_id_required"}), 400
+
+    team = get_team_info(team_id)
+    if not team:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+
+    return jsonify({"ok": True, "team": team})
