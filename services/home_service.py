@@ -501,3 +501,29 @@ def get_team_season_stats(team_id: int, league_id: int):
         "name": row.get("name"),
         "value": value,
     }
+
+# ─────────────────────────────────────
+#  6) 팀 정보 (teams 테이블)
+#     /api/home/team_info 에서 사용
+# ─────────────────────────────────────
+
+def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
+    """
+    teams 테이블에서 단일 팀 정보 조회.
+    """
+    rows = fetch_all(
+        """
+        SELECT
+            id,
+            name,
+            country,
+            logo
+        FROM teams
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (team_id,),
+    )
+    if not rows:
+        return None
+    return rows[0]
