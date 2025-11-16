@@ -4,7 +4,14 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from db import fetch_all, fetch_one
-from .utils import fmt_avg, pct_int
+from .utils import fmt_avg
+
+
+def pct_int(hit: int, total: int) -> int:
+    """정수 퍼센트 (로컬 Kotlin roundToInt()와 동일하게 반올림)."""
+    if total <= 0:
+        return 0
+    return int(round(hit * 100.0 / total))
 
 
 def enrich_overall_discipline_setpieces(
@@ -29,11 +36,6 @@ def enrich_overall_discipline_setpieces(
       - own_red_* (자팀 레드 이후 영향)
 
     을 per match 기준으로 계산한다.
-
-    ✅ 중요:
-      - 분모는 "실제 샘플이 있는 경기수" 를 사용한다.
-        (API fixtures.played.total 은 사용하지 않음)
-      - 홈/원정도 각각 실제 출전 경기수로 나눈다.
     """
     if season_int is None:
         return
@@ -131,7 +133,7 @@ def enrich_overall_discipline_setpieces(
             sum_yellows_a += yellows
             sum_reds_a += reds
 
-    # ✅ 로컬 DB와 동일하게 "실제 샘플이 있는 경기 수"를 분모로 사용
+    # 로컬 DB처럼 "실제 샘플이 있는 경기 수"를 분모로 사용
     eff_tot = tot_matches or 0
     eff_home = home_matches or 0
     eff_away = away_matches or 0
@@ -316,7 +318,7 @@ def enrich_overall_discipline_setpieces(
           COALESCE((SELECT avg_after      FROM own_red_away),    0)  AS own_avg_after_away;
         """,
         (
-            team_id,         # CASE WHEN %s = m.home_id
+            team_id,         # labeled: CASE WHEN %s = m.home_id
             league_id,       # m.league_id = %s
             season_int,      # m.season = %s
             team_id,         # (%s = m.home_id ...
@@ -352,7 +354,6 @@ def enrich_overall_discipline_setpieces(
         own_avg_home = float(red_row["own_avg_after_home"] or 0.0)
         own_avg_away = float(red_row["own_avg_after_away"] or 0.0)
     else:
-        # 샘플이 전혀 없는 경우
         opp_red_tot = opp_red_home = opp_red_away = 0
         opp_scored_tot = opp_scored_home = opp_scored_away = 0
         opp_avg_tot = opp_avg_home = opp_avg_away = 0.0
@@ -361,7 +362,7 @@ def enrich_overall_discipline_setpieces(
         own_conc_tot = own_conc_home = own_conc_away = 0
         own_avg_tot = own_avg_home = own_avg_away = 0.0
 
-    # 퍼센트는 로컬 DAO 와 동일하게 정수 % 로 계산
+    # 퍼센트는 정수 % 로 계산 (로컬 DAO와 동일)
     opp_pct_tot = pct_int(opp_scored_tot, opp_red_tot) if opp_red_tot > 0 else 0
     opp_pct_home = pct_int(opp_scored_home, opp_red_home) if opp_red_home > 0 else 0
     opp_pct_away = pct_int(opp_scored_away, opp_red_away) if opp_red_away > 0 else 0
