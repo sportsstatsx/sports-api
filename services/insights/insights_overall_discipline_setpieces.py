@@ -17,13 +17,13 @@ def enrich_overall_discipline_setpieces(
     matches_total_api: int = 0,
 ) -> None:
     """
-    Insights Overall - Discipline & Set Pieces.
+    Discipline & Set Pieces 섹션.
 
-    - corners_per_match : 경기당 코너킥 (total/home/away)
-    - yellow_per_match  : 경기당 옐로카드 (total/home/away)
-    - red_per_match     : 경기당 레드카드 (total/home/away)
-
-    (Red 카드 이후 영향 지표는 추후 확장 포인트로 남겨둠)
+    기존 home_service.py 에서 서버 DB 기준으로 계산하던
+    - corners_per_match
+    - yellow_per_match
+    - red_per_match
+    per match 값을 모듈로 분리한 버전.
     """
     if season_int is None:
         return
@@ -59,18 +59,19 @@ def enrich_overall_discipline_setpieces(
                 END
             ) AS reds
         FROM matches m
-        JOIN match_team_stats mts
-          ON m.fixture_id = mts.fixture_id
-         AND mts.team_id IN (m.home_id, m.away_id)
+        LEFT JOIN match_team_stats mts
+          ON mts.fixture_id = m.fixture_id
+         AND mts.team_id   = %s
         WHERE m.league_id = %s
           AND m.season    = %s
+          AND (%s = m.home_id OR %s = m.away_id)
           AND (
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
         GROUP BY m.fixture_id, m.home_id, m.away_id
         """,
-        (league_id, season_int),
+        (team_id, league_id, season_int, team_id, team_id),
     )
 
     if not disc_rows:
@@ -112,14 +113,12 @@ def enrich_overall_discipline_setpieces(
             sum_yellows_a += yellows
             sum_reds_a += reds
 
-    if tot_matches == 0:
-        return
+    # 분모: API fixtures.played.total 가 있으면 우선 사용, 없으면 실제 경기수
+    eff_tot = matches_total_api or tot_matches or 0
+    eff_home = home_matches or 0
+    eff_away = away_matches or 0
 
-    eff_tot = matches_total_api or tot_matches
-    eff_home = home_matches or eff_tot
-    eff_away = away_matches or eff_tot
-
-    def avg_for(v_t, v_h, v_a, d_t, d_h, d_a):
+    def avg_for(v_t: int, v_h: int, v_a: int, d_t: int, d_h: int, d_a: int):
         return (
             fmt_avg(v_t, d_t) if d_t > 0 else 0.0,
             fmt_avg(v_h, d_h) if d_h > 0 else 0.0,
@@ -127,13 +126,28 @@ def enrich_overall_discipline_setpieces(
         )
 
     c_tot, c_h, c_a = avg_for(
-        sum_corners_t, sum_corners_h, sum_corners_a, eff_tot, eff_home, eff_away
+        sum_corners_t,
+        sum_corners_h,
+        sum_corners_a,
+        eff_tot,
+        eff_home,
+        eff_away,
     )
     y_tot, y_h, y_a = avg_for(
-        sum_yellows_t, sum_yellows_h, sum_yellows_a, eff_tot, eff_home, eff_away
+        sum_yellows_t,
+        sum_yellows_h,
+        sum_yellows_a,
+        eff_tot,
+        eff_home,
+        eff_away,
     )
     r_tot, r_h, r_a = avg_for(
-        sum_reds_t, sum_reds_h, sum_reds_a, eff_tot, eff_home, eff_away
+        sum_reds_t,
+        sum_reds_h,
+        sum_reds_a,
+        eff_tot,
+        eff_home,
+        eff_away,
     )
 
     insights["corners_per_match"] = {
