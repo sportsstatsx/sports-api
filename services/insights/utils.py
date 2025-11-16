@@ -5,31 +5,24 @@ from typing import Any
 
 
 def safe_div(num: Any, den: Any) -> float:
-    """
-    안전한 나눗셈 유틸리티.
-    0 나누기, None, 문자열 등 들어와도 0.0 반환.
-    """
+    """0 나눗셈, 타입 에러 방지용 안전 나눗셈."""
     try:
-        num_f = float(num)
-        den_f = float(den)
+        n = float(num)
+        d = float(den)
     except (TypeError, ValueError):
         return 0.0
-    if den_f == 0:
+    if d == 0:
         return 0.0
-    return num_f / den_f
+    return n / d
 
 
 def fmt_pct(n: Any, d: Any) -> int:
-    """
-    비율을 % 정수로 반환. (0~100)
-    """
+    """(n / d) * 100 을 정수 퍼센트로. d=0 이면 0."""
     v = safe_div(n, d)
     return int(round(v * 100)) if v > 0 else 0
 
 
-def fmt_avg(n: Any, d: Any) -> float:
-    """
-    평균 값을 소수점 2자리까지 반환.
-    """
-    v = safe_div(n, d)
+def fmt_avg(sum_val: Any, cnt: Any) -> float:
+    """sum / cnt 를 소수 2자리 평균으로. cnt=0 이면 0.0."""
+    v = safe_div(sum_val, cnt)
     return round(v, 2) if v > 0 else 0.0
