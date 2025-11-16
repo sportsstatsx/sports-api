@@ -11,19 +11,13 @@ def insights_overall_resultscombos_draw(
     season_int: Optional[int],
 ) -> None:
     """
-    Insights Overall - Results Combos & Draw 섹션 계산용.
+    Insights Overall - Results Combos & Draw 섹션용 자리.
 
-    예:
-      - draw_pct
-      - win_and_over25_pct
-      - lose_and_btts_pct
-      - (다른 결과 조합 지표들)
+    현재 계산 로직은
+      services.insights.insights_overall_outcome_totals.insights_overall_outcome_totals
+    안에서 Outcome & Totals 와 함께 처리된다.
 
-    현재는 home_service.get_team_season_stats 안의 Outcome & Totals 블록과
-    섞여 있을 가능성이 높다.
-
-    다음 단계에서:
-      - 해당 조합/무승부 관련 계산 로직을 이 함수로 분리할 예정.
+    이 함수는 지금 단계에서는 별도 계산을 수행하지 않는다.
+    (동일 지표를 두 번 계산하지 않기 위해서)
     """
-    # TODO: Result Combos & Draw 계산 로직을 이 함수로 옮기기
     return
