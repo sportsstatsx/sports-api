@@ -1,4 +1,3 @@
-# services/home_service.py
 from __future__ import annotations
 
 import json
@@ -49,30 +48,86 @@ def _normalize_date(date_str: Optional[str]) -> str:
 
 
 # ─────────────────────────────────────
+#  league_ids 정규화 유틸
+# ─────────────────────────────────────
+
+def _normalize_league_ids(raw: Any) -> Optional[List[int]]:
+    """
+    league_ids 가 어떤 형태로 들어와도 안전하게 List[int] 로 정규화한다.
+
+    허용 예:
+      - None
+      - 39
+      - "39"
+      - "39,140"
+      - ["39", "140"]
+      - [39, 140]
+      - "[39, 140]"  (JSON 문자열)
+    """
+    if raw is None:
+        return None
+
+    # 이미 리스트/튜플인 경우
+    if isinstance(raw, (list, tuple, set)):
+        result: List[int] = []
+        for x in raw:
+            try:
+                result.append(int(str(x).strip()))
+            except (TypeError, ValueError):
+                # 숫자로 변환 안 되면 무시
+                continue
+        return result or None
+
+    # 문자열인 경우
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+
+        # JSON 배열 형태일 수 있음: "[39, 140]"
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, (list, tuple, set)):
+                return _normalize_league_ids(parsed)
+            # JSON 숫자 하나일 수도 있음
+            try:
+                return [int(parsed)]
+            except (TypeError, ValueError):
+                pass
+        except Exception:
+            # JSON 이 아니면 "39,140" 같은 CSV 로 간주
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            result: List[int] = []
+            for p in parts:
+                try:
+                    result.append(int(p))
+                except ValueError:
+                    continue
+            return result or None
+
+    # 그 외 (int 등)
+    try:
+        return [int(raw)]
+    except (TypeError, ValueError):
+        return None
+
+
+# ─────────────────────────────────────
 #  1) 홈 화면: 리그 목록
 # ─────────────────────────────────────
 
 def get_home_leagues(
     date_str: Optional[str],
-    league_ids: Optional[List[int]] = None,
+    league_ids: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     주어진 날짜(date_str)에 실제 경기가 편성된 리그 목록을 돌려준다.
     league_ids 가 주어지면 해당 리그들만 필터링.
 
-    ⚠ league_ids 가 int / str / list 등으로 넘어와도
-      항상 List[int] 형태로 정규화해서 안전하게 처리한다.
+    league_ids 는 어떤 형태로 들어와도(_normalize_league_ids) List[int] 로 맞춘다.
     """
     norm_date = _normalize_date(date_str)
-
-    # league_ids 정규화: None, int, str, list/tuple 모두 처리
-    norm_league_ids: Optional[List[int]] = None
-    if league_ids:
-        if isinstance(league_ids, (list, tuple)):
-            norm_league_ids = [int(x) for x in league_ids]
-        else:
-            # 단일 값(int, str 등)을 리스트로 감싸기
-            norm_league_ids = [int(league_ids)]
+    norm_league_ids = _normalize_league_ids(league_ids)
 
     params: List[Any] = [norm_date]
     where_clause = "m.date_utc::date = %s"
