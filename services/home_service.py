@@ -48,106 +48,38 @@ def _normalize_date(date_str: Optional[str]) -> str:
 
 
 # ─────────────────────────────────────
-#  league_ids 정규화 유틸
-# ─────────────────────────────────────
-
-def _normalize_league_ids(raw: Any) -> Optional[List[int]]:
-    """
-    league_ids 가 어떤 형태로 들어와도 안전하게 List[int] 로 정규화한다.
-
-    허용 예:
-      - None
-      - 39
-      - "39"
-      - "39,140"
-      - ["39", "140"]
-      - [39, 140]
-      - "[39, 140]"  (JSON 문자열)
-    """
-    if raw is None:
-        return None
-
-    # 이미 리스트/튜플인 경우
-    if isinstance(raw, (list, tuple, set)):
-        result: List[int] = []
-        for x in raw:
-            try:
-                result.append(int(str(x).strip()))
-            except (TypeError, ValueError):
-                # 숫자로 변환 안 되면 무시
-                continue
-        return result or None
-
-    # 문자열인 경우
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return None
-
-        # JSON 배열 형태일 수 있음: "[39, 140]"
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, (list, tuple, set)):
-                return _normalize_league_ids(parsed)
-            # JSON 숫자 하나일 수도 있음
-            try:
-                return [int(parsed)]
-            except (TypeError, ValueError):
-                pass
-        except Exception:
-            # JSON 이 아니면 "39,140" 같은 CSV 로 간주
-            parts = [p.strip() for p in s.split(",") if p.strip()]
-            result: List[int] = []
-            for p in parts:
-                try:
-                    result.append(int(p))
-                except ValueError:
-                    continue
-            return result or None
-
-    # 그 외 (int 등)
-    try:
-        return [int(raw)]
-    except (TypeError, ValueError):
-        return None
-
-
-# ─────────────────────────────────────
 #  1) 홈 화면: 리그 목록
 # ─────────────────────────────────────
 
 def get_home_leagues(
     date_str: Optional[str],
-    league_ids: Any = None,
+    league_ids: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
     주어진 날짜(date_str)에 실제 경기가 편성된 리그 목록을 돌려준다.
     league_ids 가 주어지면 해당 리그들만 필터링.
-
-    league_ids 는 어떤 형태로 들어와도(_normalize_league_ids) List[int] 로 맞춘다.
     """
     norm_date = _normalize_date(date_str)
-    norm_league_ids = _normalize_league_ids(league_ids)
 
     params: List[Any] = [norm_date]
     where_clause = "m.date_utc::date = %s"
 
-    if norm_league_ids:
-        placeholders = ", ".join(["%s"] * len(norm_league_ids))
+    if league_ids:
+        placeholders = ", ".join(["%s"] * len(league_ids))
         where_clause += f" AND m.league_id IN ({placeholders})"
-        params.extend(norm_league_ids)
+        params.extend(league_ids)
 
     rows = fetch_all(
         f"""
         SELECT
             m.league_id,
-            l.name       AS league_name,
-            l.country    AS country,
-            l.logo       AS league_logo,
+            l.name    AS league_name,
+            l.country AS country,
+            l.logo    AS league_logo,
             m.season
         FROM matches m
         JOIN leagues l
-          ON m.league_id = l.league_id
+          ON m.league_id = l.id      -- ✅ 올바른 PK 컬럼 이름
         WHERE {where_clause}
         GROUP BY
             m.league_id,
@@ -275,7 +207,7 @@ def _find_matchday(date_str: str, league_id: Optional[int], direction: str) -> O
         f"""
         SELECT
             m.date_utc::date AS match_date,
-            COUNT(*)          AS matches
+            COUNT(*)         AS matches
         FROM matches m
         WHERE {where_clause}
         GROUP BY match_date
@@ -420,7 +352,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
-                matches_total_api=matches_total_api,
             )
         except Exception:
             pass
