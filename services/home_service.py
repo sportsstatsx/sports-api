@@ -1,323 +1,16 @@
-from __future__ import annotations
-
+from typing import Optional, Dict, Any, List
 import json
-from datetime import datetime, date as date_cls
-from typing import Any, Dict, List, Optional
-
-from db import fetch_all
-
-
-# ─────────────────────────────────────
-#  공통: 날짜 파싱/정규화
-# ─────────────────────────────────────
-
-def _normalize_date(date_str: Optional[str]) -> str:
-    """
-    다양한 형태(YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS 등)의 문자열을
-    'YYYY-MM-DD' 형식으로 정규화해서 반환한다.
-    """
-    if not date_str:
-        return ""
-
-    s = date_str.strip()
-    if len(s) >= 10:
-        only_date = s[:10]
-        try:
-            dt = datetime.fromisoformat(only_date)
-            return dt.date().isoformat()
-        except Exception:
-            return only_date
-    return s
-
-
-def _normalize_target_date(target_date: Optional[str]) -> date_cls:
-    """
-    target_date 를 date 객체로 정규화한다.
-    None 이거나 잘못된 형식이면 오늘 날짜 사용.
-    """
-    if not target_date:
-        return datetime.utcnow().date()
-
-    s = _normalize_date(target_date)
-    try:
-        return datetime.fromisoformat(s).date()
-    except Exception:
-        return datetime.utcnow().date()
-
-
-# ─────────────────────────────────────
-#  1) 홈 상단 리그 목록
-# ─────────────────────────────────────
-
-def get_home_leagues(date_str: Optional[str]) -> List[Dict[str, Any]]:
-    """
-    홈 상단 리그 목록.
-
-    - date_str: "YYYY-MM-DD" 형식 문자열, 없으면 오늘 날짜
-    - 기준 날짜 ±1일 범위에서 경기가 있는 리그들을 조회
-    """
-    if date_str:
-        normalized = _normalize_date(date_str)
-    else:
-        normalized = datetime.utcnow().date().isoformat()
-
-    rows = fetch_all(
-        """
-        SELECT
-            m.league_id,
-            m.season,
-            l.name       AS league_name,
-            l.country    AS country,
-            l.logo       AS logo,
-            MIN(m.date_utc) AS first_kickoff,
-            MAX(m.date_utc) AS last_kickoff,
-            COUNT(*) > 0 AS has_matches
-        FROM matches m
-        JOIN leagues l
-          ON l.id = m.league_id
-        WHERE m.date_utc::date BETWEEN %s::date - INTERVAL '1 day'
-                                  AND %s::date + INTERVAL '1 day'
-        GROUP BY m.league_id, m.season, l.name, l.country, l.logo
-        ORDER BY m.league_id, m.season
-        """,
-        (normalized, normalized),
-    )
-
-    result: List[Dict[str, Any]] = []
-    for r in rows:
-        first_kickoff = r["first_kickoff"]
-        last_kickoff = r["last_kickoff"]
-
-        if isinstance(first_kickoff, datetime):
-            first_str = first_kickoff.isoformat()
-        else:
-            first_str = str(first_kickoff)
-
-        if isinstance(last_kickoff, datetime):
-            last_str = last_kickoff.isoformat()
-        else:
-            last_str = str(last_kickoff)
-
-        result.append(
-            {
-                "league_id": r["league_id"],
-                "season": r["season"],
-                "league_name": r["league_name"],
-                "country": r["country"],
-                "logo": r["logo"],
-                "has_matches": bool(r["has_matches"]),
-                "first_kickoff": first_str,
-                "last_kickoff": last_str,
-            }
-        )
-
-    return result
-
-
-# ─────────────────────────────────────
-#  2) 홈: 날짜 기준 매치데이 디렉터리
-# ─────────────────────────────────────
-
-def _get_matchdays_for_league(league_id: int, season: int) -> List[Dict[str, Any]]:
-    """
-    특정 (league_id, season)에 대한 "매치데이(날짜)" 목록을 가져온다.
-    """
-    rows = fetch_all(
-        """
-        SELECT
-            m.date_utc::date AS match_date,
-            COUNT(*)         AS matches_count,
-            MIN(m.date_utc)  AS first_kickoff,
-            MAX(m.date_utc)  AS last_kickoff
-        FROM matches m
-        WHERE m.league_id = %s
-          AND m.season    = %s
-        GROUP BY m.date_utc::date
-        ORDER BY match_date
-        """,
-        (league_id, season),
-    )
-
-    result: List[Dict[str, Any]] = []
-    for r in rows:
-        d = r["match_date"]
-        if isinstance(d, datetime):
-            d = d.date()
-        match_date_str = d.isoformat()
-
-        first_kickoff = r["first_kickoff"]
-        last_kickoff = r["last_kickoff"]
-
-        if isinstance(first_kickoff, datetime):
-            first_str = first_kickoff.isoformat()
-        else:
-            first_str = str(first_kickoff)
-
-        if isinstance(last_kickoff, datetime):
-            last_str = last_koff.isoformat()
-        else:
-            last_str = str(last_koff)
-
-        result.append(
-            {
-                "match_date": match_date_str,
-                "matches_count": r["matches_count"],
-                "first_kickoff": first_str,
-                "last_kickoff": last_str,
-            }
-        )
-
-    return result
-
-
-def get_home_directory(date_str: str, league_id: Optional[int]) -> Dict[str, Any]:
-    """
-    홈 화면에서, 특정 날짜(date_str)와 리그(league_id)에 대한
-    "매치데이 디렉터리 + 현재 기준 매치데이" 정보를 내려준다.
-
-    리턴 형식:
-    {
-      "target_date": "2025-08-16",
-      "league_id": 39,
-      "season": 2024,
-      "days": [...],
-      "current_matchday": {...}
-    }
-    """
-    target_date = _normalize_target_date(date_str)
-
-    # league_id 가 None 이면, 그 날짜에 경기가 있는 임의의 리그 중 하나를 선택
-    if league_id is None:
-        league_rows = fetch_all(
-            """
-            SELECT league_id, season
-            FROM matches
-            WHERE date_utc::date = %s::date
-            GROUP BY league_id, season
-            ORDER BY league_id
-            LIMIT 1
-            """,
-            (target_date.isoformat(),),
-        )
-        if not league_rows:
-            return {
-                "target_date": target_date.isoformat(),
-                "league_id": None,
-                "season": None,
-                "days": [],
-                "current_matchday": None,
-            }
-        league_id = league_rows[0]["league_id"]
-        season = league_rows[0]["season"]
-    else:
-        league_rows = fetch_all(
-            """
-            SELECT league_id, season
-            FROM matches
-            WHERE league_id = %s
-            GROUP BY league_id, season
-            ORDER BY season DESC
-            LIMIT 1
-            """,
-            (league_id,),
-        )
-        if not league_rows:
-            return {
-                "target_date": target_date.isoformat(),
-                "league_id": league_id,
-                "season": None,
-                "days": [],
-                "current_matchday": None,
-            }
-        season = league_rows[0]["season"]
-
-    days = _get_matchdays_for_league(league_id, season)
-
-    def _distance(d_str: str) -> int:
-        try:
-            d = datetime.fromisoformat(d_str).date()
-        except Exception:
-            return 10**9
-        return abs((d - target_date).days)
-
-    current_matchday = min(days, key=lambda x: _distance(x["match_date"])) if days else None
-
-    return {
-        "target_date": target_date.isoformat(),
-        "league_id": league_id,
-        "season": season,
-        "days": days,
-        "current_matchday": current_matchday,
-    }
-
-
-# ─────────────────────────────────────
-#  3) 다음 / 이전 매치데이
-# ─────────────────────────────────────
-
-def _get_adjacent_matchday(
-    date_str: str,
-    league_id: Optional[int],
-    direction: str,
-) -> Optional[str]:
-    """
-    내부용: 다음/이전 매치데이를 공통 처리.
-    direction = "next" 또는 "prev"
-    """
-    base_date = _normalize_target_date(date_str)
-    params: List[Any] = [base_date.isoformat()]
-
-    where_parts: List[str] = [
-        "m.date_utc::date >= %s" if direction == "next" else "m.date_utc::date <= %s"
-    ]
-
-    if league_id and league_id > 0:
-        where_parts.append("m.league_id = %s")
-        params.append(league_id)
-
-    order = "ASC" if direction == "next" else "DESC"
-
-    sql = f"""
-        SELECT
-            m.date_utc::date AS match_date
-        FROM matches m
-        WHERE {' AND '.join(where_parts)}
-        GROUP BY match_date
-        ORDER BY match_date {order}
-        LIMIT 1
-    """
-
-    rows = fetch_all(sql, tuple(params))
-    if not rows:
-        return None
-
-    match_date = rows[0]["match_date"]
-    return str(match_date)
-
-
-def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
-    """
-    기준 날짜 이후의 가장 가까운 매치데이 날짜 문자열("YYYY-MM-DD") 반환.
-    """
-    return _get_adjacent_matchday(date_str, league_id, "next")
-
-
-def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
-    """
-    기준 날짜 이전의 가장 가까운 매치데이 날짜 문자열("YYYY-MM-DD") 반환.
-    """
-    return _get_adjacent_matchday(date_str, league_id, "prev")
-
-
-# ─────────────────────────────────────
-#  4) 팀 시즌 스탯 (Insights Overall)
-# ─────────────────────────────────────
+from services.db import fetch_all
 
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
     """
     team_season_stats 테이블에서 (league_id, team_id)에 해당하는
     가장 최신 season 한 줄을 가져오고, 거기에 insights_overall.* 지표를
     추가/보정해서 반환한다.
+
+    ⚠️ 이번 버전에서 추가된 것:
+      - match_events 를 이용해서 Timing / First Goal / Momentum 지표를
+        실제 경기 이벤트 기반으로 계산해서 insights_overall 에 넣는다.
     """
     rows = fetch_all(
         """
@@ -340,6 +33,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
     row = rows[0]
 
+    # value(JSON)를 파싱
     raw_value = row.get("value")
     if isinstance(raw_value, str):
         try:
@@ -354,6 +48,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
     if not isinstance(stats, dict):
         stats = {}
 
+    # insights_overall 보장
     insights = stats.get("insights_overall")
     if not isinstance(insights, dict):
         insights = {}
@@ -363,12 +58,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
 
-    season = row.get("season")
-    try:
-        season_int = int(season)
-    except (TypeError, ValueError):
-        season_int = None
-
+    # 공통 유틸
     def safe_div(num, den) -> float:
         try:
             num_f = float(num)
@@ -390,6 +80,131 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         v = safe_div(n, d)
         return round(v, 2) if v > 0 else 0.0
 
+    # 시즌
+    season = row.get("season")
+    try:
+        season_int = int(season)
+    except (TypeError, ValueError):
+        season_int = None
+
+    # ─────────────────────────────
+    # Shooting & Efficiency (Shots)
+    # ─────────────────────────────
+    if season_int is not None:
+        shot_rows = fetch_all(
+            """
+            SELECT
+                m.fixture_id,
+                m.home_id,
+                m.away_id,
+                SUM(
+                    CASE
+                        WHEN lower(mts.name) IN ('total shots','shots total','shots')
+                             AND mts.value ~ '^[0-9]+$'
+                        THEN mts.value::int
+                        ELSE 0
+                    END
+                ) AS total_shots,
+                SUM(
+                    CASE
+                        WHEN lower(mts.name) IN (
+                            'shots on goal',
+                            'shotsongoal',
+                            'shots on target'
+                        )
+                        AND mts.value ~ '^[0-9]+$'
+                        THEN mts.value::int
+                        ELSE 0
+                    END
+                ) AS shots_on_goal
+            FROM matches m
+            LEFT JOIN match_team_stats mts
+              ON mts.fixture_id = m.fixture_id
+             AND mts.team_id   = %s
+            WHERE m.league_id = %s
+              AND m.season    = %s
+              AND (%s = m.home_id OR %s = m.away_id)
+              AND (
+                    lower(m.status_group) IN ('finished','ft','fulltime')
+                 OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
+              )
+            GROUP BY m.fixture_id, m.home_id, m.away_id
+            """,
+            (team_id, league_id, season_int, team_id, team_id),
+        )
+
+        if shot_rows:
+            total_matches = 0
+            home_matches = 0
+            away_matches = 0
+
+            total_shots_total = 0
+            total_shots_home = 0
+            total_shots_away = 0
+
+            sog_total = 0
+            sog_home = 0
+            sog_away = 0
+
+            for r2 in shot_rows:
+                ts = r2["total_shots"] or 0
+                sog = r2["shots_on_goal"] or 0
+
+                is_home = (r2["home_id"] == team_id)
+                is_away = (r2["away_id"] == team_id)
+                if not (is_home or is_away):
+                    continue
+
+                total_matches += 1
+                total_shots_total += ts
+                sog_total += sog
+
+                if is_home:
+                    home_matches += 1
+                    total_shots_home += ts
+                    sog_home += sog
+                else:
+                    away_matches += 1
+                    total_shots_away += ts
+                    sog_away += sog
+
+            # API 쪽 fixtures.played 값이 없으면 실제 경기 수 사용
+            eff_total = matches_total_api or total_matches or 0
+            eff_home = home_matches or 0
+            eff_away = away_matches or 0
+
+            # shots 블록도 같이 기록 (나중에 재사용 가능)
+            stats["shots"] = {
+                "total": {
+                    "total": int(total_shots_total),
+                    "home": int(total_shots_home),
+                    "away": int(total_shots_away),
+                },
+                "on": {
+                    "total": int(sog_total),
+                    "home": int(sog_home),
+                    "away": int(sog_away),
+                },
+            }
+
+            avg_total = fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
+            avg_home = fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
+            avg_away = fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
+
+            insights["shots_per_match"] = {
+                "total": avg_total,
+                "home": avg_home,
+                "away": avg_away,
+            }
+            insights["shots_on_target_pct"] = {
+                "total": fmt_pct(sog_total, total_shots_total),
+                "home": fmt_pct(sog_home, total_shots_home),
+                "away": fmt_pct(sog_away, total_shots_away),
+            }
+
+    # ─────────────────────────────
+    # Outcome & Totals / Result Combos
+    # ─────────────────────────────
     match_rows: List[Dict[str, Any]] = []
     if season_int is not None:
         match_rows = fetch_all(
@@ -413,14 +228,590 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
             (league_id, season_int, team_id, team_id),
         )
 
-    # 이후: Outcome & Totals, Results Combos, Timing, First Goal, Momentum,
-    #       Shooting & Efficiency, Discipline & Set Pieces, Goals by Time 등
-    #       (현재 네가 사용하던 모든 계산 로직이 이 아래에 그대로 있음)
-    #       ─ 여기부터는 네가 제공했던 원본 코드의 나머지 부분 그대로 유지 ─
+    if match_rows:
+        mt_tot = mh_tot = ma_tot = 0
 
-    # ... (여기에는 Outcome & Totals, Result Combos & Draw,
-    #      Timing, First Goal, Momentum, Shooting, Discipline, Goals by Time
-    #      계산 로직이 쭉 들어있음 – 네가 올린 원본 그대로)
+        win_t = win_h = win_a = 0
+        draw_t = draw_h = draw_a = 0
+        lose_t = lose_h = lose_a = 0
+
+        btts_t = btts_h = btts_a = 0
+        team_o05_t = team_o05_h = team_o05_a = 0
+        team_o15_t = team_o15_h = team_o15_a = 0
+        o15_t = o15_h = o15_a = 0
+        o25_t = o25_h = o25_a = 0
+        win_o25_t = win_o25_h = win_o25_a = 0
+        lose_btts_t = lose_btts_h = lose_btts_a = 0
+
+        cs_t = cs_h = cs_a = 0
+        ng_t = ng_h = ng_a = 0
+
+        gf_sum_t = gf_sum_h = gf_sum_a = 0.0
+        ga_sum_t = ga_sum_h = ga_sum_a = 0.0
+
+        for mr in match_rows:
+            home_id = mr["home_id"]
+            away_id = mr["away_id"]
+            home_ft = mr["home_ft"]
+            away_ft = mr["away_ft"]
+
+            if home_ft is None or away_ft is None:
+                continue
+
+            is_home = (team_id == home_id)
+            gf = home_ft if is_home else away_ft
+            ga = away_ft if is_home else home_ft
+
+            if gf is None or ga is None:
+                continue
+
+            mt_tot += 1
+            if is_home:
+                mh_tot += 1
+            else:
+                ma_tot += 1
+
+            if gf > ga:
+                win_t += 1
+                if is_home:
+                    win_h += 1
+                else:
+                    win_a += 1
+            elif gf == ga:
+                draw_t += 1
+                if is_home:
+                    draw_h += 1
+                else:
+                    draw_a += 1
+            else:
+                lose_t += 1
+                if is_home:
+                    lose_h += 1
+                else:
+                    lose_a += 1
+
+            gf_sum_t += gf
+            ga_sum_t += ga
+            if is_home:
+                gf_sum_h += gf
+                ga_sum_h += ga
+            else:
+                gf_sum_a += gf
+                ga_sum_a += ga
+
+            if gf > 0 and ga > 0:
+                btts_t += 1
+                if is_home:
+                    btts_h += 1
+                else:
+                    btts_a += 1
+
+            if gf >= 1:
+                team_o05_t += 1
+                if is_home:
+                    team_o05_h += 1
+                else:
+                    team_o05_a += 1
+            if gf >= 2:
+                team_o15_t += 1
+                if is_home:
+                    team_o15_h += 1
+                else:
+                    team_o15_a += 1
+
+            total_goals = gf + ga
+            if total_goals >= 2:
+                o15_t += 1
+                if is_home:
+                    o15_h += 1
+                else:
+                    o15_a += 1
+            if total_goals >= 3:
+                o25_t += 1
+                if is_home:
+                    o25_h += 1
+                else:
+                    o25_a += 1
+
+            if gf > ga and total_goals >= 3:
+                win_o25_t += 1
+                if is_home:
+                    win_o25_h += 1
+                else:
+                    win_o25_a += 1
+
+            if gf < ga and gf > 0 and ga > 0:
+                lose_btts_t += 1
+                if is_home:
+                    lose_btts_h += 1
+                else:
+                    lose_btts_a += 1
+
+            if ga == 0:
+                cs_t += 1
+                if is_home:
+                    cs_h += 1
+                else:
+                    cs_a += 1
+            if gf == 0:
+                ng_t += 1
+                if is_home:
+                    ng_h += 1
+                else:
+                    ng_a += 1
+
+        if mt_tot > 0:
+            insights.setdefault(
+                "win_pct",
+                {
+                    "total": fmt_pct(win_t, mt_tot),
+                    "home": fmt_pct(win_h, mh_tot or mt_tot),
+                    "away": fmt_pct(win_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "btts_pct",
+                {
+                    "total": fmt_pct(btts_t, mt_tot),
+                    "home": fmt_pct(btts_h, mh_tot or mt_tot),
+                    "away": fmt_pct(btts_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "team_over05_pct",
+                {
+                    "total": fmt_pct(team_o05_t, mt_tot),
+                    "home": fmt_pct(team_o05_h, mh_tot or mt_tot),
+                    "away": fmt_pct(team_o05_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "team_over15_pct",
+                {
+                    "total": fmt_pct(team_o15_t, mt_tot),
+                    "home": fmt_pct(team_o15_h, mh_tot or mt_tot),
+                    "away": fmt_pct(team_o15_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "over15_pct",
+                {
+                    "total": fmt_pct(o15_t, mt_tot),
+                    "home": fmt_pct(o15_h, mh_tot or mt_tot),
+                    "away": fmt_pct(o15_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "over25_pct",
+                {
+                    "total": fmt_pct(o25_t, mt_tot),
+                    "home": fmt_pct(o25_h, mh_tot or mt_tot),
+                    "away": fmt_pct(o25_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "clean_sheet_pct",
+                {
+                    "total": fmt_pct(cs_t, mt_tot),
+                    "home": fmt_pct(cs_h, mh_tot or mt_tot),
+                    "away": fmt_pct(cs_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "no_goals_pct",
+                {
+                    "total": fmt_pct(ng_t, mt_tot),
+                    "home": fmt_pct(ng_h, mh_tot or mt_tot),
+                    "away": fmt_pct(ng_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "win_and_over25_pct",
+                {
+                    "total": fmt_pct(win_o25_t, mt_tot),
+                    "home": fmt_pct(win_o25_h, mh_tot or mt_tot),
+                    "away": fmt_pct(win_o25_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "lose_and_btts_pct",
+                {
+                    "total": fmt_pct(lose_btts_t, mt_tot),
+                    "home": fmt_pct(lose_btts_h, mh_tot or mt_tot),
+                    "away": fmt_pct(lose_btts_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "draw_pct",
+                {
+                    "total": fmt_pct(draw_t, mt_tot),
+                    "home": fmt_pct(draw_h, mh_tot or mt_tot),
+                    "away": fmt_pct(draw_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "goal_diff_avg",
+                {
+                    "total": fmt_avg(gf_sum_t - ga_sum_t, mt_tot),
+                    "home": fmt_avg(gf_sum_h - ga_sum_h, mh_tot or mt_tot),
+                    "away": fmt_avg(gf_sum_a - ga_sum_a, ma_tot or mt_tot),
+                },
+            )
+
+    # ─────────────────────────────
+    # Timing / First Goal / Momentum
+    #   - match_events 기반
+    # ─────────────────────────────
+    if match_rows:
+        fixture_ids = [mr["fixture_id"] for mr in match_rows]
+        events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
+
+        if fixture_ids:
+            placeholders = ",".join(["%s"] * len(fixture_ids))
+            sql = f"""
+                SELECT
+                    e.fixture_id,
+                    e.minute,
+                    e.team_id
+                FROM match_events e
+                WHERE e.fixture_id IN ({placeholders})
+                  AND e.minute IS NOT NULL
+                  AND lower(e.type) IN ('goal','own goal','penalty','penalty goal')
+                ORDER BY e.fixture_id, e.minute ASC
+            """
+            event_rows = fetch_all(sql, tuple(fixture_ids))
+            for ev in event_rows:
+                fid = ev["fixture_id"]
+                events_by_fixture.setdefault(fid, []).append(ev)
+
+        # 샘플 수
+        half_mt_tot = half_mt_home = half_mt_away = 0
+
+        # Timing: 득점/실점 구간 플래그
+        score_1h_t = score_1h_h = score_1h_a = 0
+        score_2h_t = score_2h_h = score_2h_a = 0
+        concede_1h_t = concede_1h_h = concede_1h_a = 0
+        concede_2h_t = concede_2h_h = concede_2h_a = 0
+
+        score_015_t = score_015_h = score_015_a = 0
+        concede_015_t = concede_015_h = concede_015_a = 0
+        score_8090_t = score_8090_h = score_8090_a = 0
+        concede_8090_t = concede_8090_h = concede_8090_a = 0
+
+        # First goal 샘플
+        fg_sample_t = fg_sample_h = fg_sample_a = 0
+        fg_for_t = fg_for_h = fg_for_a = 0
+        fg_against_t = fg_against_h = fg_against_a = 0
+
+        # Momentum: 리드/열세일 때 결과
+        leading_sample_t = leading_sample_h = leading_sample_a = 0
+        leading_win_t = leading_win_h = leading_win_a = 0
+        leading_draw_t = leading_draw_h = leading_draw_a = 0
+        leading_loss_t = leading_loss_h = leading_loss_a = 0
+
+        trailing_sample_t = trailing_sample_h = trailing_sample_a = 0
+        trailing_win_t = trailing_win_h = trailing_win_a = 0
+        trailing_draw_t = trailing_draw_h = trailing_draw_a = 0
+        trailing_loss_t = trailing_loss_h = trailing_loss_a = 0
+
+        for mr in match_rows:
+            fid = mr["fixture_id"]
+            home_id = mr["home_id"]
+            away_id = mr["away_id"]
+            home_ft = mr["home_ft"]
+            away_ft = mr["away_ft"]
+
+            if home_ft is None or away_ft is None:
+                continue
+
+            is_home = (team_id == home_id)
+            gf = home_ft if is_home else away_ft
+            ga = away_ft if is_home else home_ft
+
+            evs = events_by_fixture.get(fid)
+            if not evs:
+                continue
+
+            half_mt_tot += 1
+            if is_home:
+                half_mt_home += 1
+            else:
+                half_mt_away += 1
+
+            scored_1h = conceded_1h = False
+            scored_2h = conceded_2h = False
+            scored_015 = conceded_015 = False
+            scored_8090 = conceded_8090 = False
+
+            first_minute: Optional[int] = None
+            first_for: Optional[bool] = None
+
+            for ev in evs:
+                minute = ev["minute"]
+                if minute is None:
+                    continue
+                try:
+                    m_int = int(minute)
+                except (TypeError, ValueError):
+                    continue
+
+                is_for_goal = (ev["team_id"] == team_id)
+
+                # first goal
+                if first_minute is None or m_int < first_minute:
+                    first_minute = m_int
+                    first_for = is_for_goal
+
+                # 1H / 2H
+                if m_int <= 45:
+                    if is_for_goal:
+                        scored_1h = True
+                    else:
+                        conceded_1h = True
+                else:
+                    if is_for_goal:
+                        scored_2h = True
+                    else:
+                        conceded_2h = True
+
+                # 0-15
+                if m_int <= 15:
+                    if is_for_goal:
+                        scored_015 = True
+                    else:
+                        conceded_015 = True
+
+                # 80+
+                if m_int >= 80:
+                    if is_for_goal:
+                        scored_8090 = True
+                    else:
+                        conceded_8090 = True
+
+            # Timing 카운트
+            def _inc(flag: bool, total_ref, home_ref, away_ref):
+                if not flag:
+                    return
+                if is_home:
+                    home_ref[0] += 1
+                else:
+                    away_ref[0] += 1
+                total_ref[0] += 1
+
+            # Python에서 ref 처리를 위해 리스트 래핑
+            t_ref = [score_1h_t]
+            h_ref = [score_1h_h]
+            a_ref = [score_1h_a]
+            _inc(scored_1h, t_ref, h_ref, a_ref)
+            score_1h_t, score_1h_h, score_1h_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [score_2h_t]
+            h_ref = [score_2h_h]
+            a_ref = [score_2h_a]
+            _inc(scored_2h, t_ref, h_ref, a_ref)
+            score_2h_t, score_2h_h, score_2h_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [concede_1h_t]
+            h_ref = [concede_1h_h]
+            a_ref = [concede_1h_a]
+            _inc(conceded_1h, t_ref, h_ref, a_ref)
+            concede_1h_t, concede_1h_h, concede_1h_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [concede_2h_t]
+            h_ref = [concede_2h_h]
+            a_ref = [concede_2h_a]
+            _inc(conceded_2h, t_ref, h_ref, a_ref)
+            concede_2h_t, concede_2h_h, concede_2h_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [score_015_t]
+            h_ref = [score_015_h]
+            a_ref = [score_015_a]
+            _inc(scored_015, t_ref, h_ref, a_ref)
+            score_015_t, score_015_h, score_015_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [concede_015_t]
+            h_ref = [concede_015_h]
+            a_ref = [concede_015_a]
+            _inc(conceded_015, t_ref, h_ref, a_ref)
+            concede_015_t, concede_015_h, concede_015_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [score_8090_t]
+            h_ref = [score_8090_h]
+            a_ref = [score_8090_a]
+            _inc(scored_8090, t_ref, h_ref, a_ref)
+            score_8090_t, score_8090_h, score_8090_a = t_ref[0], h_ref[0], a_ref[0]
+
+            t_ref = [concede_8090_t]
+            h_ref = [concede_8090_h]
+            a_ref = [concede_8090_a]
+            _inc(conceded_8090, t_ref, h_ref, a_ref)
+            concede_8090_t, concede_8090_h, concede_8090_a = t_ref[0], h_ref[0], a_ref[0]
+
+            # First goal & Momentum
+            if first_minute is not None and first_for is not None:
+                fg_sample_t += 1
+                if is_home:
+                    fg_sample_h += 1
+                else:
+                    fg_sample_a += 1
+
+                if first_for:
+                    fg_for_t += 1
+                    if is_home:
+                        fg_for_h += 1
+                    else:
+                        fg_for_a += 1
+
+                    # 리딩 상태에서 결과
+                    leading_sample_t += 1
+                    if is_home:
+                        leading_sample_h += 1
+                    else:
+                        leading_sample_a += 1
+
+                    if gf > ga:
+                        leading_win_t += 1
+                        if is_home:
+                            leading_win_h += 1
+                        else:
+                            leading_win_a += 1
+                    elif gf == ga:
+                        leading_draw_t += 1
+                        if is_home:
+                            leading_draw_h += 1
+                        else:
+                            leading_draw_a += 1
+                    else:
+                        leading_loss_t += 1
+                        if is_home:
+                            leading_loss_h += 1
+                        else:
+                            leading_loss_a += 1
+                else:
+                    fg_against_t += 1
+                    if is_home:
+                        fg_against_h += 1
+                    else:
+                        fg_against_a += 1
+
+                    # 트레일링 상태에서 결과
+                    trailing_sample_t += 1
+                    if is_home:
+                        trailing_sample_h += 1
+                    else:
+                        trailing_sample_a += 1
+
+                    if gf > ga:
+                        trailing_win_t += 1
+                        if is_home:
+                            trailing_win_h += 1
+                        else:
+                            trailing_win_a += 1
+                    elif gf == ga:
+                        trailing_draw_t += 1
+                        if is_home:
+                            trailing_draw_h += 1
+                        else:
+                            trailing_draw_a += 1
+                    else:
+                        trailing_loss_t += 1
+                        if is_home:
+                            trailing_loss_h += 1
+                        else:
+                            trailing_loss_a += 1
+
+        # 퍼센트 저장
+        if half_mt_tot > 0:
+            insights["score_1h_pct"] = {
+                "total": fmt_pct(score_1h_t, half_mt_tot),
+                "home": fmt_pct(score_1h_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(score_1h_a, half_mt_away or half_mt_tot),
+            }
+            insights["score_2h_pct"] = {
+                "total": fmt_pct(score_2h_t, half_mt_tot),
+                "home": fmt_pct(score_2h_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(score_2h_a, half_mt_away or half_mt_tot),
+            }
+            insights["concede_1h_pct"] = {
+                "total": fmt_pct(concede_1h_t, half_mt_tot),
+                "home": fmt_pct(concede_1h_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(concede_1h_a, half_mt_away or half_mt_tot),
+            }
+            insights["concede_2h_pct"] = {
+                "total": fmt_pct(concede_2h_t, half_mt_tot),
+                "home": fmt_pct(concede_2h_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(concede_2h_a, half_mt_away or half_mt_tot),
+            }
+            insights["score_0_15_pct"] = {
+                "total": fmt_pct(score_015_t, half_mt_tot),
+                "home": fmt_pct(score_015_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(score_015_a, half_mt_away or half_mt_tot),
+            }
+            insights["concede_0_15_pct"] = {
+                "total": fmt_pct(concede_015_t, half_mt_tot),
+                "home": fmt_pct(concede_015_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(concede_015_a, half_mt_away or half_mt_tot),
+            }
+            insights["score_80_90_pct"] = {
+                "total": fmt_pct(score_8090_t, half_mt_tot),
+                "home": fmt_pct(score_8090_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(score_8090_a, half_mt_away or half_mt_tot),
+            }
+            insights["concede_80_90_pct"] = {
+                "total": fmt_pct(concede_8090_t, half_mt_tot),
+                "home": fmt_pct(concede_8090_h, half_mt_home or half_mt_tot),
+                "away": fmt_pct(concede_8090_a, half_mt_away or half_mt_tot),
+            }
+
+        if fg_sample_t > 0:
+            insights["first_to_score_pct"] = {
+                "total": fmt_pct(fg_for_t, fg_sample_t),
+                "home": fmt_pct(fg_for_h, fg_sample_h or fg_sample_t),
+                "away": fmt_pct(fg_for_a, fg_sample_a or fg_sample_t),
+            }
+            insights["first_conceded_pct"] = {
+                "total": fmt_pct(fg_against_t, fg_sample_t),
+                "home": fmt_pct(fg_against_h, fg_sample_h or fg_sample_t),
+                "away": fmt_pct(fg_against_a, fg_sample_a or fg_sample_t),
+            }
+
+        if leading_sample_t > 0:
+            insights["when_leading_win_pct"] = {
+                "total": fmt_pct(leading_win_t, leading_sample_t),
+                "home": fmt_pct(leading_win_h, leading_sample_h or leading_sample_t),
+                "away": fmt_pct(leading_win_a, leading_sample_a or leading_sample_t),
+            }
+            insights["when_leading_draw_pct"] = {
+                "total": fmt_pct(leading_draw_t, leading_sample_t),
+                "home": fmt_pct(leading_draw_h, leading_sample_h or leading_sample_t),
+                "away": fmt_pct(leading_draw_a, leading_sample_a or leading_sample_t),
+            }
+            insights["when_leading_loss_pct"] = {
+                "total": fmt_pct(leading_loss_t, leading_sample_t),
+                "home": fmt_pct(leading_loss_h, leading_sample_h or leading_sample_t),
+                "away": fmt_pct(leading_loss_a, leading_sample_a or leading_sample_t),
+            }
+
+        if trailing_sample_t > 0:
+            insights["when_trailing_win_pct"] = {
+                "total": fmt_pct(trailing_win_t, trailing_sample_t),
+                "home": fmt_pct(trailing_win_h, trailing_sample_h or trailing_sample_t),
+                "away": fmt_pct(trailing_win_a, trailing_sample_a or trailing_sample_t),
+            }
+            insights["when_trailing_draw_pct"] = {
+                "total": fmt_pct(trailing_draw_t, trailing_sample_t),
+                "home": fmt_pct(trailing_draw_h, trailing_sample_h or trailing_sample_t),
+                "away": fmt_pct(trailing_draw_a, trailing_sample_a or trailing_sample_t),
+            }
+            insights["when_trailing_loss_pct"] = {
+                "total": fmt_pct(trailing_loss_t, trailing_sample_t),
+                "home": fmt_pct(trailing_loss_h, trailing_sample_h or trailing_sample_t),
+                "away": fmt_pct(trailing_loss_a, trailing_sample_a or trailing_sample_t),
+            }
+
+        # 샘플 수도 함께 저장
+        insights["events_sample"] = half_mt_tot
+        insights["first_goal_sample"] = fg_sample_t
 
     # 최종 반환
     return {
@@ -430,30 +821,3 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         "name": row.get("name"),
         "value": stats,
     }
-
-
-# ─────────────────────────────────────
-#  5) 팀 정보
-# ─────────────────────────────────────
-
-def get_team_info(team_id: int, league_id: Optional[int]) -> Optional[Dict[str, Any]]:
-    """
-    특정 리그/팀의 기본 정보(이름, 로고, 나라 등)를 반환
-    """
-
-    rows = fetch_all(
-        """
-        SELECT
-            id,
-            name,
-            country,
-            logo
-        FROM teams
-        WHERE id = %s
-        LIMIT 1
-        """,
-        (team_id,),
-    )
-    if not rows:
-        return None
-    return rows[0]
