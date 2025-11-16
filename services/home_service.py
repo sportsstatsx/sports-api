@@ -10,7 +10,7 @@ from .insights.insights_overall_shooting_efficiency import (
     enrich_overall_shooting_efficiency,
 )
 from .insights.insights_overall_outcome_totals import (
-    enrich_overall_outcome_and_combos,
+    enrich_overall_outcome_totals,
 )
 from .insights.insights_overall_goalsbytime import (
     enrich_overall_goals_by_time,
