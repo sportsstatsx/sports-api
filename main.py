@@ -20,12 +20,9 @@ from prometheus_client import (
 
 from db import fetch_all, fetch_one, execute
 from services.home_service import (
-    get_home_leagues,
-    get_home_league_directory,
-    get_next_matchday,
-    get_prev_matchday,
+    # 홈 관련 함수들은 home_router에서 import해서 사용하므로
+    # 여기(main.py)에서는 team_season_stats 에 필요한 것만 import
     get_team_season_stats,
-    get_team_info,
 )
 from routers.home_router import home_bp  # 👈 홈 라우터 블루프린트 등록
 
