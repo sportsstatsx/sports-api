@@ -267,7 +267,8 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         return round(v, 2) if v > 0 else 0.0
 
     # ─────────────────────────────────────────
-    # A. 슈팅 지표 (match_team_stats 기반)
+    # A. 슈팅 지표 (✅ 예전에 잘 되던 방식 복구)
+    #    match_team_stats 에서 fixture별로 뽑아서 파이썬에서 합산
     # ─────────────────────────────────────────
     shot_rows = fetch_all(
         """
@@ -341,9 +342,24 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 total_shots_away += ts
                 sog_away += sog
 
+        # fixtures.played 가 0이면 match_team_stats 기준으로 보정
         eff_total = matches_total or total_matches
         eff_home = matches_home or (home_matches or eff_total)
         eff_away = matches_away or (away_matches or eff_total)
+
+        # shots 블록도 같이 채워두면 나중에 다른 곳에서 써도 일관성 유지
+        stats["shots"] = {
+            "total": {
+                "total": int(total_shots_total),
+                "home": int(total_shots_home),
+                "away": int(total_shots_away),
+            },
+            "on": {
+                "total": int(sog_total),
+                "home": int(sog_home),
+                "away": int(sog_away),
+            },
+        }
 
         insights["shots_per_match"] = {
             "total": fmt_avg(total_shots_total, eff_total),
@@ -358,6 +374,8 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
     # ─────────────────────────────────────────
     # B. Outcome & Totals 지표 (matches 기반)
+    #    (이 부분은 슈팅과 완전히 분리되어 있어서,
+    #     잘못돼도 슈팅 데이터엔 다시 영향 안 줌)
     # ─────────────────────────────────────────
     outcome_rows = fetch_all(
         """
@@ -460,9 +478,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         WHERE gf IS NOT NULL AND ga IS NOT NULL
         """,
         (
-            team_id, team_id,
-            team_id, team_id,
-            team_id, team_id,
+            team_id, team_id,   # is_home 판별
+            team_id, team_id,   # gf
+            team_id, team_id,   # ga
             league_id, season,
             team_id, team_id,
         ),
