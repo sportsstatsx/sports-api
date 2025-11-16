@@ -5,6 +5,14 @@ from datetime import datetime, date as date_cls
 from typing import Any, Dict, List, Optional
 
 from db import fetch_all
+from services.insights import (
+    enrich_overall_outcome_and_combos,
+    enrich_overall_shooting_efficiency,
+    enrich_overall_timing,
+    enrich_overall_firstgoal_momentum,
+    enrich_overall_goals_by_time,
+    enrich_overall_discipline_setpieces,
+)
 
 
 # ─────────────────────────────────────
@@ -84,7 +92,6 @@ def get_home_league_directory(date_str: Optional[str]) -> Dict[str, Any]:
     """
     norm_date = _normalize_date(date_str)
 
-    # 전체 리그 기준 매치데이 목록
     rows = fetch_all(
         """
         SELECT
@@ -171,7 +178,7 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 
 
 # ─────────────────────────────────────
-#  4) 팀 시즌 스탯 + Insights Overall (일부)
+#  4) 팀 시즌 스탯 + Insights Overall
 # ─────────────────────────────────────
 
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
@@ -226,403 +233,60 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
 
-    # 공통 유틸
-    def safe_div(num, den) -> float:
-        try:
-            num_f = float(num)
-        except (TypeError, ValueError):
-            return 0.0
-        try:
-            den_f = float(den)
-        except (TypeError, ValueError):
-            return 0.0
-        if den_f == 0:
-            return 0.0
-        return num_f / den_f
-
-    def fmt_pct(n, d) -> int:
-        v = safe_div(n, d)
-        return int(round(v * 100)) if v > 0 else 0
-
-    def fmt_avg(n, d) -> float:
-        v = safe_div(n, d)
-        return round(v, 2) if v > 0 else 0.0
-
-    # 시즌
+    # 시즌 정수로 변환
     season = row.get("season")
     try:
         season_int = int(season)
     except (TypeError, ValueError):
         season_int = None
 
-    # ─────────────────────────────
-    # Shooting & Efficiency (Shots)
-    # ─────────────────────────────
-    if season_int is not None:
-        shot_rows = fetch_all(
-            """
-            SELECT
-                m.fixture_id,
-                m.home_id,
-                m.away_id,
-                SUM(
-                    CASE
-                        WHEN lower(mts.name) IN ('total shots','shots total','shots')
-                             AND mts.value ~ '^[0-9]+$'
-                        THEN mts.value::int
-                        ELSE 0
-                    END
-                ) AS total_shots,
-                SUM(
-                    CASE
-                        WHEN lower(mts.name) IN (
-                            'shots on goal',
-                            'shotsongoal',
-                            'shots on target'
-                        )
-                        AND mts.value ~ '^[0-9]+$'
-                        THEN mts.value::int
-                        ELSE 0
-                    END
-                ) AS shots_on_goal
-            FROM matches m
-            LEFT JOIN match_team_stats mts
-              ON mts.fixture_id = m.fixture_id
-             AND mts.team_id   = %s
-            WHERE m.league_id = %s
-              AND m.season    = %s
-              AND (%s = m.home_id OR %s = m.away_id)
-              AND (
-                    lower(m.status_group) IN ('finished','ft','fulltime')
-                 OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-              )
-            GROUP BY m.fixture_id, m.home_id, m.away_id
-            """,
-            (team_id, league_id, season_int, team_id, team_id),
-        )
+    # ─ 실제 계산은 아래 insights 모듈에게 위임 ─
+    enrich_overall_shooting_efficiency(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        matches_total_api=matches_total_api,
+    )
 
-        if shot_rows:
-            total_matches = 0
-            home_matches = 0
-            away_matches = 0
+    enrich_overall_outcome_and_combos(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+    )
 
-            total_shots_total = 0
-            total_shots_home = 0
-            total_shots_away = 0
-
-            sog_total = 0
-            sog_home = 0
-            sog_away = 0
-
-            for r2 in shot_rows:
-                ts = r2["total_shots"] or 0
-                sog = r2["shots_on_goal"] or 0
-
-                is_home = (r2["home_id"] == team_id)
-                is_away = (r2["away_id"] == team_id)
-                if not (is_home or is_away):
-                    continue
-
-                total_matches += 1
-                total_shots_total += ts
-                sog_total += sog
-
-                if is_home:
-                    home_matches += 1
-                    total_shots_home += ts
-                    sog_home += sog
-                else:
-                    away_matches += 1
-                    total_shots_away += ts
-                    sog_away += sog
-
-            # API 쪽 fixtures.played 값이 없으면 실제 경기 수 사용
-            eff_total = matches_total_api or total_matches or 0
-            eff_home = home_matches or 0
-            eff_away = away_matches or 0
-
-            # shots 블록도 같이 기록 (나중에 재사용 가능)
-            stats["shots"] = {
-                "total": {
-                    "total": int(total_shots_total),
-                    "home": int(total_shots_home),
-                    "away": int(total_shots_away),
-                },
-                "on": {
-                    "total": int(sog_total),
-                    "home": int(sog_home),
-                    "away": int(sog_away),
-                },
-            }
-
-            avg_total = fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
-            avg_home = fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
-            avg_away = fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
-
-            insights["shots_per_match"] = {
-                "total": avg_total,
-                "home": avg_home,
-                "away": avg_away,
-            }
-            insights["shots_on_target_pct"] = {
-                "total": fmt_pct(sog_total, total_shots_total),
-                "home": fmt_pct(sog_home, total_shots_home),
-                "away": fmt_pct(sog_away, total_shots_away),
-            }
-
-    # ─────────────────────────────
-    # Outcome & Totals / Result Combos
-    # ─────────────────────────────
-    if season_int is not None:
-        match_rows = fetch_all(
-            """
-            SELECT
-                m.fixture_id,
-                m.home_id,
-                m.away_id,
-                m.home_ft,
-                m.away_ft,
-                m.status_group
-            FROM matches m
-            WHERE m.league_id = %s
-              AND m.season    = %s
-              AND (%s = m.home_id OR %s = m.away_id)
-              AND (
-                    lower(m.status_group) IN ('finished','ft','fulltime')
-                 OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-              )
-            """,
-            (league_id, season_int, team_id, team_id),
-        )
-
-        mt_tot = mh_tot = ma_tot = 0
-
-        win_t = win_h = win_a = 0
-        draw_t = draw_h = draw_a = 0
-        lose_t = lose_h = lose_a = 0
-
-        btts_t = btts_h = btts_a = 0
-        team_o05_t = team_o05_h = team_o05_a = 0
-        team_o15_t = team_o15_h = team_o15_a = 0
-        o15_t = o15_h = o15_a = 0
-        o25_t = o25_h = o25_a = 0
-        win_o25_t = win_o25_h = win_o25_a = 0
-        lose_btts_t = lose_btts_h = lose_btts_a = 0
-
-        cs_t = cs_h = cs_a = 0
-        ng_t = ng_h = ng_a = 0
-
-        gf_sum_t = gf_sum_h = gf_sum_a = 0.0
-        ga_sum_t = ga_sum_h = ga_sum_a = 0.0
-
-        for mr in match_rows:
-            home_id = mr["home_id"]
-            away_id = mr["away_id"]
-            home_ft = mr["home_ft"]
-            away_ft = mr["away_ft"]
-
-            if home_ft is None or away_ft is None:
-                continue
-
-            is_home = (team_id == home_id)
-            gf = home_ft if is_home else away_ft
-            ga = away_ft if is_home else home_ft
-
-            if gf is None or ga is None:
-                continue
-
-            mt_tot += 1
-            if is_home:
-                mh_tot += 1
-            else:
-                ma_tot += 1
-
-            if gf > ga:
-                win_t += 1
-                if is_home:
-                    win_h += 1
-                else:
-                    win_a += 1
-            elif gf == ga:
-                draw_t += 1
-                if is_home:
-                    draw_h += 1
-                else:
-                    draw_a += 1
-            else:
-                lose_t += 1
-                if is_home:
-                    lose_h += 1
-                else:
-                    lose_a += 1
-
-            gf_sum_t += gf
-            ga_sum_t += ga
-            if is_home:
-                gf_sum_h += gf
-                ga_sum_h += ga
-            else:
-                gf_sum_a += gf
-                ga_sum_a += ga
-
-            if gf > 0 and ga > 0:
-                btts_t += 1
-                if is_home:
-                    btts_h += 1
-                else:
-                    btts_a += 1
-
-            if gf >= 1:
-                team_o05_t += 1
-                if is_home:
-                    team_o05_h += 1
-                else:
-                    team_o05_a += 1
-            if gf >= 2:
-                team_o15_t += 1
-                if is_home:
-                    team_o15_h += 1
-                else:
-                    team_o15_a += 1
-
-            total_goals = gf + ga
-            if total_goals >= 2:
-                o15_t += 1
-                if is_home:
-                    o15_h += 1
-                else:
-                    o15_a += 1
-            if total_goals >= 3:
-                o25_t += 1
-                if is_home:
-                    o25_h += 1
-                else:
-                    o25_a += 1
-
-            if gf > ga and total_goals >= 3:
-                win_o25_t += 1
-                if is_home:
-                    win_o25_h += 1
-                else:
-                    win_o25_a += 1
-
-            if gf < ga and gf > 0 and ga > 0:
-                lose_btts_t += 1
-                if is_home:
-                    lose_btts_h += 1
-                else:
-                    lose_btts_a += 1
-
-            if ga == 0:
-                cs_t += 1
-                if is_home:
-                    cs_h += 1
-                else:
-                    cs_a += 1
-            if gf == 0:
-                ng_t += 1
-                if is_home:
-                    ng_h += 1
-                else:
-                    ng_a += 1
-
-        if mt_tot > 0:
-            insights.setdefault(
-                "win_pct",
-                {
-                    "total": fmt_pct(win_t, mt_tot),
-                    "home": fmt_pct(win_h, mh_tot or mt_tot),
-                    "away": fmt_pct(win_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "btts_pct",
-                {
-                    "total": fmt_pct(btts_t, mt_tot),
-                    "home": fmt_pct(btts_h, mh_tot or mt_tot),
-                    "away": fmt_pct(btts_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "team_over05_pct",
-                {
-                    "total": fmt_pct(team_o05_t, mt_tot),
-                    "home": fmt_pct(team_o05_h, mh_tot or mt_tot),
-                    "away": fmt_pct(team_o05_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "team_over15_pct",
-                {
-                    "total": fmt_pct(team_o15_t, mt_tot),
-                    "home": fmt_pct(team_o15_h, mh_tot or mt_tot),
-                    "away": fmt_pct(team_o15_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "over15_pct",
-                {
-                    "total": fmt_pct(o15_t, mt_tot),
-                    "home": fmt_pct(o15_h, mh_tot or mt_tot),
-                    "away": fmt_pct(o15_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "over25_pct",
-                {
-                    "total": fmt_pct(o25_t, mt_tot),
-                    "home": fmt_pct(o25_h, mh_tot or mt_tot),
-                    "away": fmt_pct(o25_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "clean_sheet_pct",
-                {
-                    "total": fmt_pct(cs_t, mt_tot),
-                    "home": fmt_pct(cs_h, mh_tot or mt_tot),
-                    "away": fmt_pct(cs_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "no_goals_pct",
-                {
-                    "total": fmt_pct(ng_t, mt_tot),
-                    "home": fmt_pct(ng_h, mh_tot or mt_tot),
-                    "away": fmt_pct(ng_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "win_and_over25_pct",
-                {
-                    "total": fmt_pct(win_o25_t, mt_tot),
-                    "home": fmt_pct(win_o25_h, mh_tot or mt_tot),
-                    "away": fmt_pct(win_o25_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "lose_and_btts_pct",
-                {
-                    "total": fmt_pct(lose_btts_t, mt_tot),
-                    "home": fmt_pct(lose_btts_h, mh_tot or mt_tot),
-                    "away": fmt_pct(lose_btts_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "draw_pct",
-                {
-                    "total": fmt_pct(draw_t, mt_tot),
-                    "home": fmt_pct(draw_h, mh_tot or mt_tot),
-                    "away": fmt_pct(draw_a, ma_tot or mt_tot),
-                },
-            )
-            insights.setdefault(
-                "goal_diff_avg",
-                {
-                    "total": fmt_avg(gf_sum_t - ga_sum_t, mt_tot),
-                    "home": fmt_avg(gf_sum_h - ga_sum_h, mh_tot or mt_tot),
-                    "away": fmt_avg(gf_sum_a - ga_sum_a, ma_tot or mt_tot),
-                },
-            )
+    # 아직은 빈 껍데기지만, 구조만 잡아두기
+    enrich_overall_timing(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+    )
+    enrich_overall_firstgoal_momentum(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+    )
+    enrich_overall_goals_by_time(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+    )
+    enrich_overall_discipline_setpieces(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+    )
 
     # 최종 반환
     return {
