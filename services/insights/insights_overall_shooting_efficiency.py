@@ -1,4 +1,4 @@
-# services/insights/insights_overall_shooting_effiency.py
+# services/insights/insights_overall_shooting_efficiency.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -14,14 +14,13 @@ def enrich_overall_shooting_efficiency(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
-    matches_total_api: int,
+    matches_total_api: int = 0,
 ) -> None:
     """
-    Shooting & Efficiency 섹션에 필요한 지표들을 채운다.
+    Insights Overall - Shooting & Efficiency 섹션.
 
-    - stats["shots"]
-    - insights["shots_per_match"]
-    - insights["shots_on_target_pct"]
+    - shots_per_match : 경기당 슈팅 수 (total/home/away)
+    - shots_on_target_pct : 유효슈팅 비율 (total/home/away)
     """
     if season_int is None:
         return
@@ -44,28 +43,28 @@ def enrich_overall_shooting_efficiency(
                 CASE
                     WHEN lower(mts.name) IN (
                         'shots on goal',
-                        'shotsongoal',
-                        'shots on target'
+                        'shots on target',
+                        'shots on target (inc woodwork)',
+                        'shots on target (inc. woodwork)'
                     )
                     AND mts.value ~ '^[0-9]+$'
                     THEN mts.value::int
                     ELSE 0
                 END
-            ) AS shots_on_goal
+            ) AS shots_on_target
         FROM matches m
-        LEFT JOIN match_team_stats mts
-          ON mts.fixture_id = m.fixture_id
-         AND mts.team_id   = %s
+        JOIN match_team_stats mts
+          ON m.fixture_id = mts.fixture_id
+         AND mts.team_id IN (m.home_id, m.away_id)
         WHERE m.league_id = %s
           AND m.season    = %s
-          AND (%s = m.home_id OR %s = m.away_id)
           AND (
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
         GROUP BY m.fixture_id, m.home_id, m.away_id
         """,
-        (team_id, league_id, season_int, team_id, team_id),
+        (league_id, season_int),
     )
 
     if not shot_rows:
@@ -83,34 +82,44 @@ def enrich_overall_shooting_efficiency(
     sog_home = 0
     sog_away = 0
 
-    for r2 in shot_rows:
-        ts = r2["total_shots"] or 0
-        sog = r2["shots_on_goal"] or 0
-
-        is_home = (r2["home_id"] == team_id)
-        is_away = (r2["away_id"] == team_id)
+    for r in shot_rows:
+        home_id = r["home_id"]
+        away_id = r["away_id"]
+        is_home = (home_id == team_id)
+        is_away = (away_id == team_id)
         if not (is_home or is_away):
             continue
 
+        total_shots = r["total_shots"] or 0
+        sog = r["shots_on_target"] or 0
+
+        if total_shots <= 0 and sog <= 0:
+            continue
+
         total_matches += 1
-        total_shots_total += ts
+        total_shots_total += total_shots
         sog_total += sog
 
         if is_home:
             home_matches += 1
-            total_shots_home += ts
+            total_shots_home += total_shots
             sog_home += sog
         else:
             away_matches += 1
-            total_shots_away += ts
+            total_shots_away += total_shots
             sog_away += sog
 
-    # API 쪽 fixtures.played 값이 없으면 실제 경기 수 사용
+    if total_matches == 0:
+        return
+
     eff_total = matches_total_api or total_matches or 0
     eff_home = home_matches or 0
     eff_away = away_matches or 0
 
-    # shots 블록 기록
+    if eff_total == 0:
+        return
+
+    # shots 블록도 같이 기록 (다른 곳에서 재사용 가능)
     stats["shots"] = {
         "total": {
             "total": int(total_shots_total),
@@ -124,7 +133,7 @@ def enrich_overall_shooting_efficiency(
         },
     }
 
-    avg_total = fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
+    avg_total = fmt_avg(total_shots_total, eff_total)
     avg_home = fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
     avg_away = fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
 
@@ -135,6 +144,6 @@ def enrich_overall_shooting_efficiency(
     }
     insights["shots_on_target_pct"] = {
         "total": fmt_pct(sog_total, total_shots_total),
-        "home": fmt_pct(sog_home, total_shots_home),
-        "away": fmt_pct(sog_away, total_shots_away),
+        "home": fmt_pct(sog_home, total_shots_home) if total_shots_home > 0 else 0,
+        "away": fmt_pct(sog_away, total_shots_away) if total_shots_away > 0 else 0,
     }
