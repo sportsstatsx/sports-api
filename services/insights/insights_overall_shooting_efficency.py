@@ -1,55 +1,32 @@
+# services/insights/insights_overall_shooting_effiency.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from db import fetch_all
+from .utils import fmt_pct, fmt_avg
 
 
-def _safe_div(num, den) -> float:
-    try:
-        num_f = float(num)
-    except (TypeError, ValueError):
-        return 0.0
-    try:
-        den_f = float(den)
-    except (TypeError, ValueError):
-        return 0.0
-    if den_f == 0:
-        return 0.0
-    return num_f / den_f
-
-
-def _fmt_pct(n, d) -> int:
-    v = _safe_div(n, d)
-    return int(round(v * 100)) if v > 0 else 0
-
-
-def _fmt_avg(n, d) -> float:
-    v = _safe_div(n, d)
-    return round(v, 2) if v > 0 else 0.0
-
-
-def insights_overall_shooting_efficency(
+def enrich_overall_shooting_efficiency(
     stats: Dict[str, Any],
     insights: Dict[str, Any],
-    team_id: int,
+    *,
     league_id: int,
     season_int: Optional[int],
+    team_id: int,
     matches_total_api: int,
 ) -> None:
     """
-    기존 home_service.get_team_season_stats 안에 있던
-    'Shooting & Efficiency (Shots)' 블록을 그대로 분리한 함수.
+    Shooting & Efficiency 섹션에 필요한 지표들을 채운다.
 
-    - stats: team_season_stats.value 전체 JSON(dict)
-    - insights: stats["insights_overall"]
-    - matches_total_api: fixtures.played.total (없으면 0)
+    - stats["shots"]
+    - insights["shots_per_match"]
+    - insights["shots_on_target_pct"]
     """
-
     if season_int is None:
         return
 
-    shot_rows: List[Dict[str, Any]] = fetch_all(
+    shot_rows = fetch_all(
         """
         SELECT
             m.fixture_id,
@@ -128,10 +105,12 @@ def insights_overall_shooting_efficency(
             total_shots_away += ts
             sog_away += sog
 
+    # API 쪽 fixtures.played 값이 없으면 실제 경기 수 사용
     eff_total = matches_total_api or total_matches or 0
     eff_home = home_matches or 0
     eff_away = away_matches or 0
 
+    # shots 블록 기록
     stats["shots"] = {
         "total": {
             "total": int(total_shots_total),
@@ -145,9 +124,9 @@ def insights_overall_shooting_efficency(
         },
     }
 
-    avg_total = _fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
-    avg_home = _fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
-    avg_away = _fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
+    avg_total = fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
+    avg_home = fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
+    avg_away = fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
 
     insights["shots_per_match"] = {
         "total": avg_total,
@@ -155,7 +134,7 @@ def insights_overall_shooting_efficency(
         "away": avg_away,
     }
     insights["shots_on_target_pct"] = {
-        "total": _fmt_pct(sog_total, total_shots_total),
-        "home": _fmt_pct(sog_home, total_shots_home),
-        "away": _fmt_pct(sog_away, total_shots_away),
+        "total": fmt_pct(sog_total, total_shots_total),
+        "home": fmt_pct(sog_home, total_shots_home),
+        "away": fmt_pct(sog_away, total_shots_away),
     }
