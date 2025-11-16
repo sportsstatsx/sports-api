@@ -1,27 +1,18 @@
 # services/insights/__init__.py
-"""
-services/insights 패키지
+from __future__ import annotations
 
-MatchDetail → Insights 탭에서 사용하는
-Overall 섹션 관련 계산들을 모은 곳.
 """
+Insights 패키지.
 
-from .insights_overall_outcome_totals import enrich_overall_outcome_and_combos
-from .insights_overall_shooting_efficiency import enrich_overall_shooting_efficiency
-from .insights_overall_timing import enrich_overall_timing
-from .insights_overall_firstgoal_momentum import (
-    enrich_overall_firstgoal_momentum,
-)
-from .insights_overall_goalsbytime import enrich_overall_goals_by_time
-from .insights_overall_discipline_setpieces import (
-    enrich_overall_discipline_setpieces,
-)
+여기서는 패키지 마커 역할만 하고,
+개별 모듈은 필요한 곳(예: home_service)에서 직접 import 한다.
+"""
 
 __all__ = [
-    "enrich_overall_outcome_and_combos",
-    "enrich_overall_shooting_efficiency",
-    "enrich_overall_timing",
-    "enrich_overall_firstgoal_momentum",
-    "enrich_overall_goals_by_time",
-    "enrich_overall_discipline_setpieces",
+    "insights_overall_shooting_efficiency",
+    "insights_overall_outcome_totals",
+    "insights_overall_goalsbytime",
+    "insights_overall_timing",
+    "insights_overall_firstgoal_momentum",
+    "insights_overall_discipline_setpieces",
 ]
