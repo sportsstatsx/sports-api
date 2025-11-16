@@ -1,5 +1,3 @@
-# services/home_service.py
-
 from __future__ import annotations
 
 import json
@@ -222,24 +220,17 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
     if not isinstance(stats, dict):
         stats = {}
 
-    # ------------------------------------------------------------------
     # insights_overall 보장
-    # ------------------------------------------------------------------
     insights = stats.get("insights_overall")
     if not isinstance(insights, dict):
         insights = {}
         stats["insights_overall"] = insights
 
-    # ------------------------------------------------------------------
-    # 공통 유틸
-    # ------------------------------------------------------------------
     fixtures = stats.get("fixtures") or {}
     played = fixtures.get("played") or {}
-
     matches_total_api = played.get("total") or 0
-    matches_home_api = played.get("home") or 0
-    matches_away_api = played.get("away") or 0
 
+    # 공통 유틸
     def safe_div(num, den) -> float:
         try:
             num_f = float(num)
@@ -261,16 +252,16 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         v = safe_div(n, d)
         return round(v, 2) if v > 0 else 0.0
 
-    # 현재 시즌
+    # 시즌
     season = row.get("season")
     try:
         season_int = int(season)
     except (TypeError, ValueError):
         season_int = None
 
-    # ------------------------------------------------------------------
-    # 1) Shooting & Efficiency – match_team_stats 기반 계산
-    # ------------------------------------------------------------------
+    # ─────────────────────────────
+    # Shooting & Efficiency (Shots)
+    # ─────────────────────────────
     if season_int is not None:
         shot_rows = fetch_all(
             """
@@ -278,19 +269,20 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 m.fixture_id,
                 m.home_id,
                 m.away_id,
-                MAX(
+                SUM(
                     CASE
-                        WHEN mts.name IN ('Total Shots', 'Shots Total', 'Total shots', 'Shots')
+                        WHEN lower(mts.name) IN ('total shots','shots total','shots')
                              AND mts.value ~ '^[0-9]+$'
                         THEN mts.value::int
                         ELSE 0
                     END
                 ) AS total_shots,
-                MAX(
+                SUM(
                     CASE
-                        WHEN mts.name IN (
-                            'Shots on Goal', 'ShotsOnGoal',
-                            'Shots on target', 'Shots on Target'
+                        WHEN lower(mts.name) IN (
+                            'shots on goal',
+                            'shotsongoal',
+                            'shots on target'
                         )
                         AND mts.value ~ '^[0-9]+$'
                         THEN mts.value::int
@@ -298,15 +290,19 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                     END
                 ) AS shots_on_goal
             FROM matches m
-            JOIN match_team_stats mts
+            LEFT JOIN match_team_stats mts
               ON mts.fixture_id = m.fixture_id
              AND mts.team_id   = %s
-            WHERE m.league_id    = %s
-              AND m.season       = %s
-              AND m.status_group = 'FINISHED'
+            WHERE m.league_id = %s
+              AND m.season    = %s
+              AND (%s = m.home_id OR %s = m.away_id)
+              AND (
+                    lower(m.status_group) IN ('finished','ft','fulltime')
+                 OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
+              )
             GROUP BY m.fixture_id, m.home_id, m.away_id
             """,
-            (team_id, league_id, season_int),
+            (team_id, league_id, season_int, team_id, team_id),
         )
 
         if shot_rows:
@@ -344,12 +340,12 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                     total_shots_away += ts
                     sog_away += sog
 
-            # API 쪽 fixtures.played 가 없으면 실제 경기 수로 보정
-            eff_total = matches_total_api or total_matches
-            eff_home = matches_home_api or (home_matches or eff_total)
-            eff_away = matches_away_api or (away_matches or eff_total)
+            # API 쪽 fixtures.played 값이 없으면 실제 경기 수 사용
+            eff_total = matches_total_api or total_matches or 0
+            eff_home = home_matches or 0
+            eff_away = away_matches or 0
 
-            # shots 블록도 같이 채워두면 나중에 재사용 가능
+            # shots 블록도 같이 기록 (나중에 재사용 가능)
             stats["shots"] = {
                 "total": {
                     "total": int(total_shots_total),
@@ -363,10 +359,14 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 },
             }
 
+            avg_total = fmt_avg(total_shots_total, eff_total) if eff_total > 0 else 0.0
+            avg_home = fmt_avg(total_shots_home, eff_home) if eff_home > 0 else 0.0
+            avg_away = fmt_avg(total_shots_away, eff_away) if eff_away > 0 else 0.0
+
             insights["shots_per_match"] = {
-                "total": fmt_avg(total_shots_total, eff_total),
-                "home": fmt_avg(total_shots_home, eff_home),
-                "away": fmt_avg(total_shots_away, eff_away),
+                "total": avg_total,
+                "home": avg_home,
+                "away": avg_away,
             }
             insights["shots_on_target_pct"] = {
                 "total": fmt_pct(sog_total, total_shots_total),
@@ -374,9 +374,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 "away": fmt_pct(sog_away, total_shots_away),
             }
 
-    # ------------------------------------------------------------------
-    # 2) Outcome & Totals / Result Combos – matches 기반 계산
-    # ------------------------------------------------------------------
+    # ─────────────────────────────
+    # Outcome & Totals / Result Combos
+    # ─────────────────────────────
     if season_int is not None:
         match_rows = fetch_all(
             """
@@ -392,14 +392,14 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
               AND m.season    = %s
               AND (%s = m.home_id OR %s = m.away_id)
               AND (
-                    lower(m.status_group) IN ('finished', 'ft', 'fulltime')
+                    lower(m.status_group) IN ('finished','ft','fulltime')
                  OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
               )
             """,
             (league_id, season_int, team_id, team_id),
         )
 
-        mt_tot = mh_tot = ma_tot = 0  # 전체/홈/원정 경기 수
+        mt_tot = mh_tot = ma_tot = 0
 
         win_t = win_h = win_a = 0
         draw_t = draw_h = draw_a = 0
@@ -435,14 +435,12 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
             if gf is None or ga is None:
                 continue
 
-            # 경기 수
             mt_tot += 1
             if is_home:
                 mh_tot += 1
             else:
                 ma_tot += 1
 
-            # 승/무/패
             if gf > ga:
                 win_t += 1
                 if is_home:
@@ -462,7 +460,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     lose_a += 1
 
-            # 득점/실점 합계 (Goal Diff 평균용)
             gf_sum_t += gf
             ga_sum_t += ga
             if is_home:
@@ -472,7 +469,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 gf_sum_a += gf
                 ga_sum_a += ga
 
-            # BTTS
             if gf > 0 and ga > 0:
                 btts_t += 1
                 if is_home:
@@ -480,7 +476,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     btts_a += 1
 
-            # 팀 득점 기준
             if gf >= 1:
                 team_o05_t += 1
                 if is_home:
@@ -494,7 +489,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     team_o15_a += 1
 
-            # 전체 득점 기준
             total_goals = gf + ga
             if total_goals >= 2:
                 o15_t += 1
@@ -509,7 +503,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     o25_a += 1
 
-            # Win & Over 2.5
             if gf > ga and total_goals >= 3:
                 win_o25_t += 1
                 if is_home:
@@ -517,7 +510,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     win_o25_a += 1
 
-            # Lose & BTTS
             if gf < ga and gf > 0 and ga > 0:
                 lose_btts_t += 1
                 if is_home:
@@ -525,7 +517,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 else:
                     lose_btts_a += 1
 
-            # 클린시트 / 노골
             if ga == 0:
                 cs_t += 1
                 if is_home:
@@ -540,7 +531,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                     ng_a += 1
 
         if mt_tot > 0:
-            # Outcome & Totals
             insights.setdefault(
                 "win_pct",
                 {
@@ -605,8 +595,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                     "away": fmt_pct(ng_a, ma_tot or mt_tot),
                 },
             )
-
-            # Result Combos & Draw / Goal Diff
             insights.setdefault(
                 "win_and_over25_pct",
                 {
@@ -651,7 +639,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
 
 # ─────────────────────────────────────
-#  5) 팀 정보 (teams 테이블)
+#  5) 팀 정보
 # ─────────────────────────────────────
 
 def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
