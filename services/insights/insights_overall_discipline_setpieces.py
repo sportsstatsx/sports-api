@@ -11,18 +11,14 @@ def insights_overall_discipline_setpieces(
     season_int: Optional[int],
 ) -> None:
     """
-    Insights Overall - Discipline & Set Pieces 섹션 계산용.
+    Insights Overall - Discipline & Set Pieces 섹션 계산 자리.
 
-    예:
-      - 옐로/레드 카드 평균
-      - 파울, 프리킥, 코너 관련 지표 등
+    아직 서버 쪽 구현은 안 되어 있고,
+    team_season_stats.value 에 있는 원시 데이터만 사용하는 상태라면
+    여기서는 별도 작업을 하지 않아도 된다.
 
-    지금은 team_season_stats.value.cards / corners 구조를
-    그대로 쓰고 있을 가능성이 크다.
-
-    다음 단계에서:
-      - 카드/코너/세트피스 관련 계산을 이 함수 안에 정리해서
-        insights_overall.* 키로 채워 넣을 예정.
+    추후:
+      - 카드, 파울, 코너킥, 프리킥 등을 이용해
+        insights_overall.* 형태로 가공하는 로직을 이 함수에 넣으면 된다.
     """
-    # TODO: 카드 / 세트피스 관련 계산 로직을 여기로 구현
     return
