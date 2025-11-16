@@ -6,6 +6,24 @@ from typing import Any, Dict, List, Optional
 
 from db import fetch_all
 
+from .insights.insights_overall_shooting_efficiency import (
+    enrich_overall_shooting_efficiency,
+)
+from .insights.insights_overall_outcome_totals import (
+    enrich_overall_outcome_and_combos,
+)
+from .insights.insights_overall_goalsbytime import (
+    enrich_overall_goals_by_time,
+)
+from .insights.insights_overall_timing import enrich_overall_timing
+from .insights.insights_overall_firstgoal_momentum import (
+    enrich_overall_firstgoal_momentum,
+)
+from .insights.insights_overall_discipline_setpieces import (
+    enrich_overall_discipline_setpieces,
+)
+
+
 
 # ─────────────────────────────────────
 #  공통: 날짜 파싱/정규화
@@ -228,8 +246,9 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
     """
     team_season_stats 테이블에서 (league_id, team_id)에 해당하는
-    가장 최신 season 한 줄을 가져오고, 섹션별 insights_overall_* 모듈을 통해
-    모든 Insights Overall 지표를 계산/보강해서 반환한다.
+    가장 최신 season 한 줄을 가져오고,
+    stats["value"] 안의 insights_overall 블록을
+    섹션별 모듈(enrich_overall_*)을 통해 채워서 반환한다.
     """
     rows = fetch_all(
         """
@@ -251,9 +270,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         return None
 
     row = rows[0]
-
-    # value(JSON)를 dict로 안전하게 파싱
     raw_value = row.get("value")
+
+    # value(JSON) 파싱
     if isinstance(raw_value, str):
         try:
             stats: Dict[str, Any] = json.loads(raw_value)
@@ -273,114 +292,107 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         insights = {}
         stats["insights_overall"] = insights
 
-    # fixtures.played.total 등 기본 경기 수 (있으면 사용, 없으면 모듈에서 재계산)
+    # fixtures.played.total (API에서 온 경기수) 추출
     fixtures = stats.get("fixtures") or {}
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
 
-    # season 값 정수형으로 변환
+    # 시즌 값
     season = row.get("season")
     try:
-        season_int: Optional[int] = int(season) if season is not None else None
+        season_int = int(season)
     except (TypeError, ValueError):
         season_int = None
 
     if season_int is not None:
-        # 섹션별 계산 모듈 호출 (실패해도 전체가 죽지 않도록 보호)
+        # ─────────────────────────────
+        # Shooting & Efficiency
+        # ─────────────────────────────
         try:
-            from services.insights.insights_overall_shooting_efficiency import (
-                enrich_overall_shooting_efficiency,
-            )
-            from services.insights.insights_overall_outcome_totals import (
-                enrich_overall_outcome_totals,
-            )
-            from services.insights.insights_overall_resultscombos_draw import (
-                enrich_overall_resultscombos_draw,
-            )
-            from services.insights.insights_overall_goalsbytime import (
-                enrich_overall_goals_by_time,
-            )
-            from services.insights.insights_overall_timing import (
-                enrich_overall_timing,
-            )
-            from services.insights.insights_overall_firstgoal_momentum import (
-                enrich_overall_firstgoal_momentum,
-            )
-            from services.insights.insights_overall_discipline_setpieces import (
-                enrich_overall_discipline_setpieces,
-            )
-
-            # 1) 슈팅/효율
             enrich_overall_shooting_efficiency(
-                stats=stats,
-                insights=insights,
+                stats,
+                insights,
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
                 matches_total_api=matches_total_api,
             )
-
-            # 2) Outcome & Totals, Goal Diff, Clean Sheet, No Goals, Combos
-            enrich_overall_outcome_totals(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-                matches_total_api=matches_total_api,
-            )
-
-            # 3) Result Combos & Draw (추가 콤보 필요시 이쪽에서 확장)
-            enrich_overall_resultscombos_draw(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-                matches_total_api=matches_total_api,
-            )
-
-            # 4) Goals by Time (For / Against)
-            enrich_overall_goals_by_time(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-            )
-
-            # 5) Timing (1H/2H, 구간 득점 등)
-            enrich_overall_timing(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-            )
-
-            # 6) First Goal & Momentum
-            enrich_overall_firstgoal_momentum(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-            )
-
-            # 7) Discipline & Set Pieces (코너, 카드, 레드 이후 영향 등)
-            enrich_overall_discipline_setpieces(
-                stats=stats,
-                insights=insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-                matches_total_api=matches_total_api,
-            )
-
         except Exception:
-            # 일부 섹션 계산이 실패하더라도 기본 value는 그대로 반환
+            # 한 섹션 계산 실패해도 전체 응답은 유지
             pass
 
+        # ─────────────────────────────
+        # Outcome & Totals + Result Combos & Draw
+        # ─────────────────────────────
+        try:
+            enrich_overall_outcome_and_combos(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # ─────────────────────────────
+        # Goals by Time (For / Against)
+        # ─────────────────────────────
+        try:
+            enrich_overall_goals_by_time(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # ─────────────────────────────
+        # Discipline & Set Pieces (코너/옐/레드 per match)
+        # ─────────────────────────────
+        try:
+            enrich_overall_discipline_setpieces(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                matches_total_api=matches_total_api,
+            )
+        except Exception:
+            pass
+
+        # ─────────────────────────────
+        # Timing
+        # ─────────────────────────────
+        try:
+            enrich_overall_timing(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # ─────────────────────────────
+        # First Goal & Momentum
+        # ─────────────────────────────
+        try:
+            enrich_overall_firstgoal_momentum(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+    # 최종 반환 구조는 기존과 동일하게 유지
     return {
         "league_id": row["league_id"],
         "season": row["season"],
@@ -388,6 +400,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         "name": row.get("name"),
         "value": stats,
     }
+
 
 
 # ─────────────────────────────────────
