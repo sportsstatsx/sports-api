@@ -7,7 +7,7 @@ Overall 섹션 관련 계산들을 모은 곳.
 """
 
 from .insights_overall_outcome_totals import enrich_overall_outcome_and_combos
-from .insights_overall_shooting_effiency import enrich_overall_shooting_efficiency
+from .insights_overall_shooting_efficiency import enrich_overall_shooting_efficiency
 from .insights_overall_timing import enrich_overall_timing
 from .insights_overall_firstgoal_momentum import (
     enrich_overall_firstgoal_momentum,
