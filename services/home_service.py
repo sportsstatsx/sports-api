@@ -1,6 +1,6 @@
 from typing import Optional, Dict, Any, List
 import json
-from services.db import fetch_all
+from db import fetch_all
 
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
     """
