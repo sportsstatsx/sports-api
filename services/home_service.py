@@ -183,19 +183,8 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
     """
     team_season_stats 테이블에서 (league_id, team_id)에 해당하는
-    가장 최신 season 한 줄을 가져온 뒤, 서버에서만 계산 가능한
-    insights_overall.* 값을 채워 넣는다.
-
-    - shots_per_match
-    - shots_on_target_pct
-    - btts_pct
-    - team_over05_pct
-    - team_over15_pct
-    - over15_pct
-    - over25_pct
-    - win_and_over25_pct
-    - lose_and_btts_pct
-    - goal_diff_avg
+    가장 최신 season 한 줄을 가져오고, 거기에 insights_overall.* 지표를
+    추가/보정해서 반환한다.
     """
     rows = fetch_all(
         """
@@ -213,336 +202,383 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         """,
         (league_id, team_id),
     )
-
     if not rows:
         return None
 
     row = rows[0]
-    season = row["season"]
 
-    # value(JSONB/TEXT) → dict
-    raw_value = row["value"]
-    if isinstance(raw_value, dict):
-        stats = raw_value
-    else:
+    # value(JSON)를 파싱
+    raw_value = row.get("value")
+    if isinstance(raw_value, str):
         try:
             stats = json.loads(raw_value)
         except Exception:
             stats = {}
+    elif isinstance(raw_value, dict):
+        stats = raw_value
+    else:
+        stats = {}
 
     if not isinstance(stats, dict):
         stats = {}
 
+    # ------------------------------------------------------------------
     # insights_overall 보장
+    # ------------------------------------------------------------------
     insights = stats.get("insights_overall")
     if not isinstance(insights, dict):
         insights = {}
         stats["insights_overall"] = insights
 
-    # ─────────────────────────────────────────
-    # 기본 경기 수 (fixtures.played.*)
-    # ─────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # 공통 유틸
+    # ------------------------------------------------------------------
     fixtures = stats.get("fixtures") or {}
     played = fixtures.get("played") or {}
 
-    matches_total = played.get("total") or 0
-    matches_home = played.get("home") or 0
-    matches_away = played.get("away") or 0
+    matches_total_api = played.get("total") or 0
+    matches_home_api = played.get("home") or 0
+    matches_away_api = played.get("away") or 0
 
     def safe_div(num, den) -> float:
         try:
             num_f = float(num)
         except (TypeError, ValueError):
             return 0.0
-        if not den:
+        try:
+            den_f = float(den)
+        except (TypeError, ValueError):
             return 0.0
-        return num_f / float(den)
+        if den_f == 0:
+            return 0.0
+        return num_f / den_f
 
-    def fmt_pct(n, d) -> int:
-        v = safe_div(n, d)
-        return int(round(v * 100)) if v > 0 else 0
+    # ------------------------------------------------------------------
+    # 1) Shots / Shots on Target (기존 로직 유지)
+    # ------------------------------------------------------------------
+    shots = stats.get("shots") or {}
+    if isinstance(shots, dict) and matches_total_api:
+        total_block = shots.get("total") or {}
+        on_block = shots.get("on") or {}
 
-    def fmt_avg(n, d) -> float:
-        v = safe_div(n, d)
-        return round(v, 2) if v > 0 else 0.0
+        st_total = total_block.get("total") or 0
+        st_home = total_block.get("home") or 0
+        st_away = total_block.get("away") or 0
 
-    # ─────────────────────────────────────────
-    # A. 슈팅 지표 (✅ 예전에 잘 되던 방식 복구)
-    #    match_team_stats 에서 fixture별로 뽑아서 파이썬에서 합산
-    # ─────────────────────────────────────────
-    shot_rows = fetch_all(
-        """
-        SELECT
-            m.fixture_id,
-            m.home_id,
-            m.away_id,
-            MAX(
-                CASE
-                    WHEN mts.name IN ('Total Shots', 'Shots Total', 'Total shots', 'Shots')
-                         AND mts.value ~ '^[0-9]+$'
-                    THEN mts.value::int
-                    ELSE 0
-                END
-            ) AS total_shots,
-            MAX(
-                CASE
-                    WHEN mts.name IN (
-                        'Shots on Goal', 'ShotsOnGoal',
-                        'Shots on target', 'Shots on Target'
-                    )
-                    AND mts.value ~ '^[0-9]+$'
-                    THEN mts.value::int
-                    ELSE 0
-                END
-            ) AS shots_on_goal
-        FROM matches m
-        JOIN match_team_stats mts
-          ON mts.fixture_id = m.fixture_id
-         AND mts.team_id   = %s
-        WHERE m.league_id    = %s
-          AND m.season       = %s
-          AND m.status_group = 'FINISHED'
-        GROUP BY m.fixture_id, m.home_id, m.away_id
-        """,
-        (team_id, league_id, season),
-    )
+        so_total = on_block.get("total") or 0
+        so_home = on_block.get("home") or 0
+        so_away = on_block.get("away") or 0
 
-    if shot_rows:
-        total_matches = 0
-        home_matches = 0
-        away_matches = 0
+        def fmt_avg(n, m):
+            v = safe_div(n, m)
+            # 경기당 슛 수 → 소수 2자리 정도
+            return round(v, 2) if v > 0 else 0.0
 
-        total_shots_total = 0
-        total_shots_home = 0
-        total_shots_away = 0
+        def fmt_pct(n, d):
+            v = safe_div(n, d)
+            # % 값은 정수로
+            return int(round(v * 100)) if v > 0 else 0
 
-        sog_total = 0
-        sog_home = 0
-        sog_away = 0
-
-        for r2 in shot_rows:
-            ts = r2["total_shots"] or 0
-            sog = r2["shots_on_goal"] or 0
-
-            is_home = (r2["home_id"] == team_id)
-            is_away = (r2["away_id"] == team_id)
-            if not (is_home or is_away):
-                continue
-
-            total_matches += 1
-            total_shots_total += ts
-            sog_total += sog
-
-            if is_home:
-                home_matches += 1
-                total_shots_home += ts
-                sog_home += sog
-            else:
-                away_matches += 1
-                total_shots_away += ts
-                sog_away += sog
-
-        # fixtures.played 가 0이면 match_team_stats 기준으로 보정
-        eff_total = matches_total or total_matches
-        eff_home = matches_home or (home_matches or eff_total)
-        eff_away = matches_away or (away_matches or eff_total)
-
-        # shots 블록도 같이 채워두면 나중에 다른 곳에서 써도 일관성 유지
-        stats["shots"] = {
-            "total": {
-                "total": int(total_shots_total),
-                "home": int(total_shots_home),
-                "away": int(total_shots_away),
+        # 이미 값이 있으면 유지, 없으면 채움
+        insights.setdefault(
+            "shots_per_match",
+            {
+                "total": fmt_avg(st_total, matches_total_api),
+                "home": fmt_avg(st_home, matches_home_api or matches_total_api),
+                "away": fmt_avg(st_away, matches_away_api or matches_total_api),
             },
-            "on": {
-                "total": int(sog_total),
-                "home": int(sog_home),
-                "away": int(sog_away),
+        )
+
+        insights.setdefault(
+            "shots_on_target_pct",
+            {
+                "total": fmt_pct(so_total, st_total),
+                "home": fmt_pct(so_home, st_home),
+                "away": fmt_pct(so_away, st_away),
             },
-        }
+        )
 
-        insights["shots_per_match"] = {
-            "total": fmt_avg(total_shots_total, eff_total),
-            "home": fmt_avg(total_shots_home, eff_home),
-            "away": fmt_avg(total_shots_away, eff_away),
-        }
-        insights["shots_on_target_pct"] = {
-            "total": fmt_pct(sog_total, total_shots_total),
-            "home": fmt_pct(sog_home, total_shots_home),
-            "away": fmt_pct(sog_away, total_shots_away),
-        }
+    # ------------------------------------------------------------------
+    # 2) Outcome & Totals / Result Combos – 경기 테이블 기반 계산
+    # ------------------------------------------------------------------
+    season = row.get("season")
+    try:
+        season_int = int(season)
+    except (TypeError, ValueError):
+        season_int = None
 
-    # ─────────────────────────────────────────
-    # B. Outcome & Totals 지표 (matches 기반)
-    #    (이 부분은 슈팅과 완전히 분리되어 있어서,
-    #     잘못돼도 슈팅 데이터엔 다시 영향 안 줌)
-    # ─────────────────────────────────────────
-    outcome_rows = fetch_all(
-        """
-        SELECT
-            COUNT(*)                           AS matches_total,
-            SUM(CASE WHEN is_home THEN 1 ELSE 0 END) AS matches_home,
-            SUM(CASE WHEN NOT is_home THEN 1 ELSE 0 END) AS matches_away,
-
-            -- BTTS
-            SUM(CASE WHEN gf > 0 AND ga > 0 THEN 1 ELSE 0 END) AS btts_total,
-            SUM(CASE WHEN is_home AND gf > 0 AND ga > 0 THEN 1 ELSE 0 END) AS btts_home,
-            SUM(CASE WHEN NOT is_home AND gf > 0 AND ga > 0 THEN 1 ELSE 0 END) AS btts_away,
-
-            -- 팀 득점 기준
-            SUM(CASE WHEN gf >= 1 THEN 1 ELSE 0 END) AS team_over05_total,
-            SUM(CASE WHEN is_home AND gf >= 1 THEN 1 ELSE 0 END) AS team_over05_home,
-            SUM(CASE WHEN NOT is_home AND gf >= 1 THEN 1 ELSE 0 END) AS team_over05_away,
-
-            SUM(CASE WHEN gf >= 2 THEN 1 ELSE 0 END) AS team_over15_total,
-            SUM(CASE WHEN is_home AND gf >= 2 THEN 1 ELSE 0 END) AS team_over15_home,
-            SUM(CASE WHEN NOT is_home AND gf >= 2 THEN 1 ELSE 0 END) AS team_over15_away,
-
-            -- 전체 득점 기준
-            SUM(CASE WHEN (gf + ga) >= 2 THEN 1 ELSE 0 END) AS over15_total,
-            SUM(CASE WHEN is_home AND (gf + ga) >= 2 THEN 1 ELSE 0 END) AS over15_home,
-            SUM(CASE WHEN NOT is_home AND (gf + ga) >= 2 THEN 1 ELSE 0 END) AS over15_away,
-
-            SUM(CASE WHEN (gf + ga) >= 3 THEN 1 ELSE 0 END) AS over25_total,
-            SUM(CASE WHEN is_home AND (gf + ga) >= 3 THEN 1 ELSE 0 END) AS over25_home,
-            SUM(CASE WHEN NOT is_home AND (gf + ga) >= 3 THEN 1 ELSE 0 END) AS over25_away,
-
-            -- Win & Over 2.5
-            SUM(
-                CASE
-                    WHEN gf > ga AND (gf + ga) >= 3
-                    THEN 1 ELSE 0
-                END
-            ) AS win_over25_total,
-            SUM(
-                CASE
-                    WHEN is_home AND gf > ga AND (gf + ga) >= 3
-                    THEN 1 ELSE 0
-                END
-            ) AS win_over25_home,
-            SUM(
-                CASE
-                    WHEN NOT is_home AND gf > ga AND (gf + ga) >= 3
-                    THEN 1 ELSE 0
-                END
-            ) AS win_over25_away,
-
-            -- Lose & BTTS
-            SUM(
-                CASE
-                    WHEN gf < ga AND gf > 0 AND ga > 0
-                    THEN 1 ELSE 0
-                END
-            ) AS lose_btts_total,
-            SUM(
-                CASE
-                    WHEN is_home AND gf < ga AND gf > 0 AND ga > 0
-                    THEN 1 ELSE 0
-                END
-            ) AS lose_btts_home,
-            SUM(
-                CASE
-                    WHEN NOT is_home AND gf < ga AND gf > 0 AND ga > 0
-                    THEN 1 ELSE 0
-                END
-            ) AS lose_btts_away,
-
-            -- 골득실 합
-            SUM(gf - ga) AS gd_total,
-            SUM(CASE WHEN is_home THEN (gf - ga) ELSE 0 END) AS gd_home,
-            SUM(CASE WHEN NOT is_home THEN (gf - ga) ELSE 0 END) AS gd_away
-        FROM (
+    if season_int is not None:
+        match_rows = fetch_all(
+            """
             SELECT
                 m.fixture_id,
-                CASE
-                    WHEN m.home_id = %s THEN TRUE
-                    WHEN m.away_id = %s THEN FALSE
-                    ELSE NULL
-                END AS is_home,
-                CASE
-                    WHEN m.home_id = %s THEN m.home_ft
-                    WHEN m.away_id = %s THEN m.away_ft
-                    ELSE NULL
-                END AS gf,
-                CASE
-                    WHEN m.home_id = %s THEN m.away_ft
-                    WHEN m.away_id = %s THEN m.home_ft
-                    ELSE NULL
-                END AS ga
+                m.home_id,
+                m.away_id,
+                m.home_ft,
+                m.away_ft,
+                m.status_group
             FROM matches m
-            WHERE m.league_id    = %s
-              AND m.season       = %s
-              AND (m.home_id = %s OR m.away_id = %s)
-              AND m.status_group = 'FINISHED'
-        ) t
-        WHERE gf IS NOT NULL AND ga IS NOT NULL
-        """,
-        (
-            team_id, team_id,   # is_home 판별
-            team_id, team_id,   # gf
-            team_id, team_id,   # ga
-            league_id, season,
-            team_id, team_id,
-        ),
-    )
-
-    if outcome_rows:
-        o = outcome_rows[0]
-
-        m_total = o.get("matches_total") or matches_total
-        m_home = o.get("matches_home") or matches_home
-        m_away = o.get("matches_away") or matches_away
-
-        def row_pct(total_key: str, home_key: str, away_key: str) -> Dict[str, int]:
-            t = o.get(total_key) or 0
-            h = o.get(home_key) or 0
-            a = o.get(away_key) or 0
-            return {
-                "total": fmt_pct(t, m_total),
-                "home": fmt_pct(h, m_home or m_total),
-                "away": fmt_pct(a, m_away or m_total),
-            }
-
-        # BTTS
-        insights["btts_pct"] = row_pct(
-            "btts_total", "btts_home", "btts_away"
+            WHERE m.league_id = %s
+              AND m.season    = %s
+              AND (%s = m.home_id OR %s = m.away_id)
+              AND (
+                    lower(m.status_group) IN ('finished', 'ft', 'fulltime')
+                 OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
+              )
+            """,
+            (league_id, season_int, team_id, team_id),
         )
 
-        # Team Over 0.5 / 1.5
-        insights["team_over05_pct"] = row_pct(
-            "team_over05_total", "team_over05_home", "team_over05_away"
-        )
-        insights["team_over15_pct"] = row_pct(
-            "team_over15_total", "team_over15_home", "team_over15_away"
-        )
+        # 카운터들
+        mt_tot = mh_tot = ma_tot = 0  # 전체/홈/원정 경기 수
 
-        # Over 1.5 / 2.5
-        insights["over15_pct"] = row_pct(
-            "over15_total", "over15_home", "over15_away"
-        )
-        insights["over25_pct"] = row_pct(
-            "over25_total", "over25_home", "over25_away"
-        )
+        win_t = win_h = win_a = 0
+        draw_t = draw_h = draw_a = 0
+        lose_t = lose_h = lose_a = 0
 
-        # Win & Over 2.5
-        insights["win_and_over25_pct"] = row_pct(
-            "win_over25_total", "win_over25_home", "win_over25_away"
-        )
+        btts_t = btts_h = btts_a = 0
+        team_o05_t = team_o05_h = team_o05_a = 0
+        team_o15_t = team_o15_h = team_o15_a = 0
+        o15_t = o15_h = o15_a = 0
+        o25_t = o25_h = o25_a = 0
+        win_o25_t = win_o25_h = win_o25_a = 0
+        lose_btts_t = lose_btts_h = lose_btts_a = 0
 
-        # Lose & BTTS
-        insights["lose_and_btts_pct"] = row_pct(
-            "lose_btts_total", "lose_btts_home", "lose_btts_away"
-        )
+        cs_t = cs_h = cs_a = 0
+        ng_t = ng_h = ng_a = 0
 
-        # 골득실 평균
-        gd_total = o.get("gd_total") or 0
-        gd_home = o.get("gd_home") or 0
-        gd_away = o.get("gd_away") or 0
-        insights["goal_diff_avg"] = {
-            "total": fmt_avg(gd_total, m_total),
-            "home": fmt_avg(gd_home, m_home or m_total),
-            "away": fmt_avg(gd_away, m_away or m_total),
-        }
+        gf_sum_t = gf_sum_h = gf_sum_a = 0.0
+        ga_sum_t = ga_sum_h = ga_sum_a = 0.0
+
+        for mr in match_rows:
+            home_id = mr["home_id"]
+            away_id = mr["away_id"]
+            home_ft = mr["home_ft"]
+            away_ft = mr["away_ft"]
+
+            if home_ft is None or away_ft is None:
+                continue
+
+            is_home = (team_id == home_id)
+            gf = home_ft if is_home else away_ft
+            ga = away_ft if is_home else home_ft
+
+            if gf is None or ga is None:
+                continue
+
+            # 경기 수
+            mt_tot += 1
+            if is_home:
+                mh_tot += 1
+            else:
+                ma_tot += 1
+
+            # 승/무/패
+            if gf > ga:
+                win_t += 1
+                if is_home:
+                    win_h += 1
+                else:
+                    win_a += 1
+            elif gf == ga:
+                draw_t += 1
+                if is_home:
+                    draw_h += 1
+                else:
+                    draw_a += 1
+            else:
+                lose_t += 1
+                if is_home:
+                    lose_h += 1
+                else:
+                    lose_a += 1
+
+            # 득점/실점 합계 (Goal Diff 평균용)
+            gf_sum_t += gf
+            ga_sum_t += ga
+            if is_home:
+                gf_sum_h += gf
+                ga_sum_h += ga
+            else:
+                gf_sum_a += gf
+                ga_sum_a += ga
+
+            # BTTS
+            if gf > 0 and ga > 0:
+                btts_t += 1
+                if is_home:
+                    btts_h += 1
+                else:
+                    btts_a += 1
+
+            # 팀 득점 기준
+            if gf >= 1:
+                team_o05_t += 1
+                if is_home:
+                    team_o05_h += 1
+                else:
+                    team_o05_a += 1
+            if gf >= 2:
+                team_o15_t += 1
+                if is_home:
+                    team_o15_h += 1
+                else:
+                    team_o15_a += 1
+
+            # 전체 득점 기준
+            total_goals = gf + ga
+            if total_goals >= 2:
+                o15_t += 1
+                if is_home:
+                    o15_h += 1
+                else:
+                    o15_a += 1
+            if total_goals >= 3:
+                o25_t += 1
+                if is_home:
+                    o25_h += 1
+                else:
+                    o25_a += 1
+
+            # Win & Over 2.5
+            if gf > ga and total_goals >= 3:
+                win_o25_t += 1
+                if is_home:
+                    win_o25_h += 1
+                else:
+                    win_o25_a += 1
+
+            # Lose & BTTS
+            if gf < ga and gf > 0 and ga > 0:
+                lose_btts_t += 1
+                if is_home:
+                    lose_btts_h += 1
+                else:
+                    lose_btts_a += 1
+
+            # 클린시트 / 노골
+            if ga == 0:
+                cs_t += 1
+                if is_home:
+                    cs_h += 1
+                else:
+                    cs_a += 1
+            if gf == 0:
+                ng_t += 1
+                if is_home:
+                    ng_h += 1
+                else:
+                    ng_a += 1
+
+        # 실제로 집계된 경기가 있을 때만 채운다
+        if mt_tot > 0:
+            def pct(n, d):
+                v = safe_div(n, d)
+                return int(round(v * 100)) if v > 0 else 0
+
+            def avg(n, d):
+                v = safe_div(n, d)
+                return round(v, 2) if v > 0 else 0.0
+
+            # Outcome & Totals
+            insights.setdefault(
+                "win_pct",
+                {
+                    "total": pct(win_t, mt_tot),
+                    "home": pct(win_h, mh_tot or mt_tot),
+                    "away": pct(win_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "btts_pct",
+                {
+                    "total": pct(btts_t, mt_tot),
+                    "home": pct(btts_h, mh_tot or mt_tot),
+                    "away": pct(btts_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "team_over05_pct",
+                {
+                    "total": pct(team_o05_t, mt_tot),
+                    "home": pct(team_o05_h, mh_tot or mt_tot),
+                    "away": pct(team_o05_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "team_over15_pct",
+                {
+                    "total": pct(team_o15_t, mt_tot),
+                    "home": pct(team_o15_h, mh_tot or mt_tot),
+                    "away": pct(team_o15_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "over15_pct",
+                {
+                    "total": pct(o15_t, mt_tot),
+                    "home": pct(o15_h, mh_tot or mt_tot),
+                    "away": pct(o15_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "over25_pct",
+                {
+                    "total": pct(o25_t, mt_tot),
+                    "home": pct(o25_h, mh_tot or mt_tot),
+                    "away": pct(o25_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "clean_sheet_pct",
+                {
+                    "total": pct(cs_t, mt_tot),
+                    "home": pct(cs_h, mh_tot or mt_tot),
+                    "away": pct(cs_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "no_goals_pct",
+                {
+                    "total": pct(ng_t, mt_tot),
+                    "home": pct(ng_h, mh_tot or mt_tot),
+                    "away": pct(ng_a, ma_tot or mt_tot),
+                },
+            )
+
+            # Result Combos & Draw / Goal Diff
+            insights.setdefault(
+                "win_and_over25_pct",
+                {
+                    "total": pct(win_o25_t, mt_tot),
+                    "home": pct(win_o25_h, mh_tot or mt_tot),
+                    "away": pct(win_o25_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "lose_and_btts_pct",
+                {
+                    "total": pct(lose_btts_t, mt_tot),
+                    "home": pct(lose_btts_h, mh_tot or mt_tot),
+                    "away": pct(lose_btts_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "draw_pct",
+                {
+                    "total": pct(draw_t, mt_tot),
+                    "home": pct(draw_h, mh_tot or mt_tot),
+                    "away": pct(draw_a, ma_tot or mt_tot),
+                },
+            )
+            insights.setdefault(
+                "goal_diff_avg",
+                {
+                    "total": avg(gf_sum_t - ga_sum_t, mt_tot),
+                    "home": avg(gf_sum_h - ga_sum_h, mh_tot or mt_tot),
+                    "away": avg(gf_sum_a - ga_sum_a, ma_tot or mt_tot),
+                },
+            )
 
     # 최종 반환
     return {
