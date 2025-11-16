@@ -19,15 +19,24 @@ def enrich_overall_discipline_setpieces(
     """
     Discipline & Set Pieces 섹션.
 
-    기존 home_service.py 에서 서버 DB 기준으로 계산하던
-    - corners_per_match
-    - yellow_per_match
-    - red_per_match
-    per match 값을 모듈로 분리한 버전.
+    로컬 SQLite InsightsOverallDao 와 동일한 개념으로,
+    실제 이벤트가 존재하는 경기들만 모아서
+
+      - corners_per_match
+      - yellow_per_match
+      - red_per_match
+
+    을 per match 기준으로 계산한다.
+
+    ✅ 중요:
+      - 분모는 "실제 샘플이 있는 경기수" 를 사용한다.
+        (API fixtures.played.total 은 사용하지 않음)
+      - 홈/원정도 각각 실제 출전 경기수로 나눈다.
     """
     if season_int is None:
         return
 
+    # 각 경기별로 이 팀의 코너/옐/레드 합계
     disc_rows = fetch_all(
         """
         SELECT
@@ -77,10 +86,12 @@ def enrich_overall_discipline_setpieces(
     if not disc_rows:
         return
 
+    # 경기 수 (실제 stats 샘플이 있는 경기 기준)
     tot_matches = 0
     home_matches = 0
     away_matches = 0
 
+    # 총합 (T/H/A)
     sum_corners_t = sum_corners_h = sum_corners_a = 0
     sum_yellows_t = sum_yellows_h = sum_yellows_a = 0
     sum_reds_t = sum_reds_h = sum_reds_a = 0
@@ -91,17 +102,20 @@ def enrich_overall_discipline_setpieces(
         is_home = (home_id == team_id)
         is_away = (away_id == team_id)
         if not (is_home or is_away):
+            # 방어코드: 이 팀 한정으로 쿼리했기 때문에 원래는 안 들어와야 함
             continue
 
         corners = dr["corners"] or 0
         yellows = dr["yellows"] or 0
         reds = dr["reds"] or 0
 
+        # 전체 경기 카운트
         tot_matches += 1
         sum_corners_t += corners
         sum_yellows_t += yellows
         sum_reds_t += reds
 
+        # 홈/원정 분리
         if is_home:
             home_matches += 1
             sum_corners_h += corners
@@ -113,8 +127,9 @@ def enrich_overall_discipline_setpieces(
             sum_yellows_a += yellows
             sum_reds_a += reds
 
-    # 분모: API fixtures.played.total 가 있으면 우선 사용, 없으면 실제 경기수
-    eff_tot = matches_total_api or tot_matches or 0
+    # ✅ 로컬 DB와 동일하게 "실제 샘플이 있는 경기 수"를 분모로 사용
+    #   (fixtures.played.total 과 다를 수 있으므로 matches_total_api 는 사용하지 않음)
+    eff_tot = tot_matches or 0
     eff_home = home_matches or 0
     eff_away = away_matches or 0
 
@@ -125,6 +140,7 @@ def enrich_overall_discipline_setpieces(
             fmt_avg(v_a, d_a) if d_a > 0 else 0.0,
         )
 
+    # 코너, 옐로, 레드 평균 산출
     c_tot, c_h, c_a = avg_for(
         sum_corners_t,
         sum_corners_h,
@@ -150,6 +166,7 @@ def enrich_overall_discipline_setpieces(
         eff_away,
     )
 
+    # insights_overall JSON 에 기록
     insights["corners_per_match"] = {
         "total": c_tot,
         "home": c_h,
