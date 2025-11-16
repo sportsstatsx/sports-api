@@ -11,18 +11,12 @@ def insights_overall_firstgoal_momentum(
     season_int: Optional[int],
 ) -> None:
     """
-    Insights Overall - First Goal / Momentum 섹션 계산용.
+    Insights Overall - First Goal / Momentum 섹션용 자리.
 
-    예:
-      - first_to_score_pct
-      - first_conceded_pct
-      - when_leading_win_pct / draw_pct / loss_pct
-      - when_trailing_win_pct / draw_pct / loss_pct
+    실제 계산은 현재
+      services.insights.insights_overall_timing.insights_overall_timing
+    안에서 Timing 지표와 함께 수행된다.
 
-    다음 단계에서:
-      - match_events 및 전체 스코어(gf/ga)를 이용해
-        선제골/선제 실점 여부와 리드/열세 상황의 최종 결과 비율을
-        이 함수 안에서 계산하도록 구현할 예정.
+    (동일 이벤트를 두 번 조회하지 않기 위해 여기서는 별도 작업을 하지 않는다.)
     """
-    # TODO: match_events 기반 First Goal / Momentum 계산 로직을 여기로 옮기기
     return
