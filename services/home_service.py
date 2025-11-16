@@ -305,6 +305,33 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         season_int = None
 
     if season_int is not None:
+
+            # insights_overall 블록 보장
+    insights = stats.get("insights_overall")
+    if not isinstance(insights, dict):
+        insights = {}
+        stats["insights_overall"] = insights
+
+    # ✅ 우리가 서버에서 다시 계산하는 지표인데
+    #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
+    #    (그래야 setdefault 에 막히지 않고 새 값으로 채워짐)
+    for k in [
+        "win_pct",
+        "btts_pct",
+        "team_over05_pct",
+        "team_over15_pct",
+        "over15_pct",
+        "over25_pct",
+        "clean_sheet_pct",
+        "no_goals_pct",
+        "win_and_over25_pct",
+        "lose_and_btts_pct",
+        "goal_diff_avg",
+    ]:
+        if k in insights and insights[k] is None:
+            del insights[k]
+
+        
         # ─────────────────────────────
         # Shooting & Efficiency
         # ─────────────────────────────
