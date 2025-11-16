@@ -292,27 +292,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         insights = {}
         stats["insights_overall"] = insights
 
-    # fixtures.played.total (API에서 온 경기수) 추출
-    fixtures = stats.get("fixtures") or {}
-    played = fixtures.get("played") or {}
-    matches_total_api = played.get("total") or 0
-
-    # 시즌 값
-    season = row.get("season")
-    try:
-        season_int = int(season)
-    except (TypeError, ValueError):
-        season_int = None
-
-    if season_int is not None:
-
-            # insights_overall 블록 보장
-    insights = stats.get("insights_overall")
-    if not isinstance(insights, dict):
-        insights = {}
-        stats["insights_overall"] = insights
-
-    # ✅ 우리가 서버에서 다시 계산하는 지표인데
+    # ✅ 서버에서 다시 계산하는 지표인데,
     #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
     #    (그래야 setdefault 에 막히지 않고 새 값으로 채워짐)
     for k in [
@@ -331,7 +311,19 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         if k in insights and insights[k] is None:
             del insights[k]
 
-        
+    # fixtures.played.total (API에서 온 경기수) 추출
+    fixtures = stats.get("fixtures") or {}
+    played = fixtures.get("played") or {}
+    matches_total_api = played.get("total") or 0
+
+    # 시즌 값
+    season = row.get("season")
+    try:
+        season_int = int(season)
+    except (TypeError, ValueError):
+        season_int = None
+
+    if season_int is not None:
         # ─────────────────────────────
         # Shooting & Efficiency
         # ─────────────────────────────
@@ -352,7 +344,8 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         # Outcome & Totals + Result Combos & Draw
         # ─────────────────────────────
         try:
-            enrich_overall_outcome_and_combos(
+            # ⚠️ 너가 import 한 이름: enrich_overall_outcome_totals
+            enrich_overall_outcome_totals(
                 stats,
                 insights,
                 league_id=league_id,
@@ -427,6 +420,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         "name": row.get("name"),
         "value": stats,
     }
+
 
 
 
