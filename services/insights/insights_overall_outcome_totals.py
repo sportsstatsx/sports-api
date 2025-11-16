@@ -7,21 +7,30 @@ from db import fetch_all
 from .utils import fmt_pct, fmt_avg
 
 
-def enrich_overall_outcome_and_combos(
+def enrich_overall_outcome_totals(
     stats: Dict[str, Any],
     insights: Dict[str, Any],
     *,
     league_id: int,
     season_int: Optional[int],
     team_id: int,
+    matches_total_api: int = 0,
 ) -> None:
     """
-    Outcome & Totals + Result Combos & Draw 에 필요한 지표들을
-    stats["insights_overall"] 에 채워 넣는다.
+    Insights Overall - Outcome & Totals / Goal Diff / Clean Sheet / No Goals / Result Combos.
 
-    - win_pct / draw_pct / lose_and_btts_pct ...
-    - over15_pct / over25_pct / clean_sheet_pct / no_goals_pct
-    - goal_diff_avg 등
+    생성/보정하는 키들:
+      - win_pct
+      - btts_pct
+      - team_over05_pct
+      - team_over15_pct
+      - over15_pct
+      - over25_pct
+      - goal_diff_avg
+      - clean_sheet_pct
+      - no_goals_pct
+      - win_and_over25_pct
+      - lose_and_btts_pct
     """
     if season_int is None:
         return
@@ -38,7 +47,7 @@ def enrich_overall_outcome_and_combos(
         FROM matches m
         WHERE m.league_id = %s
           AND m.season    = %s
-          AND (%s = m.home_id OR %s = m.away_id)
+          AND (m.home_id = %s OR m.away_id = %s)
           AND (
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
@@ -47,7 +56,12 @@ def enrich_overall_outcome_and_combos(
         (league_id, season_int, team_id, team_id),
     )
 
-    mt_tot = mh_tot = ma_tot = 0
+    if not match_rows:
+        return
+
+    mt_tot = 0
+    mh_tot = 0
+    ma_tot = 0
 
     win_t = win_h = win_a = 0
     draw_t = draw_h = draw_a = 0
@@ -58,14 +72,15 @@ def enrich_overall_outcome_and_combos(
     team_o15_t = team_o15_h = team_o15_a = 0
     o15_t = o15_h = o15_a = 0
     o25_t = o25_h = o25_a = 0
+
     win_o25_t = win_o25_h = win_o25_a = 0
     lose_btts_t = lose_btts_h = lose_btts_a = 0
 
     cs_t = cs_h = cs_a = 0
     ng_t = ng_h = ng_a = 0
 
-    gf_sum_t = gf_sum_h = gf_sum_a = 0.0
-    ga_sum_t = ga_sum_h = ga_sum_a = 0.0
+    gf_sum_t = gf_sum_h = gf_sum_a = 0
+    ga_sum_t = ga_sum_h = ga_sum_a = 0
 
     for mr in match_rows:
         home_id = mr["home_id"]
@@ -79,17 +94,22 @@ def enrich_overall_outcome_and_combos(
         is_home = (team_id == home_id)
         gf = home_ft if is_home else away_ft
         ga = away_ft if is_home else home_ft
-
-        if gf is None or ga is None:
-            continue
+        total_goals = (gf or 0) + (ga or 0)
 
         mt_tot += 1
+        gf_sum_t += gf
+        ga_sum_t += ga
+
         if is_home:
             mh_tot += 1
+            gf_sum_h += gf
+            ga_sum_h += ga
         else:
             ma_tot += 1
+            gf_sum_a += gf
+            ga_sum_a += ga
 
-        # 승/무/패
+        # W/D/L
         if gf > ga:
             win_t += 1
             if is_home:
@@ -109,25 +129,15 @@ def enrich_overall_outcome_and_combos(
             else:
                 lose_a += 1
 
-        # 득점/실점 누적
-        gf_sum_t += gf
-        ga_sum_t += ga
-        if is_home:
-            gf_sum_h += gf
-            ga_sum_h += ga
-        else:
-            gf_sum_a += gf
-            ga_sum_a += ga
-
-        # BTTS
-        if gf > 0 and ga > 0:
+        # BTTS / Team Over / Totals
+        is_btts = (gf > 0 and ga > 0)
+        if is_btts:
             btts_t += 1
             if is_home:
                 btts_h += 1
             else:
                 btts_a += 1
 
-        # 팀 오버 0.5 / 1.5
         if gf >= 1:
             team_o05_t += 1
             if is_home:
@@ -141,9 +151,6 @@ def enrich_overall_outcome_and_combos(
             else:
                 team_o15_a += 1
 
-        total_goals = gf + ga
-
-        # 경기 오버 1.5 / 2.5
         if total_goals >= 2:
             o15_t += 1
             if is_home:
@@ -157,23 +164,7 @@ def enrich_overall_outcome_and_combos(
             else:
                 o25_a += 1
 
-        # Win & Over 2.5
-        if gf > ga and total_goals >= 3:
-            win_o25_t += 1
-            if is_home:
-                win_o25_h += 1
-            else:
-                win_o25_a += 1
-
-        # Lose & BTTS
-        if gf < ga and gf > 0 and ga > 0:
-            lose_btts_t += 1
-            if is_home:
-                lose_btts_h += 1
-            else:
-                lose_btts_a += 1
-
-        # 클린시트 / 노골
+        # Clean sheet / No goals
         if ga == 0:
             cs_t += 1
             if is_home:
@@ -187,109 +178,88 @@ def enrich_overall_outcome_and_combos(
             else:
                 ng_a += 1
 
-    if mt_tot <= 0:
+        # Combos
+        if gf > ga and total_goals >= 3:
+            win_o25_t += 1
+            if is_home:
+                win_o25_h += 1
+            else:
+                win_o25_a += 1
+
+        if gf < ga and is_btts:
+            lose_btts_t += 1
+            if is_home:
+                lose_btts_h += 1
+            else:
+                lose_btts_a += 1
+
+    if mt_tot == 0:
         return
 
-    # 일부 팀에서 home/away 경기가 0일 수 있어서, 0 나누기 방지용
-    home_base = mh_tot or mt_tot
-    away_base = ma_tot or mt_tot
+    # 경기 수: API값이 있으면 우선, 없으면 실제 경기 수
+    eff_tot = matches_total_api or mt_tot
+    eff_home = mh_tot or eff_tot
+    eff_away = ma_tot or eff_tot
 
-    # ─ Outcome & Totals ─
-    insights.setdefault(
-        "win_pct",
-        {
-            "total": fmt_pct(win_t, mt_tot),
-            "home": fmt_pct(win_h, home_base),
-            "away": fmt_pct(win_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "btts_pct",
-        {
-            "total": fmt_pct(btts_t, mt_tot),
-            "home": fmt_pct(btts_h, home_base),
-            "away": fmt_pct(btts_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "team_over05_pct",
-        {
-            "total": fmt_pct(team_o05_t, mt_tot),
-            "home": fmt_pct(team_o05_h, home_base),
-            "away": fmt_pct(team_o05_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "team_over15_pct",
-        {
-            "total": fmt_pct(team_o15_t, mt_tot),
-            "home": fmt_pct(team_o15_h, home_base),
-            "away": fmt_pct(team_o15_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "over15_pct",
-        {
-            "total": fmt_pct(o15_t, mt_tot),
-            "home": fmt_pct(o15_h, home_base),
-            "away": fmt_pct(o15_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "over25_pct",
-        {
-            "total": fmt_pct(o25_t, mt_tot),
-            "home": fmt_pct(o25_h, home_base),
-            "away": fmt_pct(o25_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "clean_sheet_pct",
-        {
-            "total": fmt_pct(cs_t, mt_tot),
-            "home": fmt_pct(cs_h, home_base),
-            "away": fmt_pct(cs_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "no_goals_pct",
-        {
-            "total": fmt_pct(ng_t, mt_tot),
-            "home": fmt_pct(ng_h, home_base),
-            "away": fmt_pct(ng_a, away_base),
-        },
-    )
+    # 승률 등
+    insights["win_pct"] = {
+        "total": fmt_pct(win_t, eff_tot),
+        "home": fmt_pct(win_h, eff_home),
+        "away": fmt_pct(win_a, eff_away),
+    }
+    insights["btts_pct"] = {
+        "total": fmt_pct(btts_t, eff_tot),
+        "home": fmt_pct(btts_h, eff_home),
+        "away": fmt_pct(btts_a, eff_away),
+    }
+    insights["team_over05_pct"] = {
+        "total": fmt_pct(team_o05_t, eff_tot),
+        "home": fmt_pct(team_o05_h, eff_home),
+        "away": fmt_pct(team_o05_a, eff_away),
+    }
+    insights["team_over15_pct"] = {
+        "total": fmt_pct(team_o15_t, eff_tot),
+        "home": fmt_pct(team_o15_h, eff_home),
+        "away": fmt_pct(team_o15_a, eff_away),
+    }
+    insights["over15_pct"] = {
+        "total": fmt_pct(o15_t, eff_tot),
+        "home": fmt_pct(o15_h, eff_home),
+        "away": fmt_pct(o15_a, eff_away),
+    }
+    insights["over25_pct"] = {
+        "total": fmt_pct(o25_t, eff_tot),
+        "home": fmt_pct(o25_h, eff_home),
+        "away": fmt_pct(o25_a, eff_away),
+    }
 
-    # ─ Result Combos & Draw ─
-    insights.setdefault(
-        "win_and_over25_pct",
-        {
-            "total": fmt_pct(win_o25_t, mt_tot),
-            "home": fmt_pct(win_o25_h, home_base),
-            "away": fmt_pct(win_o25_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "lose_and_btts_pct",
-        {
-            "total": fmt_pct(lose_btts_t, mt_tot),
-            "home": fmt_pct(lose_btts_h, home_base),
-            "away": fmt_pct(lose_btts_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "draw_pct",
-        {
-            "total": fmt_pct(draw_t, mt_tot),
-            "home": fmt_pct(draw_h, home_base),
-            "away": fmt_pct(draw_a, away_base),
-        },
-    )
-    insights.setdefault(
-        "goal_diff_avg",
-        {
-            "total": fmt_avg(gf_sum_t - ga_sum_t, mt_tot),
-            "home": fmt_avg(gf_sum_h - ga_sum_h, home_base),
-            "away": fmt_avg(gf_sum_a - ga_sum_a, away_base),
-        },
-    )
+    # 골 득실 평균
+    insights["goal_diff_avg"] = {
+        "total": fmt_avg(gf_sum_t - ga_sum_t, eff_tot),
+        "home": fmt_avg(gf_sum_h - ga_sum_h, eff_home),
+        "away": fmt_avg(gf_sum_a - ga_sum_a, eff_away),
+    }
+
+    # 클린시트 / 무득점
+    insights["clean_sheet_pct"] = {
+        "total": fmt_pct(cs_t, eff_tot),
+        "home": fmt_pct(cs_h, eff_home),
+        "away": fmt_pct(cs_a, eff_away),
+    }
+    insights["no_goals_pct"] = {
+        "total": fmt_pct(ng_t, eff_tot),
+        "home": fmt_pct(ng_h, eff_home),
+        "away": fmt_pct(ng_a, eff_away),
+    }
+
+    # 콤보
+    insights["win_and_over25_pct"] = {
+        "total": fmt_pct(win_o25_t, eff_tot),
+        "home": fmt_pct(win_o25_h, eff_home),
+        "away": fmt_pct(win_o25_a, eff_away),
+    }
+    insights["lose_and_btts_pct"] = {
+        "total": fmt_pct(lose_btts_t, eff_tot),
+        "home": fmt_pct(lose_btts_h, eff_home),
+        "away": fmt_pct(lose_btts_a, eff_away),
+    }
