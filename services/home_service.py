@@ -115,8 +115,8 @@ def get_home_leagues(
 def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[str, Any]:
     """
     특정 리그의 주어진 날짜(date_str)에 대한 매치 디렉터리 정보.
-    Postgres 스키마에 맞게 round/status_short 컬럼을 보정하고,
-    match_events 기반으로 홈/원정 레드카드 개수를 함께 내려준다.
+    Postgres matches 스키마(라운드/short 컬럼 없음)에 맞춰서,
+    각 경기의 홈/원정 레드카드 개수까지 함께 내려준다.
     """
     norm_date = _normalize_date(date_str)
 
@@ -126,11 +126,9 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             m.fixture_id,
             m.league_id,
             m.season,
-            -- matches 테이블에 round 컬럼이 없으므로, NULL 로 채워서 alias 만 맞춘다.
-            NULL::text AS round,
+            NULL::text AS round,              -- ✅ matches에는 round 컬럼이 없으니 NULL alias 로 맞춰줌
             m.date_utc,
-            -- status_short 대신 status 컬럼을 그대로 내려준다.
-            m.status AS status_short,
+            m.status AS status_short,         -- ✅ status_short 대신 status 컬럼을 그대로 alias
             m.status_group,
             m.home_id,
             th.name   AS home_name,
@@ -174,7 +172,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
 
     for r in rows:
         season = season or r["season"]
-        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춰둠
+        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춰서 KeyError 안 남
 
         fixtures.append(
             {
@@ -190,16 +188,14 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                     "name": r["home_name"],
                     "logo": r["home_logo"],
                     "goals": r["home_ft"],
-                    # ✅ 새로 추가: 홈 팀 레드카드 개수
-                    "red_cards": r["home_red_cards"],
+                    "red_cards": r["home_red_cards"],   # 👈 새로 추가
                 },
                 "away": {
                     "id": r["away_id"],
                     "name": r["away_name"],
                     "logo": r["away_logo"],
                     "goals": r["away_ft"],
-                    # ✅ 새로 추가: 원정 팀 레드카드 개수
-                    "red_cards": r["away_red_cards"],
+                    "red_cards": r["away_red_cards"],   # 👈 새로 추가
                 },
             }
         )
