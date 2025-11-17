@@ -1,7 +1,7 @@
 # services/insights/utils.py
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 
 def safe_div(num: Any, den: Any) -> float:
@@ -43,23 +43,22 @@ def fmt_avg(n: Any, d: Any) -> float:
 
 
 # ─────────────────────────────────────
-#  필터용 공통 유틸 (Competition / Last N)
+#  Insights Overall 필터 파싱 헬퍼
+#   - Competition: All / League / Cup / Europe (UEFA) / Continental
+#   - Last N: "Season", "Last 5", "Last 10" 등
 # ─────────────────────────────────────
 
 def normalize_comp(raw: Any) -> str:
     """
-    클라이언트에서 넘어오는 competition 필터 문자열을
-    서버 내부에서 쓸 표준 형태로 정규화한다.
+    UI에서 내려오는 competition 필터 값을
+    서버 내부에서 사용하는 표준 문자열로 정규화.
 
-    예)
-      "league" / "League"      → "League"
-      "cup" / "Cup"            → "Cup"
-      "europe" / "UCL" 등      → "Europe (UEFA)"
-      "continental" 등         → "Continental"
-      그 외 / 빈값 / None      → "All"
-
-    ⚠️ 지금 단계에서는 아직 각 섹션 쿼리에서 이 값을 사용하지 않고,
-       이후 단계에서 공통 match 샘플을 만들 때 사용할 예정.
+    반환값은 아래 중 하나:
+      - "All"
+      - "League"
+      - "Cup"
+      - "Europe (UEFA)"
+      - "Continental"
     """
     if raw is None:
         return "All"
@@ -68,11 +67,11 @@ def normalize_comp(raw: Any) -> str:
     if not s:
         return "All"
 
-    lower = s.lower()
-
-    # 이미 표준 키워드로 온 경우
+    # 이미 우리가 쓰는 표준 값이면 그대로 돌려준다.
     if s in ("All", "League", "Cup", "Europe (UEFA)", "Continental"):
         return s
+
+    lower = s.lower()
 
     if "league" in lower:
         return "League"
@@ -83,28 +82,24 @@ def normalize_comp(raw: Any) -> str:
     if any(k in lower for k in ("continental", "international", "afc", "conmebol", "concacaf")):
         return "Continental"
 
-    # 그 외는 모두 All 로 통일
+    # 인식 못 하면 안전하게 전체
     return "All"
 
 
 def parse_last_n(raw: Any) -> int:
     """
-    클라이언트에서 넘어오는 lastN 값을 안전하게 정수 N 으로 변환.
+    UI에서 내려오는 lastN 값을 안전하게 정수 N 으로 변환.
 
     규칙:
-      - None / 빈 문자열         → 0  (0 = 시즌 전체 사용)
-      - "Season" / "All"         → 0
-      - "Last 5", "last 10" 등   → 5, 10 추출
-      - "7" 처럼 숫자 문자열     → 7
-      - 잘못된 형식              → 0
-
-    이 값은 나중에
-      ORDER BY date DESC LIMIT N
-    형태로 사용할 수 있다.
+      - None / "", "Season", "All"         → 0   (0 = 시즌 전체 사용)
+      - "Last 5", "last 10"                → 5, 10
+      - "5", "10" 같은 숫자 문자열        → 그대로 정수
+      - 그 외 잘못된 형식                 → 0
     """
     if raw is None:
         return 0
 
+    # 이미 숫자면 그대로
     if isinstance(raw, int):
         return raw if raw > 0 else 0
 
@@ -113,22 +108,21 @@ def parse_last_n(raw: Any) -> int:
         return 0
 
     lower = s.lower()
-    if lower in ("season", "all"):
+    if lower in ("season", "all", "full season"):
         return 0
 
-    # "Last 5", "last 10" 같은 형태
-    if lower.startswith("last"):
-        parts = s.split()
-        for p in parts:
-            if p.isdigit():
-                n = int(p)
-                return n if n > 0 else 0
-        return 0
+    # "Last 5", "Last 10" 등에서 숫자만 추출
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            n = int(digits)
+            return n if n > 0 else 0
+        except ValueError:
+            return 0
 
-    # 그냥 숫자 문자열
+    # 마지막 fallback: 전체 문자열이 숫자일 때
     if s.isdigit():
         n = int(s)
         return n if n > 0 else 0
 
-    # 그 외는 모두 0
     return 0
