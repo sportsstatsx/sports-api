@@ -1,9 +1,11 @@
 # services/insights/insights_overall_firstgoal_momentum.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, List
 
 from db import fetch_all
+from .utils import pct_int
+from .filters_lastn import build_fixture_filter_clause
 
 
 def enrich_overall_firstgoal_momentum(
@@ -11,50 +13,25 @@ def enrich_overall_firstgoal_momentum(
     insights: Dict[str, Any],
     *,
     league_id: int,
-    season_int: Optional[int],
+    season_int: int,
     team_id: int,
+    fixture_ids: Optional[List[int]] = None,
 ) -> None:
     """
-    First Goal / Momentum 섹션을 채워 넣는 함수.
-
-    - 선제골/선실점 비율
-    - 리드(선제골) 상황에서의 승/무/패 비율
-    - 트레일링(상대 선제) 상황에서의 승/무/패 비율
-
-    을 실제 match_events + 최종 스코어 기반으로 계산한다.
+    First to Score / First Concede / 리드 시 결과 등.
+    fixture_ids 가 주어지면 해당 경기들만 사용.
     """
 
-    if season_int is None:
-        return
+    extra_where, id_params = build_fixture_filter_clause(fixture_ids)
 
-    # 공통 유틸
-    def safe_div(num, den) -> float:
-        try:
-            num_f = float(num)
-        except (TypeError, ValueError):
-            return 0.0
-        try:
-            den_f = float(den)
-        except (TypeError, ValueError):
-            return 0.0
-        if den_f == 0:
-            return 0.0
-        return num_f / den_f
-
-    def fmt_pct(n, d) -> int:
-        v = safe_div(n, d)
-        return int(round(v * 100)) if v > 0 else 0
-
-    # 1) 이 팀의 완료된 경기 목록
-    match_rows: List[Dict[str, Any]] = fetch_all(
-        """
+    match_rows = fetch_all(
+        f"""
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
             m.home_ft,
-            m.away_ft,
-            m.status_group
+            m.away_ft
         FROM matches m
         WHERE m.league_id = %s
           AND m.season    = %s
@@ -63,12 +40,14 @@ def enrich_overall_firstgoal_momentum(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
+          {extra_where}
         """,
-        (league_id, season_int, team_id, team_id),
+        (league_id, season_int, team_id, team_id, *id_params),
     )
 
     if not match_rows:
         return
+
 
     fixture_ids = [mr["fixture_id"] for mr in match_rows]
     events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
