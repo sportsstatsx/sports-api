@@ -22,7 +22,7 @@ from .insights.insights_overall_firstgoal_momentum import (
 from .insights.insights_overall_discipline_setpieces import (
     enrich_overall_discipline_setpieces,
 )
-from .insights.utils import normalize_comp, parse_last_n  # 🔹 새로 추가
+from .insights.utils import normalize_comp, parse_last_n
 
 
 # ─────────────────────────────────────
@@ -76,8 +76,8 @@ def build_insights_filter_meta(
     서버 내부 표준 형태로 정규화해서 메타데이터 딕셔너리로 돌려준다.
 
     현재 단계에서는:
-      - 실제 계산에는 아직 사용하지 않고,
-      - 응답 JSON 의 value["insights_filters"] 로 내려주기만 한다.
+      - 실제 계산에는 last_n (정수)만 쓰고,
+      - comp 값은 응답 메타(insights_filters)로만 내려보낸다.
     """
     comp_norm = normalize_comp(comp_raw)
     last_n = parse_last_n(last_n_raw)
@@ -121,7 +121,7 @@ def get_home_leagues(
             m.season
         FROM matches m
         JOIN leagues l
-          ON m.league_id = l.id      -- ✅ 올바른 PK 컬럼 이름
+          ON m.league_id = l.id
         WHERE {where_clause}
         GROUP BY
             m.league_id,
@@ -169,10 +169,8 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             m.fixture_id,
             m.league_id,
             m.season,
-            -- matches 테이블에는 round 컬럼이 없으므로 NULL 로 alias 만 맞춘다.
             NULL::text AS round,
             m.date_utc,
-            -- status_short 대신 status 컬럼을 그대로 alias
             m.status AS status_short,
             m.status_group,
             m.home_id,
@@ -183,7 +181,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             ta.logo   AS away_logo,
             m.home_ft,
             m.away_ft,
-            -- ✅ 홈 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -192,7 +189,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                   AND lower(e.type)   = 'card'
                   AND lower(e.detail) = 'red card'
             ) AS home_red_cards,
-            -- ✅ 원정 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -217,7 +213,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
 
     for r in rows:
         season = season or r["season"]
-        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춤
+        round_name = round_name or r["round"]
 
         fixtures.append(
             {
@@ -225,7 +221,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                 "league_id": r["league_id"],
                 "season": r["season"],
                 "round": r["round"],
-                # 🔧 여기서 r["date_utc"] 가 str 일 수도 있어서 안전하게 변환
                 "date_utc": _to_iso_or_str(r["date_utc"]),
                 "status_short": r["status_short"],
                 "status_group": r["status_group"],
@@ -234,7 +229,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                     "name": r["home_name"],
                     "logo": r["home_logo"],
                     "goals": r["home_ft"],
-                    # ✅ 홈 팀 레드카드 개수
                     "red_cards": r["home_red_cards"],
                 },
                 "away": {
@@ -242,7 +236,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                     "name": r["away_name"],
                     "logo": r["away_logo"],
                     "goals": r["away_ft"],
-                    # ✅ 원정 팀 레드카드 개수
                     "red_cards": r["away_red_cards"],
                 },
             }
@@ -313,7 +306,7 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 
 
 # ─────────────────────────────────────
-#  4) 팀 시즌 스탯 + Insights Overall (섹션별 모듈 위임)
+#  4) 팀 시즌 스탯 + Insights Overall (시즌 전체 기준)
 # ─────────────────────────────────────
 
 
@@ -366,9 +359,8 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         insights = {}
         stats["insights_overall"] = insights
 
-    # ✅ 서버에서 다시 계산하는 지표인데,
-    #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
-    #    (그래야 setdefault 에 막히지 않고 새 값으로 채워짐)
+    # 서버에서 다시 계산하는 지표인데,
+    # 원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
     for k in [
         "win_pct",
         "btts_pct",
@@ -385,7 +377,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         if k in insights and insights[k] is None:
             del insights[k]
 
-    # fixtures.played.total (API에서 온 경기수) 추출
+    # fixtures.played.total (API에서 온 시즌 경기수) 추출
     fixtures = stats.get("fixtures") or {}
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
@@ -398,9 +390,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         season_int = None
 
     if season_int is not None:
-        # ─────────────────────────────
         # Shooting & Efficiency
-        # ─────────────────────────────
         try:
             enrich_overall_shooting_efficiency(
                 stats,
@@ -411,12 +401,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 matches_total_api=matches_total_api,
             )
         except Exception:
-            # 한 섹션 계산 실패해도 전체 응답은 유지
             pass
 
-        # ─────────────────────────────
-        # Outcome & Totals + Result Combos & Draw
-        # ─────────────────────────────
+        # Outcome & Totals + Result Combos & Draw (시즌 전체)
         try:
             enrich_overall_outcome_totals(
                 stats,
@@ -424,13 +411,13 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                matches_total_api=matches_total_api,
+                last_n=0,
             )
         except Exception:
             pass
 
-        # ─────────────────────────────
         # Goals by Time (For / Against)
-        # ─────────────────────────────
         try:
             enrich_overall_goals_by_time(
                 stats,
@@ -442,9 +429,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         except Exception:
             pass
 
-        # ─────────────────────────────
-        # Discipline & Set Pieces (코너/옐/레드 per match)
-        # ─────────────────────────────
+        # Discipline & Set Pieces
         try:
             enrich_overall_discipline_setpieces(
                 stats,
@@ -457,9 +442,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         except Exception:
             pass
 
-        # ─────────────────────────────
         # Timing
-        # ─────────────────────────────
         try:
             enrich_overall_timing(
                 stats,
@@ -471,9 +454,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         except Exception:
             pass
 
-        # ─────────────────────────────
         # First Goal & Momentum
-        # ─────────────────────────────
         try:
             enrich_overall_firstgoal_momentum(
                 stats,
@@ -496,8 +477,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
 
 # ─────────────────────────────────────
-#  4-1) 팀 인사이트 (필터 메타 포함)
-#      → 앞으로 Competition / Last N 필터용 진입점
+#  4-1) 팀 인사이트 (필터 메타 + 필터 적용 Outcome)
 # ─────────────────────────────────────
 
 
@@ -510,29 +490,65 @@ def get_team_insights_overall_with_filters(
 ) -> Optional[Dict[str, Any]]:
     """
     Insights Overall 탭에서 Competition / Last N 필터를 적용하기 위한
-    향후 확장용 서비스 함수.
+    서비스 함수.
 
-    현재 단계에서는:
-      1) 기존 get_team_season_stats() 를 그대로 호출해서
-         시즌 전체 기준의 insights_overall 을 계산하고,
-      2) value["insights_filters"] 에
-         { "competition": ..., "last_n": ... } 메타만 붙여서 반환한다.
-
-    실제로 필터별 샘플(Last 5, Last 10 등)에 맞춘 계산은
-    다음 단계에서 섹션 모듈을 리팩터링하면서 이 함수 안으로 옮길 예정.
+    현재 단계:
+      1) 기존 get_team_season_stats() 를 호출해서
+         시즌 전체 기준의 insights_overall 을 먼저 계산하고,
+      2) 필터 메타(insights_filters)를 붙인 뒤,
+      3) last_n > 0 인 경우에만 Outcome & Totals 섹션을
+         최근 N경기 기준으로 다시 계산해서 덮어쓴다.
+         (다른 섹션은 아직 시즌 전체 기준 그대로)
     """
+    # 1) 필터 메타 정규화
+    filters_meta = build_insights_filter_meta(comp, last_n)
+    comp_norm = filters_meta.get("competition", "All")
+    last_n_int = filters_meta.get("last_n", 0)
+
+    # 2) 시즌 전체 기준 기본 데이터 로드
     base = get_team_season_stats(team_id=team_id, league_id=league_id)
     if base is None:
         return None
 
-    filters_meta = build_insights_filter_meta(comp, last_n)
-
     value = base.get("value")
     if not isinstance(value, dict):
         value = {}
+    insights = value.get("insights_overall")
+    if not isinstance(insights, dict):
+        insights = {}
+        value["insights_overall"] = insights
+
+    # 필터 메타를 value에 붙여준다.
     value["insights_filters"] = filters_meta
     base["value"] = value
 
+    # 3) last_n > 0 이면 Outcome & Totals 만 최근 N경기 기준으로 다시 계산
+    if last_n_int and last_n_int > 0:
+        season = base.get("season")
+        try:
+            season_int = int(season)
+        except (TypeError, ValueError):
+            season_int = None
+
+        if season_int is not None:
+            try:
+                enrich_overall_outcome_totals(
+                    stats=value,
+                    insights=insights,
+                    league_id=league_id,
+                    season_int=season_int,
+                    team_id=team_id,
+                    # 필터 샘플에서는 분모를 실제 매치 수로 쓰기 위해 0으로 넘긴다.
+                    matches_total_api=0,
+                    last_n=last_n_int,
+                )
+            except Exception:
+                # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
+                pass
+
+    # (competition 필터(comp_norm)는 아직 계산에 직접 사용하지 않고,
+    #  메타만 내려보내는 상태. 나중에 League/Cup/Europe/Continental 분기 로직을
+    #  추가할 때 comp_norm도 같이 활용하게 된다.)
     return base
 
 
