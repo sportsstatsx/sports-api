@@ -165,16 +165,8 @@ def enrich_overall_shooting_efficiency(
     }
 
     # ─────────────────────────────────────────
-    # 5) 유효슈팅 / 경기당 평균
+    # 5) 유효슈팅 비율 (%)
     # ─────────────────────────────────────────
-    insights["shots_on_target_per_match"] = {
-        "total": fmt_avg(sog_total, eff_total),
-        "home": fmt_avg(sog_home, eff_home),
-        "away": fmt_avg(sog_away, eff_away),
-    }
-
-    # ─────────────────────────────────────────
-    # 6) 유효슈팅 비율 (%)
     insights["shots_on_target_pct"] = {
         "total": fmt_pct(sog_total, total_shots_total),
         "home": fmt_pct(sog_home, total_shots_home),
