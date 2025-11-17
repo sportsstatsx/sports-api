@@ -15,6 +15,7 @@ def enrich_overall_outcome_totals(
     season_int: Optional[int],
     team_id: int,
     matches_total_api: int = 0,
+    last_n: int = 0,
 ) -> None:
     """
     Insights Overall - Outcome & Totals / Goal Diff / Clean Sheet / No Goals / Result Combos.
@@ -31,19 +32,30 @@ def enrich_overall_outcome_totals(
       - no_goals_pct
       - win_and_over25_pct
       - lose_and_btts_pct
+
+    matches_total_api:
+        API-Football 의 fixtures.played.total 같은 값.
+        0 이면 실제 경기 수(mt_tot)를 그대로 사용.
+
+    last_n:
+        >0 이면 최근 last_n 경기만 집계 (date_utc 기준 DESC).
+        0 이면 시즌 전체 경기 사용.
     """
     if season_int is None:
         return
 
-    match_rows = fetch_all(
-        """
+    # ─────────────────────────────────────
+    # 1) 샘플 매치 로딩 (시즌 전체 or 최근 N경기)
+    # ─────────────────────────────────────
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
             m.home_ft,
             m.away_ft,
-            m.status_group
+            m.status_group,
+            m.date_utc
         FROM matches m
         WHERE m.league_id = %s
           AND m.season    = %s
@@ -52,16 +64,23 @@ def enrich_overall_outcome_totals(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-        """,
-        (league_id, season_int, team_id, team_id),
-    )
+        ORDER BY m.date_utc DESC
+    """
+
+    params: list[Any] = [league_id, season_int, team_id, team_id]
+    if last_n and last_n > 0:
+        base_sql += " LIMIT %s"
+        params.append(last_n)
+
+    match_rows = fetch_all(base_sql, tuple(params))
 
     if not match_rows:
         return
 
-    mt_tot = 0
-    mh_tot = 0
-    ma_tot = 0
+    # ─────────────────────────────────────
+    # 2) 카운터 초기화
+    # ─────────────────────────────────────
+    mt_tot = mh_tot = ma_tot = 0
 
     win_t = win_h = win_a = 0
     draw_t = draw_h = draw_a = 0
@@ -82,19 +101,29 @@ def enrich_overall_outcome_totals(
     gf_sum_t = gf_sum_h = gf_sum_a = 0
     ga_sum_t = ga_sum_h = ga_sum_a = 0
 
+    # ─────────────────────────────────────
+    # 3) 매치 루프
+    # ─────────────────────────────────────
     for mr in match_rows:
         home_id = mr["home_id"]
         away_id = mr["away_id"]
         home_ft = mr["home_ft"]
         away_ft = mr["away_ft"]
 
+        # 스코어가 비어 있으면 스킵
         if home_ft is None or away_ft is None:
             continue
 
-        is_home = (team_id == home_id)
-        gf = home_ft if is_home else away_ft
-        ga = away_ft if is_home else home_ft
-        total_goals = (gf or 0) + (ga or 0)
+        try:
+            hf = int(home_ft)
+            af = int(away_ft)
+        except (TypeError, ValueError):
+            continue
+
+        is_home = home_id == team_id
+        gf = hf if is_home else af
+        ga = af if is_home else hf
+        total_goals = hf + af
 
         mt_tot += 1
         gf_sum_t += gf
@@ -144,6 +173,7 @@ def enrich_overall_outcome_totals(
                 team_o05_h += 1
             else:
                 team_o05_a += 1
+
         if gf >= 2:
             team_o15_t += 1
             if is_home:
@@ -157,6 +187,7 @@ def enrich_overall_outcome_totals(
                 o15_h += 1
             else:
                 o15_a += 1
+
         if total_goals >= 3:
             o25_t += 1
             if is_home:
@@ -171,6 +202,7 @@ def enrich_overall_outcome_totals(
                 cs_h += 1
             else:
                 cs_a += 1
+
         if gf == 0:
             ng_t += 1
             if is_home:
@@ -178,7 +210,7 @@ def enrich_overall_outcome_totals(
             else:
                 ng_a += 1
 
-        # Combos
+        # 콤보: Win & Over2.5, Lose & BTTS
         if gf > ga and total_goals >= 3:
             win_o25_t += 1
             if is_home:
@@ -196,12 +228,16 @@ def enrich_overall_outcome_totals(
     if mt_tot == 0:
         return
 
-    # 경기 수: API값이 있으면 우선, 없으면 실제 경기 수
+    # ─────────────────────────────────────
+    # 4) 분모(경기 수) 결정
+    # ─────────────────────────────────────
     eff_tot = matches_total_api or mt_tot
     eff_home = mh_tot or eff_tot
     eff_away = ma_tot or eff_tot
 
-    # 승률 등
+    # ─────────────────────────────────────
+    # 5) 승률/오버/클린시트/노골 등 퍼센트
+    # ─────────────────────────────────────
     insights["win_pct"] = {
         "total": fmt_pct(win_t, eff_tot),
         "home": fmt_pct(win_h, eff_home),
@@ -233,14 +269,7 @@ def enrich_overall_outcome_totals(
         "away": fmt_pct(o25_a, eff_away),
     }
 
-    # 골 득실 평균
-    insights["goal_diff_avg"] = {
-        "total": fmt_avg(gf_sum_t - ga_sum_t, eff_tot),
-        "home": fmt_avg(gf_sum_h - ga_sum_h, eff_home),
-        "away": fmt_avg(gf_sum_a - ga_sum_a, eff_away),
-    }
-
-    # 클린시트 / 무득점
+    # 클린 시트 / 노골
     insights["clean_sheet_pct"] = {
         "total": fmt_pct(cs_t, eff_tot),
         "home": fmt_pct(cs_h, eff_home),
@@ -252,7 +281,29 @@ def enrich_overall_outcome_totals(
         "away": fmt_pct(ng_a, eff_away),
     }
 
-    # 콤보
+    # ─────────────────────────────────────
+    # 6) 골 득실 차 평균 (GF - GA)
+    # ─────────────────────────────────────
+    gf_avg_t = fmt_avg(gf_sum_t, mt_tot)
+    ga_avg_t = fmt_avg(ga_sum_t, mt_tot)
+    gf_avg_h = fmt_avg(gf_sum_h, mh_tot)
+    ga_avg_h = fmt_avg(ga_sum_h, mh_tot)
+    gf_avg_a = fmt_avg(gf_sum_a, ma_tot)
+    ga_avg_a = fmt_avg(ga_sum_a, ma_tot)
+
+    diff_t = round(gf_avg_t - ga_avg_t, 2)
+    diff_h = round(gf_avg_h - ga_avg_h, 2)
+    diff_a = round(gf_avg_a - ga_avg_a, 2)
+
+    insights["goal_diff_avg"] = {
+        "total": diff_t,
+        "home": diff_h,
+        "away": diff_a,
+    }
+
+    # ─────────────────────────────────────
+    # 7) 콤보 지표
+    # ─────────────────────────────────────
     insights["win_and_over25_pct"] = {
         "total": fmt_pct(win_o25_t, eff_tot),
         "home": fmt_pct(win_o25_h, eff_home),
