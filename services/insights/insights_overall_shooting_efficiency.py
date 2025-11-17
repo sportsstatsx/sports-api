@@ -175,7 +175,6 @@ def enrich_overall_shooting_efficiency(
 
     # ─────────────────────────────────────────
     # 6) 유효슈팅 비율 (%)
-    # ─────────────────────────────────────────
     insights["shots_on_target_pct"] = {
         "total": fmt_pct(sog_total, total_shots_total),
         "home": fmt_pct(sog_home, total_shots_home),
