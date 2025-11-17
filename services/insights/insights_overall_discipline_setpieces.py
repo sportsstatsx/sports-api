@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 from db import fetch_all
-from .utils import fmt_avg, pct_int
-from .filters_lastn import build_fixture_filter_clause
+from .utils import fmt_avg
+
+
+def _pct_int(total: int, hit: int) -> int:
+    """
+    분모 total, 히트 hit  →  정수 퍼센트 (0~100)
+    total <= 0 이면 0으로.
+    """
+    if total <= 0:
+        return 0
+    return round(hit * 100.0 / total)
 
 
 def enrich_overall_discipline_setpieces(
@@ -12,28 +21,34 @@ def enrich_overall_discipline_setpieces(
     insights: Dict[str, Any],
     *,
     league_id: int,
-    season_int: int,
+    season_int: Optional[int],
     team_id: int,
-    matches_total_api: int,
-    fixture_ids: Optional[List[int]] = None,
+    matches_total_api: int = 0,
 ) -> None:
     """
-    코너/옐/레드 per match + 레드 이후 지표 (Opp Red → Scored, Goals After Avg 등).
-    fixture_ids 가 주어지면 해당 경기들만 대상으로 계산.
+    Discipline & Set Pieces 섹션.
+
+    - 코너 / 옐로 / 레드카드 평균 (경기당)
+    - 상대 레드카드 이후 우리가 득점한 비율 / 평균 득점
+    - 우리 레드카드 이후 우리가 실점한 비율 / 평균 실점
+
+    ✅ 시즌 값(season_int)이 None이면 아무것도 하지 않고 리턴.
     """
+    if season_int is None:
+        return
 
-    extra_where, id_params = build_fixture_filter_clause(fixture_ids)
-
-    # 1) match_team_stats 기반 코너/카드 count
+    # ─────────────────────────────────────────
+    # 1) 코너 / 옐로 / 레드 합계 및 경기 수
+    # ─────────────────────────────────────────
     disc_rows = fetch_all(
-        f"""
+        """
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
             SUM(
                 CASE
-                    WHEN lower(mts.name) LIKE '%corner%'
+                    WHEN lower(mts.name) LIKE 'corner%%'
                          AND mts.value ~ '^[0-9]+$'
                     THEN mts.value::int
                     ELSE 0
@@ -41,7 +56,7 @@ def enrich_overall_discipline_setpieces(
             ) AS corners,
             SUM(
                 CASE
-                    WHEN lower(mts.name) LIKE '%yellow card%'
+                    WHEN lower(mts.name) LIKE 'yellow%%'
                          AND mts.value ~ '^[0-9]+$'
                     THEN mts.value::int
                     ELSE 0
@@ -49,16 +64,16 @@ def enrich_overall_discipline_setpieces(
             ) AS yellows,
             SUM(
                 CASE
-                    WHEN lower(mts.name) LIKE '%red card%'
+                    WHEN lower(mts.name) LIKE 'red%%'
                          AND mts.value ~ '^[0-9]+$'
                     THEN mts.value::int
                     ELSE 0
                 END
             ) AS reds
         FROM matches m
-        JOIN match_team_stats mts
-          ON m.fixture_id = mts.fixture_id
-         AND mts.team_id  = %s
+        LEFT JOIN match_team_stats mts
+          ON mts.fixture_id = m.fixture_id
+         AND mts.team_id   = %s
         WHERE m.league_id = %s
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
@@ -66,12 +81,10 @@ def enrich_overall_discipline_setpieces(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-          {extra_where}
         GROUP BY m.fixture_id, m.home_id, m.away_id
         """,
-        (team_id, league_id, season_int, team_id, team_id, *id_params),
+        (team_id, league_id, season_int, team_id, team_id),
     )
-
 
     if not disc_rows:
         # 이 팀/시즌에 해당하는 경기 자체가 없으면 아무 것도 기록하지 않음
