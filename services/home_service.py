@@ -23,6 +23,9 @@ from .insights.insights_overall_discipline_setpieces import (
     enrich_overall_discipline_setpieces,
 )
 
+from .insights.filters_lastn import get_last_n_fixture_ids
+from .insights.filters_lastn import build_fixture_filter_clause
+
 
 # ─────────────────────────────────────
 #  공통: 날짜 파싱/정규화
@@ -285,12 +288,21 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 #  4) 팀 시즌 스탯 + Insights Overall (섹션별 모듈 위임)
 # ─────────────────────────────────────
 
-def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
+def get_team_season_stats(
+    team_id: int,
+    league_id: int,
+    last_n: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     """
     team_season_stats 테이블에서 (league_id, team_id)에 해당하는
     가장 최신 season 한 줄을 가져오고,
     stats["value"] 안의 insights_overall 블록을
     섹션별 모듈(enrich_overall_*)을 통해 채워서 반환한다.
+
+    last_n:
+      - None 이면 전체 시즌
+      - 양수이면 "가장 최근 last_n 경기"만 사용하여
+        Shooting / Outcome / Timing / FirstGoal / GoalsByTime / Discipline 를 재계산
     """
     rows = fetch_all(
         """
@@ -336,7 +348,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
     # ✅ 서버에서 다시 계산하는 지표인데,
     #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
-    #    (그래야 setdefault 에 막히지 않고 새 값으로 채워짐)
     for k in [
         "win_pct",
         "btts_pct",
@@ -365,7 +376,16 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
     except (TypeError, ValueError):
         season_int = None
 
+    fixture_ids: Optional[List[int]] = None
     if season_int is not None:
+        # ✅ Last N 경기용 fixture_id 목록 계산 (없으면 전체 시즌 사용)
+        fixture_ids = get_last_n_fixture_ids(
+            league_id=league_id,
+            season_int=season_int,
+            team_id=team_id,
+            last_n=last_n,
+        )
+
         # ─────────────────────────────
         # Shooting & Efficiency
         # ─────────────────────────────
@@ -377,9 +397,9 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 season_int=season_int,
                 team_id=team_id,
                 matches_total_api=matches_total_api,
+                fixture_ids=fixture_ids,
             )
         except Exception:
-            # 한 섹션 계산 실패해도 전체 응답은 유지
             pass
 
         # ─────────────────────────────
@@ -392,6 +412,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                fixture_ids=fixture_ids,
             )
         except Exception:
             pass
@@ -406,12 +427,13 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                fixture_ids=fixture_ids,
             )
         except Exception:
             pass
 
         # ─────────────────────────────
-        # Discipline & Set Pieces (코너/옐/레드 per match)
+        # Discipline & Set Pieces (코너/옐/레드 per match + 레드 이후 지표)
         # ─────────────────────────────
         try:
             enrich_overall_discipline_setpieces(
@@ -421,6 +443,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 season_int=season_int,
                 team_id=team_id,
                 matches_total_api=matches_total_api,
+                fixture_ids=fixture_ids,
             )
         except Exception:
             pass
@@ -435,6 +458,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                fixture_ids=fixture_ids,
             )
         except Exception:
             pass
@@ -449,6 +473,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                fixture_ids=fixture_ids,
             )
         except Exception:
             pass
