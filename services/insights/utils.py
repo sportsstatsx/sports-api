@@ -33,6 +33,14 @@ def fmt_pct(n: Any, d: Any) -> int:
     return int(round(v * 100)) if v > 0 else 0
 
 
+def pct_int(n: Any, d: Any) -> int:
+    """
+    예전 코드에서 쓰던 이름을 그대로 맞춰주기 위한 래퍼.
+    fmt_pct 와 동일하게 동작한다.
+    """
+    return fmt_pct(n, d)
+
+
 def fmt_avg(n: Any, d: Any) -> float:
     """
     (n / d) 를 소수점 둘째 자리까지 반올림.
