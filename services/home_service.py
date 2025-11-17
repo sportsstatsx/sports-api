@@ -22,11 +22,13 @@ from .insights.insights_overall_firstgoal_momentum import (
 from .insights.insights_overall_discipline_setpieces import (
     enrich_overall_discipline_setpieces,
 )
+from .insights.utils import normalize_comp, parse_last_n  # 🔹 새로 추가
 
 
 # ─────────────────────────────────────
 #  공통: 날짜 파싱/정규화
 # ─────────────────────────────────────
+
 
 def _normalize_date(date_str: Optional[str]) -> str:
     """
@@ -61,8 +63,35 @@ def _to_iso_or_str(val: Any) -> Optional[str]:
 
 
 # ─────────────────────────────────────
+#  공통: Insights Overall 필터 메타
+# ─────────────────────────────────────
+
+
+def build_insights_filter_meta(
+    comp_raw: Optional[str],
+    last_n_raw: Optional[str],
+) -> Dict[str, Any]:
+    """
+    클라이언트에서 넘어오는 competition / lastN 값을
+    서버 내부 표준 형태로 정규화해서 메타데이터 딕셔너리로 돌려준다.
+
+    현재 단계에서는:
+      - 실제 계산에는 아직 사용하지 않고,
+      - 응답 JSON 의 value["insights_filters"] 로 내려주기만 한다.
+    """
+    comp_norm = normalize_comp(comp_raw)
+    last_n = parse_last_n(last_n_raw)
+
+    return {
+        "competition": comp_norm,
+        "last_n": last_n,
+    }
+
+
+# ─────────────────────────────────────
 #  1) 홈 화면: 리그 목록
 # ─────────────────────────────────────
+
 
 def get_home_leagues(
     date_str: Optional[str],
@@ -124,6 +153,7 @@ def get_home_leagues(
 # ─────────────────────────────────────
 #  2) 홈 화면: 특정 리그의 매치 디렉터리
 # ─────────────────────────────────────
+
 
 def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[str, Any]:
     """
@@ -231,6 +261,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
 #  3) 다음/이전 매치데이
 # ─────────────────────────────────────
 
+
 def _find_matchday(date_str: str, league_id: Optional[int], direction: str) -> Optional[str]:
     """
     direction: 'next' or 'prev'
@@ -284,6 +315,7 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 # ─────────────────────────────────────
 #  4) 팀 시즌 스탯 + Insights Overall (섹션별 모듈 위임)
 # ─────────────────────────────────────
+
 
 def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -464,8 +496,50 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
 
 
 # ─────────────────────────────────────
+#  4-1) 팀 인사이트 (필터 메타 포함)
+#      → 앞으로 Competition / Last N 필터용 진입점
+# ─────────────────────────────────────
+
+
+def get_team_insights_overall_with_filters(
+    team_id: int,
+    league_id: int,
+    *,
+    comp: Optional[str] = None,
+    last_n: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Insights Overall 탭에서 Competition / Last N 필터를 적용하기 위한
+    향후 확장용 서비스 함수.
+
+    현재 단계에서는:
+      1) 기존 get_team_season_stats() 를 그대로 호출해서
+         시즌 전체 기준의 insights_overall 을 계산하고,
+      2) value["insights_filters"] 에
+         { "competition": ..., "last_n": ... } 메타만 붙여서 반환한다.
+
+    실제로 필터별 샘플(Last 5, Last 10 등)에 맞춘 계산은
+    다음 단계에서 섹션 모듈을 리팩터링하면서 이 함수 안으로 옮길 예정.
+    """
+    base = get_team_season_stats(team_id=team_id, league_id=league_id)
+    if base is None:
+        return None
+
+    filters_meta = build_insights_filter_meta(comp, last_n)
+
+    value = base.get("value")
+    if not isinstance(value, dict):
+        value = {}
+    value["insights_filters"] = filters_meta
+    base["value"] = value
+
+    return base
+
+
+# ─────────────────────────────────────
 #  5) 팀 기본 정보
 # ─────────────────────────────────────
+
 
 def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
     rows = fetch_all(
