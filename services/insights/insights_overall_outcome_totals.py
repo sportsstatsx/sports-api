@@ -1,10 +1,11 @@
 # services/insights/insights_overall_outcome_totals.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from db import fetch_all
-from .utils import fmt_pct, fmt_avg
+from .utils import pct_int
+from .filters_lastn import build_fixture_filter_clause
 
 
 def enrich_overall_outcome_totals(
@@ -12,52 +13,41 @@ def enrich_overall_outcome_totals(
     insights: Dict[str, Any],
     *,
     league_id: int,
-    season_int: Optional[int],
+    season_int: int,
     team_id: int,
-    matches_total_api: int = 0,
+    fixture_ids: Optional[List[int]] = None,
 ) -> None:
     """
-    Insights Overall - Outcome & Totals / Goal Diff / Clean Sheet / No Goals / Result Combos.
-
-    생성/보정하는 키들:
-      - win_pct
-      - btts_pct
-      - team_over05_pct
-      - team_over15_pct
-      - over15_pct
-      - over25_pct
-      - goal_diff_avg
-      - clean_sheet_pct
-      - no_goals_pct
-      - win_and_over25_pct
-      - lose_and_btts_pct
+    WIN / BTTS / Over 1.5 / Over 2.5 등 Outcome & Totals 쪽 지표.
+    fixture_ids 가 주어지면 해당 경기만 사용.
     """
-    if season_int is None:
-        return
+
+    extra_where, id_params = build_fixture_filter_clause(fixture_ids)
 
     match_rows = fetch_all(
-        """
+        f"""
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
             m.home_ft,
-            m.away_ft,
-            m.status_group
+            m.away_ft
         FROM matches m
         WHERE m.league_id = %s
           AND m.season    = %s
-          AND (m.home_id = %s OR m.away_id = %s)
+          AND (%s = m.home_id OR %s = m.away_id)
           AND (
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
+          {extra_where}
         """,
-        (league_id, season_int, team_id, team_id),
+        (league_id, season_int, team_id, team_id, *id_params),
     )
 
     if not match_rows:
         return
+
 
     mt_tot = 0
     mh_tot = 0
