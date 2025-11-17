@@ -115,6 +115,7 @@ def get_home_leagues(
 def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[str, Any]:
     """
     특정 리그의 주어진 날짜(date_str)에 대한 매치 디렉터리 정보.
+    레드카드 개수는 match_events 를 서브쿼리로 집계해서 붙인다.
     """
     norm_date = _normalize_date(date_str)
 
@@ -136,54 +137,29 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             ta.logo   AS away_logo,
             m.home_ft,
             m.away_ft,
-            -- ✅ 홈/원정 레드카드 개수 집계
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN lower(e.type)   = 'card'
-                         AND lower(e.detail) = 'red card'
-                         AND e.team_id       = m.home_id
-                        THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
+            -- ✅ 홈 팀 레드카드 개수
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id    = m.home_id
+                  AND lower(e.type)   = 'card'
+                  AND lower(e.detail) = 'red card'
             ) AS home_red_cards,
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN lower(e.type)   = 'card'
-                         AND lower(e.detail) = 'red card'
-                         AND e.team_id       = m.away_id
-                        THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
+            -- ✅ 원정 팀 레드카드 개수
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id    = m.away_id
+                  AND lower(e.type)   = 'card'
+                  AND lower(e.detail) = 'red card'
             ) AS away_red_cards
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
-        LEFT JOIN match_events e
-          ON e.fixture_id = m.fixture_id
         WHERE m.league_id = %s
           AND m.date_utc::date = %s
-        GROUP BY
-            m.fixture_id,
-            m.league_id,
-            m.season,
-            m.round,
-            m.date_utc,
-            m.status_short,
-            m.status_group,
-            m.home_id,
-            th.name,
-            th.logo,
-            m.away_id,
-            ta.name,
-            ta.logo,
-            m.home_ft,
-            m.away_ft
         ORDER BY m.date_utc ASC, m.fixture_id ASC
         """,
         (league_id, norm_date),
@@ -232,6 +208,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
         "round": round_name,
         "fixtures": fixtures,
     }
+
 
 
 
