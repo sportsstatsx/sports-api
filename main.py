@@ -177,13 +177,32 @@ def after_request(resp: Response):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    # HTTPException(404, 400 같은 것)은 그대로 통과
     if isinstance(e, HTTPException):
         HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
         return e
 
+    # 나머지는 모두 "서버 코드 버그"로 간주
+    import traceback
+    tb = traceback.format_exc()
+
     HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
-    log_json("error", "Unhandled exception", error=str(e))
-    return jsonify({"ok": False, "error": "internal_error"}), 500
+    # 로그에 스택트레이스까지 남기기
+    log_json(
+        "error",
+        "Unhandled exception",
+        error=str(e),
+        traceback=tb,
+        path=request.path if request else "",
+    )
+
+    # ⚠️ 디버깅용으로 클라이언트에도 상세 에러를 같이 내려줌
+    return jsonify({
+        "ok": False,
+        "error": "internal_error",
+        "detail": str(e),
+    }), 500
+
 
 
 # ─────────────────────────────────────────
@@ -424,3 +443,4 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
