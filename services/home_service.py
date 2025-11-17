@@ -135,12 +135,55 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             ta.name   AS away_name,
             ta.logo   AS away_logo,
             m.home_ft,
-            m.away_ft
+            m.away_ft,
+            -- ✅ 홈/원정 레드카드 개수 집계
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN lower(e.type)   = 'card'
+                         AND lower(e.detail) = 'red card'
+                         AND e.team_id       = m.home_id
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            ) AS home_red_cards,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN lower(e.type)   = 'card'
+                         AND lower(e.detail) = 'red card'
+                         AND e.team_id       = m.away_id
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            ) AS away_red_cards
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
+        LEFT JOIN match_events e
+          ON e.fixture_id = m.fixture_id
         WHERE m.league_id = %s
           AND m.date_utc::date = %s
+        GROUP BY
+            m.fixture_id,
+            m.league_id,
+            m.season,
+            m.round,
+            m.date_utc,
+            m.status_short,
+            m.status_group,
+            m.home_id,
+            th.name,
+            th.logo,
+            m.away_id,
+            ta.name,
+            ta.logo,
+            m.home_ft,
+            m.away_ft
         ORDER BY m.date_utc ASC, m.fixture_id ASC
         """,
         (league_id, norm_date),
@@ -168,12 +211,16 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                     "name": r["home_name"],
                     "logo": r["home_logo"],
                     "goals": r["home_ft"],
+                    # ✅ 새로 추가: 홈 팀 레드카드 개수
+                    "red_cards": r["home_red_cards"],
                 },
                 "away": {
                     "id": r["away_id"],
                     "name": r["away_name"],
                     "logo": r["away_logo"],
                     "goals": r["away_ft"],
+                    # ✅ 새로 추가: 원정 팀 레드카드 개수
+                    "red_cards": r["away_red_cards"],
                 },
             }
         )
@@ -185,6 +232,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
         "round": round_name,
         "fixtures": fixtures,
     }
+
 
 
 # ─────────────────────────────────────
