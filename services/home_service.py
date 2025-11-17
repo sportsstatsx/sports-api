@@ -115,7 +115,8 @@ def get_home_leagues(
 def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[str, Any]:
     """
     특정 리그의 주어진 날짜(date_str)에 대한 매치 디렉터리 정보.
-    레드카드 개수는 match_events 를 서브쿼리로 집계해서 붙인다.
+    Postgres 스키마에 맞게 round/status_short 컬럼을 보정하고,
+    match_events 기반으로 홈/원정 레드카드 개수를 함께 내려준다.
     """
     norm_date = _normalize_date(date_str)
 
@@ -125,9 +126,11 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             m.fixture_id,
             m.league_id,
             m.season,
-            m.round,
+            -- matches 테이블에 round 컬럼이 없으므로, NULL 로 채워서 alias 만 맞춘다.
+            NULL::text AS round,
             m.date_utc,
-            m.status_short,
+            -- status_short 대신 status 컬럼을 그대로 내려준다.
+            m.status AS status_short,
             m.status_group,
             m.home_id,
             th.name   AS home_name,
@@ -171,7 +174,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
 
     for r in rows:
         season = season or r["season"]
-        round_name = round_name or r["round"]
+        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춰둠
 
         fixtures.append(
             {
@@ -208,8 +211,6 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
         "round": round_name,
         "fixtures": fixtures,
     }
-
-
 
 
 # ─────────────────────────────────────
