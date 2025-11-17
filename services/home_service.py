@@ -126,9 +126,11 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
             m.fixture_id,
             m.league_id,
             m.season,
-            NULL::text AS round,              -- ✅ matches에는 round 컬럼이 없으니 NULL alias 로 맞춰줌
+            -- matches 테이블에는 round 컬럼이 없으므로 NULL 로 alias 만 맞춘다.
+            NULL::text AS round,
             m.date_utc,
-            m.status AS status_short,         -- ✅ status_short 대신 status 컬럼을 그대로 alias
+            -- status_short 대신 status 컬럼을 그대로 alias
+            m.status AS status_short,
             m.status_group,
             m.home_id,
             th.name   AS home_name,
@@ -172,7 +174,7 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
 
     for r in rows:
         season = season or r["season"]
-        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춰서 KeyError 안 남
+        round_name = round_name or r["round"]  # 위에서 NULL::text AS round 로 alias 맞춤
 
         fixtures.append(
             {
@@ -188,14 +190,16 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                     "name": r["home_name"],
                     "logo": r["home_logo"],
                     "goals": r["home_ft"],
-                    "red_cards": r["home_red_cards"],   # 👈 새로 추가
+                    # ✅ 홈 팀 레드카드 개수
+                    "red_cards": r["home_red_cards"],
                 },
                 "away": {
                     "id": r["away_id"],
                     "name": r["away_name"],
                     "logo": r["away_logo"],
                     "goals": r["away_ft"],
-                    "red_cards": r["away_red_cards"],   # 👈 새로 추가
+                    # ✅ 원정 팀 레드카드 개수
+                    "red_cards": r["away_red_cards"],
                 },
             }
         )
