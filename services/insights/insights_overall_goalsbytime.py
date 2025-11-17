@@ -1,9 +1,10 @@
 # services/insights/insights_overall_goalsbytime.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from db import fetch_all
+from .filters_lastn import build_fixture_filter_clause
 
 
 def enrich_overall_goals_by_time(
@@ -11,28 +12,26 @@ def enrich_overall_goals_by_time(
     insights: Dict[str, Any],
     *,
     league_id: int,
-    season_int: Optional[int],
+    season_int: int,
     team_id: int,
+    fixture_ids: Optional[List[int]] = None,
 ) -> None:
     """
-    Goals by Time 섹션.
-
-    기존 home_service.py 에서 잘 동작하던
-    - goals_by_time_for
-    - goals_by_time_against
-    계산 로직을 그대로 모듈로 분리한 버전.
+    Goals by Time (0–15, 16–30, ..., 80–90) 득점/실점 분포.
+    fixture_ids 가 주어지면 해당 경기들만 사용.
     """
-    if season_int is None:
-        return
+
+    extra_where, id_params = build_fixture_filter_clause(fixture_ids)
 
     goal_rows = fetch_all(
-        """
+        f"""
         SELECT
-            e.fixture_id,
-            e.minute,
-            e.team_id,
+            m.fixture_id,
             m.home_id,
-            m.away_id
+            m.away_id,
+            e.team_id,
+            e.minute,
+            e.extra
         FROM matches m
         JOIN match_events e
           ON e.fixture_id = m.fixture_id
@@ -41,8 +40,9 @@ def enrich_overall_goals_by_time(
           AND (%s = m.home_id OR %s = m.away_id)
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
+          {extra_where}
         """,
-        (league_id, season_int, team_id, team_id),
+        (league_id, season_int, team_id, team_id, *id_params),
     )
 
     if not goal_rows:
