@@ -394,7 +394,25 @@ def list_fixtures():
             th.name     AS home_name,
             th.logo     AS home_logo,
             ta.name     AS away_name,
-            ta.logo     AS away_logo
+            ta.logo     AS away_logo,
+            -- ✅ 홈 팀 레드카드 개수
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id    = m.home_id
+                  AND lower(e.type)   = 'card'
+                  AND lower(e.detail) = 'red card'
+            ) AS home_red_cards,
+            -- ✅ 원정 팀 레드카드 개수
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id    = m.away_id
+                  AND lower(e.type)   = 'card'
+                  AND lower(e.detail) = 'red card'
+            ) AS away_red_cards
         FROM matches m
         JOIN leagues l
           ON l.id = m.league_id
@@ -443,4 +461,5 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
