@@ -47,6 +47,19 @@ def _normalize_date(date_str: Optional[str]) -> str:
         return datetime.utcnow().date().isoformat()
 
 
+def _to_iso_or_str(val: Any) -> Optional[str]:
+    """
+    DB에서 가져온 date_utc가 datetime 일 수도, 문자열일 수도 있어서
+    안전하게 문자열로 변환해주는 유틸.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (datetime, date_cls)):
+        return val.isoformat()
+    # 이미 문자열이거나 다른 타입이면 str()로 통일
+    return str(val)
+
+
 # ─────────────────────────────────────
 #  1) 홈 화면: 리그 목록
 # ─────────────────────────────────────
@@ -182,7 +195,8 @@ def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[s
                 "league_id": r["league_id"],
                 "season": r["season"],
                 "round": r["round"],
-                "date_utc": r["date_utc"].isoformat() if r["date_utc"] else None,
+                # 🔧 여기서 r["date_utc"] 가 str 일 수도 있어서 안전하게 변환
+                "date_utc": _to_iso_or_str(r["date_utc"]),
                 "status_short": r["status_short"],
                 "status_group": r["status_group"],
                 "home": {
