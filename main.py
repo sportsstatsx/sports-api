@@ -444,11 +444,20 @@ def list_fixtures():
 def api_team_season_stats():
     team_id = request.args.get("team_id", type=int)
     league_id = request.args.get("league_id", type=int)
+    last_n = request.args.get("last_n", type=int)  # 새 필터
 
     if not team_id or not league_id:
         return jsonify({"ok": False, "error": "missing_params"}), 400
 
-    row = get_team_season_stats(team_id=team_id, league_id=league_id)
+    # 0 이하 값은 무시 (전체 시즌)
+    if last_n is not None and last_n <= 0:
+        last_n = None
+
+    row = get_team_season_stats(
+        team_id=team_id,
+        league_id=league_id,
+        last_n=last_n,
+    )
     if row is None:
         return jsonify({"ok": False, "error": "not_found"}), 404
 
@@ -461,5 +470,6 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
