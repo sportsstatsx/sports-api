@@ -83,7 +83,7 @@ def enrich_overall_timing(
             FROM match_events e
             WHERE e.fixture_id IN ({placeholders})
               AND e.minute IS NOT NULL
-              AND lower(e.type) IN ('goal','own goal','penalty','penalty goal')
+              AND lower(e.type) = 'goal'
             ORDER BY e.fixture_id, e.minute ASC
         """
         event_rows = fetch_all(sql, tuple(fixture_ids))
@@ -119,11 +119,10 @@ def enrich_overall_timing(
 
         is_home = (team_id == home_id)
 
-        evs = events_by_fixture.get(fid)
-        if not evs:
-            continue
+        # 이 경기의 골 이벤트 목록 (없으면 빈 리스트)
+        evs = events_by_fixture.get(fid, [])
 
-        # 샘플 경기 수
+        # 샘플 경기 수: 골 유무와 상관없이 포함
         half_mt_tot += 1
         if is_home:
             half_mt_home += 1
@@ -146,8 +145,8 @@ def enrich_overall_timing(
 
             is_for_goal = (ev["team_id"] == team_id)
 
-            # 전/후반
-            if m_int <= 45:
+            # 전/후반 (45분 골은 2H 로 간주 – 로컬 SQL과 동일)
+            if m_int < 45:
                 if is_for_goal:
                     scored_1h = True
                 else:
@@ -176,13 +175,13 @@ def enrich_overall_timing(
         def _inc(flag: bool, total_ref, home_ref, away_ref):
             if not flag:
                 return
+            total_ref[0] += 1
             if is_home:
                 home_ref[0] += 1
             else:
                 away_ref[0] += 1
-            total_ref[0] += 1
 
-        # 득점/실점 구간별 카운터 업데이트
+        # 각 플래그별 카운트 증가
         t_ref = [score_1h_t]
         h_ref = [score_1h_h]
         a_ref = [score_1h_a]
@@ -231,8 +230,16 @@ def enrich_overall_timing(
         _inc(conceded_8090, t_ref, h_ref, a_ref)
         concede_8090_t, concede_8090_h, concede_8090_a = t_ref[0], h_ref[0], a_ref[0]
 
-    # 4) 퍼센트 계산해서 insights_overall 에 기록
+    # 4) 퍼센트로 변환해서 insights 에 기록
     if half_mt_tot > 0:
+        def fmt(n, d_total, d_home, d_away):
+            return {
+                "total": fmt_pct(n[0], d_total),
+                "home": fmt_pct(n[1], d_home or d_total),
+                "away": fmt_pct(n[2], d_away or d_total),
+            }
+
+        # 득점 1H / 2H
         insights["score_1h_pct"] = {
             "total": fmt_pct(score_1h_t, half_mt_tot),
             "home": fmt_pct(score_1h_h, half_mt_home or half_mt_tot),
@@ -243,6 +250,8 @@ def enrich_overall_timing(
             "home": fmt_pct(score_2h_h, half_mt_home or half_mt_tot),
             "away": fmt_pct(score_2h_a, half_mt_away or half_mt_tot),
         }
+
+        # 실점 1H / 2H
         insights["concede_1h_pct"] = {
             "total": fmt_pct(concede_1h_t, half_mt_tot),
             "home": fmt_pct(concede_1h_h, half_mt_home or half_mt_tot),
@@ -253,6 +262,8 @@ def enrich_overall_timing(
             "home": fmt_pct(concede_2h_h, half_mt_home or half_mt_tot),
             "away": fmt_pct(concede_2h_a, half_mt_away or half_mt_tot),
         }
+
+        # 0–15 득/실점
         insights["score_0_15_pct"] = {
             "total": fmt_pct(score_015_t, half_mt_tot),
             "home": fmt_pct(score_015_h, half_mt_home or half_mt_tot),
@@ -263,6 +274,8 @@ def enrich_overall_timing(
             "home": fmt_pct(concede_015_h, half_mt_home or half_mt_tot),
             "away": fmt_pct(concede_015_a, half_mt_away or half_mt_tot),
         }
+
+        # 80–90+ 득/실점
         insights["score_80_90_pct"] = {
             "total": fmt_pct(score_8090_t, half_mt_tot),
             "home": fmt_pct(score_8090_h, half_mt_home or half_mt_tot),
