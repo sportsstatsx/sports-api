@@ -444,11 +444,16 @@ def list_fixtures():
 def api_team_season_stats():
     team_id = request.args.get("team_id", type=int)
     league_id = request.args.get("league_id", type=int)
+    season = request.args.get("season", type=int)
 
     if not team_id or not league_id:
         return jsonify({"ok": False, "error": "missing_params"}), 400
 
-    row = get_team_season_stats(team_id=team_id, league_id=league_id)
+    row = get_team_season_stats(
+        team_id=team_id,
+        league_id=league_id,
+        season=season,
+    )
     if row is None:
         return jsonify({"ok": False, "error": "not_found"}), 404
 
@@ -461,5 +466,6 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
