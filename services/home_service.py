@@ -611,6 +611,35 @@ def get_team_insights_overall_with_filters(
 
 
 # ─────────────────────────────────────
+#  X) 팀별 사용 가능한 시즌 목록
+# ─────────────────────────────────────
+
+
+def get_team_seasons(league_id: int, team_id: int) -> List[int]:
+    """
+    team_season_stats 테이블에서 해당 리그/팀의 시즌 목록만 뽑아서
+    최신순으로 돌려준다. (예: [2025, 2024])
+    """
+    rows = fetch_all(
+        """
+        SELECT DISTINCT season
+        FROM team_season_stats
+        WHERE league_id = %s
+          AND team_id   = %s
+        ORDER BY season DESC
+        """,
+        (league_id, team_id),
+    )
+    seasons: List[int] = []
+    for r in rows:
+        try:
+            seasons.append(int(r["season"]))
+        except (TypeError, ValueError):
+            continue
+    return seasons
+
+
+# ─────────────────────────────────────
 #  5) 팀 기본 정보
 # ─────────────────────────────────────
 
