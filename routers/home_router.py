@@ -8,7 +8,8 @@ from services.home_service import (
     get_next_matchday,
     get_prev_matchday,
     get_team_info,
-    get_team_insights_overall_with_filters,  # 🔹 Insights Overall용 서비스 함수
+    get_team_insights_overall_with_filters,
+    get_team_seasons,  # ⭐ 팀 시즌 목록용
 )
 
 # /api/home 로 시작하는 모든 엔드포인트
@@ -57,7 +58,7 @@ def home_league_directory():
     if not date_str:
         return jsonify({"ok": False, "error": "missing_date"}), 400
 
-    # ⚠️ home_service 시그니처: (league_id, date_str)
+    # home_service 시그니처: (league_id, date_str)
     row = get_home_league_directory(league_id=league_id, date_str=date_str)
     return jsonify({"ok": True, "row": row})
 
@@ -127,7 +128,7 @@ def home_team_info():
 
 # ─────────────────────────────────────────
 # 5) 홈: Insights Overall (Competition / Last N / Season 필터 메타 포함)
-#     → 인사이트 탭이 사용할 API
+#     → 인사이트 탭이 사용할 새 API
 # ─────────────────────────────────────────
 
 @home_bp.get("/team_insights_overall")
@@ -138,7 +139,7 @@ def home_team_insights_overall():
     query:
       - league_id: 리그 ID (필수)
       - team_id  : 팀 ID (필수)
-      - season   : 시즌 (선택, 없으면 서버 기본 시즌)
+      - season   : 시즌(연도) (선택, 없으면 서버에서 최신 시즌 사용)
       - comp     : Competition 필터 (선택, 없으면 'All')
       - last_n   : Last N 필터 (선택, 없으면 0 = 시즌 전체)
     """
@@ -150,13 +151,11 @@ def home_team_insights_overall():
     if not team_id:
         return jsonify({"ok": False, "error": "missing_team_id"}), 400
 
-    # 🔹 시즌 필터 (2025 / 2024 등)
+    # 시즌은 선택값
     season: Optional[int] = request.args.get("season", type=int)
 
-    # 🔹 대회 필터 (League / Cup / All 등)
+    # 클라이언트에서 보낸 comp / last_n 라벨 그대로 받기
     comp: Optional[str] = request.args.get("comp")
-
-    # 🔹 Last N 필터 ("3" / "5" / "7" / "10" 등, 없으면 None)
     last_n_raw: Optional[str] = request.args.get("last_n")
 
     row = get_team_insights_overall_with_filters(
@@ -170,3 +169,35 @@ def home_team_insights_overall():
         return jsonify({"ok": False, "error": "not_found"}), 404
 
     return jsonify({"ok": True, "row": row})
+
+
+# ─────────────────────────────────────────
+# 6) 홈: 팀별 사용 가능한 시즌 목록
+#     → 인사이트 시즌 필터용
+# ─────────────────────────────────────────
+
+@home_bp.get("/team_seasons")
+def home_team_seasons():
+    """
+    Insights 필터용: 해당 리그/팀이 가진 시즌 목록만 돌려줌.
+
+    query:
+      - league_id: 리그 ID (필수)
+      - team_id  : 팀 ID (필수)
+
+    response 예:
+      {
+        "ok": true,
+        "seasons": [2025, 2024]
+      }
+    """
+    league_id: Optional[int] = request.args.get("league_id", type=int)
+    team_id: Optional[int] = request.args.get("team_id", type=int)
+
+    if not league_id:
+        return jsonify({"ok": False, "error": "missing_league_id"}), 400
+    if not team_id:
+        return jsonify({"ok": False, "error": "missing_team_id"}), 400
+
+    seasons = get_team_seasons(league_id=league_id, team_id=team_id)
+    return jsonify({"ok": True, "seasons": seasons})
