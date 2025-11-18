@@ -580,6 +580,15 @@ def get_team_insights_overall_with_filters(
     value["insights_filters"] = filters_meta
     base["value"] = value
 
+    # 🔥 2-1) 기본 시즌 경기 수(fixtures.played.total)에서 샘플 수 베이스를 만든다.
+    fixtures = value.get("fixtures") or {}
+    played = fixtures.get("played") or {}
+    matches_total_api = played.get("total") or 0
+    try:
+        matches_total_int = int(matches_total_api)
+    except (TypeError, ValueError):
+        matches_total_int = 0
+
     # 3) last_n > 0 이면 Outcome & Totals 만 최근 N경기 기준으로 다시 계산
     if last_n_int and last_n_int > 0:
         season_val = base.get("season")
@@ -603,6 +612,25 @@ def get_team_insights_overall_with_filters(
             except Exception:
                 # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
                 pass
+
+    # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
+    #        - last_n 이 없으면 시즌 전체 경기 수
+    #        - last_n 이 있으면 min(last_n, 시즌 전체 경기 수)를 사용
+    if last_n_int and last_n_int > 0:
+        if matches_total_int > 0:
+            events_sample = min(last_n_int, matches_total_int)
+        else:
+            # fixtures 정보가 없으면 일단 last_n 을 그대로 사용 (보수적 추정)
+            events_sample = last_n_int
+    else:
+        events_sample = matches_total_int
+
+    # first_goal_sample 은 현재는 별도의 분모를 쓰지 않고,
+    # 일단 events_sample 과 동일하게 내려준다. (나중에 필요시 분리 가능)
+    first_goal_sample = events_sample
+
+    insights["events_sample"] = events_sample
+    insights["first_goal_sample"] = first_goal_sample
 
     # (competition 필터(comp_norm)는 아직 계산에 직접 사용하지 않고,
     #  메타만 내려보내는 상태. 나중에 League/Cup/Europe/Continental 분기 로직을
