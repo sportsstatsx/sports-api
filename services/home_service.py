@@ -537,19 +537,21 @@ def get_team_insights_overall_with_filters(
     team_id: int,
     league_id: int,
     *,
+    season: Optional[int] = None,
     comp: Optional[str] = None,
     last_n: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Insights Overall 탭에서 Competition / Last N 필터를 적용하기 위한
+    Insights Overall 탭에서 Season / Competition / Last N 필터를 적용하기 위한
     서비스 함수.
 
     현재 단계:
-      1) 기존 get_team_season_stats() 를 호출해서
-         시즌 전체 기준의 insights_overall 을 먼저 계산하고,
+      1) get_team_season_stats() 를 호출해서
+         (season 이 지정되면 해당 시즌, 아니면 최신 시즌) 기준으로
+         시즌 전체 insights_overall 을 먼저 계산하고,
       2) 필터 메타(insights_filters)를 붙인 뒤,
       3) last_n > 0 인 경우에만 Outcome & Totals 섹션을
-         최근 N경기 기준으로 다시 계산해서 덮어쓴다.
+         해당 시즌의 '최근 N경기' 기준으로 다시 계산해서 덮어쓴다.
          (다른 섹션은 아직 시즌 전체 기준 그대로)
     """
     # 1) 필터 메타 정규화
@@ -558,7 +560,11 @@ def get_team_insights_overall_with_filters(
     last_n_int = filters_meta.get("last_n", 0)
 
     # 2) 시즌 전체 기준 기본 데이터 로드
-    base = get_team_season_stats(team_id=team_id, league_id=league_id)
+    base = get_team_season_stats(
+        team_id=team_id,
+        league_id=league_id,
+        season=season,  # 🔹 시즌 필터 반영: 2025 / 2024 등
+    )
     if base is None:
         return None
 
@@ -576,9 +582,9 @@ def get_team_insights_overall_with_filters(
 
     # 3) last_n > 0 이면 Outcome & Totals 만 최근 N경기 기준으로 다시 계산
     if last_n_int and last_n_int > 0:
-        season = base.get("season")
+        season_val = base.get("season")
         try:
-            season_int = int(season)
+            season_int = int(season_val)
         except (TypeError, ValueError):
             season_int = None
 
