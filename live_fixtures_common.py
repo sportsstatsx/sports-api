@@ -31,11 +31,19 @@ def parse_live_leagues(env_val: str) -> List[int]:
 
 def get_target_date() -> str:
     """
-    CLI 인자에 YYYY-MM-DD 가 들어오면 그 날짜,
-    없으면 오늘(UTC)의 날짜 문자열을 반환.
+    대상 날짜 결정 규칙:
+
+      1) LIVE_TARGET_DATE 환경변수가 있으면 그 값을 사용 (YYYY-MM-DD)
+      2) 없으면, CLI 인자(sys.argv[1])에 들어온 YYYY-MM-DD 사용
+      3) 둘 다 없으면, 오늘(UTC)의 날짜 문자열 반환
     """
+    env = os.environ.get("LIVE_TARGET_DATE")
+    if env:
+        return env.strip()
+
     if len(sys.argv) >= 2:
         return sys.argv[1]
+
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
 
