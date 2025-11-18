@@ -310,15 +310,41 @@ def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
 # ─────────────────────────────────────
 
 
-def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, Any]]:
+def get_team_season_stats(
+    team_id: int,
+    league_id: int,
+    season: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     """
     team_season_stats 테이블에서 (league_id, team_id)에 해당하는
-    가장 최신 season 한 줄을 가져오고,
+    한 시즌에 대한 한 줄을 가져오고,
     stats["value"] 안의 insights_overall 블록을
     섹션별 모듈(enrich_overall_*)을 통해 채워서 반환한다.
+
+    season 이 None 이면 기존처럼 가장 최신 season 1개를 사용하고,
+    season 이 지정되면 해당 season 만 사용한다.
     """
+    # ─────────────────────────────────────
+    # 1) team_season_stats 원본 row 조회
+    # ─────────────────────────────────────
+    where_clause = """
+        WHERE league_id = %s
+          AND team_id   = %s
+    """
+    params: list[Any] = [league_id, team_id]
+
+    # season 이 지정되면 해당 시즌만 필터링
+    if season is not None:
+        where_clause += "\n          AND season   = %s"
+        params.append(season)
+
+    order_limit = ""
+    if season is None:
+        # season 이 지정되지 않은 경우에만 "가장 최신 시즌 1개" 규칙 적용
+        order_limit = "\n        ORDER BY season DESC\n        LIMIT 1"
+
     rows = fetch_all(
-        """
+        f"""
         SELECT
             league_id,
             season,
@@ -326,12 +352,10 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
             name,
             value
         FROM team_season_stats
-        WHERE league_id = %s
-          AND team_id   = %s
-        ORDER BY season DESC
-        LIMIT 1
+        {where_clause}
+        {order_limit}
         """,
-        (league_id, team_id),
+        tuple(params),
     )
     if not rows:
         return None
@@ -359,8 +383,8 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         insights = {}
         stats["insights_overall"] = insights
 
-    # 서버에서 다시 계산하는 지표인데,
-    # 원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
+    # ✅ 서버에서 다시 계산하는 지표인데,
+    #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
     for k in [
         "win_pct",
         "btts_pct",
@@ -370,25 +394,55 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         "over25_pct",
         "clean_sheet_pct",
         "no_goals_pct",
+        "score_1h_pct",
+        "score_2h_pct",
+        "concede_1h_pct",
+        "concede_2h_pct",
+        "score_0_15_pct",
+        "concede_0_15_pct",
+        "score_80_90_pct",
+        "concede_80_90_pct",
+        "first_to_score_pct",
+        "first_conceded_pct",
+        "when_leading_win_pct",
+        "when_leading_draw_pct",
+        "when_leading_loss_pct",
+        "when_trailing_win_pct",
+        "when_trailing_draw_pct",
+        "when_trailing_loss_pct",
+        "shots_per_match",
+        "shots_on_target_pct",
         "win_and_over25_pct",
         "lose_and_btts_pct",
         "goal_diff_avg",
+        "corners_per_match",
+        "yellow_per_match",
+        "red_per_match",
+        "opp_red_sample",
+        "opp_red_scored_pct",
+        "opp_red_goals_after_avg",
+        "own_red_sample",
+        "own_red_conceded_pct",
+        "own_red_goals_after_avg",
+        "goals_by_time_for",
+        "goals_by_time_against",
     ]:
         if k in insights and insights[k] is None:
             del insights[k]
 
-    # fixtures.played.total (API에서 온 시즌 경기수) 추출
+    # fixtures.played.total (API에서 온 경기수) 추출
     fixtures = stats.get("fixtures") or {}
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
 
     # 시즌 값
-    season = row.get("season")
+    season_val = row.get("season")
     try:
-        season_int = int(season)
+        season_int = int(season_val)
     except (TypeError, ValueError):
         season_int = None
 
+    # season_int 가 있어야 나머지 enrich_* 계산 가능
     if season_int is not None:
         # Shooting & Efficiency
         try:
@@ -403,7 +457,7 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         except Exception:
             pass
 
-        # Outcome & Totals + Result Combos & Draw (시즌 전체)
+        # Outcome & Totals + Result Combos & Draw
         try:
             enrich_overall_outcome_totals(
                 stats,
@@ -411,8 +465,6 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
-                matches_total_api=matches_total_api,
-                last_n=0,
             )
         except Exception:
             pass
@@ -466,12 +518,12 @@ def get_team_season_stats(team_id: int, league_id: int) -> Optional[Dict[str, An
         except Exception:
             pass
 
-    # 최종 반환 구조는 기존과 동일하게 유지
+    # 최종 결과 row 형태로 반환
     return {
         "league_id": row["league_id"],
         "season": row["season"],
         "team_id": row["team_id"],
-        "name": row.get("name"),
+        "name": row["name"],
         "value": stats,
     }
 
