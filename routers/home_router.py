@@ -8,7 +8,7 @@ from services.home_service import (
     get_next_matchday,
     get_prev_matchday,
     get_team_info,
-    get_team_insights_overall_with_filters,  # 🔹 새로 추가
+    get_team_insights_overall_with_filters,  # 🔹 Insights Overall용 서비스 함수
 )
 
 # /api/home 로 시작하는 모든 엔드포인트
@@ -126,8 +126,8 @@ def home_team_info():
 
 
 # ─────────────────────────────────────────
-# 5) 홈: Insights Overall (Competition / Last N 필터 메타 포함)
-#     → 앞으로 인사이트 탭이 사용할 새 API
+# 5) 홈: Insights Overall (Competition / Last N / Season 필터 메타 포함)
+#     → 인사이트 탭이 사용할 API
 # ─────────────────────────────────────────
 
 @home_bp.get("/team_insights_overall")
@@ -138,6 +138,7 @@ def home_team_insights_overall():
     query:
       - league_id: 리그 ID (필수)
       - team_id  : 팀 ID (필수)
+      - season   : 시즌 (선택, 없으면 서버 기본 시즌)
       - comp     : Competition 필터 (선택, 없으면 'All')
       - last_n   : Last N 필터 (선택, 없으면 0 = 시즌 전체)
     """
@@ -149,12 +150,19 @@ def home_team_insights_overall():
     if not team_id:
         return jsonify({"ok": False, "error": "missing_team_id"}), 400
 
+    # 🔹 시즌 필터 (2025 / 2024 등)
+    season: Optional[int] = request.args.get("season", type=int)
+
+    # 🔹 대회 필터 (League / Cup / All 등)
     comp: Optional[str] = request.args.get("comp")
+
+    # 🔹 Last N 필터 ("3" / "5" / "7" / "10" 등, 없으면 None)
     last_n_raw: Optional[str] = request.args.get("last_n")
 
     row = get_team_insights_overall_with_filters(
         team_id=team_id,
         league_id=league_id,
+        season=season,
         comp=comp,
         last_n=last_n_raw,
     )
