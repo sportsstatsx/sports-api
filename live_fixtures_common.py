@@ -106,8 +106,15 @@ def _parse_kickoff_to_utc(value: Any) -> dt.datetime | None:
         return value.astimezone(dt.timezone.utc)
 
     if isinstance(value, str):
+        # "YYYY-MM-DD HH:MM:SS" 혹은 ISO8601("2025-11-15T13:00:00+00:00") 포맷 모두 허용
         try:
-            # "YYYY-MM-DD HH:MM:SS" 같은 포맷 가정
+            if "T" in value:
+                # ISO8601 → 파싱 후 UTC 로 맞춤
+                dt_parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if dt_parsed.tzinfo is None:
+                    return dt_parsed.replace(tzinfo=dt.timezone.utc)
+                return dt_parsed.astimezone(dt.timezone.utc)
+            # "YYYY-MM-DD HH:MM:SS"
             dt_naive = dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
             return dt_naive.replace(tzinfo=dt.timezone.utc)
         except ValueError:
@@ -251,11 +258,13 @@ def detect_static_phase_for_league(
         if sg == "FINISHED" and -10 <= diff_minutes <= 10:
             return "POSTMATCH"
 
+        # 그 외(INPLAY 등)는 B그룹에는 직접 영향 없음
+
     return None
 
 
 # ─────────────────────────────────────
-#  season 유추 (B그룹 공통)
+#  season 유추 (기존: 특정 날짜 기준)
 # ─────────────────────────────────────
 
 def resolve_league_season_for_date(league_id: int, date_str: str) -> Optional[int]:
@@ -278,3 +287,71 @@ def resolve_league_season_for_date(league_id: int, date_str: str) -> Optional[in
     if not rows:
         return None
     return rows[0]["season"]
+
+
+# ─────────────────────────────────────
+#  season 유추 (A/B그룹 공통, 미래까지 안정적으로)
+# ─────────────────────────────────────
+
+def infer_season_for_league_and_date(league_id: int, date_str: str) -> int:
+    """
+    주어진 league_id + 날짜(date_str)에 대해 사용할 season 을 추론한다.
+
+    우선순위:
+      1) matches 테이블에 이미 저장된 시즌별 경기 날짜 범위를 보고,
+         date_str 이 그 범위 근처(앞뒤 버퍼 포함)에 속하면 해당 season 을 사용
+      2) 아직 DB 에 데이터가 거의 없으면,
+         date_str 의 연도(YYYY)를 그대로 season 으로 사용
+
+    이렇게 해두면:
+      - 유럽형 시즌(8월 시작 → 다음해 5월 종료)도,
+        한 번만 DB 에 쌓이고 나면 이후 날짜들은 자동으로 같은 season 을 따라간다.
+      - 남미/일본 같이 "연도=시즌"인 리그들은 그냥 연도를 쓰게 된다.
+    """
+    # 0) date_str 파싱
+    try:
+        d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        # 이상한 값이면 그냥 현재 연도로 fallback
+        return dt.datetime.now(dt.timezone.utc).year
+
+    year = d.year
+
+    # 1) 해당 리그의 시즌별 경기 날짜 범위 조회
+    rows = fetch_all(
+        """
+        SELECT
+            season,
+            MIN(SUBSTRING(date_utc FROM 1 FOR 10)) AS min_date,
+            MAX(SUBSTRING(date_utc FROM 1 FOR 10)) AS max_date
+        FROM matches
+        WHERE league_id = %s
+        GROUP BY season
+        ORDER BY season DESC
+        """,
+        (league_id,),
+    )
+
+    best_season: Optional[int] = None
+
+    for r in rows:
+        try:
+            s = int(r["season"])
+            min_d = dt.datetime.strptime(r["min_date"], "%Y-%m-%d").date()
+            max_d = dt.datetime.strptime(r["max_date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        # 시즌 시작 30일 전 ~ 시즌 종료 60일 후까지를 같은 시즌으로 본다.
+        before = min_d - dt.timedelta(days=30)
+        after = max_d + dt.timedelta(days=60)
+
+        if before <= d <= after:
+            best_season = s
+            break
+
+    if best_season is not None:
+        return best_season
+
+    # 2) 아직 이 리그에 대한 matches 데이터가 거의 없으면 → 날짜 연도 기준 season
+    return year
