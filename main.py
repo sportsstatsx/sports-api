@@ -384,6 +384,7 @@ def list_fixtures():
             m.date_utc,
             m.status,
             m.status_group,
+            m.elapsed,   -- ✅ 실제 진행 시간(분) 컬럼 추가
             m.home_id,
             m.away_id,
             m.home_ft,
@@ -466,6 +467,3 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-
-
