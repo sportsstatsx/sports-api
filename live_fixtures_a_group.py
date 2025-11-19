@@ -37,7 +37,6 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
     headers = _get_headers()
 
     # ✅ date_str에서 연도(YYYY)를 뽑아서 season 으로 사용
-    season = None
     try:
         season = int(date_str[:4])
     except Exception:
@@ -56,14 +55,26 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
 
     results = data.get("results", 0) or 0
     if results == 0:
-        # 디버깅용으로 errors 도 한 번 찍어주면 좋음
+        # 디버깅용: 앞으로 문제 생기면 errors도 같이 찍어보자
         errors = data.get("errors")
         if errors:
-            print(f"[WARN] fixtures league={league_id}, date={date_str} results=0, errors={errors}")
+            print(
+                f"[WARN] fixtures league={league_id}, date={date_str}, "
+                f"season={season} → results=0, errors={errors}"
+            )
         return []
 
     rows = data.get("response", []) or []
-    return rows
+
+    # 혹시라도 다른 리그가 섞여 있을 경우를 대비해 한 번 더 필터
+    fixtures: List[Dict[str, Any]] = []
+    for item in rows:
+        league = item.get("league") or {}
+        if int(league.get("id") or 0) != int(league_id):
+            continue
+        fixtures.append(item)
+
+    return fixtures
 
 
 
