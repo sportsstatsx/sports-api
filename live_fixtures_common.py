@@ -31,11 +31,8 @@ def parse_live_leagues(env_val: str) -> List[int]:
 
 def get_target_date() -> str:
     """
-    대상 날짜 결정 규칙:
-
-      1) LIVE_TARGET_DATE 환경변수가 있으면 그 값을 사용 (YYYY-MM-DD)
-      2) 없으면, CLI 인자(sys.argv[1])에 들어온 YYYY-MM-DD 사용
-      3) 둘 다 없으면, 오늘(UTC)의 날짜 문자열 반환
+    LIVE_TARGET_DATE 환경변수 또는 CLI 인자가 있으면 그 값을 사용하고,
+    없으면 오늘(UTC 기준) 날짜 문자열 "YYYY-MM-DD" 반환.
     """
     env = os.environ.get("LIVE_TARGET_DATE")
     if env:
@@ -95,32 +92,32 @@ def map_status_group(short_code: str) -> str:
 def _parse_kickoff_to_utc(value: Any) -> dt.datetime | None:
     """
     Postgres 에서 넘어온 date_utc 를 UTC datetime 으로 변환.
+
+    - DB에는 보통 "YYYY-MM-DD HH:MM:SS" (timezone 없는 naive 문자열)로 저장되어 있다고 가정.
+    - 여기서는 그것을 'UTC 시각'이라고 보고, timezone-aware UTC datetime 으로 변환.
     """
     if value is None:
         return None
 
     if isinstance(value, dt.datetime):
+        # timezone 이 없으면 UTC 로 가정해서 붙여준다.
         if value.tzinfo is None:
             return value.replace(tzinfo=dt.timezone.utc)
         return value.astimezone(dt.timezone.utc)
 
     if isinstance(value, str):
-        s = value.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
         try:
-            d = dt.datetime.fromisoformat(s)
+            # "YYYY-MM-DD HH:MM:SS" 같은 포맷 가정
+            dt_naive = dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            return dt_naive.replace(tzinfo=dt.timezone.utc)
         except ValueError:
             return None
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=dt.timezone.utc)
-        return d.astimezone(dt.timezone.utc)
 
     return None
 
 
 # ─────────────────────────────────────
-#  A그룹(라이브) 호출 판단
+#  A그룹(라이브) 호출 타이밍 판단
 # ─────────────────────────────────────
 
 def match_needs_live_update(row: Dict[str, Any], now: dt.datetime) -> bool:
@@ -146,7 +143,10 @@ def match_needs_live_update(row: Dict[str, Any], now: dt.datetime) -> bool:
     if kickoff is None:
         return False
 
-    sg = (row.get("status_group") or "").upper()
+    # ✅ 구버전 데이터에서 status_group 이 'NS', 'FT' 같은 short 코드로 들어가 있어도
+    #    항상 map_status_group 으로 UPCOMING/INPLAY/FINISHED 로 정규화해서 사용
+    raw_status = (row.get("status_group") or row.get("status") or "").upper()
+    sg = map_status_group(raw_status)
     diff_minutes = (kickoff - now).total_seconds() / 60.0
 
     if sg == "UPCOMING":
@@ -173,13 +173,16 @@ def should_call_league_today(league_id: int, date_str: str, now: dt.datetime) ->
     """
     오늘(date_str) 기준으로, 해당 리그에
     '지금 A그룹(라이브 데이터) 업데이트가 필요한 경기'가 하나라도 있으면 True.
+
+    - matches 테이블 기준으로만 판단.
     """
     rows = fetch_all(
         """
         SELECT
             fixture_id,
             date_utc,
-            status_group
+            status_group,
+            status
         FROM matches
         WHERE league_id = %s
           AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
@@ -198,9 +201,7 @@ def should_call_league_today(league_id: int, date_str: str, now: dt.datetime) ->
 
 
 # ─────────────────────────────────────
-#  B그룹(느리게 바뀌는 애들) 호출 타이밍 판단
-#   - PREMATCH : 킥오프 59~61분 전
-#   - POSTMATCH: 킥오프 기준 -10~+10분
+#  B그룹(standings, team_season_stats 등) 호출 타이밍 판단
 # ─────────────────────────────────────
 
 def detect_static_phase_for_league(
@@ -222,7 +223,8 @@ def detect_static_phase_for_league(
         SELECT
             fixture_id,
             date_utc,
-            status_group
+            status_group,
+            status
         FROM matches
         WHERE league_id = %s
           AND SUBSTRING(date_utc FROM 1 FOR 10) = %s
@@ -238,7 +240,9 @@ def detect_static_phase_for_league(
         if kickoff is None:
             continue
 
-        sg = (r.get("status_group") or "").upper()
+        # ✅ 여기서도 구버전 status_group/status 를 모두 정규화해서 사용
+        raw_status = (r.get("status_group") or r.get("status") or "").upper()
+        sg = map_status_group(raw_status)
         diff_minutes = (kickoff - now).total_seconds() / 60.0
 
         if sg == "UPCOMING" and 59 <= diff_minutes <= 61:
