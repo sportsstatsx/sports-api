@@ -89,7 +89,7 @@ def build_insights_filter_meta(
 
 
 # ─────────────────────────────────────
-#  1) 홈 화면: 리그 목록
+#  1) 홈 화면: 상단 리그 탭용 목록
 # ─────────────────────────────────────
 
 
@@ -151,103 +151,64 @@ def get_home_leagues(
 
 
 # ─────────────────────────────────────
-#  2) 홈 화면: 특정 리그의 매치 디렉터리
+#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리 (옵션 A)
 # ─────────────────────────────────────
 
 
-def get_home_league_directory(league_id: int, date_str: Optional[str]) -> Dict[str, Any]:
+def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
-    특정 리그의 주어진 날짜(date_str)에 대한 매치 디렉터리 정보.
-    Postgres matches 스키마(라운드/short 컬럼 없음)에 맞춰서,
-    각 경기의 홈/원정 레드카드 개수까지 함께 내려준다.
+    리그 선택 바텀시트 전용 디렉터리.
+
+    - 전체 지원 리그를 내려주고,
+    - 각 리그별로 해당 날짜(norm_date)에 편성된 경기 수(today_count)를 함께 내려준다.
+    - 앱에서는 /api/home/league_directory?date=YYYY-MM-DD 로 호출해서
+      리그 필터 목록을 구성한다.
     """
     norm_date = _normalize_date(date_str)
 
     rows = fetch_all(
         """
         SELECT
-            m.fixture_id,
-            m.league_id,
-            m.season,
-            NULL::text AS round,
-            m.date_utc,
-            m.status AS status_short,
-            m.status_group,
-            m.home_id,
-            th.name   AS home_name,
-            th.logo   AS home_logo,
-            m.away_id,
-            ta.name   AS away_name,
-            ta.logo   AS away_logo,
-            m.home_ft,
-            m.away_ft,
-            (
-                SELECT COUNT(*)
-                FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                  AND e.team_id    = m.home_id
-                  AND lower(e.type)   = 'card'
-                  AND lower(e.detail) = 'red card'
-            ) AS home_red_cards,
-            (
-                SELECT COUNT(*)
-                FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                  AND e.team_id    = m.away_id
-                  AND lower(e.type)   = 'card'
-                  AND lower(e.detail) = 'red card'
-            ) AS away_red_cards
-        FROM matches m
-        JOIN teams th ON th.id = m.home_id
-        JOIN teams ta ON ta.id = m.away_id
-        WHERE m.league_id = %s
-          AND m.date_utc::date = %s
-        ORDER BY m.date_utc ASC, m.fixture_id ASC
+            l.id      AS league_id,
+            l.name    AS league_name,
+            l.country AS country,
+            l.logo    AS league_logo,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN m.date_utc::date = %s THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
+            ) AS today_count
+        FROM leagues l
+        LEFT JOIN matches m
+          ON m.league_id = l.id
+        GROUP BY
+            l.id,
+            l.name,
+            l.country,
+            l.logo
+        ORDER BY
+            l.country,
+            l.name
         """,
-        (league_id, norm_date),
+        (norm_date,),
     )
 
-    fixtures: List[Dict[str, Any]] = []
-    season: Optional[int] = None
-    round_name: Optional[str] = None
-
+    result: List[Dict[str, Any]] = []
     for r in rows:
-        season = season or r["season"]
-        round_name = round_name or r["round"]
-
-        fixtures.append(
+        result.append(
             {
-                "fixture_id": r["fixture_id"],
                 "league_id": r["league_id"],
-                "season": r["season"],
-                "round": r["round"],
-                "date_utc": _to_iso_or_str(r["date_utc"]),
-                "status_short": r["status_short"],
-                "status_group": r["status_group"],
-                "home": {
-                    "id": r["home_id"],
-                    "name": r["home_name"],
-                    "logo": r["home_logo"],
-                    "goals": r["home_ft"],
-                    "red_cards": r["home_red_cards"],
-                },
-                "away": {
-                    "id": r["away_id"],
-                    "name": r["away_name"],
-                    "logo": r["away_logo"],
-                    "goals": r["away_ft"],
-                    "red_cards": r["away_red_cards"],
-                },
+                "league_name": r["league_name"],
+                "country": r["country"],
+                "league_logo": r["league_logo"],
+                "today_count": r["today_count"],
             }
         )
-
-    return {
-        "league_id": league_id,
-        "date": norm_date,
-        "season": season,
-        "round": round_name,
-        "fixtures": fixtures,
-    }
+    return result
 
 
 # ─────────────────────────────────────
@@ -556,7 +517,7 @@ def get_team_insights_overall_with_filters(
     """
     # 1) 필터 메타 정규화
     filters_meta = build_insights_filter_meta(comp, last_n)
-    comp_norm = filters_meta.get("competition", "All")
+    comp_norm = filters_meta.get("competition", "All")  # 현재는 메타용
     last_n_int = filters_meta.get("last_n", 0)
 
     # 2) 시즌 전체 기준 기본 데이터 로드
