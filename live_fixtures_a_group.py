@@ -5,7 +5,12 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from db import execute
-from live_fixtures_common import API_KEY, map_status_group, now_utc
+from live_fixtures_common import (
+    API_KEY,
+    map_status_group,
+    now_utc,
+    infer_season_for_league_and_date,
+)
 
 
 BASE_URL = "https://v3.football.api-sports.io/fixtures"
@@ -32,22 +37,18 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
     - params:
         league: 리그 ID
         date:   YYYY-MM-DD (UTC 기준)
-        season: 연도 (예: 2025)
+        season: infer_season_for_league_and_date() 로 계산한 시즌
     """
     headers = _get_headers()
 
-    # ✅ date_str에서 연도(YYYY)를 뽑아서 season 으로 사용
-    try:
-        season = int(date_str[:4])
-    except Exception:
-        season = None
+    # ✅ 시즌 추론: DB 기반 + 연도 기반 fallback
+    season = infer_season_for_league_and_date(league_id, date_str)
 
     params = {
         "league": league_id,
         "date": date_str,
+        "season": season,
     }
-    if season is not None:
-        params["season"] = season
 
     resp = requests.get(BASE_URL, headers=headers, params=params, timeout=15)
     resp.raise_for_status()
@@ -75,7 +76,6 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
         fixtures.append(item)
 
     return fixtures
-
 
 
 def fetch_events_from_api(fixture_id: int) -> List[Dict[str, Any]]:
