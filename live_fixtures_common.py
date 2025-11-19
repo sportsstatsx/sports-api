@@ -138,6 +138,8 @@ def match_needs_live_update(row: Dict[str, Any], now: dt.datetime) -> bool:
           * 59~61분 전에 1번  (≈ 킥오프 1시간 전)
           * 29~31분 전에 1번  (≈ 킥오프 30분 전)
           *  -1~+1분 사이 1번 (≈ 킥오프 시점)
+          * 🆕 킥오프를 이미 지났는데 아직 UPCOMING 이면,
+                킥오프 후 120분(2시간)까지는 강제로 라이브 호출
 
       - INPLAY:
           * 경기 중에는 항상 True (크론이 1분마다 돌기 때문에
@@ -150,30 +152,39 @@ def match_needs_live_update(row: Dict[str, Any], now: dt.datetime) -> bool:
     if kickoff is None:
         return False
 
-    # ✅ 구버전 데이터에서 status_group 이 'NS', 'FT' 같은 short 코드로 들어가 있어도
-    #    항상 map_status_group 으로 UPCOMING/INPLAY/FINISHED 로 정규화해서 사용
     raw_status = (row.get("status_group") or row.get("status") or "").upper()
     sg = map_status_group(raw_status)
     diff_minutes = (kickoff - now).total_seconds() / 60.0
 
     if sg == "UPCOMING":
+        # 킥오프 전: 60분 / 30분 / 직전 시점에 한 번씩
         if 59 <= diff_minutes <= 61:
             return True
         if 29 <= diff_minutes <= 31:
             return True
         if -1 <= diff_minutes <= 1:
             return True
+
+        # 🆕 킥오프 시간을 이미 지났는데도 아직 UPCOMING 으로 남아 있는 경우
+        #    (DB에 일정만 있고 라이브 업데이트 한 번도 안 된 상황)
+        #    → 킥오프 후 최대 2시간 동안은 라이브 호출을 계속 해준다.
+        if -120 <= diff_minutes < -1:
+            return True
+
         return False
 
     if sg == "INPLAY":
+        # 이미 라이브로 인식되는 상태면 매 분마다 갱신
         return True
 
     if sg == "FINISHED":
+        # 경기 직후/전후 10분 정도는 한 번 더 보는 용도
         if -10 <= diff_minutes <= 10:
             return True
         return False
 
     return False
+
 
 
 def should_call_league_today(league_id: int, date_str: str, now: dt.datetime) -> bool:
