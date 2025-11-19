@@ -20,6 +20,7 @@ home_bp = Blueprint("home", __name__, url_prefix="/api/home")
 # 1) 홈: 상단 리그 탭용 API
 # ─────────────────────────────────────────
 
+
 @home_bp.get("/leagues")
 def home_leagues():
     """
@@ -38,34 +39,33 @@ def home_leagues():
 
 
 # ─────────────────────────────────────────
-# 2) 홈: 특정 리그 매치 디렉터리 (홈 매치리스트용)
+# 2) 홈: 리그 선택 바텀시트용 디렉터리 (옵션 A)
 # ─────────────────────────────────────────
+
 
 @home_bp.get("/league_directory")
 def home_league_directory():
     """
-    홈 매치리스트용: 특정 리그의 해당 날짜 매치 리스트.
+    리그 선택 바텀시트용 디렉터리.
+
+    - 전체 지원 리그 목록과
+    - 해당 날짜(date)에 편성된 경기 수(today_count)를 함께 돌려준다.
 
     query:
-      - league_id: 리그 ID (필수)
       - date: yyyy-MM-dd (필수)
     """
-    league_id: Optional[int] = request.args.get("league_id", type=int)
     date_str: Optional[str] = request.args.get("date")
-
-    if not league_id:
-        return jsonify({"ok": False, "error": "missing_league_id"}), 400
     if not date_str:
         return jsonify({"ok": False, "error": "missing_date"}), 400
 
-    # home_service 시그니처: (league_id, date_str)
-    row = get_home_league_directory(league_id=league_id, date_str=date_str)
-    return jsonify({"ok": True, "row": row})
+    rows = get_home_league_directory(date_str=date_str)
+    return jsonify({"ok": True, "rows": rows, "count": len(rows)})
 
 
 # ─────────────────────────────────────────
 # 3) 홈: 다음 / 이전 매치데이 API
 # ─────────────────────────────────────────
+
 
 @home_bp.get("/next_matchday")
 def next_matchday():
@@ -107,6 +107,7 @@ def prev_matchday():
 # 4) 홈: 팀 정보 (이름/국가/로고)
 # ─────────────────────────────────────────
 
+
 @home_bp.get("/team_info")
 def home_team_info():
     """
@@ -130,6 +131,7 @@ def home_team_info():
 # 5) 홈: Insights Overall (Competition / Last N / Season 필터 메타 포함)
 #     → 인사이트 탭이 사용할 새 API
 # ─────────────────────────────────────────
+
 
 @home_bp.get("/team_insights_overall")
 def home_team_insights_overall():
@@ -175,6 +177,7 @@ def home_team_insights_overall():
 # 6) 홈: 팀별 사용 가능한 시즌 목록
 #     → 인사이트 시즌 필터용
 # ─────────────────────────────────────────
+
 
 @home_bp.get("/team_seasons")
 def home_team_seasons():
