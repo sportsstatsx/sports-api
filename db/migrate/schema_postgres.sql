@@ -50,6 +50,7 @@ CREATE TABLE matches (
     date_utc        TIMESTAMPTZ NOT NULL,
     status          TEXT NOT NULL,
     status_group    TEXT NOT NULL,
+    elapsed         INTEGER,
     home_id         INTEGER NOT NULL,
     away_id         INTEGER NOT NULL,
     home_ft         INTEGER,
