@@ -12,11 +12,16 @@ Api-Football /fixtures (league + season 전체)와
 
 사용 예시:
 
-  # LIVE_LEAGUES 에 지정된 리그 전체, 2025 시즌 맞추기
+  # ① 시즌을 직접 지정 (2025만)
   python reconcile_fixtures_season.py 2025
 
-  # 2024, 2025 두 시즌
+  # ② 여러 시즌 지정
   python reconcile_fixtures_season.py 2024 2025
+  python reconcile_fixtures_season.py 2024,2025
+
+  # ③ 인자를 하나도 안 주면:
+  #    matches 테이블에 존재하는 모든 season 을 자동으로 찾아서 실행
+  python reconcile_fixtures_season.py
 """
 
 import os
@@ -32,7 +37,6 @@ from live_fixtures_a_group import (
     upsert_fixture_row,    # fixtures 테이블 upsert
     upsert_match_row,      # matches 테이블 upsert
 )
-
 
 BASE_URL = "https://v3.football.api-sports.io/fixtures"
 
@@ -68,6 +72,32 @@ def parse_seasons_from_argv(argv: List[str]) -> List[int]:
 
     # 중복 제거 + 정렬
     return sorted(set(seasons))
+
+
+def load_all_seasons_from_db() -> List[int]:
+    """
+    matches 테이블에서 DISTINCT season 목록을 가져온다.
+    인자를 하나도 안 줬을 때 사용.
+    """
+    rows = fetch_all(
+        """
+        SELECT DISTINCT season
+        FROM matches
+        WHERE season IS NOT NULL
+        ORDER BY season ASC
+        """,
+        (),
+    )
+    seasons: List[int] = []
+    for r in rows:
+        s = r.get("season")
+        if s is None:
+            continue
+        try:
+            seasons.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    return seasons
 
 
 # ─────────────────────────────────────
@@ -192,7 +222,7 @@ def reconcile_league_season(league_id: int, season: int) -> None:
     # 1) API에만 있는 fixture → 신규 or 복구 → UPSERT
     only_api = api_ids - db_ids
 
-    # 2) 둘 다 있는 fixture → 항상 UPSERT로 최신화 (날짜/상태 등이 변했을 수 있음)
+    # 2) 둘 다 있는 fixture → 항상 UPSERT로 최신화 (날짜/상태가 변했을 수 있음)
     common = api_ids & db_ids
 
     # 3) DB에만 있는 fixture → 유령 경기 → 삭제
@@ -227,19 +257,29 @@ def reconcile_league_season(league_id: int, season: int) -> None:
 # ─────────────────────────────────────
 
 def main() -> None:
+    # 1) CLI 인자로 들어온 시즌들 먼저 파싱
     seasons = parse_seasons_from_argv(sys.argv[1:])
+
+    # 2) 인자가 하나도 없으면 DB에서 시즌 목록 자동으로 가져오기
     if not seasons:
-        print("[ERROR] 최소 한 개 이상의 시즌(연도)을 인자로 넘겨줘야 합니다. 예: python reconcile_fixtures_season.py 2025")
-        sys.exit(1)
+        seasons = load_all_seasons_from_db()
+        if not seasons:
+            print("[ERROR] matches 테이블에서 season 정보를 찾지 못했습니다. "
+                  "최소 한 개 시즌을 인자로 넘기거나, DB에 데이터를 채워 주세요.",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"[INFO] 인자로 시즌이 지정되지 않아, DB에서 자동으로 찾은 시즌들: {seasons}")
+    else:
+        print(f"[INFO] CLI 인자로 지정된 시즌만 리컨실리에이션: {seasons}")
 
     live_leagues_env = os.environ.get("LIVE_LEAGUES", "")
     league_ids = parse_live_leagues(live_leagues_env)
 
     if not league_ids:
-        print("[ERROR] LIVE_LEAGUES 환경변수가 비어 있어서, 어떤 리그를 리컨실리에이션할지 알 수 없습니다.")
+        print("[ERROR] LIVE_LEAGUES 환경변수가 비어 있어서, 어떤 리그를 리컨실리에이션할지 알 수 없습니다.",
+              file=sys.stderr)
         sys.exit(1)
 
-    print(f"[INFO] 대상 시즌들: {seasons}")
     print(f"[INFO] LIVE_LEAGUES 에서 읽은 리그들: {league_ids}")
 
     for season in seasons:
