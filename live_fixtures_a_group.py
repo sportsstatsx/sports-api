@@ -32,28 +32,39 @@ def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any
     - params:
         league: 리그 ID
         date:   YYYY-MM-DD (UTC 기준)
+        season: 연도 (예: 2025)
     """
     headers = _get_headers()
+
+    # ✅ date_str에서 연도(YYYY)를 뽑아서 season 으로 사용
+    season = None
+    try:
+        season = int(date_str[:4])
+    except Exception:
+        season = None
+
     params = {
         "league": league_id,
         "date": date_str,
     }
+    if season is not None:
+        params["season"] = season
 
     resp = requests.get(BASE_URL, headers=headers, params=params, timeout=15)
     resp.raise_for_status()
-
     data = resp.json()
-    results = data.get("response", []) or []
 
-    # 혹시라도 다른 리그가 섞여 있을 경우를 대비해 한 번 더 필터
-    fixtures: List[Dict[str, Any]] = []
-    for item in results:
-        league = item.get("league") or {}
-        if int(league.get("id") or 0) != int(league_id):
-            continue
-        fixtures.append(item)
+    results = data.get("results", 0) or 0
+    if results == 0:
+        # 디버깅용으로 errors 도 한 번 찍어주면 좋음
+        errors = data.get("errors")
+        if errors:
+            print(f"[WARN] fixtures league={league_id}, date={date_str} results=0, errors={errors}")
+        return []
 
-    return fixtures
+    rows = data.get("response", []) or []
+    return rows
+
 
 
 def fetch_events_from_api(fixture_id: int) -> List[Dict[str, Any]]:
