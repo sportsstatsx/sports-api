@@ -12,21 +12,20 @@ Api-Football /fixtures (league + season 전체)와
 
 사용 예시:
 
-  # ① 시즌을 직접 지정 (2025만)
+  # ① 현재 진행중 시즌만 (인자 없음 → DB에서 MAX(season) 자동 선택)
+  python reconcile_fixtures_season.py
+
+  # ② 특정 시즌만
   python reconcile_fixtures_season.py 2025
 
-  # ② 여러 시즌 지정
+  # ③ 여러 시즌 지정
   python reconcile_fixtures_season.py 2024 2025
   python reconcile_fixtures_season.py 2024,2025
-
-  # ③ 인자를 하나도 안 주면:
-  #    matches 테이블에 존재하는 모든 season 을 자동으로 찾아서 실행
-  python reconcile_fixtures_season.py
 """
 
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import requests
 
@@ -74,30 +73,33 @@ def parse_seasons_from_argv(argv: List[str]) -> List[int]:
     return sorted(set(seasons))
 
 
-def load_all_seasons_from_db() -> List[int]:
+def load_latest_season_from_db() -> int:
     """
-    matches 테이블에서 DISTINCT season 목록을 가져온다.
-    인자를 하나도 안 줬을 때 사용.
+    matches 테이블에서 가장 최신 season 하나(MAX)를 가져온다.
+
+    - 크론잡에서 인자를 안 줬을 때:
+      => 이 함수가 돌면서 '현재 진행중인 시즌'이라고 볼 수 있는
+         가장 큰 season 값 하나만 사용.
     """
     rows = fetch_all(
         """
-        SELECT DISTINCT season
+        SELECT MAX(season) AS max_season
         FROM matches
         WHERE season IS NOT NULL
-        ORDER BY season ASC
         """,
         (),
     )
-    seasons: List[int] = []
-    for r in rows:
-        s = r.get("season")
-        if s is None:
-            continue
-        try:
-            seasons.append(int(s))
-        except (TypeError, ValueError):
-            continue
-    return seasons
+    if not rows:
+        return None
+
+    max_s = rows[0].get("max_season")
+    if max_s is None:
+        return None
+
+    try:
+        return int(max_s)
+    except (TypeError, ValueError):
+        return None
 
 
 # ─────────────────────────────────────
@@ -228,8 +230,10 @@ def reconcile_league_season(league_id: int, season: int) -> None:
     # 3) DB에만 있는 fixture → 유령 경기 → 삭제
     only_db = db_ids - api_ids
 
-    print(f"    API={len(api_ids)}, DB={len(db_ids)}, "
-          f"only_api={len(only_api)}, common={len(common)}, only_db={len(only_db)}")
+    print(
+        f"    API={len(api_ids)}, DB={len(db_ids)}, "
+        f"only_api={len(only_api)}, common={len(common)}, only_db={len(only_db)}"
+    )
 
     # 1) API 전용 → UPSERT
     for fid in sorted(only_api):
@@ -260,15 +264,18 @@ def main() -> None:
     # 1) CLI 인자로 들어온 시즌들 먼저 파싱
     seasons = parse_seasons_from_argv(sys.argv[1:])
 
-    # 2) 인자가 하나도 없으면 DB에서 시즌 목록 자동으로 가져오기
+    # 2) 인자가 없으면 DB에서 최신 시즌 하나만 자동 선택
     if not seasons:
-        seasons = load_all_seasons_from_db()
-        if not seasons:
-            print("[ERROR] matches 테이블에서 season 정보를 찾지 못했습니다. "
-                  "최소 한 개 시즌을 인자로 넘기거나, DB에 데이터를 채워 주세요.",
-                  file=sys.stderr)
+        latest = load_latest_season_from_db()
+        if latest is None:
+            print(
+                "[ERROR] matches 테이블에서 유효한 season 값을 찾지 못했습니다. "
+                "인자로 시즌(연도)을 직접 넘겨 주세요. 예: python reconcile_fixtures_season.py 2025",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        print(f"[INFO] 인자로 시즌이 지정되지 않아, DB에서 자동으로 찾은 시즌들: {seasons}")
+        seasons = [latest]
+        print(f"[INFO] 인자가 없어 DB에서 최신 시즌({latest}) 한 개만 선택해서 리컨실리에이션합니다.")
     else:
         print(f"[INFO] CLI 인자로 지정된 시즌만 리컨실리에이션: {seasons}")
 
@@ -276,8 +283,10 @@ def main() -> None:
     league_ids = parse_live_leagues(live_leagues_env)
 
     if not league_ids:
-        print("[ERROR] LIVE_LEAGUES 환경변수가 비어 있어서, 어떤 리그를 리컨실리에이션할지 알 수 없습니다.",
-              file=sys.stderr)
+        print(
+            "[ERROR] LIVE_LEAGUES 환경변수가 비어 있어서, 어떤 리그를 리컨실리에이션할지 알 수 없습니다.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     print(f"[INFO] LIVE_LEAGUES 에서 읽은 리그들: {league_ids}")
