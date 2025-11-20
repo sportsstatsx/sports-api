@@ -232,6 +232,8 @@ def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     status_block = fixture_block.get("status") or {}
     status_short = status_block.get("short") or "NS"
     status_group = map_status_group(status_short)
+    # ✅ 실제 진행 시간(분): Api-Football status.elapsed
+    elapsed = status_block.get("elapsed")
 
     league_id = league_block.get("id")
     season = league_block.get("season")
@@ -243,6 +245,8 @@ def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "date_utc": date_utc,
         "status": status_short,
         "status_group": status_group,
+        # ✅ matches.elapsed 로 저장할 값
+        "elapsed": elapsed,
     }
 
 
@@ -314,6 +318,7 @@ def upsert_match_row(
       date_utc     TEXT    NOT NULL
       status       TEXT    NOT NULL
       status_group TEXT    NOT NULL
+      elapsed      INTEGER
       home_id      INTEGER NOT NULL
       away_id      INTEGER NOT NULL
       home_ft      INTEGER
@@ -333,6 +338,8 @@ def upsert_match_row(
     date_utc = basic["date_utc"]
     status_short = basic["status"]
     status_group = basic["status_group"]
+    # ✅ 위에서 뽑은 elapsed (없으면 None → DB에서는 NULL)
+    elapsed = basic.get("elapsed")
 
     teams_block = fixture.get("teams") or {}
     home_team = teams_block.get("home") or {}
@@ -354,18 +361,20 @@ def upsert_match_row(
             date_utc,
             status,
             status_group,
+            elapsed,
             home_id,
             away_id,
             home_ft,
             away_ft
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id    = EXCLUDED.league_id,
             season       = EXCLUDED.season,
             date_utc     = EXCLUDED.date_utc,
             status       = EXCLUDED.status,
             status_group = EXCLUDED.status_group,
+            elapsed      = EXCLUDED.elapsed,
             home_id      = EXCLUDED.home_id,
             away_id      = EXCLUDED.away_id,
             home_ft      = EXCLUDED.home_ft,
@@ -378,6 +387,7 @@ def upsert_match_row(
             date_utc,
             status_short,
             status_group,
+            elapsed,
             home_team_id,
             away_team_id,
             goals_home,
