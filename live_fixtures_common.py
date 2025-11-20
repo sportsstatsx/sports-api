@@ -17,34 +17,29 @@ LIVE_LEAGUES_ENV = os.environ.get("LIVE_LEAGUES", "")
 
 def now_utc() -> dt.datetime:
     """
-    항상 timezone 이 붙은 UTC 현재시각으로 반환.
+    항상 timezone-aware UTC datetime 을 반환.
     """
     return dt.datetime.now(dt.timezone.utc)
 
 
 def get_target_date() -> str:
     """
-    update_live_fixtures.py 에서 사용하는 대상 날짜 결정.
+    update_live_fixtures.py 등에서 사용하는 대상 날짜 문자열(YYYY-MM-DD).
 
-    - 인자가 주어지지 않으면: 오늘(UTC 기준) YYYY-MM-DD
-    - 인자가 1개 이상이면: 첫 번째 인자를 날짜로 사용
-      (YYYY-MM-DD 형식이 아니면 그대로 사용하지만, 일반적으로 YYYY-MM-DD 만 사용)
+    - 인자로 날짜가 들어오면 그 값을 사용
+    - 없으면 오늘 날짜를 YYYY-MM-DD 로 반환
     """
     if len(sys.argv) >= 2:
-        return str(sys.argv[1])
-    return now_utc().strftime("%Y-%m-%d")
+        return sys.argv[1]
+    return dt.date.today().isoformat()
 
 
 def parse_live_leagues(env_val: str) -> List[int]:
     """
-    LIVE_LEAGUES 환경변수("39, 40, 140") 등을 정수 리스트로 파싱.
-
-    잘못된 값은 조용히 무시.
+    LIVE_LEAGUES 환경변수("39,140,141") 등을 정수 리스트로 파싱.
+    공백이나 잘못된 값은 무시한다.
     """
     ids: List[int] = []
-    if not env_val:
-        return ids
-
     for part in env_val.replace(" ", "").split(","):
         if not part:
             continue
@@ -56,7 +51,7 @@ def parse_live_leagues(env_val: str) -> List[int]:
 
 
 # ─────────────────────────────────────
-#  상태 코드 정규화
+#  status 정규화
 # ─────────────────────────────────────
 
 
@@ -80,55 +75,63 @@ def map_status_group(code: str) -> str:
     if c in {"UPCOMING", "INPLAY", "FINISHED"}:
         return c
 
-    # Api-Football status.short 기준 대략적인 매핑
-    if c in {"FT", "AET", "PEN", "FT_PEN", "AWD", "WO"}:
+    # Api-Football 의 short 코드 기준 대략적인 매핑
+    upcoming_codes = {
+        "NS", "TBD", "PST", "CANC", "ABD", "AWD", "WO",
+    }
+    inplay_codes = {
+        "1H", "2H", "ET", "P", "LIVE", "BT", "HT",
+    }
+    finished_codes = {
+        "FT", "AET", "PEN", "SUSP", "INT",
+    }
+
+    if c in upcoming_codes:
+        return "UPCOMING"
+    if c in inplay_codes:
+        return "INPLAY"
+    if c in finished_codes:
         return "FINISHED"
 
-    if c in {
-        "1H",
-        "2H",
-        "ET",
-        "P",
-        "LIVE",
-        "INT",  # 하프타임(전반 종료)
-        "BT",   # 브레이크
-    }:
-        return "INPLAY"
-
-    # 그 외 대부분은 킥오프 전/취소 등을 UPCOMING 으로 처리
+    # 알 수 없는 값이면 일단 UPCOMING 으로 본다.
     return "UPCOMING"
+
+
+# ─────────────────────────────────────
+#  킥오프 시각 파싱
+# ─────────────────────────────────────
 
 
 def _parse_kickoff_to_utc(val: Any) -> Optional[dt.datetime]:
     """
-    matches.date_utc 값(문자열 또는 datetime)을 UTC aware datetime 으로 변환.
+    matches.date_utc 등에 들어있는 값을 UTC datetime 으로 변환.
+
+    - timezone-aware datetime  → UTC 로 변환
+    - naive datetime          → UTC 로 가정
+    - ISO 문자열              → fromisoformat 으로 파싱 후 위와 동일
     """
     if val is None:
         return None
 
     if isinstance(val, dt.datetime):
         if val.tzinfo is None:
-            # tz 정보 없으면 UTC 로 간주
             return val.replace(tzinfo=dt.timezone.utc)
         return val.astimezone(dt.timezone.utc)
 
-    s = str(val)
-    try:
-        # ISO8601 형태("2025-11-01T15:00:00+00:00" 등) 우선
-        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(
-            dt.timezone.utc
-        )
-    except Exception:
+    if isinstance(val, str):
         try:
-            # DATE 만 있을 수도 있음("2025-11-01")
-            d = dt.date.fromisoformat(s[:10])
-            return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc)
-        except Exception:
+            dt_val = dt.datetime.fromisoformat(val)
+        except ValueError:
             return None
+        if dt_val.tzinfo is None:
+            return dt_val.replace(tzinfo=dt.timezone.utc)
+        return dt_val.astimezone(dt.timezone.utc)
+
+    return None
 
 
 # ─────────────────────────────────────
-#  A그룹 호출 여부 (경기 일정 기반, 라이브 우선 버전)
+#  A그룹(라이브 호출) 여부 판단
 # ─────────────────────────────────────
 
 
@@ -138,42 +141,44 @@ def should_call_league_today(
     now: dt.datetime,
 ) -> bool:
     """
-    "지금 이 리그에 대해 A그룹(Api-Football 라이브 호출)을 해야 하는지" 판단.
+    경기 일정(matches.date_utc)을 기준으로
+    "지금 이 리그에 대해 A그룹(Api-Football 라이브 호출)을 해야 하는지"
+    를 최소 호출 + 안정성 위주로 판단한다.
 
-    목표:
-      - 해당 리그의 오늘 경기 가운데
-        킥오프 30분 전 ~ 킥오프 120분 후 구간에 있는 경기 하나라도 있으면
-        → True 를 반환해서, 그 시간 동안은 1분마다 라이브 호출이 돌도록 한다.
-      - 그 외 시간대(너무 이르거나, 경기가 다 끝난 뒤)는 호출하지 않는다.
+    ✅ 변경 1: DATE(date_utc) = %s 필터 제거
+        - 리그 전체 시즌을 대상으로, 지금 시각(now)과의 시간 차이로만 판단.
+        - DB 에서 날짜가 하루 정도 밀려 있어도, 실제 시간 차이만 맞으면 잡을 수 있다.
 
-    정의:
-      diff_min = (now_utc - kickoff_utc)  [분]
+    로직:
+      diff_min = (now_utc - kickoff_utc) [분 단위]
 
-        * 킥오프 30분 전:  diff_min = -30
-        * 킥오프 시점:     diff_min = 0
-        * 킥오프 120분 후: diff_min = 120
+      -30분  ≤ diff_min ≤ 120분   → A그룹 활성 (라이브/전후 포함)
 
-      따라서, -30 <= diff_min <= 120 이면 라이브 구간으로 본다.
+    이 구간 밖이면:
+      - 이 리그에 대해서는 지금 Api-Football 라이브 호출을 하지 않는다.
+
+    ※ date_str 는 B그룹 등 다른 용도 호환을 위해 인자로만 유지,
+       여기 로직은 오로지 DB 일정 + now(UTC)만 사용.
     """
 
-    # 오늘(date_str)에 해당하는 이 리그 경기만 본다.
+    # 이 리그의 전체 경기를 한 번에 읽어온다.
     rows = fetch_all(
         """
         SELECT fixture_id, date_utc
         FROM matches
         WHERE league_id = %s
-          AND DATE(date_utc) = %s
         """,
-        (league_id, date_str),
+        (league_id,),
     )
     if not rows:
         return False
 
     # now 를 UTC aware 로 정규화
-    if now.tzinfo is None:
-        now_utc_val = now.replace(tzinfo=dt.timezone.utc)
+    now_utc_val = now
+    if now_utc_val.tzinfo is None:
+        now_utc_val = now_utc_val.replace(tzinfo=dt.timezone.utc)
     else:
-        now_utc_val = now.astimezone(dt.timezone.utc)
+        now_utc_val = now_utc_val.astimezone(dt.timezone.utc)
 
     for r in rows:
         kickoff_raw = r.get("date_utc")
@@ -183,7 +188,7 @@ def should_call_league_today(
 
         diff_min = (now_utc_val - kickoff_utc).total_seconds() / 60.0
 
-        # 킥오프 30분 전 ~ 킥오프 120분 후 → 라이브/프리매치 구간
+        # 경기 직전/중/직후 (라이브 구간: 1분마다 호출)
         if -30.0 <= diff_min <= 120.0:
             return True
 
@@ -193,6 +198,8 @@ def should_call_league_today(
 
 # ─────────────────────────────────────
 #  B그룹(정적 데이터) 호출 타이밍 감지
+#   - PREMATCH: 킥오프 60분 전 ~ 30분 전 사이
+#   - POSTMATCH: 경기 종료 후, 밤 21시 이후
 # ─────────────────────────────────────
 
 
@@ -202,17 +209,20 @@ def detect_static_phase_for_league(
     now: dt.datetime,
 ) -> Optional[str]:
     """
-    standings / team_season_stats 같은 "정적" 데이터 업데이트 타이밍을 대략 판단.
+    B그룹(standings / squads / players / transfers 등)을
+    언제 호출할지 결정하는 헬퍼.
 
-    반환값:
-      - "PREMATCH" : 오늘 날짜에 예정/진행/종료 경기가 있고,
-                     아직 당일이 많이 지나지 않은 시점 (대략 킥오프 전/중/직후)
-      - "POSTMATCH": 오늘 경기가 있고, 대부분 종료된 뒤 (하루 거의 끝난 시점)
-      - None       : 오늘은 이 리그에 업데이트할 필요 없음
+    ✅ 변경 2: PREMATCH 는 "킥오프 60분 전 ~ 30분 전 사이" 에만 True
+        - 이 구간에만 PREMATCH 로 인식 → 그 외 시간에는 PREMATCH 호출 안 함.
+        - 1분 크론 기준으로 최대 30회까지만 호출되므로,
+          예전처럼 하루 종일 PREMATCH 가 반복 호출되는 문제를 줄인다.
 
-    너무 복잡하게 가지 말고,
-    단순히 status_group + 현재 시각(hour) 기준으로만 판단한다.
+    POSTMATCH 는 기존과 동일하게:
+      - 오늘(date_str)에 FINISHED 경기들이 있고
+      - now.hour >= 21 인 경우만 "POSTMATCH" 반환.
     """
+
+    # 오늘 날짜의 경기만 본다 (static 은 날짜 기반으로 충분)
     rows = fetch_all(
         """
         SELECT status_group, status, date_utc
@@ -222,30 +232,41 @@ def detect_static_phase_for_league(
         """,
         (league_id, date_str),
     )
-
     if not rows:
         return None
 
-    has_inplay_or_upcoming = False
+    # now 를 UTC aware 로 정규화
+    now_utc_val = now
+    if now_utc_val.tzinfo is None:
+        now_utc_val = now_utc_val.replace(tzinfo=dt.timezone.utc)
+    else:
+        now_utc_val = now_utc_val.astimezone(dt.timezone.utc)
+
+    # 1) PREMATCH: 킥오프 60분 전 ~ 30분 전 사이에만 활성
+    for r in rows:
+        kickoff_raw = r.get("date_utc")
+        kickoff_utc = _parse_kickoff_to_utc(kickoff_raw)
+        if kickoff_utc is None:
+            continue
+
+        # kickoff 기준: 미래면 양수, 과거면 음수
+        diff_to_kickoff_min = (kickoff_utc - now_utc_val).total_seconds() / 60.0
+
+        # now 가 킥오프보다 60~30분 이전에 있는 경우만 PREMATCH
+        if 30.0 <= diff_to_kickoff_min <= 60.0:
+            return "PREMATCH"
+
+    # 2) POSTMATCH: 경기들이 전부 끝난 뒤, 밤 9시 이후에만 동작
     has_finished = False
 
     for r in rows:
         sg_raw = r.get("status_group") or r.get("status") or ""
         sg = map_status_group(sg_raw)
-        if sg == "INPLAY" or sg == "UPCOMING":
-            has_inplay_or_upcoming = True
-        elif sg == "FINISHED":
+        if sg == "FINISHED":
             has_finished = True
 
-    # UTC 기준 오늘 날짜의 "현재 시간" 을 사용
-    hour = now.hour
-
-    if has_inplay_or_upcoming:
-        # 경기 전/중
-        return "PREMATCH"
-
     if has_finished:
-        # 경기들이 전부 끝나고, 하루가 꽤 지난 시점이면 POSTMATCH 로 본다.
+        hour = now_utc_val.hour
         if hour >= 21:
             return "POSTMATCH"
 
@@ -259,21 +280,25 @@ def detect_static_phase_for_league(
 
 def _fetch_season_range_for_league(league_id: int) -> List[Dict[str, Any]]:
     """
-    matches 테이블에서 리그별 season / 최소일 / 최대일 을 가져온다.
+    해당 리그에 대해 DB 에 저장된 시즌 목록을 가져온다.
+    가장 단순하게 matches 테이블 기준 DISTINCT season 리스트를 사용.
     """
     rows = fetch_all(
         """
-        SELECT
-            season,
-            MIN(date_utc) AS min_date_utc,
-            MAX(date_utc) AS max_date_utc
+        SELECT DISTINCT season
         FROM matches
         WHERE league_id = %s
-        GROUP BY season
+        ORDER BY season
         """,
         (league_id,),
     )
-    return rows or []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        season = r.get("season")
+        if season is None:
+            continue
+        out.append({"season": int(season)})
+    return out
 
 
 def infer_season_for_league_and_date(
@@ -281,59 +306,35 @@ def infer_season_for_league_and_date(
     date_str: str,
 ) -> int:
     """
-    Api-Football /fixtures 호출에서 사용할 season 값을 추론.
+    주어진 league_id + date_str(YYYY-MM-DD)에 대해 적절한 시즌을 추론.
 
-    1) matches 테이블에 이 리그의 season 별로 date_utc 범위가 들어있다면:
-         - 각 season 의 [시즌 시작-30일, 시즌 종료+60일] 범위 안에
-           date_str 가 들어가는 season 을 우선 사용.
-    2) 적당한 시즌을 못 찾으면:
-         - date_str 의 연도를 그대로 season 으로 사용.
+    우선순위:
+      1) matches 테이블에서 해당 날짜에 실제로 존재하는 season 이 있으면 그 값을 사용
+      2) 없으면 해당 리그의 시즌 목록 중 가장 최신 시즌(max season)을 사용
     """
-    try:
-        d = dt.date.fromisoformat(date_str[:10])
-    except Exception:
-        d = now_utc().date()
+    # 1) 해당 날짜에 실제 경기 있는지 확인
+    rows = fetch_all(
+        """
+        SELECT season
+        FROM matches
+        WHERE league_id = %s
+          AND DATE(date_utc) = %s
+        ORDER BY season DESC
+        LIMIT 1
+        """,
+        (league_id, date_str),
+    )
+    if rows:
+        season = rows[0].get("season")
+        if season is not None:
+            return int(season)
 
-    year = d.year
+    # 2) 없으면 시즌 범위에서 가장 최신 시즌 사용
+    seasons = _fetch_season_range_for_league(league_id)
+    if not seasons:
+        raise ValueError(f"no season info found for league_id={league_id}")
 
-    season_rows = _fetch_season_range_for_league(league_id)
-    best_season: Optional[int] = None
-
-    for row in season_rows:
-        s = row.get("season")
-        if s is None:
-            continue
-        try:
-            s_int = int(s)
-        except (TypeError, ValueError):
-            continue
-
-        min_raw = row.get("min_date_utc")
-        max_raw = row.get("max_date_utc")
-        if not min_raw or not max_raw:
-            continue
-
-        min_dt = _parse_kickoff_to_utc(min_raw)
-        max_dt = _parse_kickoff_to_utc(max_raw)
-        if not min_dt or not max_dt:
-            continue
-
-        min_d = min_dt.date()
-        max_d = max_dt.date()
-
-        # 시즌 시작 30일 전 ~ 시즌 종료 60일 후까지를 같은 시즌으로 본다.
-        before = min_d - dt.timedelta(days=30)
-        after = max_d + dt.timedelta(days=60)
-
-        if before <= d <= after:
-            best_season = s_int
-            break
-
-    if best_season is not None:
-        return best_season
-
-    # 아직 이 리그에 대한 matches 데이터가 거의 없으면 → 날짜 연도 기준 season
-    return year
+    return int(seasons[-1]["season"])
 
 
 def resolve_league_season_for_date(
