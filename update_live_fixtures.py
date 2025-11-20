@@ -58,7 +58,9 @@ def main() -> None:
                 # A그룹(라이브) 필요 여부
                 if not should_call_league_today(lid, target_date, now):
                     # A는 필요 없지만 B(PREMATCH/POSTMATCH)만 필요할 수도 있음
-                    static_phase = detect_static_phase_for_league(lid, target_date, now)
+                    static_phase = detect_static_phase_for_league(
+                        lid, target_date, now
+                    )
                     if static_phase is None:
                         print(
                             f"  - league {lid}: 지금 업데이트가 필요한 경기가 없어 "
@@ -75,7 +77,9 @@ def main() -> None:
                     print(
                         f"  - league {lid}: 시간 창 조건 만족 → Api-Football 호출 (A그룹)"
                     )
-                    static_phase = detect_static_phase_for_league(lid, target_date, now)
+                    static_phase = detect_static_phase_for_league(
+                        lid, target_date, now
+                    )
                     a_group_active = True
             else:
                 print(
