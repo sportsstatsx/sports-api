@@ -128,7 +128,7 @@ def _parse_kickoff_to_utc(val: Any) -> Optional[dt.datetime]:
 
 
 # ─────────────────────────────────────
-#  A그룹 호출 여부 (킥오프 기반 2번 방식)
+#  A그룹 호출 여부 (경기 일정 기반, 호출 최소화 버전)
 # ─────────────────────────────────────
 
 
@@ -138,30 +138,29 @@ def should_call_league_today(
     now: dt.datetime,
 ) -> bool:
     """
-    ✅ 2번 방식: "해당 리그의 경기 킥오프 시간" 기준으로
-       호출해야 할 시간 창인지 판단한다.
+    경기 일정(matches.date_utc)을 기준으로
+    "지금 이 리그에 대해 A그룹(Api-Football 라이브 호출)을 해야 하는지"
+   를 최소 호출 + 안정성 위주로 판단한다.
 
-    - matches 테이블에서 league_id 에 해당하는 모든 경기의 date_utc 를 가져온 뒤,
-      각 경기의 킥오프(kickoff_utc) 와 현재 시각(now)의 차이(diff_min)를 계산한다.
+    - matches 테이블에는 미리 reconcile 로 저장해 둔 전체 시즌 일정이 들어있다고 가정.
+    - 각 경기의 킥오프 시각(kickoff_utc)과 현재 시각(now_utc)의 차이를 분 단위로 계산해서,
+      특정 시간 구간에 들어온 경기 하나라도 있으면 → True(호출).
 
-    - diff_min = (kickoff_utc - now) [분 단위]
+    diff_min = (kickoff_utc - now_utc) [분 단위]
 
-    아래 구간에 한 번이라도 걸리면 → 이 리그에 대해 지금 A그룹(Api-Football)을 호출:
+      1) -75 ~ -45분 : 킥오프 60분 전 근처 (PRE60, 라인업/프리매치 준비)
+      2) -45 ~ -15분 : 킥오프 30분 전 근처 (PRE30, 라인업 한 번 더 반영)
+      3) -15 ~ 130분 : 경기 직전 ~ 경기 중/직후 (INPLAY, 1분마다 호출 구간)
+      4) 130 ~ 180분 : 경기 종료 후 조금 지난 구간 (POST, 마무리 정리용)
 
-      1) -75 ~ -45분 : 킥오프 60분 전 근처 (PRE60)
-      2) -45 ~ -15분 : 킥오프 30분 전 근처 (PRE30)
-      3) -15 ~ 130분 : 경기 직전 ~ 경기 중/직후 (LIVE 구간, 1분마다 호출)
-      4) 130 ~ 180분 : 경기 종료 후 조금 지난 구간 (POST)
+    이 구간 밖이면:
+      - 이 리그에 대해서는 지금 Api-Football 라이브 호출을 하지 않는다.
 
-    이렇게 하면:
-      - 경기 없으면 호출 안 함.
-      - 경기와 상관없는 시간대(오전/한밤중 등)에는 Api-Football 호출 안 함.
-      - 경기 전후 3~4시간 정도에만 크론(1분마다) + Api 호출이 돌아간다.
-
-    ※ date_str 는 과거/미래 백필 및 B그룹용으로 유지하지만,
-       여기서는 "오늘 날짜" 여부와 상관없이 오로지 킥오프 시간 차이만 사용한다.
+    ※ date_str 는 B그룹 등 다른 용도 호환을 위해 인자로만 유지,
+       여기 로직은 오로지 DB 일정 + now(UTC)만 사용.
     """
-    # 리그 전체 경기의 킥오프 시간 목록
+
+    # 이 리그의 전체 경기를 한 번에 읽어온다.
     rows = fetch_all(
         """
         SELECT fixture_id, date_utc
@@ -170,25 +169,24 @@ def should_call_league_today(
         """,
         (league_id,),
     )
-
     if not rows:
         return False
 
-    # 현재 시각을 UTC 기준으로 정규화
+    # now 를 UTC aware 로 정규화
     if now.tzinfo is None:
-        now = now.replace(tzinfo=dt.timezone.utc)
+        now_utc_val = now.replace(tzinfo=dt.timezone.utc)
     else:
-        now = now.astimezone(dt.timezone.utc)
+        now_utc_val = now.astimezone(dt.timezone.utc)
 
     for r in rows:
         kickoff_raw = r.get("date_utc")
         kickoff_utc = _parse_kickoff_to_utc(kickoff_raw)
-        if not kickoff_utc:
+        if kickoff_utc is None:
             continue
 
-        diff_min = (kickoff_utc - now).total_seconds() / 60.0
+        diff_min = (kickoff_utc - now_utc_val).total_seconds() / 60.0
 
-        # 1) 킥오프 60분 전 근처
+        # 1) 킥오프 60분 전 근처 (여유 15분)
         if -75.0 <= diff_min <= -45.0:
             return True
 
@@ -196,14 +194,15 @@ def should_call_league_today(
         if -45.0 < diff_min <= -15.0:
             return True
 
-        # 3) 경기 직전/중/직후 (여기서는 1분마다 호출 유지)
+        # 3) 경기 직전/중/직후 (라이브 구간: 1분마다 호출)
         if -15.0 < diff_min <= 130.0:
             return True
 
-        # 4) 경기 종료 후 살짝 지난 구간
+        # 4) 경기 종료 후 조금 지난 구간
         if 130.0 < diff_min <= 180.0:
             return True
 
+    # 어느 경기에도 해당 안 되면, 지금은 이 리그에 대해 라이브 호출할 필요 없음
     return False
 
 
