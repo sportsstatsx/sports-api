@@ -198,7 +198,8 @@ def should_call_league_today(
 
 # ─────────────────────────────────────
 #  B그룹(정적 데이터) 호출 타이밍 감지
-#   - PREMATCH: 킥오프 60분 전 ~ 30분 전 사이
+#   - PREMATCH: 킥오프 60분 전 ~ 30분 전 사이, 단
+#               현재 시각의 분이 0 또는 30일 때만 1번씩(최대 2회)
 #   - POSTMATCH: 경기 종료 후, 밤 21시 이후
 # ─────────────────────────────────────
 
@@ -212,14 +213,14 @@ def detect_static_phase_for_league(
     B그룹(standings / squads / players / transfers 등)을
     언제 호출할지 결정하는 헬퍼.
 
-    ✅ 변경 2: PREMATCH 는 "킥오프 60분 전 ~ 30분 전 사이" 에만 True
-        - 이 구간에만 PREMATCH 로 인식 → 그 외 시간에는 PREMATCH 호출 안 함.
-        - 1분 크론 기준으로 최대 30회까지만 호출되므로,
-          예전처럼 하루 종일 PREMATCH 가 반복 호출되는 문제를 줄인다.
+    ✅ 변경 2:
+        PREMATCH 는 "킥오프 60분 전 ~ 30분 전" 구간이면서
+        현재 시각의 분이 0 또는 30 인 경우에만 True.
+        → 1분 크론 기준, 각 리그/날짜당 최대 2번만 PREMATCH 호출.
 
-    POSTMATCH 는 기존과 동일하게:
+    POSTMATCH 는:
       - 오늘(date_str)에 FINISHED 경기들이 있고
-      - now.hour >= 21 인 경우만 "POSTMATCH" 반환.
+      - now.hour >= 21 (UTC 기준) 인 경우만 "POSTMATCH" 반환.
     """
 
     # 오늘 날짜의 경기만 본다 (static 은 날짜 기반으로 충분)
@@ -242,21 +243,32 @@ def detect_static_phase_for_league(
     else:
         now_utc_val = now_utc_val.astimezone(dt.timezone.utc)
 
-    # 1) PREMATCH: 킥오프 60분 전 ~ 30분 전 사이에만 활성
+    # ── 1) PREMATCH: 킥오프 60분 전 ~ 30분 전, 분이 0 또는 30일 때만 ──
+    min_future_diff: Optional[float] = None
+
     for r in rows:
         kickoff_raw = r.get("date_utc")
         kickoff_utc = _parse_kickoff_to_utc(kickoff_raw)
         if kickoff_utc is None:
             continue
 
-        # kickoff 기준: 미래면 양수, 과거면 음수
-        diff_to_kickoff_min = (kickoff_utc - now_utc_val).total_seconds() / 60.0
+        diff_future_min = (kickoff_utc - now_utc_val).total_seconds() / 60.0
 
-        # now 가 킥오프보다 60~30분 이전에 있는 경우만 PREMATCH
-        if 30.0 <= diff_to_kickoff_min <= 60.0:
+        # 미래 경기만 고려 (이미 시작/끝난 경기는 PREMATCH 대상 아님)
+        if diff_future_min < 0:
+            continue
+
+        if min_future_diff is None or diff_future_min < min_future_diff:
+            min_future_diff = diff_future_min
+
+    # 가장 가까운 미래 경기까지 남은 시간이 60~30분 사이인 경우만 PREMATCH 후보
+    if min_future_diff is not None and 30.0 <= min_future_diff <= 60.0:
+        # 매분이 아니라, 시각의 분이 0 or 30 인 시점에만 PREMATCH 실행
+        minute = now_utc_val.minute
+        if minute in (0, 30):
             return "PREMATCH"
 
-    # 2) POSTMATCH: 경기들이 전부 끝난 뒤, 밤 9시 이후에만 동작
+    # ── 2) POSTMATCH: 경기들이 전부 끝난 뒤, 밤 21시 이후 ──
     has_finished = False
 
     for r in rows:
