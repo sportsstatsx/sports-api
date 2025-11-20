@@ -128,7 +128,7 @@ def _parse_kickoff_to_utc(val: Any) -> Optional[dt.datetime]:
 
 
 # ─────────────────────────────────────
-#  A그룹 호출 여부 (경기 일정 기반, 호출 최소화 버전)
+#  A그룹 호출 여부 (경기 일정 기반, 라이브 우선 버전)
 # ─────────────────────────────────────
 
 
@@ -138,36 +138,33 @@ def should_call_league_today(
     now: dt.datetime,
 ) -> bool:
     """
-    경기 일정(matches.date_utc)을 기준으로
-    "지금 이 리그에 대해 A그룹(Api-Football 라이브 호출)을 해야 하는지"
-   를 최소 호출 + 안정성 위주로 판단한다.
+    "지금 이 리그에 대해 A그룹(Api-Football 라이브 호출)을 해야 하는지" 판단.
 
-    - matches 테이블에는 미리 reconcile 로 저장해 둔 전체 시즌 일정이 들어있다고 가정.
-    - 각 경기의 킥오프 시각(kickoff_utc)과 현재 시각(now_utc)의 차이를 분 단위로 계산해서,
-      특정 시간 구간에 들어온 경기 하나라도 있으면 → True(호출).
+    목표:
+      - 해당 리그의 오늘 경기 가운데
+        킥오프 30분 전 ~ 킥오프 120분 후 구간에 있는 경기 하나라도 있으면
+        → True 를 반환해서, 그 시간 동안은 1분마다 라이브 호출이 돌도록 한다.
+      - 그 외 시간대(너무 이르거나, 경기가 다 끝난 뒤)는 호출하지 않는다.
 
-    diff_min = (kickoff_utc - now_utc) [분 단위]
+    정의:
+      diff_min = (now_utc - kickoff_utc)  [분]
 
-      1) -75 ~ -45분 : 킥오프 60분 전 근처 (PRE60, 라인업/프리매치 준비)
-      2) -45 ~ -15분 : 킥오프 30분 전 근처 (PRE30, 라인업 한 번 더 반영)
-      3) -15 ~ 130분 : 경기 직전 ~ 경기 중/직후 (INPLAY, 1분마다 호출 구간)
-      4) 130 ~ 180분 : 경기 종료 후 조금 지난 구간 (POST, 마무리 정리용)
+        * 킥오프 30분 전:  diff_min = -30
+        * 킥오프 시점:     diff_min = 0
+        * 킥오프 120분 후: diff_min = 120
 
-    이 구간 밖이면:
-      - 이 리그에 대해서는 지금 Api-Football 라이브 호출을 하지 않는다.
-
-    ※ date_str 는 B그룹 등 다른 용도 호환을 위해 인자로만 유지,
-       여기 로직은 오로지 DB 일정 + now(UTC)만 사용.
+      따라서, -30 <= diff_min <= 120 이면 라이브 구간으로 본다.
     """
 
-    # 이 리그의 전체 경기를 한 번에 읽어온다.
+    # 오늘(date_str)에 해당하는 이 리그 경기만 본다.
     rows = fetch_all(
         """
         SELECT fixture_id, date_utc
         FROM matches
         WHERE league_id = %s
+          AND DATE(date_utc) = %s
         """,
-        (league_id,),
+        (league_id, date_str),
     )
     if not rows:
         return False
@@ -184,22 +181,10 @@ def should_call_league_today(
         if kickoff_utc is None:
             continue
 
-        diff_min = (kickoff_utc - now_utc_val).total_seconds() / 60.0
+        diff_min = (now_utc_val - kickoff_utc).total_seconds() / 60.0
 
-        # 1) 킥오프 60분 전 근처 (여유 15분)
-        if -75.0 <= diff_min <= -45.0:
-            return True
-
-        # 2) 킥오프 30분 전 근처
-        if -45.0 < diff_min <= -15.0:
-            return True
-
-        # 3) 경기 직전/중/직후 (라이브 구간: 1분마다 호출)
-        if -15.0 < diff_min <= 130.0:
-            return True
-
-        # 4) 경기 종료 후 조금 지난 구간
-        if 130.0 < diff_min <= 180.0:
+        # 킥오프 30분 전 ~ 킥오프 120분 후 → 라이브/프리매치 구간
+        if -30.0 <= diff_min <= 120.0:
             return True
 
     # 어느 경기에도 해당 안 되면, 지금은 이 리그에 대해 라이브 호출할 필요 없음
