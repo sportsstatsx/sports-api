@@ -2,40 +2,123 @@ import sys
 import datetime as dt
 from typing import Optional
 
+from db import execute
 from live_fixtures_common import (
     LIVE_LEAGUES_ENV,
     parse_live_leagues,
     get_target_date,
     now_utc,
     should_call_league_today,
-    detect_static_phase_for_league,
 )
 from live_fixtures_a_group import (
     fetch_fixtures_from_api,
-    fetch_events_from_api,
-    fetch_lineups_from_api,
-    fetch_team_stats_from_api,
-    fetch_player_stats_from_api,
     upsert_fixture_row,
-    upsert_match_row,
-    upsert_match_events,
-    upsert_match_events_raw,
-    upsert_match_lineups,
-    upsert_match_team_stats,
-    upsert_match_player_stats,
+    _extract_fixture_basic,
 )
-from live_fixtures_b_group import (
-    update_static_data_prematch_for_league,
-    update_static_data_postmatch_for_league,
-)
+
+
+def upsert_match_status_only(
+    fixture,
+    league_id: Optional[int],
+    season: Optional[int],
+) -> None:
+    """
+    matches 테이블에 '상태 전용' upsert.
+    - 시작 / 하프타임 / 종료 (status, status_group, elapsed)
+    - 기본 정보 (league_id, season, date_utc, home_id, away_id)
+    - ❌ 스코어(home_ft, away_ft)는 절대 수정하지 않는다.
+    """
+    basic = _extract_fixture_basic(fixture)
+    if basic is None:
+        return
+
+    fixture_id = basic["fixture_id"]
+
+    # 상위에서 전달한 league_id / season 이 우선
+    league_id = league_id or basic["league_id"]
+    if season is None:
+        season = basic["season"]
+
+    date_utc = basic["date_utc"]
+    status_short = basic["status"]
+    status_group = basic["status_group"]
+    # elapsed 없으면 None → DB에서는 NULL
+    elapsed = basic.get("elapsed")
+
+    teams_block = fixture.get("teams") or {}
+    home_team = teams_block.get("home") or {}
+    away_team = teams_block.get("away") or {}
+
+    home_team_id = home_team.get("id")
+    away_team_id = away_team.get("id")
+
+    if home_team_id is None or away_team_id is None:
+        # 팀 ID 없으면 matches 에 넣지 않음
+        return
+
+    # ❗ home_ft / away_ft 는 여기서 다루지 않는다.
+    #    (postmatch_backfill.py 에서만 세팅)
+    execute(
+        """
+        INSERT INTO matches (
+            fixture_id,
+            league_id,
+            season,
+            date_utc,
+            status,
+            status_group,
+            elapsed,
+            home_id,
+            away_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            league_id    = EXCLUDED.league_id,
+            season       = EXCLUDED.season,
+            date_utc     = EXCLUDED.date_utc,
+            status       = EXCLUDED.status,
+            status_group = EXCLUDED.status_group,
+            elapsed      = EXCLUDED.elapsed,
+            home_id      = EXCLUDED.home_id,
+            away_id      = EXCLUDED.away_id
+        """,
+        (
+            fixture_id,
+            league_id,
+            season,
+            date_utc,
+            status_short,
+            status_group,
+            elapsed,
+            home_team_id,
+            away_team_id,
+        ),
+    )
 
 
 def main() -> None:
+    """
+    경량 라이브 워커.
+
+    - 역할: 경기 상태(시작 / 하프타임 / 종료), elapsed, 기본 팀/리그 정보만 업데이트
+    - Api-Football 호출: /fixtures 만 사용
+    - DB 작업:
+        * fixtures 테이블: upsert_fixture_row
+        * matches 테이블: upsert_match_status_only
+    - 절대 하지 않는 것:
+        * 스코어(home_ft, away_ft)
+        * events / lineups / team stats / player stats
+        * standings / squads / players / transfers / toplists 등 정적 데이터
+          → 전부 postmatch_backfill.py 에서 처리
+    """
     target_date = get_target_date()
     live_leagues = parse_live_leagues(LIVE_LEAGUES_ENV)
 
     if not live_leagues:
-        print("LIVE_LEAGUES env 에 리그 ID 가 없습니다. 종료.", file=sys.stderr)
+        print(
+            "[update_live_fixtures] LIVE_LEAGUES env 가 비어있습니다. 종료.",
+            file=sys.stderr,
+        )
         return
 
     today_str = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
@@ -51,125 +134,39 @@ def main() -> None:
 
     for lid in live_leagues:
         try:
-            static_phase: Optional[str] = None
-            a_group_active: bool = False
-
             if is_today:
-                # A그룹(라이브) 필요 여부
+                # 오늘 날짜 → should_call_league_today 로 호출 시간대인지 체크
                 if not should_call_league_today(lid, target_date, now):
-                    # A는 필요 없지만 B(PREMATCH/POSTMATCH)만 필요할 수도 있음
-                    static_phase = detect_static_phase_for_league(
-                        lid, target_date, now
+                    print(
+                        f"  - league {lid}: 지금은 라이브 호출 시간대가 아님 → 스킵"
                     )
-                    if static_phase is None:
-                        print(
-                            f"  - league {lid}: 지금 업데이트가 필요한 경기가 없어 "
-                            f"Api 호출 스킵 (A/B 모두 해당 없음)"
-                        )
-                        continue
-                    else:
-                        print(
-                            f"  - league {lid}: A그룹은 필요 없지만 "
-                            f"static_phase={static_phase} → B그룹만 처리"
-                        )
-                        a_group_active = False
+                    continue
                 else:
                     print(
-                        f"  - league {lid}: 시간 창 조건 만족 → Api-Football 호출 (A그룹)"
+                        f"  - league {lid}: 라이브 호출 시간대 → /fixtures 호출"
                     )
-                    static_phase = detect_static_phase_for_league(
-                        lid, target_date, now
-                    )
-                    a_group_active = True
             else:
+                # 과거/미래 날짜 → 수동 백필용으로 전체 호출 허용
                 print(
-                    f"  - league {lid}: date={target_date} (today 아님) → 전체 백필 호출"
+                    f"  - league {lid}: date={target_date} (today 아님) → /fixtures 전체 호출"
                 )
-                # 과거/미래 날짜 전체 백필 시에는 A그룹 데이터도 같이 채움
-                a_group_active = True
 
-            # A/B 그룹 중 하나라도 필요하면 fixtures 호출
             fixtures = fetch_fixtures_from_api(lid, target_date)
             print(f"    응답 경기 수: {len(fixtures)}")
 
-            for row in fixtures:
-                # A그룹: 라이브 핵심( fixtures / matches )
-                # season 은 None 으로 넘기면, 내부에서 Api-Football 응답의 season 을 fallback 으로 사용
-                upsert_fixture_row(row, lid, None)
-                upsert_match_row(row, lid, None)
+            for fx in fixtures:
+                # fixtures 테이블 기본 정보(upsert)
+                upsert_fixture_row(fx, lid, None)
+                # matches 테이블에는 상태만 upsert (스코어 제외)
+                upsert_match_status_only(fx, lid, None)
                 total_updated += 1
-
-                if not a_group_active:
-                    continue
-
-                fixture_block = row.get("fixture") or {}
-                fid = fixture_block.get("id")
-                if not fid:
-                    continue
-
-                # 이벤트
-                try:
-                    events = fetch_events_from_api(fid)
-                except Exception as e:
-                    print(
-                        f"    ! fixture {fid}: events 호출 중 에러: {e}",
-                        file=sys.stderr,
-                    )
-                    events = []
-
-                if events:
-                    upsert_match_events(fid, events)
-                    upsert_match_events_raw(fid, events)
-
-                # 라인업
-                try:
-                    lineups = fetch_lineups_from_api(fid)
-                except Exception as e:
-                    print(
-                        f"    ! fixture {fid}: lineups 호출 중 에러: {e}",
-                        file=sys.stderr,
-                    )
-                    lineups = []
-
-                if lineups:
-                    upsert_match_lineups(fid, lineups)
-
-                # 팀 통계
-                try:
-                    stats = fetch_team_stats_from_api(fid)
-                except Exception as e:
-                    print(
-                        f"    ! fixture {fid}: statistics 호출 중 에러: {e}",
-                        file=sys.stderr,
-                    )
-                    stats = []
-
-                if stats:
-                    upsert_match_team_stats(fid, stats)
-
-                # 선수 통계
-                try:
-                    players_stats = fetch_player_stats_from_api(fid)
-                except Exception as e:
-                    print(
-                        f"    ! fixture {fid}: players 호출 중 에러: {e}",
-                        file=sys.stderr,
-                    )
-                    players_stats = []
-
-                if players_stats:
-                    upsert_match_player_stats(fid, players_stats)
-
-            # B그룹: standings 등 정적 데이터 (지금은 standings만, 나중에 확장)
-            if is_today and static_phase == "PREMATCH":
-                update_static_data_prematch_for_league(lid, target_date)
-            elif is_today and static_phase == "POSTMATCH":
-                update_static_data_postmatch_for_league(lid, target_date)
 
         except Exception as e:
             print(f"  ! league {lid} 처리 중 에러: {e}", file=sys.stderr)
 
-    print(f"[update_live_fixtures] 완료. 총 업데이트/삽입 경기 수 = {total_updated}")
+    print(
+        f"[update_live_fixtures] 완료. 총 상태 업데이트 경기 수 = {total_updated}"
+    )
 
 
 if __name__ == "__main__":
