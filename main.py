@@ -1,12 +1,13 @@
 import os
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Dict
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
+import pytz  # ← 타임존 계산용
 
 from prometheus_client import (
     Counter,
@@ -112,25 +113,48 @@ def metrics():
 
 
 # ─────────────────────────────────────────
-# 핵심 API: /api/fixtures  (A 방식)
+# 핵심 API: /api/fixtures  (타임존 기반 날짜 처리)
 # ─────────────────────────────────────────
 @app.route("/api/fixtures")
 @track_metrics("/api/fixtures")
 def list_fixtures():
     """
-    경기 리스트는 "오직 DB(matches)" 기준으로 제공한다.
+    사용자가 있는 지역 날짜를 기반으로 경기 조회.
+    - date: YYYY-MM-DD (사용자 지역 날짜)
+    - timezone: 사용자 지역의 타임존 ex) Asia/Seoul, America/New_York
     """
 
     league_id = request.args.get("league_id", type=int)
-    date = request.args.get("date", type=str)
-    tz = request.args.get("timezone", "UTC")
+    date_str = request.args.get("date", type=str)
+    tz_str = request.args.get("timezone", "UTC")
 
-    if not league_id or not date:
+    if not league_id or not date_str:
         return (
             jsonify({"ok": False, "error": "league_id and date are required"}),
             400,
         )
 
+    # 1) 사용자 타임존 객체
+    try:
+        user_tz = pytz.timezone(tz_str)
+    except Exception:
+        return jsonify({"ok": False, "error": f"Invalid timezone: {tz_str}"}), 400
+
+    # 2) 사용자 날짜 → datetime
+    try:
+        local_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
+
+    # 3) 사용자 날짜의 시작/끝 (지역 기준)
+    local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
+    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+
+    # 4) UTC 로 변환
+    utc_start = local_start.astimezone(timezone.utc)
+    utc_end = local_end.astimezone(timezone.utc)
+
+    # 5) SQL 범위 필터 (date_utc 는 text → timestamptz 로 변환)
     sql = """
         SELECT
             m.fixture_id,
@@ -144,10 +168,10 @@ def list_fixtures():
             m.away_id,
             m.home_ft,
             m.away_ft,
-            th.name      AS home_name,
-            ta.name      AS away_name,
-            th.logo      AS home_logo,
-            ta.logo      AS away_logo,
+            th.name  AS home_name,
+            ta.name  AS away_name,
+            th.logo  AS home_logo,
+            ta.logo  AS away_logo,
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -168,11 +192,11 @@ def list_fixtures():
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         WHERE m.league_id = %s
-          AND (timezone(%s, m.date_utc::timestamp))::date = %s
+          AND (m.date_utc::timestamptz BETWEEN %s AND %s)
         ORDER BY m.date_utc ASC
     """
 
-    rows = fetch_all(sql, (league_id, tz, date))
+    rows = fetch_all(sql, (league_id, utc_start, utc_end))
 
     fixtures = []
     for r in rows:
@@ -210,4 +234,3 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
