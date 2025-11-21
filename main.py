@@ -28,6 +28,7 @@ from services.home_service import (
     get_team_info,
 )
 from routers.home_router import home_bp  # 👈 홈 라우터 블루프린트 등록
+from zoneinfo import ZoneInfo  # 👈 타임존 검증용 추가
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -204,7 +205,6 @@ def handle_exception(e):
     }), 500
 
 
-
 # ─────────────────────────────────────────
 # 루트 (브라우저 테스트용)
 # ─────────────────────────────────────────
@@ -365,6 +365,15 @@ def health():
 def list_fixtures():
     league_id = request.args.get("league_id", type=int)
     date_str = request.args.get("date")  # YYYY-MM-DD
+
+    # 🔹 단말 타임존 (예: Asia/Seoul, Europe/London)
+    tz = request.args.get("tz") or "UTC"
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        # 잘못된 타임존이 들어오면 UTC로 강제
+        tz = "UTC"
+
     page = request.args.get("page", 1, type=int)
     page_size = request.args.get("page_size", 50, type=int)
 
@@ -384,7 +393,7 @@ def list_fixtures():
             m.date_utc,
             m.status,
             m.status_group,
-            m.elapsed,   -- ✅ 실제 진행 시간(분) 컬럼 추가
+            m.elapsed,   -- ✅ 실제 진행 시간(분)
             m.home_id,
             m.away_id,
             m.home_ft,
@@ -396,7 +405,7 @@ def list_fixtures():
             th.logo     AS home_logo,
             ta.name     AS away_name,
             ta.logo     AS away_logo,
-            -- ✅ 홈 팀 레드카드 개수
+            -- 홈 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -405,7 +414,7 @@ def list_fixtures():
                   AND lower(e.type)   = 'card'
                   AND lower(e.detail) = 'red card'
             ) AS home_red_cards,
-            -- ✅ 원정 팀 레드카드 개수
+            -- 원정 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -421,9 +430,10 @@ def list_fixtures():
           ON th.id = m.home_id
         JOIN teams ta
           ON ta.id = m.away_id
-        WHERE DATE(m.date_utc) = %s
+        WHERE (m.date_utc AT TIME ZONE %s)::date = %s
     """
-    params = [date_str]
+    # 첫 두 파라미터: tz, date
+    params = [tz, date_str]
 
     if league_id is not None:
         sql += " AND m.league_id = %s"
