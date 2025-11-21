@@ -207,18 +207,17 @@ def get_home_league_directory(
     - 전체 지원 리그를 내려주고,
     - 각 리그별로 해당 날짜(date_str, timezone_str 기준 로컬 하루)에
       편성된 경기 수(today_count)를 함께 내려준다.
-    - 앱에서는 /api/home/league_directory?date=YYYY-MM-DD&timezone=Asia/Seoul
-      형태로 호출해서 리그 필터 목록을 구성한다.
     """
     utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
 
     rows = fetch_all(
         """
         SELECT
-            l.id      AS league_id,
-            l.name    AS league_name,
-            l.country AS country,
-            l.logo    AS league_logo,
+            l.id        AS league_id,
+            l.name      AS league_name,
+            l.country   AS country,
+            l.continent AS continent,     -- ✅ 대륙 추가
+            l.logo      AS league_logo,
             COALESCE(
                 SUM(
                     CASE
@@ -235,6 +234,7 @@ def get_home_league_directory(
             l.id,
             l.name,
             l.country,
+            l.continent,                  -- ✅ group by 에도 포함
             l.logo
         ORDER BY
             l.country,
@@ -250,11 +250,13 @@ def get_home_league_directory(
                 "league_id": r["league_id"],
                 "league_name": r["league_name"],
                 "country": r["country"],
+                "continent": r["continent"],   # ✅ JSON 에 포함
                 "league_logo": r["league_logo"],
                 "today_count": r["today_count"],
             }
         )
     return result
+
 
 
 # ─────────────────────────────────────
