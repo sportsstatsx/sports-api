@@ -25,6 +25,8 @@ from .insights.insights_overall_discipline_setpieces import (
     enrich_overall_discipline_setpieces,
 )
 from .insights.utils import normalize_comp, parse_last_n
+from .league_directory_service import build_league_directory
+
 
 
 # ─────────────────────────────────────
@@ -202,59 +204,11 @@ def get_home_league_directory(
     timezone_str: str,
 ) -> List[Dict[str, Any]]:
     """
-    리그 선택 바텀시트 전용 디렉터리.
-
-    - 전체 지원 리그를 내려주고,
-    - 각 리그별로 해당 '로컬 날짜(date_str, timezone 기준)'에 편성된
-      경기 수(today_count)를 함께 내려준다.
-    - /api/home/league_directory?date=YYYY-MM-DD&timezone=Asia/Seoul
-      형태로 호출하는 것을 기준으로 한다.
+    홈 리그 디렉터리(필터용)는 전부 league_directory_service 쪽에서 계산한다.
+    여기서는 날짜/타임존만 넘겨주는 얇은 래퍼 역할만 한다.
     """
-    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+    return build_league_directory(date_str=date_str, timezone_str=timezone_str)
 
-    rows = fetch_all(
-        """
-        SELECT
-            l.id      AS league_id,
-            l.name    AS league_name,
-            l.country AS country,
-            l.logo    AS logo,
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN m.date_utc::timestamptz BETWEEN %s AND %s THEN 1
-                        ELSE 0
-                    END
-                ),
-                0
-            ) AS today_count
-        FROM leagues l
-        LEFT JOIN matches m
-          ON m.league_id = l.id
-        GROUP BY
-            l.id,
-            l.name,
-            l.country,
-            l.logo
-        ORDER BY
-            l.country,
-            l.name
-        """,
-        (utc_start, utc_end),
-    )
-
-    result: List[Dict[str, Any]] = []
-    for r in rows:
-        result.append(
-            {
-                "league_id": r["league_id"],
-                "league_name": r["league_name"],
-                "country": r["country"],
-                "logo": r["logo"],
-                "today_count": r["today_count"],
-            }
-        )
-    return result
 
 
 # ─────────────────────────────────────
