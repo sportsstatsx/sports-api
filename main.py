@@ -3,7 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from typing import Dict
+from typing import Dict, List, Any
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
@@ -113,24 +113,48 @@ def metrics():
 
 
 # ─────────────────────────────────────────
-# 핵심 API: /api/fixtures  (타임존 기반 날짜 처리)
+# 핵심 API: /api/fixtures  (타임존 + 다중 리그 필터)
 # ─────────────────────────────────────────
 @app.route("/api/fixtures")
 @track_metrics("/api/fixtures")
 def list_fixtures():
     """
     사용자가 있는 지역 날짜를 기반으로 경기 조회.
-    - date: YYYY-MM-DD (사용자 지역 날짜)
-    - timezone: 사용자 지역의 타임존 ex) Asia/Seoul, America/New_York
+
+    Query params:
+      - date: YYYY-MM-DD (필수, 사용자 지역 날짜)
+      - timezone: 사용자 지역의 타임존 ex) Asia/Seoul, America/New_York (기본: UTC)
+      - league_id: 단일 리그 ID (선택)
+      - league_ids: "39,78,61" 형식의 여러 리그 ID (선택)
+
+    league_ids 가 있으면 IN 필터,
+    없고 league_id 가 > 0 이면 = 필터,
+    둘 다 없으면 모든 리그를 반환한다.
     """
 
+    # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
+    league_ids_raw = request.args.get("league_ids", type=str)
+
+    league_ids: List[int] = []
+    if league_ids_raw:
+        for part in league_ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                league_ids.append(int(part))
+            except ValueError:
+                # 잘못된 값은 무시
+                continue
+
+    # 🔹 날짜 & 타임존
     date_str = request.args.get("date", type=str)
     tz_str = request.args.get("timezone", "UTC")
 
-    if not league_id or not date_str:
+    if not date_str:
         return (
-            jsonify({"ok": False, "error": "league_id and date are required"}),
+            jsonify({"ok": False, "error": "date is required (YYYY-MM-DD)"}),
             400,
         )
 
@@ -147,15 +171,37 @@ def list_fixtures():
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
     # 3) 사용자 날짜의 시작/끝 (지역 기준)
-    local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_start = user_tz.localize(
+        datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0)
+    )
+    local_end = user_tz.localize(
+        datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59)
+    )
 
     # 4) UTC 로 변환
     utc_start = local_start.astimezone(timezone.utc)
     utc_end = local_end.astimezone(timezone.utc)
 
-    # 5) SQL 범위 필터 (date_utc 는 text → timestamptz 로 변환)
-    sql = """
+    # 5) SQL 구성
+    params: List[Any] = [utc_start, utc_end]
+    where_clauses: List[str] = [
+        "(m.date_utc::timestamptz BETWEEN %s AND %s)"
+    ]
+
+    #   - 여러 리그가 넘어온 경우: IN (...)
+    if league_ids:
+        placeholders = ", ".join(["%s"] * len(league_ids))
+        where_clauses.append(f"m.league_id IN ({placeholders})")
+        params.extend(league_ids)
+    #   - 하나만 넘어온 경우: = league_id
+    elif league_id is not None and league_id > 0:
+        where_clauses.append("m.league_id = %s")
+        params.append(league_id)
+    #   - 둘 다 없으면 리그 필터 없음 (ALL)
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
         SELECT
             m.fixture_id,
             m.league_id,
@@ -172,6 +218,10 @@ def list_fixtures():
             ta.name  AS away_name,
             th.logo  AS home_logo,
             ta.logo  AS away_logo,
+            -- 리그 정보도 같이 내려주면 클라이언트에서 섹션 헤더 등에 사용 가능
+            l.name   AS league_name,
+            l.logo   AS league_logo,
+            l.country AS league_country,
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -191,12 +241,12 @@ def list_fixtures():
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
-        WHERE m.league_id = %s
-          AND (m.date_utc::timestamptz BETWEEN %s AND %s)
+        JOIN leagues l ON l.id = m.league_id
+        WHERE {where_sql}
         ORDER BY m.date_utc ASC
     """
 
-    rows = fetch_all(sql, (league_id, utc_start, utc_end))
+    rows = fetch_all(sql, tuple(params))
 
     fixtures = []
     for r in rows:
@@ -209,6 +259,9 @@ def list_fixtures():
                 "status_group": r["status_group"],
                 "status": r["status"],
                 "elapsed": r["elapsed"],
+                "league_name": r.get("league_name"),
+                "league_logo": r.get("league_logo"),
+                "league_country": r.get("league_country"),
                 "home": {
                     "id": r["home_id"],
                     "name": r["home_name"],
