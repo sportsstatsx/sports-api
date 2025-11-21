@@ -260,7 +260,8 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     if any(k in n for k in [
         "brazil", "argentina", "colombia", "uruguay", "paraguay",
         "chile", "peru", "ecuador", "bolivia", "venezuela",
-        "mls", "liga mx", "ligamx", "expansion mx", "liga de expansión mx",
+        "mls", "major league soccer", "liga mx", "ligamx",
+        "expansion mx", "liga de expansión mx",
     ]):
         return "Americas"
 
@@ -270,6 +271,7 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
         "j1 league", "j2 league", "j-league", "j league",
         "qatar", "saudi",
         "japan", "korea",
+        "a-league", "a league",
     ]):
         return "Asia"
 
@@ -301,40 +303,86 @@ def _calc_inner_sort(league_name: str, continent: str) -> int:
     """
     한 대륙 내부에서의 정렬 우선순위 숫자.
 
-    tier:
-      1 = 유럽 빅5 1부리그 (EPL > La Liga > Bundesliga > Ligue 1 > Serie A)
-      2 = 그 외 1부리그
-      3 = 2부리그 / 하위리그
-      4 = 국내컵(FA Cup 등)
-      5 = 대륙컵(UCL, AFC CL, Libertadores 등)
+    Europe:
+      - EPL > La Liga > Bundesliga > Ligue 1 > Serie A > 기타 1부 > 2부 > 국내컵 > 대륙컵
 
-    같은 tier 안에서는 이름(또는 서브 우선순위)으로 정렬.
+    Asia:
+      - K League 1 > J1 League > Australia A-League > 기타 1부 > 2부 > 국내컵 > 대륙컵(AFC CL)
+
+    Americas:
+      - MLS (Major League Soccer) 최상단
+      - 나머지 1부리그 > 2부리그 > 국내컵 > 대륙컵(CONCACAF, Libertadores 등)
     """
-    # 5) 대륙 컵은 항상 맨 아래
+    n = _normalize_name(league_name)
+
+    # 6) 대륙 컵은 항상 맨 아래
     if _is_continental_cup(league_name):
+        tier = 6
+        sub = 0
+        return tier * 100 + sub
+
+    # 5) 국내 컵
+    if _is_domestic_cup(league_name):
         tier = 5
         sub = 0
         return tier * 100 + sub
 
-    # 4) 국내 컵
-    if _is_domestic_cup(league_name):
+    # 4) 2부리그 / 하위리그
+    if _is_second_division(league_name):
         tier = 4
         sub = 0
         return tier * 100 + sub
 
-    # 3) 2부리그 / 하위리그
-    if _is_second_division(league_name):
-        tier = 3
+    # 1~3) 대륙별 1부리그 우선규칙
+    # ───────────────── Europe ─────────────────
+    if continent == "Europe":
+        # 유럽 빅5 1부리그: EPL > La Liga > Bundesliga > Ligue 1 > Serie A
+        if league_name in _TOP_FIRST_PRIORITY:
+            tier = 1
+            sub = _TOP_FIRST_PRIORITY[league_name]  # 1~5
+            return tier * 100 + sub
+
+        # 그 외 1부리그
+        tier = 2
         sub = 0
         return tier * 100 + sub
 
-    # 1) 유럽 빅5 1부리그
-    if league_name in _TOP_FIRST_PRIORITY:
-        tier = 1
-        sub = _TOP_FIRST_PRIORITY[league_name]
+    # ───────────────── Asia ─────────────────
+    if continent == "Asia":
+        # K League 1 > J1 League > A-League
+        if "k league 1" in n or "k-league 1" in n:
+            tier = 1
+            sub = 1
+            return tier * 100 + sub
+        if "j1 league" in n:
+            tier = 1
+            sub = 2
+            return tier * 100 + sub
+        if "a-league" in n or "a league" in n:
+            tier = 1
+            sub = 3
+            return tier * 100 + sub
+
+        # 나머지 1부리그
+        tier = 2
+        sub = 0
         return tier * 100 + sub
 
-    # 2) 나머지 1부리그 (이름순)
+    # ───────────────── Americas ─────────────────
+    if continent == "Americas":
+        # MLS 최상단 (Major League Soccer / MLS 모두 인식)
+        if "major league soccer" in n or "mls" in n:
+            tier = 1
+            sub = 1
+            return tier * 100 + sub
+
+        # 나머지 1부리그
+        tier = 2
+        sub = 0
+        return tier * 100 + sub
+
+    # ───────────────── Other (기타 대륙) ─────────────────
+    # 기본: 1부리그 = tier 2
     tier = 2
     sub = 0
     return tier * 100 + sub
