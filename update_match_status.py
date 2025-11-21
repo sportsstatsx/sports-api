@@ -6,16 +6,20 @@ from typing import Dict, Any, List
 
 from db import fetch_all, execute
 
-API_KEY = os.environ.get("APIFOOTBALL_KEY")
-API_HOST = "api-football-v1.p.rapidapi.com"
-
-HEADERS = {
-    "x-rapidapi-key": API_KEY,
-    "x-rapidapi-host": API_HOST,
-}
 
 # ─────────────────────────────────────
-# 상태 매핑 (1단계에서 확정한 규칙)
+# API-Sports 설정
+# ─────────────────────────────────────
+API_KEY = os.environ.get("APIFOOTBALL_KEY")
+API_HOST = "v3.football.api-sports.io"
+
+HEADERS = {
+    "x-apisports-key": API_KEY
+}
+
+
+# ─────────────────────────────────────
+# 상태 매핑
 # ─────────────────────────────────────
 STATUS_MAP = {
     "NS": ("UPCOMING", "NS"),
@@ -37,21 +41,21 @@ STATUS_MAP = {
 # API 호출
 # ─────────────────────────────────────
 def fetch_fixture_detail(fixture_id: int) -> Dict[str, Any]:
-    url = f"https://{API_HOST}/v3/fixtures"
+    url = f"https://{API_HOST}/fixtures"
     params = {"id": fixture_id}
 
     r = requests.get(url, headers=HEADERS, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()
 
-    if not data or "response" not in data or len(data["response"]) == 0:
+    if "response" not in data or len(data["response"]) == 0:
         return {}
 
     return data["response"][0]
 
 
 # ─────────────────────────────────────
-# 오늘 + 어제 범위의 경기 중 FINISHED 아닌 경기 조회
+# 오늘+어제 중 FINISHED 아닌 경기들 조회
 # ─────────────────────────────────────
 def get_target_matches() -> List[Dict[str, Any]]:
     now = dt.datetime.utcnow()
@@ -62,7 +66,7 @@ def get_target_matches() -> List[Dict[str, Any]]:
     end_dt = f"{today} 23:59:59"
 
     sql = """
-        SELECT fixture_id, date_utc, status, status_group, home_ft, away_ft
+        SELECT fixture_id, date_utc, status, status_group
         FROM matches
         WHERE date_utc BETWEEN %s AND %s
           AND status_group != 'FINISHED'
@@ -73,10 +77,9 @@ def get_target_matches() -> List[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────
-# match_events 갱신
+# 이벤트 업데이트
 # ─────────────────────────────────────
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]):
-    # 기존 이벤트 삭제 후 전체 재삽입
     execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
 
     for ev in events:
@@ -99,25 +102,18 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]):
         """
 
         execute(sql, (
-            fixture_id,
-            team_id,
-            player_id,
-            ev.get("type"),
-            ev.get("detail"),
-            minute,
-            extra,
-            assist_id,
-            assist_name,
-            p_in,
-            None  # player_in_name 사용 안함
+            fixture_id, team_id, player_id,
+            ev.get("type"), ev.get("detail"),
+            minute, extra,
+            assist_id, assist_name,
+            p_in, None
         ))
 
 
 # ─────────────────────────────────────
-# match_team_stats 갱신
+# 팀 스탯 업데이트
 # ─────────────────────────────────────
 def upsert_match_team_stats(fixture_id: int, stats: List[Dict[str, Any]]):
-    # 기존 삭제 후 재삽입
     execute("DELETE FROM match_team_stats WHERE fixture_id = %s", (fixture_id,))
 
     for team_stat in stats:
@@ -136,8 +132,7 @@ def upsert_match_team_stats(fixture_id: int, stats: List[Dict[str, Any]]):
 
 
 # ─────────────────────────────────────
-# 논리적 종료 처리
-# kickoff_time + 150분 기준
+# 논리적 종료 (kickoff + 150분)
 # ─────────────────────────────────────
 def is_logical_finished(date_utc: str) -> bool:
     try:
@@ -150,10 +145,11 @@ def is_logical_finished(date_utc: str) -> bool:
 
 
 # ─────────────────────────────────────
-# 메인 업데이트 로직
+# 메인 처리
 # ─────────────────────────────────────
 def update_matches():
     rows = get_target_matches()
+
     if not rows:
         print("No matches to update.")
         return
@@ -165,38 +161,34 @@ def update_matches():
 
     for row in rows:
         fid = row["fixture_id"]
-        current_status = row["status"]
-        current_group = row["status_group"]
         date_utc = row["date_utc"]
 
-        # 논리 종료 체크
+        # 논리 종료 판단
         if is_logical_finished(date_utc):
-            if current_group != "FINISHED":
-                print(f"[LOGICAL FINISH] Fixture {fid} → FINISHED (timeout)")
-                sql = """
-                    UPDATE matches
-                    SET status_group='FINISHED', status='FT', elapsed=90
-                    WHERE fixture_id=%s
-                """
-                execute(sql, (fid,))
-                finished += 1
+            sql = """
+                UPDATE matches
+                SET status_group='FINISHED', status='FT', elapsed=90
+                WHERE fixture_id=%s
+            """
+            execute(sql, (fid,))
+            print(f"[LOGICAL FINISH] Fixture {fid} → FINISHED")
+            finished += 1
             continue
 
-        # API 조회
+        # API에서 최신 상태 가져오기
         data = fetch_fixture_detail(fid)
         if not data:
             print(f"[WARN] No API data for fixture {fid}")
             continue
 
-        api_status = data["fixture"]["status"]["short"]
+        s = data["fixture"]["status"]["short"]
 
-        if api_status not in STATUS_MAP:
-            print(f"[WARN] Unknown status {api_status} for fixture {fid}")
+        if s not in STATUS_MAP:
+            print(f"[WARN] Unknown status {s} for fixture {fid}")
             continue
 
-        group, status = STATUS_MAP[api_status]
+        group, status = STATUS_MAP[s]
 
-        # 기본 정보 업데이트
         goals = data.get("goals", {})
         home_ft = goals.get("home")
         away_ft = goals.get("away")
@@ -212,21 +204,18 @@ def update_matches():
             WHERE fixture_id=%s
         """
         execute(sql, (
-            group, status, elapsed, home_ft, away_ft, fid
+            group, status, elapsed,
+            home_ft, away_ft, fid
         ))
         updated += 1
 
-        # FINISHED면 이벤트/스탯 업데이트
+        # FINISHED면 이벤트/스탯도 저장
         if group == "FINISHED":
             finished += 1
+            upsert_match_events(fid, data.get("events", []))
+            upsert_match_team_stats(fid, data.get("statistics", []))
 
-            events = data.get("events", [])
-            stats = data.get("statistics", [])
-
-            upsert_match_events(fid, events)
-            upsert_match_team_stats(fid, stats)
-
-        print(f"[OK] Fixture {fid} updated → {group}/{status}")
+        print(f"[OK] Fixture {fid} → {group}/{status}")
 
     print(f"\n[RESULT] Updated: {updated}, Finished: {finished}")
 
