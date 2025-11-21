@@ -127,6 +127,21 @@ _TOP_FIRST_PRIORITY: Dict[str, int] = {
     "Serie A": 5,          # Italy 1st
 }
 
+# 유럽 2부리그 우선순위 (1부 순서와 매칭)
+_SECOND_DIV_PRIORITY_EUROPE: Dict[str, int] = {
+    "Championship": 1,      # England 2부
+    "La Liga 2": 2,         # Spain 2부
+    "2. Bundesliga": 3,     # Germany 2부
+    "Ligue 2": 4,           # France 2부
+    "Serie B": 5,           # Italy 2부
+}
+
+# 아시아 2부리그 우선순위 (K1/J1 순서와 매칭)
+_SECOND_DIV_PRIORITY_ASIA: Dict[str, int] = {
+    "K League 2": 1,
+    "J2 League": 2,
+}
+
 # 2부리그/하위리그 키워드
 _SECOND_DIV_KEYWORDS = [
     "2. bundesliga",
@@ -304,10 +319,14 @@ def _calc_inner_sort(league_name: str, continent: str) -> int:
     한 대륙 내부에서의 정렬 우선순위 숫자.
 
     Europe:
-      - EPL > La Liga > Bundesliga > Ligue 1 > Serie A > 기타 1부 > 2부 > 국내컵 > 대륙컵
+      - EPL > La Liga > Bundesliga > Ligue 1 > Serie A > 기타 1부
+      - Championship > La Liga 2 > 2. Bundesliga > Ligue 2 > Serie B > 기타 2부
+      - 국내컵 > 대륙컵
 
     Asia:
-      - K League 1 > J1 League > Australia A-League > 기타 1부 > 2부 > 국내컵 > 대륙컵(AFC CL)
+      - K League 1 > J1 League > A-League > 기타 1부
+      - K League 2 > J2 League > 기타 2부
+      - 국내컵 > 대륙컵(AFC CL)
 
     Americas:
       - MLS (Major League Soccer) 최상단
@@ -330,6 +349,18 @@ def _calc_inner_sort(league_name: str, continent: str) -> int:
     # 4) 2부리그 / 하위리그
     if _is_second_division(league_name):
         tier = 4
+
+        # 유럽: Championship > La Liga 2 > 2. Bundesliga > Ligue 2 > Serie B > 기타 2부
+        if continent == "Europe":
+            sub = _SECOND_DIV_PRIORITY_EUROPE.get(league_name, 50)
+            return tier * 100 + sub
+
+        # 아시아: K League 2 > J2 League > 기타 2부
+        if continent == "Asia":
+            sub = _SECOND_DIV_PRIORITY_ASIA.get(league_name, 50)
+            return tier * 100 + sub
+
+        # 그 외 대륙 2부는 그냥 같은 tier 안에서 이름순
         sub = 0
         return tier * 100 + sub
 
