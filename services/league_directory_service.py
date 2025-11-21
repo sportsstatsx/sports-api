@@ -8,8 +8,7 @@ import pytz
 from db import fetch_all
 
 # ─────────────────────────────────────
-#  Country → Continent / Region
-#  (모두 소문자 기준으로 매핑)
+#  Country → Continent / Region (소문자 키)
 # ─────────────────────────────────────
 
 _COUNTRY_TO_CONTINENT: Dict[str, str] = {
@@ -45,10 +44,10 @@ _COUNTRY_TO_CONTINENT: Dict[str, str] = {
     "south korea": "asia",
     "korea republic": "asia",
     "republic of korea": "asia",
-    "south-korea": "asia",
+    "south-korea": "asia",          # 하이픈 포함 케이스
     "japan": "asia",
     "saudi arabia": "asia",
-    "saudi-arabia": "asia",
+    "saudi-arabia": "asia",         # 하이픈 포함 케이스
     "qatar": "asia",
     "united arab emirates": "asia",
     "uae": "asia",
@@ -83,7 +82,7 @@ _COUNTRY_TO_CONTINENT: Dict[str, str] = {
     "venezuela": "south america",
 
     # Oceania / 기타
-    "australia": "other",
+    "australia": "asia",            # 🔥 호주는 Asia 그룹으로 묶기
     "new zealand": "other",
     "world": "other",
 }
@@ -96,7 +95,7 @@ _CONTINENT_GROUP_ORDER: Dict[str, int] = {
     "Other": 4,
 }
 
-# Kotlin MatchRepository.leaguePriority 와 동일한 맵
+# Kotlin MatchRepository.leaguePriority 와 동일한 맵 (fallback 용)
 _LEAGUE_PRIORITY: Dict[str, int] = {
     "Premier League": 1,
     "La Liga": 2,
@@ -118,6 +117,37 @@ _LEAGUE_PRIORITY: Dict[str, int] = {
     "CONMEBOL Libertadores": 300,
     "CONMEBOL Sudamericana": 301,
 }
+
+# 유럽 빅5 1부리그 우선순위 (대륙 내부 최상단)
+_TOP_FIRST_PRIORITY: Dict[str, int] = {
+    "Premier League": 1,   # EPL
+    "La Liga": 2,          # Spain 1st
+    "Bundesliga": 3,       # Germany 1st
+    "Ligue 1": 4,          # France 1st
+    "Serie A": 5,          # Italy 1st
+}
+
+# 2부리그/하위리그 키워드
+_SECOND_DIV_KEYWORDS = [
+    "2. bundesliga",
+    "liga 2",
+    "segunda división",
+    "segunda division",
+    "segunda liga",
+    "ligue 2",
+    "serie b",
+    "primera nacional",
+    "primera b",
+    "championship",
+    "eerste divisie",
+    "j2 league",
+    "k league 2",
+    "liga de expansión mx",
+    "expansion mx",
+    "b nacional",
+    "b serie",
+]
+
 
 # ─────────────────────────────────────
 #  날짜 → UTC 하루 범위
@@ -148,6 +178,7 @@ def _get_utc_range_for_local_date(
     utc_end = local_end.astimezone(pytz.UTC)
     return utc_start, utc_end
 
+
 # ─────────────────────────────────────
 #  리그 분류 유틸
 # ─────────────────────────────────────
@@ -158,73 +189,12 @@ def _normalize_name(name: str) -> str:
     s = s.replace("laliga", "la liga")
     return s
 
+
 def _country_to_continent(country: Optional[str]) -> Optional[str]:
     if not country:
         return None
     key = country.strip().lower()
     return _COUNTRY_TO_CONTINENT.get(key)
-
-def _detect_continent(country: Optional[str], league_name: str) -> str:
-    """
-    country + league_name 을 보고 최종 대륙 그룹을 결정한다.
-
-    - South America / North America → Americas 로 통합
-    - UEFA / AFC / CONCACAF 등 대륙컵은 이름만 보고도 우선 결정
-    - country 값이 애매해도, league_name 안에 들어있는 국가/리그 키워드로 보정
-    """
-    n = _normalize_name(league_name)
-
-    # ───── 0) 대륙 컵: 이름만 보고 우선 대륙 결정 ─────
-    if "uefa" in n:
-        # UCL / UEL / UECL 모두 Europe
-        return "Europe"
-    if "afc champions league" in n:
-        return "Asia"
-    if "concacaf" in n:
-        return "Americas"
-    if "libertadores" in n or "sudamericana" in n:
-        return "Americas"
-
-    # ───── 1) 이름만 보고 강제 매핑 (country 가 엉망이어도 잡아주기) ─────
-    # Americas 계열
-    if any(k in n for k in [
-        "brazil", "argentina", "colombia", "uruguay", "paraguay",
-        "chile", "peru", "ecuador", "bolivia", "venezuela",
-        "mls", "liga mx", "ligamx", "expansion mx", "liga de expansion mx",
-    ]):
-        return "Americas"
-
-    # Asia 계열
-    if any(k in n for k in [
-        "k league", "k-league",
-        "j1 league", "j2 league", "j-league", "j league",
-        "qatar", "saudi",
-        "japan", "korea",
-    ]):
-        return "Asia"
-
-    # ───── 2) country 기반 기본 매핑 ─────
-    base = _country_to_continent(country)
-
-    if base == "north america" or base == "south america":
-        return "Americas"
-    if base == "europe":
-        return "Europe"
-    if base == "asia":
-        return "Asia"
-    if base == "other":
-        return "Other"
-
-    # ───── 3) 그래도 못 잡으면 이름 기반 대략 추측 ─────
-    if any(k in n for k in ["k league", "j1 league", "j2 league", "j-league", "j league"]):
-        return "Asia"
-    if any(k in n for k in ["mls", "liga mx"]):
-        return "Americas"
-    if any(k in n for k in ["brasileirao", "serie a (brazil)", "argentina", "brazil"]):
-        return "Americas"
-
-    # ───── 4) 마지막 fallback ─────
-    return "Other"
 
 
 def _is_continental_cup(league_name: str) -> bool:
@@ -243,6 +213,7 @@ def _is_continental_cup(league_name: str) -> bool:
         return True
     return False
 
+
 def _is_domestic_cup(league_name: str) -> bool:
     n = _normalize_name(league_name)
     if _is_continental_cup(league_name):
@@ -258,22 +229,116 @@ def _is_domestic_cup(league_name: str) -> bool:
     ]
     return any(k in n for k in keywords)
 
+
+def _is_second_division(league_name: str) -> bool:
+    n = _normalize_name(league_name)
+    return any(k in n for k in _SECOND_DIV_KEYWORDS)
+
+
+def _detect_continent(country: Optional[str], league_name: str) -> str:
+    """
+    country + league_name 을 보고 최종 대륙 그룹을 결정한다.
+
+    - South America / North America → Americas 로 통합
+    - UEFA / AFC / CONCACAF 등 대륙컵은 이름만 보고도 우선 결정
+    - country 값이 애매해도, league_name 안에 들어있는 국가/리그 키워드로 보정
+    """
+    n = _normalize_name(league_name)
+
+    # 0) 대륙 컵: 이름만 보고 우선 대륙 결정
+    if "uefa" in n:
+        return "Europe"
+    if "afc champions league" in n:
+        return "Asia"
+    if "concacaf" in n:
+        return "Americas"
+    if "libertadores" in n or "sudamericana" in n:
+        return "Americas"
+
+    # 1) 이름만 보고 강제 매핑 (country 엉망이어도 잡기)
+    # Americas 계열
+    if any(k in n for k in [
+        "brazil", "argentina", "colombia", "uruguay", "paraguay",
+        "chile", "peru", "ecuador", "bolivia", "venezuela",
+        "mls", "liga mx", "ligamx", "expansion mx", "liga de expansión mx",
+    ]):
+        return "Americas"
+
+    # Asia 계열
+    if any(k in n for k in [
+        "k league", "k-league",
+        "j1 league", "j2 league", "j-league", "j league",
+        "qatar", "saudi",
+        "japan", "korea",
+    ]):
+        return "Asia"
+
+    # 2) country 기반 기본 매핑
+    base = _country_to_continent(country)
+
+    if base == "north america" or base == "south america":
+        return "Americas"
+    if base == "europe":
+        return "Europe"
+    if base == "asia":
+        return "Asia"
+    if base == "other":
+        return "Other"
+
+    # 3) 그래도 못 잡으면 이름 기반 대략 추측
+    if any(k in n for k in ["k league", "j1 league", "j2 league", "j-league", "j league"]):
+        return "Asia"
+    if any(k in n for k in ["mls", "liga mx"]):
+        return "Americas"
+    if any(k in n for k in ["brasileirao", "serie a (brazil)", "argentina", "brazil"]):
+        return "Americas"
+
+    # 4) 마지막 fallback
+    return "Other"
+
+
 def _calc_inner_sort(league_name: str, continent: str) -> int:
     """
     한 대륙 내부에서의 정렬 우선순위 숫자.
-    숫자가 작을수록 위로.
+
+    tier:
+      1 = 유럽 빅5 1부리그 (EPL > La Liga > Bundesliga > Ligue 1 > Serie A)
+      2 = 그 외 1부리그
+      3 = 2부리그 / 하위리그
+      4 = 국내컵(FA Cup 등)
+      5 = 대륙컵(UCL, AFC CL, Libertadores 등)
+
+    같은 tier 안에서는 이름(또는 서브 우선순위)으로 정렬.
     """
-    # 대륙 컵은 항상 맨 아래로
+    # 5) 대륙 컵은 항상 맨 아래
     if _is_continental_cup(league_name):
-        return 900
+        tier = 5
+        sub = 0
+        return tier * 100 + sub
 
-    # 국내 컵은 리그보다는 아래, 대륙 컵보다는 위
+    # 4) 국내 컵
     if _is_domestic_cup(league_name):
-        return 800
+        tier = 4
+        sub = 0
+        return tier * 100 + sub
 
-    # 나머지는 leaguePriority 에서 가져오고, 없으면 500대
-    base = _LEAGUE_PRIORITY.get(league_name, 500)
-    return base
+    # 3) 2부리그 / 하위리그
+    if _is_second_division(league_name):
+        tier = 3
+        sub = 0
+        return tier * 100 + sub
+
+    # 1) 유럽 빅5 1부리그
+    if league_name in _TOP_FIRST_PRIORITY:
+        tier = 1
+        sub = _TOP_FIRST_PRIORITY[league_name]
+        return tier * 100 + sub
+
+    # 2) 나머지 1부리그 (이름순)
+    tier = 2
+    sub = 0
+    return tier * 100 + sub
+
 
 def _calc_sort_order(league_name: str, country: Optional[str]) -> Tuple[str, int, int]:
     """
@@ -299,6 +364,7 @@ def _calc_sort_order(league_name: str, country: Optional[str]) -> Tuple[str, int
     sort_order = continent_order * 1000 + inner
     return continent, continent_order, sort_order
 
+
 def _calc_display_country(
     league_name: str,
     country: Optional[str],
@@ -316,6 +382,7 @@ def _calc_display_country(
         if continent in ("Europe", "Asia", "Americas"):
             return continent
     return country
+
 
 # ─────────────────────────────────────
 #  메인: 리그 디렉터리 빌더
@@ -388,7 +455,7 @@ def build_league_directory(
             {
                 "league_id": league_id,
                 "league_name": league_name,
-                "country": display_country,   # ← 여기서 가공된 country 사용
+                "country": display_country,   # 앱에 노출될 country
                 "logo": logo,
                 "today_count": today_count,
                 "continent": continent,
