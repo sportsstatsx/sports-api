@@ -6,6 +6,7 @@ from datetime import datetime
 from functools import wraps
 from typing import Dict
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
@@ -366,6 +367,13 @@ def list_fixtures():
     if not date_str:
         return jsonify({"ok": False, "error": "missing_date"}), 400
 
+    # 단말 타임존 (예: Asia/Seoul, Europe/London, America/New_York)
+    tz = request.args.get("tz") or "UTC"
+    try:
+        ZoneInfo(tz)  # 유효성 검사
+    except Exception:
+        tz = "UTC"
+
     # 단일 league_id (옛 파라미터)
     league_id = request.args.get("league_id", type=int)
 
@@ -384,7 +392,7 @@ def list_fixtures():
             m.date_utc,
             m.status,
             m.status_group,
-            m.elapsed,   -- ✅ 실제 진행 시간(분)
+            m.elapsed,
             m.home_id,
             m.away_id,
             m.home_ft,
@@ -396,7 +404,6 @@ def list_fixtures():
             th.logo     AS home_logo,
             ta.name     AS away_name,
             ta.logo     AS away_logo,
-            -- 홈 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -405,7 +412,6 @@ def list_fixtures():
                   AND lower(e.type)   = 'card'
                   AND lower(e.detail) = 'red card'
             ) AS home_red_cards,
-            -- 원정 팀 레드카드 개수
             (
                 SELECT COUNT(*)
                 FROM match_events e
@@ -421,9 +427,10 @@ def list_fixtures():
           ON th.id = m.home_id
         JOIN teams ta
           ON ta.id = m.away_id
-        WHERE m.date_utc::date = %s
+        -- 🔥 여기서 UTC → 사용자 타임존으로 변환한 "날짜" 기준으로 비교
+        WHERE timezone(%s::text, m.date_utc::timestamptz)::date = %s
     """
-    params = [date_str]
+    params = [tz, date_str]
 
     # league_ids=140,78,61 방식 우선
     if league_ids_raw:
@@ -477,3 +484,4 @@ def api_team_season_stats():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
