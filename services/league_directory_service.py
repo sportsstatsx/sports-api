@@ -167,13 +167,12 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     country + league_name 을 보고 최종 대륙 그룹을 결정한다.
 
     - South America / North America → Americas 로 통합
-    - UEFA / AFC / CONCACAF 등 대륙컵은 country 가 World 여도
-      각각 Europe / Asia / Americas 로 보냄
+    - UEFA / AFC / CONCACAF 등 대륙컵은 이름만 보고도 우선 결정
+    - country 값이 애매해도, league_name 안에 들어있는 국가/리그 키워드로 보정
     """
     n = _normalize_name(league_name)
-    base = _country_to_continent(country)
 
-    # 1) 대륙 컵: 이름만 보고 우선 대륙 지정
+    # ───── 0) 대륙 컵: 이름만 보고 우선 대륙 결정 ─────
     if "uefa" in n:
         # UCL / UEL / UECL 모두 Europe
         return "Europe"
@@ -184,7 +183,27 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     if "libertadores" in n or "sudamericana" in n:
         return "Americas"
 
-    # 2) country 기반 기본 매핑
+    # ───── 1) 이름만 보고 강제 매핑 (country 가 엉망이어도 잡아주기) ─────
+    # Americas 계열
+    if any(k in n for k in [
+        "brazil", "argentina", "colombia", "uruguay", "paraguay",
+        "chile", "peru", "ecuador", "bolivia", "venezuela",
+        "mls", "liga mx", "ligamx", "expansion mx", "liga de expansion mx",
+    ]):
+        return "Americas"
+
+    # Asia 계열
+    if any(k in n for k in [
+        "k league", "k-league",
+        "j1 league", "j2 league", "j-league", "j league",
+        "qatar", "saudi",
+        "japan", "korea",
+    ]):
+        return "Asia"
+
+    # ───── 2) country 기반 기본 매핑 ─────
+    base = _country_to_continent(country)
+
     if base == "north america" or base == "south america":
         return "Americas"
     if base == "europe":
@@ -194,7 +213,7 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     if base == "other":
         return "Other"
 
-    # 3) country 를 몰라도, 리그 이름으로 대략적인 대륙 추측
+    # ───── 3) 그래도 못 잡으면 이름 기반 대략 추측 ─────
     if any(k in n for k in ["k league", "j1 league", "j2 league", "j-league", "j league"]):
         return "Asia"
     if any(k in n for k in ["mls", "liga mx"]):
@@ -202,7 +221,9 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     if any(k in n for k in ["brasileirao", "serie a (brazil)", "argentina", "brazil"]):
         return "Americas"
 
+    # ───── 4) 마지막 fallback ─────
     return "Other"
+
 
 def _is_continental_cup(league_name: str) -> bool:
     n = _normalize_name(league_name)
