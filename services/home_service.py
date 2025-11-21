@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, date as date_cls
-from typing import Any, Dict, List, Optional
+from datetime import datetime, date as date_cls, time as time_cls
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytz
 
 from db import fetch_all
 
@@ -36,7 +38,7 @@ def _normalize_date(date_str: Optional[str]) -> str:
     안전하게 'YYYY-MM-DD' 로 정규화한다.
     """
     if not date_str:
-        # 오늘 날짜
+        # 오늘 날짜 (UTC 기준)
         return datetime.utcnow().date().isoformat()
 
     if isinstance(date_str, date_cls):
@@ -60,6 +62,40 @@ def _to_iso_or_str(val: Any) -> Optional[str]:
         return val.isoformat()
     # 이미 문자열이거나 다른 타입이면 str()로 통일
     return str(val)
+
+
+def _get_utc_range_for_local_date(
+    date_str: Optional[str],
+    timezone_str: str,
+) -> Tuple[datetime, datetime]:
+    """
+    date_str(YYYY-MM-DD)을 timezone_str (예: 'Asia/Seoul') 기준 '하루'로 보고,
+    그 하루가 커버하는 UTC 시작/끝 datetime 을 반환한다.
+
+    - DB matches.date_utc 는 항상 UTC로 저장되어 있고,
+    - 여기서 계산한 utc_start ~ utc_end 범위로 필터링하면
+      "사용자 로컬 Today" 기준으로 경기를 가져올 수 있다.
+    """
+    try:
+        tz = pytz.timezone(timezone_str)
+    except Exception:
+        tz = pytz.UTC
+
+    if not date_str:
+        local_now = datetime.now(tz)
+        local_date = local_now.date()
+    else:
+        try:
+            local_date = datetime.fromisoformat(str(date_str)).date()
+        except Exception:
+            local_date = datetime.now(tz).date()
+
+    local_start = tz.localize(datetime.combine(local_date, time_cls(0, 0, 0)))
+    local_end = tz.localize(datetime.combine(local_date, time_cls(23, 59, 59)))
+
+    utc_start = local_start.astimezone(pytz.UTC)
+    utc_end = local_end.astimezone(pytz.UTC)
+    return utc_start, utc_end
 
 
 # ─────────────────────────────────────
@@ -95,16 +131,22 @@ def build_insights_filter_meta(
 
 def get_home_leagues(
     date_str: Optional[str],
+    timezone_str: str,
     league_ids: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    주어진 날짜(date_str)에 실제 경기가 편성된 리그 목록을 돌려준다.
-    league_ids 가 주어지면 해당 리그들만 필터링.
-    """
-    norm_date = _normalize_date(date_str)
+    주어진 날짜(date_str)를 'timezone_str 기준 로컬 날짜'로 보고,
+    그 하루(00:00~23:59)가 커버하는 UTC 구간에 실제 경기가 편성된
+    리그 목록을 돌려준다.
 
-    params: List[Any] = [norm_date]
-    where_clause = "m.date_utc::date = %s"
+    - DB matches.date_utc 는 UTC 기준이고,
+    - 여기서 계산한 utc_start ~ utc_end 사이에 있는 경기만 Today 로 본다.
+    - league_ids 가 주어지면 해당 리그들만 필터링.
+    """
+    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+
+    params: List[Any] = [utc_start, utc_end]
+    where_clause = "m.date_utc::timestamptz BETWEEN %s AND %s"
 
     if league_ids:
         placeholders = ", ".join(["%s"] * len(league_ids))
@@ -151,20 +193,24 @@ def get_home_leagues(
 
 
 # ─────────────────────────────────────
-#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리 (옵션 A)
+#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리
 # ─────────────────────────────────────
 
 
-def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
+def get_home_league_directory(
+    date_str: Optional[str],
+    timezone_str: str,
+) -> List[Dict[str, Any]]:
     """
     리그 선택 바텀시트 전용 디렉터리.
 
     - 전체 지원 리그를 내려주고,
-    - 각 리그별로 해당 날짜(norm_date)에 편성된 경기 수(today_count)를 함께 내려준다.
-    - 앱에서는 /api/home/league_directory?date=YYYY-MM-DD 로 호출해서
-      리그 필터 목록을 구성한다.
+    - 각 리그별로 해당 날짜(date_str, timezone_str 기준 로컬 하루)에
+      편성된 경기 수(today_count)를 함께 내려준다.
+    - 앱에서는 /api/home/league_directory?date=YYYY-MM-DD&timezone=Asia/Seoul
+      형태로 호출해서 리그 필터 목록을 구성한다.
     """
-    norm_date = _normalize_date(date_str)
+    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
 
     rows = fetch_all(
         """
@@ -176,7 +222,7 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
             COALESCE(
                 SUM(
                     CASE
-                        WHEN m.date_utc::date = %s THEN 1
+                        WHEN m.date_utc::timestamptz BETWEEN %s AND %s THEN 1
                         ELSE 0
                     END
                 ),
@@ -194,7 +240,7 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
             l.country,
             l.name
         """,
-        (norm_date,),
+        (utc_start, utc_end),
     )
 
     result: List[Dict[str, Any]] = []
