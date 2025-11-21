@@ -119,10 +119,6 @@ def metrics():
 def list_fixtures():
     """
     경기 리스트는 "오직 DB(matches)" 기준으로 제공한다.
-    - status_group / status / elapsed / home_ft / away_ft
-    - red cards
-    - 팀명/로고
-    - 날짜/시간 (timezone에서 변환)
     """
 
     league_id = request.args.get("league_id", type=int)
@@ -169,8 +165,8 @@ def list_fixtures():
                   AND e.detail = 'Red Card'
             ) AS away_red_cards
         FROM matches m
-        JOIN teams th ON th.team_id = m.home_id
-        JOIN teams ta ON ta.team_id = m.away_id
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
         WHERE m.league_id = %s
           AND (timezone(%s, m.date_utc))::date = %s
         ORDER BY m.date_utc ASC
