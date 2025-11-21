@@ -168,7 +168,7 @@ def list_fixtures():
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         WHERE m.league_id = %s
-          AND (timezone(%s, m.date_utc))::date = %s
+          AND (timezone(%s, m.date_utc::timestamp))::date = %s
         ORDER BY m.date_utc ASC
     """
 
@@ -210,3 +210,4 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
