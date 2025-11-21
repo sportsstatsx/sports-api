@@ -28,7 +28,6 @@ from services.home_service import (
     get_team_info,
 )
 from routers.home_router import home_bp  # 👈 홈 라우터 블루프린트 등록
-from zoneinfo import ZoneInfo  # 👈 타임존 검증용 추가
 
 # ─────────────────────────────────────────
 # 환경 변수 / 기본 설정
@@ -363,26 +362,18 @@ def health():
 @app.get("/api/fixtures")
 @rate_limited
 def list_fixtures():
-    league_id = request.args.get("league_id", type=int)
     date_str = request.args.get("date")  # YYYY-MM-DD
-
-    # 🔹 단말 타임존 (예: Asia/Seoul, Europe/London)
-    tz = request.args.get("tz") or "UTC"
-    try:
-        ZoneInfo(tz)
-    except Exception:
-        # 잘못된 타임존이 들어오면 UTC로 강제
-        tz = "UTC"
-
-    page = request.args.get("page", 1, type=int)
-    page_size = request.args.get("page_size", 50, type=int)
-
     if not date_str:
         return jsonify({"ok": False, "error": "missing_date"}), 400
 
-    if league_id == 0:
-        league_id = None
+    # 단일 league_id (옛 파라미터)
+    league_id = request.args.get("league_id", type=int)
 
+    # 다중 리그 필터: league_ids=140,78,61 형식
+    league_ids_raw = request.args.get("league_ids")
+
+    page = request.args.get("page", 1, type=int)
+    page_size = request.args.get("page_size", 50, type=int)
     offset = (page - 1) * page_size
 
     sql = """
@@ -430,12 +421,21 @@ def list_fixtures():
           ON th.id = m.home_id
         JOIN teams ta
           ON ta.id = m.away_id
-        WHERE (m.date_utc AT TIME ZONE %s)::date = %s
+        WHERE m.date_utc::date = %s
     """
-    # 첫 두 파라미터: tz, date
-    params = [tz, date_str]
+    params = [date_str]
 
-    if league_id is not None:
+    # league_ids=140,78,61 방식 우선
+    if league_ids_raw:
+        try:
+            league_ids = [int(x) for x in league_ids_raw.split(",") if x]
+        except ValueError:
+            league_ids = []
+        if league_ids:
+            sql += " AND m.league_id = ANY(%s)"
+            params.append(league_ids)
+    elif league_id is not None and league_id != 0:
+        # 단일 리그 필터
         sql += " AND m.league_id = %s"
         params.append(league_id)
 
