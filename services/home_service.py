@@ -193,7 +193,7 @@ def get_home_leagues(
 
 
 # ─────────────────────────────────────
-#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리 (옵션 A)
+#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리
 # ─────────────────────────────────────
 
 def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
@@ -213,7 +213,7 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
             l.id      AS league_id,
             l.name    AS league_name,
             l.country AS country,
-            l.logo    AS logo,          -- ✅ 앱에서 optString("logo") 로 읽음
+            l.logo    AS logo,
             COALESCE(
                 SUM(
                     CASE
@@ -245,12 +245,11 @@ def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
                 "league_id": r["league_id"],
                 "league_name": r["league_name"],
                 "country": r["country"],
-                "logo": r["logo"],            # ✅ key 이름 통일
+                "logo": r["logo"],
                 "today_count": r["today_count"],
             }
         )
     return result
-
 
 
 
