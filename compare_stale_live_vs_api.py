@@ -54,8 +54,7 @@ def force_close_fixture(fixture_id: int) -> None:
             elapsed      = CASE
                              WHEN elapsed IS NULL OR elapsed < 90 THEN 90
                              ELSE elapsed
-                           END,
-            updated_at   = now()
+                           END
         WHERE fixture_id = %s
           AND status_group = 'INPLAY';
     """
@@ -84,7 +83,7 @@ def main() -> None:
 
         try:
             force_close_fixture(fid)
-            print("  AFTER  → status=FT, status_group=FINISHED, elapsed>=90 로 강제 종료 처리 완료.")
+            print("  AFTER  → status=FT, status_group=FINISHED, elapsed>=90 로 강제 종료 처리 시도.")
         except Exception as e:
             print(f"  [ERROR] fixture_id={fid} 업데이트 중 오류 발생: {e}", file=sys.stderr)
 
