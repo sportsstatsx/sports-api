@@ -193,35 +193,31 @@ def get_home_leagues(
 
 
 # ─────────────────────────────────────
-#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리
+#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리 (옵션 A)
 # ─────────────────────────────────────
 
-
-def get_home_league_directory(
-    date_str: Optional[str],
-    timezone_str: str,
-) -> List[Dict[str, Any]]:
+def get_home_league_directory(date_str: Optional[str]) -> List[Dict[str, Any]]:
     """
     리그 선택 바텀시트 전용 디렉터리.
 
     - 전체 지원 리그를 내려주고,
-    - 각 리그별로 해당 날짜(date_str, timezone_str 기준 로컬 하루)에
-      편성된 경기 수(today_count)를 함께 내려준다.
+    - 각 리그별로 해당 날짜(norm_date)에 편성된 경기 수(today_count)를 함께 내려준다.
+    - 앱에서는 /api/home/league_directory?date=YYYY-MM-DD 로 호출해서
+      리그 필터 목록을 구성한다.
     """
-    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+    norm_date = _normalize_date(date_str)
 
     rows = fetch_all(
         """
         SELECT
-            l.id        AS league_id,
-            l.name      AS league_name,
-            l.country   AS country,
-            l.continent AS continent,     -- ✅ 대륙 추가
-            l.logo      AS league_logo,
+            l.id      AS league_id,
+            l.name    AS league_name,
+            l.country AS country,
+            l.logo    AS logo,          -- ✅ 앱에서 optString("logo") 로 읽음
             COALESCE(
                 SUM(
                     CASE
-                        WHEN m.date_utc::timestamptz BETWEEN %s AND %s THEN 1
+                        WHEN m.date_utc::date = %s THEN 1
                         ELSE 0
                     END
                 ),
@@ -234,13 +230,12 @@ def get_home_league_directory(
             l.id,
             l.name,
             l.country,
-            l.continent,                  -- ✅ group by 에도 포함
             l.logo
         ORDER BY
             l.country,
             l.name
         """,
-        (utc_start, utc_end),
+        (norm_date,),
     )
 
     result: List[Dict[str, Any]] = []
@@ -250,12 +245,12 @@ def get_home_league_directory(
                 "league_id": r["league_id"],
                 "league_name": r["league_name"],
                 "country": r["country"],
-                "continent": r["continent"],   # ✅ JSON 에 포함
-                "league_logo": r["league_logo"],
+                "logo": r["logo"],            # ✅ key 이름 통일
                 "today_count": r["today_count"],
             }
         )
     return result
+
 
 
 
