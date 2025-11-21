@@ -1,12 +1,9 @@
 import os
 import json
-import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Dict
-from collections import defaultdict
-from zoneinfo import ZoneInfo
 
 from flask import Flask, request, jsonify, Response
 from werkzeug.exceptions import HTTPException
@@ -19,7 +16,7 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
-from db import fetch_all, fetch_one, execute
+from db import fetch_all, fetch_one
 from services.home_service import (
     get_home_leagues,
     get_home_league_directory,
@@ -28,361 +25,115 @@ from services.home_service import (
     get_team_season_stats,
     get_team_info,
 )
-from routers.home_router import home_bp  # 👈 홈 라우터 블루프린트 등록
+from routers.home_router import home_bp
+
 
 # ─────────────────────────────────────────
-# 환경 변수 / 기본 설정
+# 기본 설정
 # ─────────────────────────────────────────
-
 SERVICE_NAME = os.getenv("SERVICE_NAME", "sportsstatsx-api")
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
-APP_ENV = os.getenv("APP_ENV", "prod")
-
-LOG_SAMPLE_RATE = float(os.getenv("LOG_SAMPLE_RATE", "1.0"))
-API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "120"))
-
-START_TS = time.time()
 
 app = Flask(__name__)
-app.register_blueprint(home_bp)  # 👈 /api/home/* 라우트는 전부 여기서 등록
+app.register_blueprint(home_bp)
+
+
+# ─────────────────────────────────────────
+# 에러 핸들러
+# ─────────────────────────────────────────
+@app.errorhandler(Exception)
+def handle_error(e):
+    if isinstance(e, HTTPException):
+        return jsonify({"ok": False, "error": e.description}), e.code
+    return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
 # ─────────────────────────────────────────
-
-HTTP_REQUESTS_TOTAL = Counter(
-    "http_requests_total",
-    "Total HTTP requests",
-    ["method", "path", "status"],
+REQUEST_COUNT = Counter(
+    "api_request_total",
+    "Total API Requests",
+    ["service", "version", "endpoint", "method"],
 )
 
-HTTP_REQUEST_DURATION_SECONDS = Histogram(
-    "http_request_duration_seconds",
-    "HTTP request duration in seconds",
-    ["method", "path"],
+REQUEST_LATENCY = Histogram(
+    "api_request_latency_seconds",
+    "API Request latency",
+    ["service", "version", "endpoint"],
 )
 
-HTTP_REQUEST_EXCEPTIONS_TOTAL = Counter(
-    "http_request_exceptions_total",
-    "Total HTTP exceptions",
-    ["type"],
-)
-
-RATE_LIMITED_TOTAL = Counter(
-    "http_rate_limited_total",
-    "Total rate limited responses (429)",
-)
-
-UPTIME_SECONDS = Gauge(
-    "process_uptime_seconds",
-    "Process uptime in seconds",
-)
-
-# ─────────────────────────────────────────
-# 레이트 리미터
-# ─────────────────────────────────────────
-
-_ip_buckets: Dict[str, Dict[str, int]] = defaultdict(
-    lambda: {"ts": 0, "cnt": 0}
+ACTIVE_REQUESTS = Gauge(
+    "api_active_requests",
+    "Active requests",
+    ["service", "version"],
 )
 
 
-def _client_ip() -> str:
-    return (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or request.remote_addr
-        or "unknown"
-    )
+def track_metrics(endpoint_name):
+    """API 호출 측정용 데코레이터"""
 
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            REQUEST_COUNT.labels(
+                SERVICE_NAME, SERVICE_VERSION, endpoint_name, request.method
+            ).inc()
+            ACTIVE_REQUESTS.labels(SERVICE_NAME, SERVICE_VERSION).inc()
 
-def check_rate_limit() -> bool:
-    """분당 요청 수가 API_RATE_LIMIT_PER_MINUTE 이상이면 False."""
-    ip = _client_ip()
-    now = int(time.time())
-    bucket = _ip_buckets[ip]
-    if now - bucket["ts"] >= 60:
-        bucket["ts"] = now
-        bucket["cnt"] = 0
-    bucket["cnt"] += 1
-    return bucket["cnt"] <= API_RATE_LIMIT_PER_MINUTE
+            with REQUEST_LATENCY.labels(
+                SERVICE_NAME, SERVICE_VERSION, endpoint_name
+            ).time():
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    ACTIVE_REQUESTS.labels(SERVICE_NAME, SERVICE_VERSION).dec()
 
+        return wrapper
 
-def rate_limited(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not check_rate_limit():
-            RATE_LIMITED_TOTAL.inc()
-            return (
-                jsonify(
-                    {
-                        "ok": False,
-                        "error": "rate_limited",
-                        "message": "Too many requests. Please slow down.",
-                    }
-                ),
-                429,
-            )
-        return fn(*args, **kwargs)
-
-    return wrapper
+    return decorator
 
 
 # ─────────────────────────────────────────
-# JSON 로깅 / 에러 처리
+# API: /health
 # ─────────────────────────────────────────
-
-def log_json(level: str, msg: str, **kwargs):
-    if LOG_SAMPLE_RATE <= 0:
-        return
-    if LOG_SAMPLE_RATE < 1.0:
-        if uuid.uuid4().int % 10_000 > int(LOG_SAMPLE_RATE * 10_000):
-            return
-
-    payload = {
-        "level": level,
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "msg": msg,
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "path": request.path if request else "",
-        "method": request.method if request else "",
-        "ip": _client_ip() if request else "",
-    }
-    payload.update(kwargs)
-    print(json.dumps(payload, ensure_ascii=False))
-
-
-@app.before_request
-def before_request():
-    request._start_ts = time.perf_counter()
-
-
-@app.after_request
-def after_request(resp: Response):
-    start_ts = getattr(request, "_start_ts", None)
-    if start_ts is not None:
-        dur = time.perf_counter() - start_ts
-        HTTP_REQUEST_DURATION_SECONDS.labels(
-            method=request.method,
-            path=request.path,
-        ).observe(dur)
-
-    HTTP_REQUESTS_TOTAL.labels(
-        method=request.method,
-        path=request.path,
-        status=resp.status_code,
-    ).inc()
-
-    return resp
-
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-    # HTTPException(404, 400 같은 것)은 그대로 통과
-    if isinstance(e, HTTPException):
-        HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
-        return e
-
-    # 나머지는 모두 "서버 코드 버그"로 간주
-    import traceback
-    tb = traceback.format_exc()
-
-    HTTP_REQUEST_EXCEPTIONS_TOTAL.labels(type=e.__class__.__name__).inc()
-    # 로그에 스택트레이스까지 남기기
-    log_json(
-        "error",
-        "Unhandled exception",
-        error=str(e),
-        traceback=tb,
-        path=request.path if request else "",
-    )
-
-    # ⚠️ 디버깅용으로 클라이언트에도 상세 에러를 같이 내려줌
-    return jsonify({
-        "ok": False,
-        "error": "internal_error",
-        "detail": str(e),
-    }), 500
+@app.route("/health")
+@track_metrics("/health")
+def health():
+    return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
 
 
 # ─────────────────────────────────────────
-# 루트 (브라우저 테스트용)
+# API: Prometheus metrics
 # ─────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return jsonify(
-        {
-            "ok": True,
-            "service": SERVICE_NAME,
-            "version": SERVICE_VERSION,
-            "time_utc": datetime.utcnow().isoformat() + "Z",
-        }
-    )
-
-
-# ─────────────────────────────────────────
-# /metrics  (Prometheus 기본 메트릭)
-# ─────────────────────────────────────────
-
-@app.get("/metrics")
+@app.route("/metrics")
 def metrics():
-    UPTIME_SECONDS.set(time.time() - START_TS)
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 
-@app.get("/metrics_prom")
-def metrics_prom():
-    lines = []
-
-    # http_requests_total
-    try:
-        lines.append("# HELP http_requests_total Total HTTP requests")
-        lines.append("# TYPE http_requests_total counter")
-        metrics_map = getattr(HTTP_REQUESTS_TOTAL, "_metrics", None)
-        if metrics_map:
-            for labels, metric in metrics_map.items():
-                method, path, status = labels
-                value = metric._value.get()
-                lines.append(
-                    f'http_requests_total{{method="{method}",path="{path}",status="{status}"}} {value}'
-                )
-    except Exception as e:
-        log_json("error", "metrics_prom http_requests_total error", error=str(e))
-
-    # http_request_duration_seconds
-    try:
-        lines.append(
-            "# HELP http_request_duration_seconds HTTP request duration in seconds"
-        )
-        lines.append("# TYPE http_request_duration_seconds histogram")
-        metrics_map = getattr(HTTP_REQUEST_DURATION_SECONDS, "_metrics", None)
-        if metrics_map:
-            for labels, metric in metrics_map.items():
-                method, path = labels
-                buckets = getattr(metric, "_buckets", {}) or {}
-
-                sum_obj = getattr(metric, "_sum", None)
-                if hasattr(sum_obj, "get"):
-                    sum_v = sum_obj.get()
-                else:
-                    sum_v = 0
-
-                count_obj = getattr(metric, "_count", None)
-                if hasattr(count_obj, "get"):
-                    count_v = count_obj.get()
-                else:
-                    try:
-                        count_v = float(list(buckets.values())[-1]) if buckets else 0
-                    except Exception:
-                        count_v = 0
-
-                for le, v in buckets.items():
-                    lines.append(
-                        f'http_request_duration_seconds_bucket{{method="{method}",path="{path}",le="{le}"}} {v}'
-                    )
-                lines.append(
-                    f'http_request_duration_seconds_sum{{method="{method}",path="{path}"}} {sum_v}'
-                )
-                lines.append(
-                    f'http_request_duration_seconds_count{{method="{method}",path="{path}"}} {count_v}'
-                )
-    except Exception as e:
-        log_json(
-            "error",
-            "metrics_prom http_request_duration_seconds error",
-            error=str(e),
-        )
-
-    # http_request_exceptions_total
-    try:
-        lines.append("# HELP http_request_exceptions_total Total HTTP exceptions")
-        lines.append("# TYPE http_request_exceptions_total counter")
-        metrics_map = getattr(HTTP_REQUEST_EXCEPTIONS_TOTAL, "_metrics", None)
-        if metrics_map:
-            for labels, metric in metrics_map.items():
-                (etype,) = labels
-                value = metric._value.get()
-                lines.append(
-                    f'http_request_exceptions_total{{type="{etype}"}} {value}'
-                )
-    except Exception as e:
-        log_json(
-            "error",
-            "metrics_prom http_request_exceptions_total error",
-            error=str(e),
-        )
-
-    # http_rate_limited_total
-    try:
-        lines.append(
-            "# HELP http_rate_limited_total Total rate limited responses (429)"
-        )
-        lines.append("# TYPE http_rate_limited_total counter")
-        value_obj = getattr(RATE_LIMITED_TOTAL, "_value", None)
-        if value_obj is not None:
-            lines.append(f"http_rate_limited_total {value_obj.get()}")
-    except Exception as e:
-        log_json(
-            "error",
-            "metrics_prom http_rate_limited_total error",
-            error=str(e),
-        )
-
-    # process_uptime_seconds
-    lines.append("# HELP process_uptime_seconds Process uptime in seconds")
-    lines.append("# TYPE process_uptime_seconds gauge")
-    lines.append(f"process_uptime_seconds {time.time() - START_TS}")
-
-    body = "\n".join(lines) + "\n"
-    return Response(body, mimetype="text/plain; version=0.0.4")
-
-
 # ─────────────────────────────────────────
-# 헬스 체크 (/health)
+# 핵심 API: /api/fixtures  (A 방식)
 # ─────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    try:
-        row = fetch_one("SELECT 1 AS ok")
-        if not row or row.get("ok") != 1:
-            raise RuntimeError("DB check failed")
-        return jsonify(
-            {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION}
-        )
-    except Exception as e:
-        log_json("error", "Health check failed", error=str(e))
-        return jsonify({"ok": False, "error": "db_unavailable"}), 500
-
-
-# ─────────────────────────────────────────
-# 홈 화면: fixtures 리스트 (/api/fixtures)
-# ─────────────────────────────────────────
-
-@app.get("/api/fixtures")
-@rate_limited
+@app.route("/api/fixtures")
+@track_metrics("/api/fixtures")
 def list_fixtures():
-    date_str = request.args.get("date")  # YYYY-MM-DD
-    if not date_str:
-        return jsonify({"ok": False, "error": "missing_date"}), 400
+    """
+    경기 리스트는 "오직 DB(matches)" 기준으로 제공한다.
+    - status_group / status / elapsed / home_ft / away_ft
+    - red cards
+    - 팀명/로고
+    - 날짜/시간 (timezone에서 변환)
+    """
 
-    # 단말 타임존 (예: Asia/Seoul, Europe/London, America/New_York)
-    tz = request.args.get("tz") or "UTC"
-    try:
-        ZoneInfo(tz)  # 유효성 검사
-    except Exception:
-        tz = "UTC"
-
-    # 단일 league_id (옛 파라미터)
     league_id = request.args.get("league_id", type=int)
+    date = request.args.get("date", type=str)
+    tz = request.args.get("timezone", "UTC")
 
-    # 다중 리그 필터: league_ids=140,78,61 형식
-    league_ids_raw = request.args.get("league_ids")
-
-    page = request.args.get("page", 1, type=int)
-    page_size = request.args.get("page_size", 50, type=int)
-    offset = (page - 1) * page_size
+    if not league_id or not date:
+        return (
+            jsonify({"ok": False, "error": "league_id and date are required"}),
+            400,
+        )
 
     sql = """
         SELECT
@@ -390,98 +141,76 @@ def list_fixtures():
             m.league_id,
             m.season,
             m.date_utc,
-            m.status,
             m.status_group,
+            m.status,
             m.elapsed,
             m.home_id,
             m.away_id,
             m.home_ft,
             m.away_ft,
-            l.name      AS league_name,
-            l.logo      AS league_logo,
-            l.country   AS league_country,
-            th.name     AS home_name,
-            th.logo     AS home_logo,
-            ta.name     AS away_name,
-            ta.logo     AS away_logo,
+            th.name      AS home_name,
+            ta.name      AS away_name,
+            th.logo      AS home_logo,
+            ta.logo      AS away_logo,
             (
                 SELECT COUNT(*)
                 FROM match_events e
                 WHERE e.fixture_id = m.fixture_id
-                  AND e.team_id    = m.home_id
-                  AND lower(e.type)   = 'card'
-                  AND lower(e.detail) = 'red card'
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail = 'Red Card'
             ) AS home_red_cards,
             (
                 SELECT COUNT(*)
                 FROM match_events e
                 WHERE e.fixture_id = m.fixture_id
-                  AND e.team_id    = m.away_id
-                  AND lower(e.type)   = 'card'
-                  AND lower(e.detail) = 'red card'
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail = 'Red Card'
             ) AS away_red_cards
         FROM matches m
-        JOIN leagues l
-          ON l.id = m.league_id
-        JOIN teams th
-          ON th.id = m.home_id
-        JOIN teams ta
-          ON ta.id = m.away_id
-        -- 🔥 여기서 UTC → 사용자 타임존으로 변환한 "날짜" 기준으로 비교
-        WHERE timezone(%s::text, m.date_utc::timestamptz)::date = %s
+        JOIN teams th ON th.team_id = m.home_id
+        JOIN teams ta ON ta.team_id = m.away_id
+        WHERE m.league_id = %s
+          AND (timezone(%s, m.date_utc))::date = %s
+        ORDER BY m.date_utc ASC
     """
-    params = [tz, date_str]
 
-    # league_ids=140,78,61 방식 우선
-    if league_ids_raw:
-        try:
-            league_ids = [int(x) for x in league_ids_raw.split(",") if x]
-        except ValueError:
-            league_ids = []
-        if league_ids:
-            sql += " AND m.league_id = ANY(%s)"
-            params.append(league_ids)
-    elif league_id is not None and league_id != 0:
-        # 단일 리그 필터
-        sql += " AND m.league_id = %s"
-        params.append(league_id)
+    rows = fetch_all(sql, (league_id, tz, date))
 
-    sql += " ORDER BY m.date_utc ASC LIMIT %s OFFSET %s"
-    params.extend([page_size, offset])
+    fixtures = []
+    for r in rows:
+        fixtures.append(
+            {
+                "fixture_id": r["fixture_id"],
+                "league_id": r["league_id"],
+                "season": r["season"],
+                "date_utc": r["date_utc"],
+                "status_group": r["status_group"],
+                "status": r["status"],
+                "elapsed": r["elapsed"],
+                "home": {
+                    "id": r["home_id"],
+                    "name": r["home_name"],
+                    "logo": r["home_logo"],
+                    "ft": r["home_ft"],
+                    "red_cards": r["home_red_cards"],
+                },
+                "away": {
+                    "id": r["away_id"],
+                    "name": r["away_name"],
+                    "logo": r["away_logo"],
+                    "ft": r["away_ft"],
+                    "red_cards": r["away_red_cards"],
+                },
+            }
+        )
 
-    rows = fetch_all(sql, tuple(params))
-    return jsonify({"ok": True, "rows": rows})
-
-
-# ─────────────────────────────────────────
-# 팀 시즌 스탯 (/api/team_season_stats)
-# ─────────────────────────────────────────
-
-@app.get("/api/team_season_stats")
-@rate_limited
-def api_team_season_stats():
-    team_id = request.args.get("team_id", type=int)
-    league_id = request.args.get("league_id", type=int)
-    season = request.args.get("season", type=int)
-
-    if not team_id or not league_id:
-        return jsonify({"ok": False, "error": "missing_params"}), 400
-
-    row = get_team_season_stats(
-        team_id=team_id,
-        league_id=league_id,
-        season=season,
-    )
-    if row is None:
-        return jsonify({"ok": False, "error": "not_found"}), 404
-
-    return jsonify({"ok": True, "row": row})
+    return jsonify({"ok": True, "rows": fixtures})
 
 
 # ─────────────────────────────────────────
-# 메인
+# 실행
 # ─────────────────────────────────────────
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
+    app.run(host="0.0.0.0", port=10000)
