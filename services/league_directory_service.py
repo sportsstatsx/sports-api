@@ -9,46 +9,81 @@ from db import fetch_all
 
 # ─────────────────────────────────────
 #  Country → Continent / Region
+#  (모두 소문자 기준으로 매핑)
 # ─────────────────────────────────────
 
 _COUNTRY_TO_CONTINENT: Dict[str, str] = {
     # Europe
-    "England": "Europe",
-    "Spain": "Europe",
-    "Germany": "Europe",
-    "Italy": "Europe",
-    "France": "Europe",
-    "Netherlands": "Europe",
-    "Portugal": "Europe",
-    "Scotland": "Europe",
-    "Belgium": "Europe",
-    "Turkey": "Europe",
-    "Greece": "Europe",
-    "Sweden": "Europe",
-    "Norway": "Europe",
-    "Denmark": "Europe",
+    "england": "europe",
+    "spain": "europe",
+    "germany": "europe",
+    "italy": "europe",
+    "france": "europe",
+    "netherlands": "europe",
+    "portugal": "europe",
+    "scotland": "europe",
+    "belgium": "europe",
+    "turkey": "europe",
+    "greece": "europe",
+    "sweden": "europe",
+    "norway": "europe",
+    "denmark": "europe",
+    "switzerland": "europe",
+    "austria": "europe",
+    "czech republic": "europe",
+    "czechia": "europe",
+    "poland": "europe",
+    "croatia": "europe",
+    "serbia": "europe",
+    "russia": "europe",
+    "ukraine": "europe",
+    "romania": "europe",
+    "bulgaria": "europe",
+    "hungary": "europe",
 
     # Asia
-    "South Korea": "Asia",
-    "Korea Republic": "Asia",
-    "Japan": "Asia",
-    "Saudi Arabia": "Asia",
-    "Qatar": "Asia",
-    "United Arab Emirates": "Asia",
-    "China": "Asia",
+    "south korea": "asia",
+    "korea republic": "asia",
+    "republic of korea": "asia",
+    "japan": "asia",
+    "saudi arabia": "asia",
+    "qatar": "asia",
+    "united arab emirates": "asia",
+    "uae": "asia",
+    "china": "asia",
+    "iran": "asia",
+    "iraq": "asia",
+    "uzbekistan": "asia",
+    "thailand": "asia",
+    "vietnam": "asia",
 
     # North America
-    "USA": "North America",
-    "Mexico": "North America",
+    "usa": "north america",
+    "united states": "north america",
+    "united states of america": "north america",
+    "mexico": "north america",
+    "canada": "north america",
+    "costa rica": "north america",
+    "honduras": "north america",
+    "guatemala": "north america",
+    "panama": "north america",
 
     # South America
-    "Argentina": "South America",
-    "Brazil": "South America",
-    "Colombia": "South America",
+    "argentina": "south america",
+    "brazil": "south america",
+    "colombia": "south america",
+    "chile": "south america",
+    "uruguay": "south america",
+    "paraguay": "south america",
+    "peru": "south america",
+    "ecuador": "south america",
+    "bolivia": "south america",
+    "venezuela": "south america",
 
-    # 기타
-    "Australia": "Other",
-    "World": "Other",
+    # Oceania / 기타
+    "australia": "other",
+    "new zealand": "other",
+    "world": "other",
 }
 
 # 대륙 그룹 순서: Europe → Asia → Americas → Other
@@ -121,6 +156,12 @@ def _normalize_name(name: str) -> str:
     s = s.replace("laliga", "la liga")
     return s
 
+def _country_to_continent(country: Optional[str]) -> Optional[str]:
+    if not country:
+        return None
+    key = country.strip().lower()
+    return _COUNTRY_TO_CONTINENT.get(key)
+
 def _detect_continent(country: Optional[str], league_name: str) -> str:
     """
     country + league_name 을 보고 최종 대륙 그룹을 결정한다.
@@ -129,25 +170,38 @@ def _detect_continent(country: Optional[str], league_name: str) -> str:
     - UEFA / AFC / CONCACAF 등 대륙컵은 country 가 World 여도
       각각 Europe / Asia / Americas 로 보냄
     """
-    normalized = _normalize_name(league_name)
-    base = _COUNTRY_TO_CONTINENT.get(country or "", "Other")
+    n = _normalize_name(league_name)
+    base = _country_to_continent(country)
 
-    # 대륙 컵: country 가 World 여도 이름 기준으로 대륙 결정
-    if "uefa" in normalized:
+    # 1) 대륙 컵: 이름만 보고 우선 대륙 지정
+    if "uefa" in n:
         # UCL / UEL / UECL 모두 Europe
         return "Europe"
-    if "afc champions league" in normalized:
+    if "afc champions league" in n:
         return "Asia"
-    if "concacaf" in normalized:
+    if "concacaf" in n:
         return "Americas"
-    if "libertadores" in normalized or "sudamericana" in normalized:
+    if "libertadores" in n or "sudamericana" in n:
         return "Americas"
 
-    # South / North America → Americas 로 묶기
-    if base in ("North America", "South America"):
+    # 2) country 기반 기본 매핑
+    if base == "north america" or base == "south america":
         return "Americas"
-    if base in ("Europe", "Asia", "Americas", "Other"):
-        return base
+    if base == "europe":
+        return "Europe"
+    if base == "asia":
+        return "Asia"
+    if base == "other":
+        return "Other"
+
+    # 3) country 를 몰라도, 리그 이름으로 대략적인 대륙 추측
+    if any(k in n for k in ["k league", "j1 league", "j2 league", "j-league", "j league"]):
+        return "Asia"
+    if any(k in n for k in ["mls", "liga mx"]):
+        return "Americas"
+    if any(k in n for k in ["brasileirao", "serie a (brazil)", "argentina", "brazil"]):
+        return "Americas"
+
     return "Other"
 
 def _is_continental_cup(league_name: str) -> bool:
@@ -170,7 +224,6 @@ def _is_domestic_cup(league_name: str) -> bool:
     n = _normalize_name(league_name)
     if _is_continental_cup(league_name):
         return False
-    # 흔한 국내 컵 패턴들 (너무 과하게 잡지 않도록 적당히 제한)
     keywords = [
         "fa cup",
         "coppa",
@@ -208,12 +261,38 @@ def _calc_sort_order(league_name: str, country: Optional[str]) -> Tuple[str, int
     를 계산해서 돌려준다.
     """
     continent = _detect_continent(country, league_name)
+    # 대문자 첫 글자로 정규화
+    if continent == "europe":
+        continent = "Europe"
+    elif continent == "asia":
+        continent = "Asia"
+    elif continent == "americas":
+        continent = "Americas"
+    elif continent == "other":
+        continent = "Other"
+
     continent_order = _CONTINENT_GROUP_ORDER.get(continent, 99)
     inner = _calc_inner_sort(league_name, continent)
-
-    # 전체 sort_order 는 "대륙 우선순위 * 1000 + 대륙내 정렬" 형식
     sort_order = continent_order * 1000 + inner
     return continent, continent_order, sort_order
+
+def _calc_display_country(
+    league_name: str,
+    country: Optional[str],
+    continent: str,
+) -> Optional[str]:
+    """
+    앱에서 'Country - League Name' 앞부분에 어떤 텍스트를 보여줄지 결정.
+
+    - 대륙 컵(UCL, AFC CL, CONCACAF, Libertadores 등)은
+      World 대신 'Europe' / 'Asia' / 'Americas' 로 노출되게 조정.
+    - 나머지는 DB에서 온 country 그대로 사용.
+    """
+    if _is_continental_cup(league_name):
+        # 대륙컵은 World 대신 대륙 이름으로
+        if continent in ("Europe", "Asia", "Americas"):
+            return continent
+    return country
 
 # ─────────────────────────────────────
 #  메인: 리그 디렉터리 빌더
@@ -267,20 +346,26 @@ def build_league_directory(
     for r in rows:
         league_id = r["league_id"]
         league_name = r["league_name"]
-        country = r.get("country")
+        raw_country = r.get("country")
         logo = r.get("logo")
         today_count = r.get("today_count", 0)
 
         continent, continent_order, sort_order = _calc_sort_order(
             league_name=league_name,
-            country=country,
+            country=raw_country,
+        )
+
+        display_country = _calc_display_country(
+            league_name=league_name,
+            country=raw_country,
+            continent=continent,
         )
 
         enriched.append(
             {
                 "league_id": league_id,
                 "league_name": league_name,
-                "country": country,
+                "country": display_country,   # ← 여기서 가공된 country 사용
                 "logo": logo,
                 "today_count": today_count,
                 "continent": continent,
