@@ -908,16 +908,23 @@ def get_team_insights_overall_with_filters(
             pass
 
     # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
-    #        - last_n 이 없으면 시즌 전체 경기 수
-    #        - last_n 이 있으면 min(last_n, 시즌 전체 경기 수)를 사용
-    if last_n_int and last_n_int > 0:
-        if matches_total_int > 0:
-            events_sample = min(last_n_int, matches_total_int)
-        else:
-            # fixtures 정보가 없으면 일단 last_n 을 그대로 사용 (보수적 추정)
-            events_sample = last_n_int
+    #        - 섹션(enrich_overall_outcome_totals)에서 이미 기록해 둔 값이 있으면 우선 사용
+    #        - 없으면 기존 시즌 전체 / lastN 기반 로직을 그대로 사용
+    existing_events_sample = insights.get("events_sample")
+    if isinstance(existing_events_sample, int) and existing_events_sample > 0:
+        events_sample = existing_events_sample
     else:
-        events_sample = matches_total_int
+        # 기존 로직 그대로 유지
+        #   - last_n 이 없으면 시즌 전체 경기 수
+        #   - last_n 이 있으면 min(last_n, 시즌 전체 경기 수)를 사용
+        if last_n_int and last_n_int > 0:
+            if matches_total_int > 0:
+                events_sample = min(last_n_int, matches_total_int)
+            else:
+                # fixtures 정보가 없으면 일단 last_n 을 그대로 사용 (보수적 추정)
+                events_sample = last_n_int
+        else:
+            events_sample = matches_total_int
 
     # first_goal_sample 은 현재는 별도의 분모를 쓰지 않고,
     # 일단 events_sample 과 동일하게 내려준다. (나중에 필요시 분리 가능)
@@ -925,6 +932,7 @@ def get_team_insights_overall_with_filters(
 
     insights["events_sample"] = events_sample
     insights["first_goal_sample"] = first_goal_sample
+
 
     # (competition 필터(comp_norm)는 현재 단계에서는
     #  계산에 직접 사용되는 것은 target_league_ids_last_n 뿐이고,
