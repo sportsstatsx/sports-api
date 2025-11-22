@@ -1,7 +1,7 @@
 # services/insights/insights_overall_shooting_efficiency.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from db import fetch_all
 from .utils import fmt_pct, fmt_avg
@@ -30,12 +30,37 @@ def enrich_overall_shooting_efficiency(
     if season_int is None:
         return
 
+        # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
+    league_ids_for_query: List[Any]
+    filters = stats.get("insights_filters") if isinstance(stats, dict) else None
+    target_ids = None
+    if filters and isinstance(filters, dict):
+        target_ids = filters.get("target_league_ids_last_n")
+
+    if last_n and last_n > 0 and isinstance(target_ids, list):
+        league_ids_for_query = []
+        for v in target_ids:
+            try:
+                league_ids_for_query.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        # 혹시라도 잘못된 값만 들어오면 베이스 리그 한 개로 폴백
+        if not league_ids_for_query:
+            league_ids_for_query = [league_id]
+    else:
+        # 시즌 전체(Last N 없음) 이거나 필터 정보가 없으면 기존처럼 베이스 리그만 사용
+        league_ids_for_query = [league_id]
+
+
     # ─────────────────────────────────────────
     # 1) 경기별 우리 팀 슈팅 / 유효슈팅 집계
     #    - match_team_stats 에서 team_id = 우리 팀만 가져옴
     #    - finished / fulltime 경기만
     #    - last_n 이 있으면 "최근 N경기"만 사용
     # ─────────────────────────────────────────
+
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
     base_sql = """
         SELECT
             m.fixture_id,
@@ -67,7 +92,7 @@ def enrich_overall_shooting_efficiency(
         JOIN match_team_stats mts
           ON m.fixture_id = mts.fixture_id
          AND mts.team_id  = %s          -- ✅ 우리 팀만
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
           AND (
@@ -78,7 +103,7 @@ def enrich_overall_shooting_efficiency(
         ORDER BY m.date_utc DESC
     """
 
-    params = [team_id, league_id, season_int, team_id, team_id]
+    params = [team_id, *league_ids_for_query, season_int, team_id, team_id]
 
     # 🔹 last_n 이 지정된 경우 → 최근 N경기만 사용
     if last_n is not None and last_n > 0:
