@@ -13,21 +13,22 @@ def enrich_overall_goals_by_time(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
-    last_n: Optional[int] = None,  # 🔹 Last N (없으면 시즌 전체)
+    last_n: Optional[int] = None,  # Last N (없으면 시즌 전체)
 ) -> None:
     """
     Goals by Time 섹션.
 
-    기존 home_service.py 에서 잘 동작하던
-    - goals_by_time_for
-    - goals_by_time_against
-    계산 로직을 그대로 모듈로 분리한 버전.
+    🔹 기본 아이디어
+      1) matches 테이블에서 Competition + Last N 기준으로
+         이 팀이 뛴 경기들의 fixture_id 목록을 먼저 뽑는다.
+      2) 그 fixture_id 들에 속한 goal 이벤트만 모아서
+         10개 버킷(0~9,10~19,...,80~90+)에 득점/실점을 카운트한다.
 
-    🔹 Competition + Last N 필터 규칙
-        - 시즌 전체(last_n 가 None/0)일 때는 항상 league_id 한 개만 사용
-        - last_n > 0 이고 stats.insights_filters.target_league_ids_last_n 가 존재하면,
-          해당 ID 리스트를 IN (...) 으로 사용해서
-          리그 / 컵 / 대륙컵을 함께 집계한다.
+    🔹 Competition + Last N 규칙
+      - 시즌 전체(last_n == None 또는 0)일 때는 항상 league_id 한 개만 사용.
+      - last_n > 0 이고 stats.insights_filters.target_league_ids_last_n 가 있으면
+        그 ID 리스트를 IN (...) 으로 사용해서
+        리그 / 국내컵 / 대륙컵을 함께 집계한다.
     """
     if season_int is None:
         return
@@ -49,7 +50,7 @@ def enrich_overall_goals_by_time(
             except (TypeError, ValueError):
                 # 잘못된 값은 건너뛴다.
                 continue
-        # 비정상적으로 비어 있으면 안전하게 기본 리그만 사용
+        # 비어 있으면 안전하게 기본 리그만 사용
         if not league_ids_for_query:
             league_ids_for_query = [league_id]
     else:
@@ -57,53 +58,77 @@ def enrich_overall_goals_by_time(
         league_ids_for_query = [league_id]
 
     # ─────────────────────────────────────
-    # 1) 골 이벤트 로딩 (시즌 전체 or 최근 N경기)
+    # 1) Competition + Last N 기준으로 이 팀의 경기 목록(fixture_id) 뽑기
     # ─────────────────────────────────────
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
-    base_sql = f"""
+    matches_sql = f"""
         SELECT
-            e.fixture_id,
-            e.minute,
-            e.team_id,
+            m.fixture_id,
             m.home_id,
-            m.away_id
+            m.away_id,
+            m.date_utc
         FROM matches m
-        JOIN match_events e
-          ON e.fixture_id = m.fixture_id
         WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
+          AND (
+                lower(m.status_group) IN ('finished','ft','fulltime')
+             OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
+          )
+        ORDER BY m.date_utc DESC
+    """
+
+    match_params: List[Any] = [*league_ids_for_query, season_int, team_id, team_id]
+
+    # last_n > 0 이면 최근 N경기만 사용
+    if last_n is not None and last_n > 0:
+        matches_sql += "\n        LIMIT %s"
+        match_params.append(last_n)
+
+    match_rows = fetch_all(matches_sql, tuple(match_params))
+    if not match_rows:
+        return
+
+    fixture_ids: List[int] = []
+    for mr in match_rows:
+        fid = mr.get("fixture_id")
+        if fid is None:
+            continue
+        try:
+            fixture_ids.append(int(fid))
+        except (TypeError, ValueError):
+            continue
+
+    if not fixture_ids:
+        return
+
+    # ─────────────────────────────────────
+    # 2) 위에서 뽑은 fixture_id 들에 대해 골 이벤트만 로드
+    # ─────────────────────────────────────
+    fi_placeholders = ",".join(["%s"] * len(fixture_ids))
+
+    goals_sql = f"""
+        SELECT
+            e.fixture_id,
+            e.minute,
+            e.team_id
+        FROM match_events e
+        WHERE e.fixture_id IN ({fi_placeholders})
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
     """
 
-    # m.league_id IN (...), m.season, home/away 조건
-    params: List[Any] = [*league_ids_for_query, season_int, team_id, team_id]
-
-    # 🔹 last_n > 0 이면, 이 팀의 "최근 N경기"에 해당하는 fixture_id 들만 사용
-    if last_n is not None and last_n > 0:
-        placeholders_sub = ",".join(["%s"] * len(league_ids_for_query))
-        base_sql += f"""
-          AND m.fixture_id IN (
-              SELECT m2.fixture_id
-              FROM matches m2
-              WHERE m2.league_id IN ({placeholders_sub})
-                AND m2.season    = %s
-                AND (%s = m2.home_id OR %s = m2.away_id)
-              ORDER BY m2.date_utc DESC
-              LIMIT %s
-          )
-        """
-        # 서브쿼리용: league_ids_for_query + season_int + home/away + last_n
-        params.extend([*league_ids_for_query, season_int, team_id, team_id, last_n])
-
-    goal_rows = fetch_all(base_sql, tuple(params))
-
+    goal_rows = fetch_all(goals_sql, tuple(fixture_ids))
     if not goal_rows:
+        # 경기 자체는 있지만 골이 하나도 없는 경우
+        insights["goals_by_time_for"] = [0] * 10
+        insights["goals_by_time_against"] = [0] * 10
         return
 
-    # 10 구간 버킷 (0~9, 10~19, ..., 80~90+)
+    # ─────────────────────────────────────
+    # 3) 10 구간 버킷 (0~9, 10~19, ..., 80~90+)
+    # ─────────────────────────────────────
     for_buckets = [0] * 10
     against_buckets = [0] * 10
 
