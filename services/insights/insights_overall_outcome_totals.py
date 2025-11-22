@@ -44,10 +44,34 @@ def enrich_overall_outcome_totals(
     if season_int is None:
         return
 
+        # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
+    league_ids_for_query: list[Any]
+    filters = stats.get("insights_filters") if isinstance(stats, dict) else None
+    target_ids = None
+    if filters and isinstance(filters, dict):
+        target_ids = filters.get("target_league_ids_last_n")
+
+    if last_n and last_n > 0 and isinstance(target_ids, list):
+        league_ids_for_query = []
+        for v in target_ids:
+            try:
+                league_ids_for_query.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        # 혹시라도 잘못된 값만 들어오면 베이스 리그 한 개로 폴백
+        if not league_ids_for_query:
+            league_ids_for_query = [league_id]
+    else:
+        # 시즌 전체(Last N 없음) 이거나 필터 정보가 없으면 기존처럼 베이스 리그만 사용
+        league_ids_for_query = [league_id]
+
+
     # ─────────────────────────────────────
     # 1) 샘플 매치 로딩 (시즌 전체 or 최근 N경기)
     # ─────────────────────────────────────
-    base_sql = """
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    base_sql = f"""
         SELECT
             m.fixture_id,
             m.home_id,
@@ -57,7 +81,7 @@ def enrich_overall_outcome_totals(
             m.status_group,
             m.date_utc
         FROM matches m
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND (
@@ -67,7 +91,7 @@ def enrich_overall_outcome_totals(
         ORDER BY m.date_utc DESC
     """
 
-    params: list[Any] = [league_id, season_int, team_id, team_id]
+    params: list[Any] = [*league_ids_for_query, season_int, team_id, team_id]
     if last_n and last_n > 0:
         base_sql += " LIMIT %s"
         params.append(last_n)
