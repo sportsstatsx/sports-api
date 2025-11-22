@@ -125,6 +125,153 @@ def build_insights_filter_meta(
         "last_n": last_n,
     }
 
+    return {
+        "competition": comp_norm,
+        "last_n": last_n,
+    }
+
+
+def _get_team_competitions_for_season(
+    team_id: int,
+    base_league_id: int,
+    season_int: int,
+) -> Dict[str, Any]:
+    """
+    주어진 시즌에서 특정 팀이 실제로 뛴 대회(리그/국내컵/대륙컵)를
+    DB 기준으로 분류해서 돌려준다.
+
+    반환 형태 예시:
+
+    {
+        "base_league": {"league_id": 39, "name": "...", "country": "..."},
+        "all_league_ids": [39, 45, 100, ...],
+        "cup_league_ids": [100, 101, ...],
+        "uefa_league_ids": [...],
+        "acl_league_ids": [...],
+        "other_continental_league_ids": [...],
+        "competitions": [
+            {"league_id": 39, "name": "...", "country": "...", "category": "league"},
+            {"league_id": 100, "name": "...", "country": "...", "category": "cup"},
+            {"league_id": 2, "name": "...", "country": "...", "category": "uefa"},
+            ...
+        ],
+    }
+    """
+
+    # 1) 베이스 리그 메타 정보 (나라 비교용)
+    base_rows = fetch_all(
+        """
+        SELECT id, name, country
+        FROM leagues
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (base_league_id,),
+    )
+    base_name: Optional[str] = None
+    base_country: Optional[str] = None
+    if base_rows:
+        base_name = (base_rows[0].get("name") or "").strip() or None
+        base_country = (base_rows[0].get("country") or "").strip() or None
+
+    # 2) 이 팀이 해당 시즌에 실제로 뛴 모든 대회 목록
+    rows = fetch_all(
+        """
+        SELECT DISTINCT
+            m.league_id,
+            l.name   AS league_name,
+            l.country AS country
+        FROM matches m
+        JOIN leagues l
+          ON m.league_id = l.id
+        WHERE m.season = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+        """,
+        (season_int, team_id, team_id),
+    )
+
+    all_ids: set[int] = set()
+    cup_ids: set[int] = set()
+    uefa_ids: set[int] = set()
+    acl_ids: set[int] = set()
+    other_cont_ids: set[int] = set()
+    competitions: List[Dict[str, Any]] = []
+
+    for r in rows:
+        lid = r["league_id"]
+        name = (r.get("league_name") or "").strip()
+        country = (r.get("country") or "").strip()
+
+        all_ids.add(lid)
+
+        if lid == base_league_id:
+            # 현재 화면의 베이스 리그
+            category = "league"
+        else:
+            lower_name = name.lower()
+            lower_country = country.lower()
+
+            # 같은 나라면 → 그 나라 컵대회로 본다.
+            if base_country and country and country == base_country:
+                category = "cup"
+                cup_ids.add(lid)
+            else:
+                # 유럽 계열 대륙컵 (UCL/UEL/UECL/Conference/UEFA 등) → UEFA 그룹
+                if (
+                    "uefa" in lower_name
+                    or "ucl" in lower_name
+                    or "champions league" in lower_name
+                    or "europa" in lower_name
+                    or "conference" in lower_name
+                    or "europe" in lower_country
+                ):
+                    category = "uefa"
+                    uefa_ids.add(lid)
+                # 아시아 계열 대륙컵 (AFC Champions League / ACL 등) → ACL 그룹
+                elif (
+                    "afc" in lower_name
+                    or "asia" in lower_name
+                    or "asian" in lower_name
+                    or "acl" in lower_name
+                    or "afc" in lower_country
+                    or "asia" in lower_country
+                ):
+                    category = "acl"
+                    acl_ids.add(lid)
+                else:
+                    # 그 외 대륙컵 (CONMEBOL/CONCACAF 등)
+                    category = "other_continental"
+                    other_cont_ids.add(lid)
+
+        competitions.append(
+            {
+                "league_id": lid,
+                "name": name or None,
+                "country": country or None,
+                "category": category,
+            }
+        )
+
+    return {
+        "base_league": {
+            "league_id": base_league_id,
+            "name": base_name,
+            "country": base_country,
+        },
+        # 이 시즌에 이 팀이 실제로 뛴 모든 대회 ID
+        "all_league_ids": sorted(all_ids),
+        # 같은 나라의 컵대회들
+        "cup_league_ids": sorted(cup_ids),
+        # 유럽 계열 대륙컵 (UCL/UEL/UECL 등)
+        "uefa_league_ids": sorted(uefa_ids),
+        # 아시아 계열 대륙컵 (ACL 등)
+        "acl_league_ids": sorted(acl_ids),
+        # 그 외 대륙컵
+        "other_continental_league_ids": sorted(other_cont_ids),
+        # 디버깅/확인용 전체 목록
+        "competitions": competitions,
+    }
+
 
 # ─────────────────────────────────────
 #  1) 홈 화면: 상단 리그 탭용 목록
@@ -520,7 +667,7 @@ def get_team_insights_overall_with_filters(
     """
     # 1) 필터 메타 정규화
     filters_meta = build_insights_filter_meta(comp, last_n)
-    comp_norm = filters_meta.get("competition", "All")  # 현재는 메타용
+    comp_norm = filters_meta.get("competition", "All")  # 현재는 메타용 + 향후 분기용
     last_n_int = filters_meta.get("last_n", 0)
 
     # 2) 시즌 전체 기준 기본 데이터 로드
@@ -531,6 +678,28 @@ def get_team_insights_overall_with_filters(
     )
     if base is None:
         return None
+
+    # 2-1) 시즌 값 정규화해서 competition_detail 계산에 사용
+    season_val = base.get("season")
+    try:
+        season_int_meta = int(season_val) if season_val is not None else None
+    except (TypeError, ValueError):
+        season_int_meta = None
+
+    # 2-2) 이 시즌에 팀이 실제로 뛴 대회(리그/국내컵/대륙컵) 메타 정보 계산
+    if season_int_meta is not None:
+        try:
+            comp_detail = _get_team_competitions_for_season(
+                team_id=team_id,
+                base_league_id=league_id,
+                season_int=season_int_meta,
+            )
+        except Exception:
+            comp_detail = None
+
+        if comp_detail is not None:
+            # 클라이언트에서 Competition 필터 옵션 구성할 때 참고 가능
+            filters_meta["competition_detail"] = comp_detail
 
     value = base.get("value")
     if not isinstance(value, dict):
@@ -543,6 +712,7 @@ def get_team_insights_overall_with_filters(
     # 필터 메타를 value에 붙여준다.
     value["insights_filters"] = filters_meta
     base["value"] = value
+
 
     # 🔥 2-1) 기본 시즌 경기 수(fixtures.played.total)에서 샘플 수 베이스를 만든다.
     fixtures = value.get("fixtures") or {}
