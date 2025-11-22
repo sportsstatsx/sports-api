@@ -13,6 +13,7 @@ def enrich_overall_goals_by_time(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
+    last_n: Optional[int] = None,  # 🔹 추가: Last N (없으면 시즌 전체)
 ) -> None:
     """
     Goals by Time 섹션.
@@ -25,8 +26,10 @@ def enrich_overall_goals_by_time(
     if season_int is None:
         return
 
-    goal_rows = fetch_all(
-        """
+    # ─────────────────────────────────────
+    # 1) 골 이벤트 로딩 (시즌 전체 or 최근 N경기)
+    # ─────────────────────────────────────
+    base_sql = """
         SELECT
             e.fixture_id,
             e.minute,
@@ -41,9 +44,27 @@ def enrich_overall_goals_by_time(
           AND (%s = m.home_id OR %s = m.away_id)
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
-        """,
-        (league_id, season_int, team_id, team_id),
-    )
+    """
+
+    params = [league_id, season_int, team_id, team_id]
+
+    # 🔹 last_n > 0 이면, 이 팀의 "최근 N경기"에 해당하는 fixture_id 들만 사용
+    if last_n is not None and last_n > 0:
+        base_sql += """
+          AND m.fixture_id IN (
+              SELECT m2.fixture_id
+              FROM matches m2
+              WHERE m2.league_id = %s
+                AND m2.season    = %s
+                AND (%s = m2.home_id OR %s = m2.away_id)
+              ORDER BY m2.date_utc DESC
+              LIMIT %s
+          )
+        """
+        params.extend([league_id, season_int, team_id, team_id, last_n])
+
+    goal_rows = fetch_all(base_sql, tuple(params))
+
 
     if not goal_rows:
         return
