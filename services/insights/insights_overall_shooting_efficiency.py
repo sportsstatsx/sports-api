@@ -15,6 +15,7 @@ def enrich_overall_shooting_efficiency(
     season_int: Optional[int],
     team_id: int,
     matches_total_api: int = 0,
+    last_n: int = 0,   # 🔹 추가: 최근 N경기 필터
 ) -> None:
     """
     Insights Overall - Shooting & Efficiency 섹션.
@@ -33,13 +34,14 @@ def enrich_overall_shooting_efficiency(
     # 1) 경기별 우리 팀 슈팅 / 유효슈팅 집계
     #    - match_team_stats 에서 team_id = 우리 팀만 가져옴
     #    - finished / fulltime 경기만
+    #    - last_n > 0 이면 date_utc 기준 최근 N경기만 사용
     # ─────────────────────────────────────────
-    shot_rows = fetch_all(
-        """
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
+            MAX(m.date_utc) AS date_utc,
             SUM(
                 CASE
                     WHEN lower(mts.name) IN ('total shots','shots total','shots')
@@ -72,10 +74,18 @@ def enrich_overall_shooting_efficiency(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-        GROUP BY m.fixture_id, m.home_id, m.away_id
-        """,
-        (team_id, league_id, season_int, team_id, team_id),
-    )
+        GROUP BY m.fixture_id, m.home_id, m.away_id, m.date_utc
+        ORDER BY date_utc DESC
+    """
+
+    params: list[Any] = [team_id, league_id, season_int, team_id, team_id]
+
+    # last_n > 0 이면 최근 N경기만 LIMIT
+    if last_n and last_n > 0:
+        base_sql += "\n        LIMIT %s"
+        params.append(last_n)
+
+    shot_rows = fetch_all(base_sql, tuple(params))
 
     if not shot_rows:
         return
