@@ -61,7 +61,7 @@ def enrich_overall_shooting_efficiency(
 
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
-    base_sql = """
+    base_sql = f"""
         SELECT
             m.fixture_id,
             m.home_id,
