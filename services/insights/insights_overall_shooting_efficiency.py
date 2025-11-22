@@ -15,7 +15,7 @@ def enrich_overall_shooting_efficiency(
     season_int: Optional[int],
     team_id: int,
     matches_total_api: int = 0,
-    last_n: int = 0,   # 🔹 추가: 최근 N경기 필터
+    last_n: Optional[int] = None,  # 🔹 Last N 필터용 (없으면 시즌 전체)
 ) -> None:
     """
     Insights Overall - Shooting & Efficiency 섹션.
