@@ -622,6 +622,23 @@ def get_team_insights_overall_with_filters(
                 # Shooting 계산 실패 시에도 기본 시즌 값은 유지
                 pass
 
+                # Discipline & Set Pieces: 최근 N경기 기준으로 다시 계산
+            try:
+                enrich_overall_discipline_setpieces(
+                    stats=value,
+                    insights=insights,
+                    league_id=league_id,
+                    season_int=season_int,
+                    team_id=team_id,
+                    # Last N 모드에서는 분모용 matches_total_api 는 사용하지 않으므로 0
+                    matches_total_api=0,
+                    last_n=last_n_int,
+                )
+            except Exception:
+                # Discipline 계산 실패 시에도 기본 시즌 값은 유지
+                pass
+
+
     # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
     #        - last_n 이 없으면 시즌 전체 경기 수
     #        - last_n 이 있으면 min(last_n, 시즌 전체 경기 수)를 사용
