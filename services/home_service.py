@@ -551,14 +551,8 @@ def get_team_insights_overall_with_filters(
         matches_total_int = 0
 
     # 3) last_n > 0 이면 Outcome & Totals 만 최근 N경기 기준으로 다시 계산
-    if last_n_int and last_n_int > 0:
-        season_val = base.get("season")
-        try:
-            season_int = int(season_val)
-        except (TypeError, ValueError):
-            season_int = None
-
-        if season_int is not None:
+            if season_int is not None:
+            # Outcome & Totals: 최근 N경기 기준으로 다시 계산
             try:
                 enrich_overall_outcome_totals(
                     stats=value,
@@ -572,6 +566,20 @@ def get_team_insights_overall_with_filters(
                 )
             except Exception:
                 # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
+                pass
+
+            # Timing: 최근 N경기 기준으로 다시 계산
+            try:
+                enrich_overall_timing(
+                    stats=value,
+                    insights=insights,
+                    league_id=league_id,
+                    season_int=season_int,
+                    team_id=team_id,
+                    last_n=last_n_int,
+                )
+            except Exception:
+                # Timing 계산 실패 시에도 기본 시즌 값은 유지
                 pass
 
     # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
