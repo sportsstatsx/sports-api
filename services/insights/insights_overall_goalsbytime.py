@@ -13,7 +13,7 @@ def enrich_overall_goals_by_time(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
-    last_n: Optional[int] = None,  # 🔹 추가: Last N (없으면 시즌 전체)
+    last_n: Optional[int] = None,  # 🔹 Last N (없으면 시즌 전체)
 ) -> None:
     """
     Goals by Time 섹션.
@@ -22,12 +22,20 @@ def enrich_overall_goals_by_time(
     - goals_by_time_for
     - goals_by_time_against
     계산 로직을 그대로 모듈로 분리한 버전.
+
+    🔹 Competition + Last N 필터 규칙
+        - 시즌 전체(last_n 가 None/0)일 때는 항상 league_id 한 개만 사용
+        - last_n > 0 이고 stats.insights_filters.target_league_ids_last_n 가 존재하면,
+          해당 ID 리스트를 IN (...) 으로 사용해서
+          리그 / 컵 / 대륙컵을 함께 집계한다.
     """
     if season_int is None:
         return
 
-        # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
-    league_ids_for_query: List[Any]
+    # ─────────────────────────────────────
+    # 0) Competition / Last N 에 따른 league_id 집합 결정
+    # ─────────────────────────────────────
+    league_ids_for_query: List[int]
     filters = stats.get("insights_filters") if isinstance(stats, dict) else None
     target_ids = None
     if filters and isinstance(filters, dict):
@@ -39,19 +47,18 @@ def enrich_overall_goals_by_time(
             try:
                 league_ids_for_query.append(int(v))
             except (TypeError, ValueError):
+                # 잘못된 값은 건너뛴다.
                 continue
-        # 잘못된 값만 들어오면 베이스 리그 한 개로 폴백
+        # 비정상적으로 비어 있으면 안전하게 기본 리그만 사용
         if not league_ids_for_query:
             league_ids_for_query = [league_id]
     else:
-        # 시즌 전체(Last N 없음) 이거나 필터 정보가 없으면 기존처럼 베이스 리그만 사용
+        # 시즌 전체 모드 또는 필터 정보 없음 → 기본 리그만
         league_ids_for_query = [league_id]
-
 
     # ─────────────────────────────────────
     # 1) 골 이벤트 로딩 (시즌 전체 or 최근 N경기)
     # ─────────────────────────────────────
-    # 골 이벤트: 시즌 전체 or 최근 N경기 (Competition 필터 반영)
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
     base_sql = f"""
@@ -92,7 +99,6 @@ def enrich_overall_goals_by_time(
         params.extend([*league_ids_for_query, season_int, team_id, team_id, last_n])
 
     goal_rows = fetch_all(base_sql, tuple(params))
-
 
     if not goal_rows:
         return
