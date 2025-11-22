@@ -24,6 +24,7 @@ def enrich_overall_discipline_setpieces(
     season_int: Optional[int],
     team_id: int,
     matches_total_api: int = 0,
+    last_n: Optional[int] = None,  # 🔹 추가: Last N 필터 (없으면 시즌 전체)
 ) -> None:
     """
     Discipline & Set Pieces 섹션.
@@ -39,9 +40,9 @@ def enrich_overall_discipline_setpieces(
 
     # ─────────────────────────────────────────
     # 1) 코너 / 옐로 / 레드 합계 및 경기 수
+    #    - last_n 이 있으면 "최근 N경기"만 사용
     # ─────────────────────────────────────────
-    disc_rows = fetch_all(
-        """
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
@@ -81,10 +82,18 @@ def enrich_overall_discipline_setpieces(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-        GROUP BY m.fixture_id, m.home_id, m.away_id
-        """,
-        (team_id, league_id, season_int, team_id, team_id),
-    )
+        GROUP BY m.fixture_id, m.home_id, m.away_id, m.date_utc
+        ORDER BY m.date_utc DESC
+    """
+
+    params = [team_id, league_id, season_int, team_id, team_id]
+
+    # 🔹 last_n > 0 이면 시즌 내에서 최근 N경기만 사용
+    if last_n is not None and last_n > 0:
+        base_sql += "\n        LIMIT %s"
+        params.append(last_n)
+
+    disc_rows = fetch_all(base_sql, tuple(params))
 
     if not disc_rows:
         # 이 팀/시즌에 해당하는 경기 자체가 없으면 아무 것도 기록하지 않음
