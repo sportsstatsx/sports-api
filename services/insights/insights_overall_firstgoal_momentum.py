@@ -13,6 +13,7 @@ def enrich_overall_firstgoal_momentum(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
+    last_n: Optional[int] = None,
 ) -> None:
     """
     First Goal / Momentum 섹션을 채워 넣는 함수.
@@ -45,9 +46,8 @@ def enrich_overall_firstgoal_momentum(
         v = safe_div(n, d)
         return int(round(v * 100)) if v > 0 else 0
 
-    # 1) 이 팀의 완료된 경기 목록
-    match_rows: List[Dict[str, Any]] = fetch_all(
-        """
+    # 1) 이 팀의 완료된 경기 목록 (시즌 전체 or 최근 N경기)
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
@@ -63,9 +63,16 @@ def enrich_overall_firstgoal_momentum(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-        """,
-        (league_id, season_int, team_id, team_id),
-    )
+        ORDER BY m.date_utc DESC
+    """
+
+    params: list[Any] = [league_id, season_int, team_id, team_id]
+    if last_n and last_n > 0:
+        # last_n 이 지정되면 시즌 내에서 최근 N경기만 사용
+        base_sql += "\n        LIMIT %s"
+        params.append(last_n)
+
+    match_rows: List[Dict[str, Any]] = fetch_all(base_sql, tuple(params))
 
     if not match_rows:
         return
