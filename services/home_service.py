@@ -272,6 +272,82 @@ def _get_team_competitions_for_season(
         "competitions": competitions,
     }
 
+def _resolve_target_league_ids_for_last_n(
+    base_league_id: int,
+    comp_norm: str,
+    comp_detail: Dict[str, Any],
+) -> List[int]:
+    """
+    Competition 필터(comp_norm)와 competition_detail 메타 정보를 이용해서
+    Last N 계산에 사용할 리그 ID 목록을 결정한다.
+
+    - base_league_id: 현재 화면의 베이스 리그 (예: EPL, K League 1)
+    - comp_norm: normalize_comp() 로 정규화된 competition 값
+    - comp_detail: _get_team_competitions_for_season() 이 내려준 딕셔너리
+    """
+    # 안전장치: comp_detail 이 없으면 항상 베이스 리그만 사용
+    if not isinstance(comp_detail, dict):
+        return [base_league_id]
+
+    comp_norm_str = (comp_norm or "All") if isinstance(comp_norm, str) else "All"
+    comp_norm_lower = comp_norm_str.strip().lower()
+
+    all_ids = comp_detail.get("all_league_ids") or []
+    cup_ids = comp_detail.get("cup_league_ids") or []
+    uefa_ids = comp_detail.get("uefa_league_ids") or []
+    acl_ids = comp_detail.get("acl_league_ids") or []
+    other_cont_ids = comp_detail.get("other_continental_league_ids") or []
+    competitions = comp_detail.get("competitions") or []
+
+    def _fallback(ids: List[int]) -> List[int]:
+        ids_clean: List[int] = []
+        for x in ids:
+            try:
+                ids_clean.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if ids_clean:
+            return ids_clean
+        return [base_league_id]
+
+    # 1) All → 이 시즌 이 팀이 출전한 모든 대회
+    if comp_norm_lower in ("all", "", "전체"):
+        return _fallback(all_ids)
+
+    # 2) League → 항상 베이스 리그 한 개만
+    if comp_norm_lower in ("league", "리그"):
+        return [base_league_id]
+
+    # 3) UEFA 대륙컵 그룹
+    if comp_norm_lower in ("uefa", "europe (uefa)", "ucl", "champions league"):
+        return _fallback(uefa_ids)
+
+    # 4) ACL (아시아 대륙컵 그룹)
+    if comp_norm_lower in ("acl", "asia (acl)", "afc champions league", "afc"):
+        return _fallback(acl_ids)
+
+    # 5) Domestic Cup 전체 (특정 이름 없이 "Cup" 만 들어온 경우)
+    if comp_norm_lower in ("cup", "domestic cup", "국내컵"):
+        return _fallback(cup_ids)
+
+    # 6) 그 외에는 comp_norm 이 "FA Cup", "Emperor's Cup" 처럼
+    #    특정 대회 이름과 같다고 보고, competitions 목록에서 매칭을 시도한다.
+    for comp_row in competitions:
+        name = (comp_row.get("name") or "").strip()
+        category = comp_row.get("category")
+        lid = comp_row.get("league_id")
+        if not name or lid is None:
+            continue
+        if name.strip().lower() == comp_norm_lower:
+            try:
+                return [int(lid)]
+            except (TypeError, ValueError):
+                return [base_league_id]
+
+    # 매칭되는 게 없으면 최종 fallback: 베이스 리그 한 개
+    return [base_league_id]
+
+
 
 # ─────────────────────────────────────
 #  1) 홈 화면: 상단 리그 탭용 목록
@@ -653,21 +729,26 @@ def get_team_insights_overall_with_filters(
     Insights Overall 탭에서 Season / Competition / Last N 필터를 적용하기 위한
     서비스 함수.
 
-    현재 단계:
+    동작 순서:
       1) get_team_season_stats() 를 호출해서
          (season 이 지정되면 해당 시즌, 아니면 최신 시즌) 기준으로
          시즌 전체 insights_overall 을 먼저 계산하고,
-      2) 필터 메타(insights_filters)를 붙인 뒤,
+      2) 필터 메타(insights_filters)를 value 에 붙여준다.
+         - competition / last_n
+         - competition_detail (이 시즌에 이 팀이 출전한 리그/컵/대륙컵 목록)
+         - target_league_ids_last_n (Last N 계산에 사용할 league_id 리스트)
       3) last_n > 0 인 경우에만 일부 섹션을
          해당 시즌의 '최근 N경기' 기준으로 다시 계산해서 덮어쓴다.
          - Outcome & Totals / Result Combos & Draw
          - Timing
          - First Goal & Momentum
          - Shooting & Efficiency
+         - Discipline & Set Pieces
+         - Goals by Time
     """
     # 1) 필터 메타 정규화
     filters_meta = build_insights_filter_meta(comp, last_n)
-    comp_norm = filters_meta.get("competition", "All")  # 현재는 메타용 + 향후 분기용
+    comp_norm = filters_meta.get("competition", "All")
     last_n_int = filters_meta.get("last_n", 0)
 
     # 2) 시즌 전체 기준 기본 데이터 로드
@@ -679,7 +760,7 @@ def get_team_insights_overall_with_filters(
     if base is None:
         return None
 
-    # 2-1) 시즌 값 정규화해서 competition_detail 계산에 사용
+    # 2-1) 시즌 값 정규화 (competition_detail / Last N 계산에 모두 사용)
     season_val = base.get("season")
     try:
         season_int_meta = int(season_val) if season_val is not None else None
@@ -687,6 +768,7 @@ def get_team_insights_overall_with_filters(
         season_int_meta = None
 
     # 2-2) 이 시즌에 팀이 실제로 뛴 대회(리그/국내컵/대륙컵) 메타 정보 계산
+    comp_detail: Optional[Dict[str, Any]] = None
     if season_int_meta is not None:
         try:
             comp_detail = _get_team_competitions_for_season(
@@ -698,9 +780,17 @@ def get_team_insights_overall_with_filters(
             comp_detail = None
 
         if comp_detail is not None:
-            # 클라이언트에서 Competition 필터 옵션 구성할 때 참고 가능
             filters_meta["competition_detail"] = comp_detail
 
+    # 2-3) Last N 계산에 사용할 리그 ID 리스트를 competition 필터에 맞게 선택
+    target_league_ids_last_n = _resolve_target_league_ids_for_last_n(
+        base_league_id=league_id,
+        comp_norm=str(comp_norm) if comp_norm is not None else "All",
+        comp_detail=comp_detail or filters_meta.get("competition_detail") or {},
+    )
+    filters_meta["target_league_ids_last_n"] = target_league_ids_last_n
+
+    # 2-4) value / insights 초기화 및 필터 메타 부착
     value = base.get("value")
     if not isinstance(value, dict):
         value = {}
@@ -709,12 +799,10 @@ def get_team_insights_overall_with_filters(
         insights = {}
         value["insights_overall"] = insights
 
-    # 필터 메타를 value에 붙여준다.
     value["insights_filters"] = filters_meta
     base["value"] = value
 
-
-    # 🔥 2-1) 기본 시즌 경기 수(fixtures.played.total)에서 샘플 수 베이스를 만든다.
+    # 🔥 2-5) 기본 시즌 경기 수(fixtures.played.total)에서 샘플 수 베이스를 만든다.
     fixtures = value.get("fixtures") or {}
     played = fixtures.get("played") or {}
     matches_total_api = played.get("total") or 0
@@ -724,105 +812,100 @@ def get_team_insights_overall_with_filters(
         matches_total_int = 0
 
     # 3) last_n > 0 이면 일부 섹션을 최근 N경기 기준으로 다시 계산
-    if last_n_int and last_n_int > 0:
-        season_val = base.get("season")
+    #    (섹션 내부에서는 stats["insights_filters"]["target_league_ids_last_n"]
+    #     값을 읽어서 league_id IN (...) 조건으로 사용하게 된다.)
+    if last_n_int and last_n_int > 0 and season_int_meta is not None:
+        season_int = season_int_meta
+
+        # Outcome & Totals / Result Combos & Draw
         try:
-            season_int = int(season_val)
-        except (TypeError, ValueError):
-            season_int = None
+            enrich_overall_outcome_totals(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # 필터 샘플에서는 분모를 실제 매치 수로 쓰기 위해 0으로 넘긴다.
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
+            pass
 
-        if season_int is not None:
-            # Outcome & Totals / Result Combos & Draw
-            try:
-                enrich_overall_outcome_totals(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    # 필터 샘플에서는 분모를 실제 매치 수로 쓰기 위해 0으로 넘긴다.
-                    matches_total_api=0,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
-                pass
+        # Timing
+        try:
+            enrich_overall_timing(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Timing 계산 실패 시에도 기본 시즌 값은 유지
+            pass
 
-            # Timing
-            try:
-                enrich_overall_timing(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # Timing 계산 실패 시에도 기본 시즌 값은 유지
-                pass
+        # First Goal & Momentum
+        try:
+            enrich_overall_firstgoal_momentum(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # First Goal 계산 실패 시에도 기본 시즌 값은 유지
+            pass
 
-            # First Goal & Momentum
-            try:
-                enrich_overall_firstgoal_momentum(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # First Goal 계산 실패 시에도 기본 시즌 값은 유지
-                pass
+        # Shooting & Efficiency
+        try:
+            enrich_overall_shooting_efficiency(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # Last N 모드에서는 분모를 내부 total_matches 로만 사용
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Shooting 계산 실패 시에도 기본 시즌 값은 유지
+            pass
 
-            # Shooting & Efficiency
-            try:
-                enrich_overall_shooting_efficiency(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    # Last N 모드에서는 분모를 내부 total_matches 로만 사용
-                    matches_total_api=0,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # Shooting 계산 실패 시에도 기본 시즌 값은 유지
-                pass
+        # Discipline & Set Pieces: 최근 N경기 기준으로 다시 계산
+        try:
+            enrich_overall_discipline_setpieces(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # Last N 모드에서는 분모용 matches_total_api 는 사용하지 않으므로 0
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Discipline 계산 실패 시에도 기본 시즌 값은 유지
+            pass
 
-                # Discipline & Set Pieces: 최근 N경기 기준으로 다시 계산
-            try:
-                enrich_overall_discipline_setpieces(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    # Last N 모드에서는 분모용 matches_total_api 는 사용하지 않으므로 0
-                    matches_total_api=0,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # Discipline 계산 실패 시에도 기본 시즌 값은 유지
-                pass
-
-                # Goals by Time (For / Against): 최근 N경기 기준으로 다시 계산
-            try:
-                enrich_overall_goals_by_time(
-                    stats=value,
-                    insights=insights,
-                    league_id=league_id,
-                    season_int=season_int,
-                    team_id=team_id,
-                    last_n=last_n_int,
-                )
-            except Exception:
-                # Goals by Time 계산 실패 시에도 기본 시즌 값은 유지
-                pass
-
-
+        # Goals by Time (For / Against): 최근 N경기 기준으로 다시 계산
+        try:
+            enrich_overall_goals_by_time(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Goals by Time 계산 실패 시에도 기본 시즌 값은 유지
+            pass
 
     # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
     #        - last_n 이 없으면 시즌 전체 경기 수
@@ -843,10 +926,13 @@ def get_team_insights_overall_with_filters(
     insights["events_sample"] = events_sample
     insights["first_goal_sample"] = first_goal_sample
 
-    # (competition 필터(comp_norm)는 아직 계산에 직접 사용하지 않고,
-    #  메타만 내려보내는 상태. 나중에 League/Cup/Europe/Continental 분기 로직을
-    #  추가할 때 comp_norm도 같이 활용하게 된다.)
+    # (competition 필터(comp_norm)는 현재 단계에서는
+    #  계산에 직접 사용되는 것은 target_league_ids_last_n 뿐이고,
+    #  나머지는 메타(insights_filters)로만 내려보낸다.
+    #  -> 각 섹션 모듈에서 stats["insights_filters"]["target_league_ids_last_n"]
+    #     를 참고해서 league_id IN (...) 조건을 적용하게 된다.)
     return base
+
 
 
 # ─────────────────────────────────────
