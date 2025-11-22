@@ -259,6 +259,21 @@ def enrich_overall_outcome_totals(
     eff_home = mh_tot or eff_tot
     eff_away = ma_tot or eff_tot
 
+    # 4-1) 샘플 수(events_sample) 기록
+    #      - 이미 다른 곳에서 유효한 값이 들어있으면 그대로 두고
+    #      - 없으면 Outcome & Totals 분모(eff_tot)를 기준으로 세팅
+    try:
+        current_events_sample = insights.get("events_sample")
+    except Exception:
+        current_events_sample = None
+
+    if not isinstance(current_events_sample, int) or current_events_sample <= 0:
+        try:
+            insights["events_sample"] = int(eff_tot)
+        except (TypeError, ValueError):
+            # 변환 실패 시에는 조용히 무시 (기존 동작 유지)
+            pass
+
     # ─────────────────────────────────────
     # 5) 승률/오버/클린시트/노골 등 퍼센트
     # ─────────────────────────────────────
