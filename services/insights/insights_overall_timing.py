@@ -13,6 +13,7 @@ def enrich_overall_timing(
     league_id: int,
     season_int: Optional[int],
     team_id: int,
+    last_n: Optional[int] = None,
 ) -> None:
     """
     Timing 섹션을 채워 넣는 함수.
@@ -21,6 +22,10 @@ def enrich_overall_timing(
       전/후반 득점/실점, 0–15분 / 80–90분 득점/실점 비율을 계산한다.
     - 로컬 DB 시절 InsightsOverallDao 에서 하던 계산을
       PostgreSQL + Python 코드로 옮긴 버전이다.
+
+    last_n:
+        > 0 이면 해당 시즌 내에서 최근 last_n 경기만 대상으로 Timing을 계산한다.
+        None 또는 <= 0 이면 시즌 전체 경기(완료된 경기)를 사용한다.
     """
 
     if season_int is None:
@@ -44,9 +49,8 @@ def enrich_overall_timing(
         v = safe_div(n, d)
         return int(round(v * 100)) if v > 0 else 0
 
-    # 1) 이 팀이 뛴 완료된 경기 목록
-    match_rows: List[Dict[str, Any]] = fetch_all(
-        """
+    # 1) 이 팀이 뛴 완료된 경기 목록 (시즌 전체 or 최근 N경기)
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
@@ -62,9 +66,16 @@ def enrich_overall_timing(
                 lower(m.status_group) IN ('finished','ft','fulltime')
              OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
           )
-        """,
-        (league_id, season_int, team_id, team_id),
-    )
+        ORDER BY m.date_utc DESC
+    """
+
+    params: list[Any] = [league_id, season_int, team_id, team_id]
+    if last_n and last_n > 0:
+        # last_n 이 지정되면 시즌 내에서 최근 N경기만 사용
+        base_sql += "\n        LIMIT %s"
+        params.append(last_n)
+
+    match_rows: List[Dict[str, Any]] = fetch_all(base_sql, tuple(params))
 
     if not match_rows:
         return
