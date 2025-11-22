@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from db import fetch_all
 from .utils import fmt_avg
@@ -38,11 +38,35 @@ def enrich_overall_discipline_setpieces(
     if season_int is None:
         return
 
+        # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
+    league_ids_for_query: List[Any]
+    filters = stats.get("insights_filters") if isinstance(stats, dict) else None
+    target_ids = None
+    if filters and isinstance(filters, Dict):
+        target_ids = filters.get("target_league_ids_last_n")
+
+    if last_n and last_n > 0 and isinstance(target_ids, list):
+        league_ids_for_query = []
+        for v in target_ids:
+            try:
+                league_ids_for_query.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        # 혹시라도 잘못된 값만 들어오면 베이스 리그 한 개로 폴백
+        if not league_ids_for_query:
+            league_ids_for_query = [league_id]
+    else:
+        # 시즌 전체(Last N 없음) 이거나 필터 정보가 없으면 기존처럼 베이스 리그만 사용
+        league_ids_for_query = [league_id]
+
+
     # ─────────────────────────────────────────
     # 1) 코너 / 옐로 / 레드 합계 및 경기 수
     #    - last_n 이 있으면 "최근 N경기"만 사용
     # ─────────────────────────────────────────
-    base_sql = """
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    base_sql = f"""
         SELECT
             m.fixture_id,
             m.home_id,
@@ -75,7 +99,7 @@ def enrich_overall_discipline_setpieces(
         LEFT JOIN match_team_stats mts
           ON mts.fixture_id = m.fixture_id
          AND mts.team_id   = %s
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
           AND (
@@ -86,7 +110,7 @@ def enrich_overall_discipline_setpieces(
         ORDER BY m.date_utc DESC
     """
 
-    params = [team_id, league_id, season_int, team_id, team_id]
+    params = [team_id, *league_ids_for_query, season_int, team_id, team_id]
 
     # 🔹 last_n > 0 이면 시즌 내에서 최근 N경기만 사용
     if last_n is not None and last_n > 0:
@@ -98,6 +122,7 @@ def enrich_overall_discipline_setpieces(
     if not disc_rows:
         # 이 팀/시즌에 해당하는 경기 자체가 없으면 아무 것도 기록하지 않음
         return
+
 
     # 경기 수 및 합계 (T/H/A)
     tot_matches = 0
@@ -193,8 +218,10 @@ def enrich_overall_discipline_setpieces(
     # ─────────────────────────────────────────
 
     # 카드 이벤트 (레드 카드만 필터)
+    placeholders_ev = ",".join(["%s"] * len(league_ids_for_query))
+
     card_rows = fetch_all(
-        """
+        f"""
         SELECT
             e.fixture_id,
             e.minute,
@@ -203,7 +230,7 @@ def enrich_overall_discipline_setpieces(
             m.away_id
         FROM match_events e
         JOIN matches m ON m.fixture_id = e.fixture_id
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders_ev})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
           AND (
@@ -217,19 +244,20 @@ def enrich_overall_discipline_setpieces(
           )
           AND e.minute IS NOT NULL
         """,
-        (league_id, season_int, team_id, team_id),
+        (*league_ids_for_query, season_int, team_id, team_id),
     )
+
 
     # 골 이벤트
     goal_rows = fetch_all(
-        """
+        f"""
         SELECT
             e.fixture_id,
             e.minute,
             e.team_id
         FROM match_events e
         JOIN matches m ON m.fixture_id = e.fixture_id
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders_ev})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
           AND (
@@ -239,8 +267,9 @@ def enrich_overall_discipline_setpieces(
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
         """,
-        (league_id, season_int, team_id, team_id),
+        (*league_ids_for_query, season_int, team_id, team_id),
     )
+
 
     # fixture 별 첫 레드카드 시각 (상대 / 자팀)
     opp_red_min: Dict[int, int] = {}
