@@ -511,9 +511,12 @@ def get_team_insights_overall_with_filters(
          (season 이 지정되면 해당 시즌, 아니면 최신 시즌) 기준으로
          시즌 전체 insights_overall 을 먼저 계산하고,
       2) 필터 메타(insights_filters)를 붙인 뒤,
-      3) last_n > 0 인 경우에만 Outcome & Totals 섹션을
+      3) last_n > 0 인 경우에만 일부 섹션을
          해당 시즌의 '최근 N경기' 기준으로 다시 계산해서 덮어쓴다.
-         (다른 섹션은 아직 시즌 전체 기준 그대로)
+         - Outcome & Totals / Result Combos & Draw
+         - Timing
+         - First Goal & Momentum
+         - Shooting & Efficiency
     """
     # 1) 필터 메타 정규화
     filters_meta = build_insights_filter_meta(comp, last_n)
@@ -550,7 +553,7 @@ def get_team_insights_overall_with_filters(
     except (TypeError, ValueError):
         matches_total_int = 0
 
-    # 3) last_n > 0 이면 Outcome & Totals / Timing 을 최근 N경기 기준으로 다시 계산
+    # 3) last_n > 0 이면 일부 섹션을 최근 N경기 기준으로 다시 계산
     if last_n_int and last_n_int > 0:
         season_val = base.get("season")
         try:
@@ -559,7 +562,7 @@ def get_team_insights_overall_with_filters(
             season_int = None
 
         if season_int is not None:
-            # Outcome & Totals: 최근 N경기 기준으로 다시 계산
+            # Outcome & Totals / Result Combos & Draw
             try:
                 enrich_overall_outcome_totals(
                     stats=value,
@@ -575,7 +578,7 @@ def get_team_insights_overall_with_filters(
                 # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
                 pass
 
-            # Timing: 최근 N경기 기준으로 다시 계산
+            # Timing
             try:
                 enrich_overall_timing(
                     stats=value,
@@ -589,7 +592,7 @@ def get_team_insights_overall_with_filters(
                 # Timing 계산 실패 시에도 기본 시즌 값은 유지
                 pass
 
-                # First Goal / Momentum: 최근 N경기 기준으로 다시 계산
+            # First Goal & Momentum
             try:
                 enrich_overall_firstgoal_momentum(
                     stats=value,
@@ -603,7 +606,21 @@ def get_team_insights_overall_with_filters(
                 # First Goal 계산 실패 시에도 기본 시즌 값은 유지
                 pass
 
-
+            # Shooting & Efficiency
+            try:
+                enrich_overall_shooting_efficiency(
+                    stats=value,
+                    insights=insights,
+                    league_id=league_id,
+                    season_int=season_int,
+                    team_id=team_id,
+                    # Last N 모드에서는 분모를 내부 total_matches 로만 사용
+                    matches_total_api=0,
+                    last_n=last_n_int,
+                )
+            except Exception:
+                # Shooting 계산 실패 시에도 기본 시즌 값은 유지
+                pass
 
     # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
     #        - last_n 이 없으면 시즌 전체 경기 수
