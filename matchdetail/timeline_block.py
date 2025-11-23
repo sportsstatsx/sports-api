@@ -5,16 +5,21 @@ from db import fetch_all
 
 
 def _first_non_empty(row: Dict[str, Any], keys: List[str]) -> str | None:
+    """
+    row 안에서 여러 후보 컬럼 이름 중 먼저 나오는 non-empty 값을 반환.
+    DB 스키마가 조금 달라도 안전하게 가져오려고 이렇게 처리.
+    """
     for k in keys:
-        v = row.get(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
+        if k in row:
+            v = row.get(k)
+            if v is not None and str(v).strip() != "":
+                return str(v).strip()
     return None
 
 
 def _map_period(minute: int) -> str:
     """
-    H1 / H2 / ET / PEN 구분
+    분(minute) 기준으로 H1/H2/ET/PEN 구분.
     """
     if minute <= 45:
         return "H1"
@@ -27,7 +32,7 @@ def _map_period(minute: int) -> str:
 
 def _build_minute_label(minute: int, time_extra: int | None, period: str) -> tuple[str, int | None]:
     """
-    46분이면 45’+1 이런 식의 라벨, extra 계산
+    46분 -> 45’+1 형태 라벨 + extra 반환.
     """
     extra = time_extra
     if extra is None:
@@ -52,8 +57,13 @@ def _build_minute_label(minute: int, time_extra: int | None, period: str) -> tup
 
 def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     """
-    DB에 저장된 type/detail 문자열을 UI용 canonical type 으로 매핑
-    (GOAL / PEN_GOAL / OWN_GOAL / YELLOW / RED / SUB / PEN_MISSED / VAR / OTHER)
+    DB type/detail 문자열을 UI에서 쓰기 좋은 canonical type 으로 매핑.
+    - GOAL / PEN_GOAL / OWN_GOAL
+    - YELLOW / RED
+    - SUB
+    - PEN_MISSED
+    - VAR
+    - OTHER
     """
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
@@ -102,22 +112,22 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
 
 def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    match_events 테이블을 기반으로, **UI에서 그대로 쓸 수 있는**
+    match_events 테이블을 기반으로, **앱에서 그대로 사용하는**
     타임라인 이벤트 리스트를 만든다.
 
-    반환 예시 이벤트 구조:
+    각 이벤트 구조 예시:
 
     {
       "id_stable": "12345-0",
       "minute": 33,
-      "minute_label": "33\u2019",
+      "minute_label": "33’",
       "side": "home",
       "side_home": true,
-      "type": "GOAL",          # GOAL / PEN_GOAL / OWN_GOAL / YELLOW / RED / SUB / ...
-      "line1": "Salah (P)",    # 득점자 / 카드 받은 선수 / In 선수 등
-      "line2": "Assist Nunez", # 어시 / Out 선수 등 (없으면 null)
+      "type": "GOAL",
+      "line1": "Salah (P)",
+      "line2": "Assist Núñez",
       "snapshot_score": "1 - 0",
-      "period": "H1",          # H1 / H2 / ET / PEN
+      "period": "H1",
       "minute_extra": null
     }
     """
@@ -148,7 +158,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         t_canon = _map_type(type_raw, detail)
 
-        # 원래 앱에서는 VAR 안 보이게 했다고 해서 여기서 제거
+        # 예전 앱에서 VAR은 안 보이게 했다고 했으니 여기서 제거
         if t_canon == "VAR":
             continue
 
@@ -167,7 +177,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             period,
         )
 
-        # 득점이면 스코어 진행 누적
+        # 득점 이벤트면 스코어 누적
         snapshot_score: str | None = None
         if t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
             if side == "home":
@@ -182,7 +192,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
                     away_score += 1
             snapshot_score = f"{home_score} - {away_score}"
 
-        # 이름들 (컬럼 이름이 DB마다 다를 수 있으니 여러 후보를 봄)
+        # 이름들 (컬럼 이름 여러 형태 지원)
         player = _first_non_empty(
             r,
             ["player_name", "player", "scorer_name", "player1", "name"],
