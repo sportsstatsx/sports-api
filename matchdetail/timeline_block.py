@@ -8,15 +8,15 @@ import re
 
 
 # ─────────────────────────────────────────────
-#  Type / Period 매핑 (Kotlin TimelineRepository 그대로 포팅)
+#  Type / Period 매핑 (Kotlin TimelineRepository 포팅) :contentReference[oaicite:4]{index=4}
 # ─────────────────────────────────────────────
 
 def _map_type(type_raw: Optional[str], detail_raw: Optional[str]) -> str:
     """
     Kotlin:
       private fun mapType(typeRaw: String?, detailRaw: String?): TimelineType
-    을 그대로 Python으로 옮긴 것.
-    반환값은 TimelineType enum 이름 문자열 (e.g. "GOAL", "PEN_GOAL")
+    을 거의 그대로 Python으로 옮긴 것.
+    반환값은 TimelineType enum 이름 문자열 (예: "GOAL", "PEN_GOAL")
     """
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
@@ -71,7 +71,7 @@ def _map_period_by_minute(minute: int) -> str:
         return "H1"
     if minute <= 90:
         return "H2"
-    # ET 나중에 필요시 PEN 분리는 여기서 조정 가능
+    # 연장전/승부차기는 ET/PEN 으로 확장 가능
     return "ET"
 
 
@@ -82,6 +82,8 @@ def _build_minute_label_and_extra(minute: int, extra: Optional[int], period: str
     과 동일한 동작.
     """
     ex: Optional[int] = extra if (extra is not None and extra > 0) else None
+
+    # H1/H2 에서는 minute 값이 45/90 넘어가면 +ex 로 환산
     if ex is None:
         if period == "H1":
             v = minute - 45
@@ -97,7 +99,6 @@ def _build_minute_label_and_extra(minute: int, extra: Optional[int], period: str
     else:
         base = minute
 
-    # Kotlin: "${base}’+$ex" / "${max(0, min)}’"
     prime = "’"  # U+2019
     if ex is not None and ex > 0:
         label = f"{base}{prime}+{ex}"
@@ -109,10 +110,7 @@ def _build_minute_label_and_extra(minute: int, extra: Optional[int], period: str
 
 def _normalize_name_light(s: str) -> str:
     """
-    Kotlin:
-      private fun normalizeNameLight(s: String): String =
-          Normalizer.normalize(...).replace(...)
-
+    Kotlin normalizeNameLight 와 비슷한 경량 버전:
     - 소문자
     - NFD 정규화 후 accent 제거
     - 마침표 제거
@@ -126,7 +124,7 @@ def _normalize_name_light(s: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Player name map (match_player_stats + match_lineups)
+#  Player name map (match_player_stats + match_lineups) :contentReference[oaicite:5]{index=5}
 # ─────────────────────────────────────────────
 
 def _build_player_name_map_from_stats(fixture_id: int) -> Dict[int, str]:
@@ -176,8 +174,7 @@ def _build_player_name_map_from_lineups(fixture_id: int) -> Dict[int, str]:
     """
     match_lineups:
       - fixture_id
-      - team_id
-      - data_json (lineups json)
+      - data_json (API-Football lineups json)
     """
     rows = fetch_all(
         """
@@ -209,14 +206,22 @@ def _build_player_name_map_from_lineups(fixture_id: int) -> Dict[int, str]:
             root = json.loads(data_json)
         except Exception:
             continue
-        if not isinstance(root, dict):
-            continue
 
-        # API-Football typical keys: "startXI" / "substitutes", 케이스 변형 포함
-        for key in ("startXI", "startXi", "substitutes", "subs"):
-            arr = root.get(key)
-            if isinstance(arr, list):
-                absorb_from_array(arr)
+        # lineups 구조가 [ {team+startXI+substitutes}, {…} ] 일 수도 있고
+        # dict 하나일 수도 있어서 둘 다 처리
+        if isinstance(root, list):
+            for team_block in root:
+                if not isinstance(team_block, dict):
+                    continue
+                for key in ("startXI", "startXi", "substitutes", "subs"):
+                    arr = team_block.get(key)
+                    if isinstance(arr, list):
+                        absorb_from_array(arr)
+        elif isinstance(root, dict):
+            for key in ("startXI", "startXi", "substitutes", "subs"):
+                arr = root.get(key)
+                if isinstance(arr, list):
+                    absorb_from_array(arr)
 
     return out
 
@@ -224,6 +229,7 @@ def _build_player_name_map_from_lineups(fixture_id: int) -> Dict[int, str]:
 def _build_player_name_map(fixture_id: int) -> Dict[int, str]:
     stats = _build_player_name_map_from_stats(fixture_id)
     lu = _build_player_name_map_from_lineups(fixture_id)
+    # stats 기준으로 합치되, lineups 값이 있으면 보완
     for pid, name in lu.items():
         stats.setdefault(pid, name)
     return stats
@@ -235,17 +241,17 @@ def _build_player_name_map(fixture_id: int) -> Dict[int, str]:
 
 def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    match_events + stats + lineups 를 기반으로
+    match_events + match_player_stats + match_lineups 를 기반으로
     안드로이드 TimelineRepository.kt 와 동일한 의미의 타임라인 이벤트 리스트를 만든다. 
 
     반환값 예시:
     [
       {
-        "id_stable": "...",
+        "id_stable": "123-45-GOAL-true",
         "minute": 45,
         "minute_label": "45’+2",
         "side": "home",
-        "side_home": True,
+        "side_home": true,
         "type": "GOAL",
         "line1": "Son Heung-Min (P)",
         "line2": "Assist James Maddison",
@@ -264,21 +270,21 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     # 1) 선수 이름 맵 (stats + lineups)
     player_name_map = _build_player_name_map(fixture_id)
 
-    # 2) 이벤트 질의: match_events (새 컬럼 포함)
+    # 2) 이벤트 질의: match_events (로컬에서 쓰던 확장 컬럼 포함) :contentReference[oaicite:7]{index=7}
     rows = fetch_all(
         """
         SELECT
-            e.id AS rid,                -- 고유 ID
-            e.minute,
-            e.extra,
-            e.team_id,
-            e.player_id,
-            e.type,
-            e.detail,
-            e.assist_player_id,
-            e.assist_name,
-            e.player_in_id,
-            e.player_in_name
+            e.id               AS rid,
+            e.minute           AS minute,
+            e.extra            AS extra,
+            e.team_id          AS team_id,
+            e.player_id        AS player_id,
+            e.type             AS type,
+            e.detail           AS detail,
+            e.assist_player_id AS assist_player_id,
+            e.assist_name      AS assist_name,
+            e.player_in_id     AS player_in_id,
+            e.player_in_name   AS player_in_name
         FROM match_events AS e
         WHERE e.fixture_id = %s
         ORDER BY e.minute ASC, e.id ASC
@@ -292,12 +298,17 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         return player_name_map.get(int(pid))
 
     def prefer_name(pid: Optional[int], fallback: Optional[str]) -> Optional[str]:
-        return name_for(pid) or (fallback.strip() if isinstance(fallback, str) and fallback.strip() else None)
+        nm = name_for(pid)
+        if nm:
+            return nm
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+        return None
 
-    out: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
 
     for r in rows:
-        rid = r.get("id") or r.get("rid") or 0
+        rid = r.get("rid") or r.get("id") or 0
         minute = int(r.get("minute") or 0)
         extra = r.get("extra")
         extra = int(extra) if extra is not None else None
@@ -310,14 +321,25 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         in_id = r.get("player_in_id")
         in_name = r.get("player_in_name")
 
+        # 타입 매핑
         type_code = _map_type(type_raw, detail_raw)
-        is_home = bool(team_id == home_id) if team_id is not None else False
-        side = "home" if is_home else ("away" if team_id == away_id else "unknown")
 
+        # 홈/어웨이 사이드
+        if team_id == home_id:
+            is_home = True
+            side = "home"
+        elif team_id == away_id:
+            is_home = False
+            side = "away"
+        else:
+            is_home = False
+            side = "unknown"
+
+        # 기간/분 레이블
         period = _map_period_by_minute(minute)
         minute_label, minute_extra = _build_minute_label_and_extra(minute, extra, period)
 
-        # Kotlin 동일 로직으로 line1/line2 구성
+        # Kotlin 과 동일하게 line1/line2 구성 :contentReference[oaicite:8]{index=8}
         line1: str
         line2: Optional[str] = None
 
@@ -328,7 +350,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             line1 = f"In {in_nm}" if in_nm else "Substitution"
             line2 = f"Out {out_nm}" if out_nm else None
 
-            # In / Out 이름이 우연히 같은 경우 line2 숨김
+            # In / Out 이름이 우연히 같으면 line2 숨김 (normalizeNameLight 동일 로직)
             if line2:
                 a = _normalize_name_light(line1.replace("In", "", 1).strip())
                 b = _normalize_name_light(line2.replace("Out", "", 1).strip())
@@ -338,10 +360,11 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         elif type_code in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
             scorer = name_for(player_id)
             if type_code == "OWN_GOAL":
-                # "Scorer (OG)"
+                # "이름 (OG)"
                 parts = [p for p in [scorer, "(OG)"] if p]
                 line1 = " ".join(parts) if parts else (detail_raw or "Goal")
             elif type_code == "PEN_GOAL":
+                # "이름 (P)"
                 parts = [p for p in [scorer, "(P)"] if p]
                 line1 = " ".join(parts) if parts else (detail_raw or "Goal")
             else:
@@ -367,7 +390,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         elif type_code == "CANCELLED_GOAL":
             who = name_for(player_id)
             parts = [p for p in [who, "Goal cancelled"] if p]
-            line1 = " ".join(parts)
+            line1 = " ".join(parts) if parts else (detail_raw or "Goal cancelled")
 
         else:
             # OTHER / VAR 등
@@ -379,19 +402,19 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             "minute_label": minute_label,
             "side": side,
             "side_home": is_home,
-            "type": type_code,
+            "type": type_code,           # 안드로이드 TimelineType 과 1:1 (문자열)
             "line1": line1,
             "line2": line2,
             "snapshot_score": None,
-            "period": period,
+            "period": period,            # "H1"/"H2"/"ET"/"PEN"
             "minute_extra": minute_extra,
         }
-        out.append(event)
+        events.append(event)
 
-    # Kotlin: period.ordinal, minute, minuteExtra, idStable 정렬과 같게
+    # Kotlin: period.ordinal → minute → minuteExtra → idStable 정렬과 동일하게 정렬 :contentReference[oaicite:9]{index=9}
     period_order = {"H1": 0, "H2": 1, "ET": 2, "PEN": 3}
 
-    out.sort(
+    events.sort(
         key=lambda ev: (
             period_order.get(ev["period"], 9),
             ev["minute"],
@@ -400,4 +423,4 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
     )
 
-    return out
+    return events
