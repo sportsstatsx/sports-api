@@ -254,10 +254,18 @@ def enrich_overall_outcome_totals(
 
     # ─────────────────────────────────────
     # 4) 분모(경기 수) 결정
+    #    - 가능한 한 실제로 집계에 사용된 경기 수(mt_tot)를 우선 사용
+    #    - mt_tot 이 0(데이터가 없거나 쿼리 실패)일 때만
+    #      fixtures.played.total(matches_total_api)를 폴백으로 사용
     # ─────────────────────────────────────
-    eff_tot = matches_total_api or mt_tot
+    if mt_tot > 0:
+        eff_tot = mt_tot
+    else:
+        eff_tot = matches_total_api or 0
+
     eff_home = mh_tot or eff_tot
     eff_away = ma_tot or eff_tot
+
 
     # 4-1) 샘플 수(events_sample) 기록
     #      - 이미 다른 곳에서 유효한 값이 들어있으면 그대로 두고
