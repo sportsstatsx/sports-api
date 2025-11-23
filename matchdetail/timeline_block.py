@@ -1,69 +1,123 @@
 # matchdetail/timeline_block.py
 
 from typing import Any, Dict, List
+import json
+
 from db import fetch_all
 
 
-def _first_non_empty(row: Dict[str, Any], keys: List[str]) -> str | None:
+# ─────────────────────────────────────
+#  내부 유틸: 이름 매핑
+# ─────────────────────────────────────
+
+def _build_player_name_map_from_stats(fixture_id: int) -> Dict[int, str]:
     """
-    row 안에서 여러 후보 컬럼 이름 중 먼저 나오는 non-empty 값을 반환.
-    DB 스키마가 조금 달라도 안전하게 가져오려고 이렇게 처리.
+    match_player_stats: (fixture_id, player_id, data_json)
+    data_json 안의 player.name / name 을 읽어서 id -> name 맵 생성
     """
-    for k in keys:
-        if k in row:
-            v = row.get(k)
-            if v is not None and str(v).strip() != "":
-                return str(v).strip()
-    return None
+    rows = fetch_all(
+        """
+        SELECT player_id, data_json
+        FROM match_player_stats
+        WHERE fixture_id = %s
+        """,
+        (fixture_id,),
+    )
+
+    out: Dict[int, str] = {}
+    for r in rows:
+        pid = r.get("player_id")
+        if pid is None:
+            continue
+        raw = r.get("data_json")
+        if not raw:
+            continue
+        try:
+            root = json.loads(raw)
+        except Exception:
+            continue
+
+        name = None
+        player = root.get("player")
+        if isinstance(player, dict):
+            name = player.get("name") or player.get("fullname")
+        if not name:
+            name = root.get("name")
+        if isinstance(name, str) and name.strip():
+            out.setdefault(int(pid), name.strip())
+
+    return out
 
 
-def _map_period(minute: int) -> str:
+def _build_player_name_map_from_lineups(fixture_id: int) -> Dict[int, str]:
     """
-    분(minute) 기준으로 H1/H2/ET/PEN 구분.
+    match_lineups: (fixture_id, data_json)
+    data_json 안의 startXI / substitutes 배열에서 id + name 추출
     """
-    if minute <= 45:
-        return "H1"
-    if minute <= 90:
-        return "H2"
-    if minute <= 120:
-        return "ET"
-    return "PEN"
+    rows = fetch_all(
+        """
+        SELECT data_json
+        FROM match_lineups
+        WHERE fixture_id = %s
+        """,
+        (fixture_id,),
+    )
+
+    out: Dict[int, str] = {}
+
+    def absorb_from_array(arr: Any):
+        if not isinstance(arr, list):
+            return
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            p = item.get("player") or item
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            name = p.get("name")
+            if isinstance(pid, int) and isinstance(name, str) and name.strip():
+                out.setdefault(int(pid), name.strip())
+
+    for r in rows:
+        raw = r.get("data_json")
+        if not raw:
+            continue
+        try:
+            root = json.loads(raw)
+        except Exception:
+            continue
+
+        absorb_from_array(root.get("startXI"))
+        absorb_from_array(root.get("startXi"))      # 대소문자 fallback
+        absorb_from_array(root.get("substitutes"))
+        absorb_from_array(root.get("subs"))         # 예비 키
+
+    return out
 
 
-def _build_minute_label(minute: int, time_extra: int | None, period: str) -> tuple[str, int | None]:
+def _build_player_name_map(fixture_id: int) -> Dict[int, str]:
     """
-    46분 -> 45’+1 형태 라벨 + extra 반환.
+    stats + lineups 를 합쳐서 최종 player_id -> name 맵 생성
     """
-    extra = time_extra
-    if extra is None:
-        if period == "H1":
-            extra = max(0, minute - 45) or None
-        elif period == "H2":
-            extra = max(0, minute - 90) or None
+    stats = _build_player_name_map_from_stats(fixture_id)
+    lu = _build_player_name_map_from_lineups(fixture_id)
+    for pid, name in lu.items():
+        stats.setdefault(pid, name)
+    return stats
 
-    base_min = minute
-    if period == "H1" and minute > 45:
-        base_min = 45
-    elif period == "H2" and minute > 90:
-        base_min = 90
 
-    if extra is not None and extra > 0:
-        label = f"{base_min}\u2019+{extra}"
-    else:
-        label = f"{max(0, minute)}\u2019"
+def _normalize_name_light(s: str) -> str:
+    return " ".join(s.lower().replace(".", " ").split())
 
-    return label, extra
 
+# ─────────────────────────────────────
+#  내부 유틸: 타입/기간/분 표시
+# ─────────────────────────────────────
 
 def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     """
-    DB type/detail 문자열을 UI에서 쓰기 좋은 canonical type 으로 매핑.
-    - GOAL / PEN_GOAL / OWN_GOAL
-    - YELLOW / RED
-    - SUB
-    - PEN_MISSED
-    - VAR
-    - OTHER
+    Kotlin TimelineType 과 거의 동일한 canonical type
     """
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
@@ -110,31 +164,76 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     return "OTHER"
 
 
+def _map_period(minute: int) -> str:
+    if minute <= 45:
+        return "H1"
+    if minute <= 90:
+        return "H2"
+    if minute <= 120:
+        return "ET"
+    return "PEN"
+
+
+def _build_minute_label(minute: int, extra_raw: Any, period: str) -> tuple[str, int | None]:
+    """
+    Kotlin buildMinuteLabelAndExtra 와 동일한 규칙으로 minute_label / extra 계산
+    """
+    extra = None
+    if isinstance(extra_raw, int):
+        extra = extra_raw
+
+    if extra is None:
+        if period == "H1":
+            extra = max(0, minute - 45) or None
+        elif period == "H2":
+            extra = max(0, minute - 90) or None
+
+    base = minute
+    if period == "H1" and minute > 45:
+        base = 45
+    elif period == "H2" and minute > 90:
+        base = 90
+
+    if extra is not None and extra > 0:
+        label = f"{base}\u2019+{extra}"
+    else:
+        label = f"{max(0, minute)}\u2019"
+
+    return label, extra
+
+
+# ─────────────────────────────────────
+#  메인: 타임라인 블록
+# ─────────────────────────────────────
+
 def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    match_events 테이블을 기반으로, **앱에서 그대로 사용하는**
-    타임라인 이벤트 리스트를 만든다.
-
-    각 이벤트 구조 예시:
-
-    {
-      "id_stable": "12345-0",
-      "minute": 33,
-      "minute_label": "33’",
-      "side": "home",
-      "side_home": true,
-      "type": "GOAL",
-      "line1": "Salah (P)",
-      "line2": "Assist Núñez",
-      "snapshot_score": "1 - 0",
-      "period": "H1",
-      "minute_extra": null
-    }
+    match_events + (match_player_stats / match_lineups) 를 사용해
+    앱에서 그대로 그릴 수 있는 타임라인 이벤트 배열을 만든다.
     """
 
-    fixture_id = header["fixture_id"]
+    fixture_id = int(header["fixture_id"])
     home_id = header["home"]["id"]
     away_id = header["away"]["id"]
+
+    # 이름 맵
+    player_name_map = _build_player_name_map(fixture_id)
+
+    def name_for(pid: Any | None) -> str | None:
+        if pid is None:
+            return None
+        try:
+            return player_name_map.get(int(pid))
+        except Exception:
+            return None
+
+    def prefer_name(pid: Any | None, fallback: Any | None) -> str | None:
+        n = name_for(pid)
+        if n:
+            return n
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+        return None
 
     rows = fetch_all(
         """
@@ -147,7 +246,6 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
 
     events: List[Dict[str, Any]] = []
-
     home_score = 0
     away_score = 0
 
@@ -158,7 +256,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         t_canon = _map_type(type_raw, detail)
 
-        # 예전 앱에서 VAR은 안 보이게 했다고 했으니 여기서 제거
+        # 예전 앱과 동일하게 VAR 이벤트는 숨김
         if t_canon == "VAR":
             continue
 
@@ -173,11 +271,17 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         period = _map_period(minute)
         label, minute_extra = _build_minute_label(
             minute,
-            r.get("time_extra") if isinstance(r.get("time_extra"), int) else None,
+            r.get("extra") if "extra" in r else r.get("time_extra"),
             period,
         )
 
-        # 득점 이벤트면 스코어 누적
+        player_id = r.get("player_id")
+        assist_id = r.get("assist_player_id")
+        assist_name_raw = r.get("assist_name")
+        in_id = r.get("player_in_id")
+        in_name_raw = r.get("player_in_name")
+
+        # 스코어 스냅샷 (득점 이벤트만)
         snapshot_score: str | None = None
         if t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
             if side == "home":
@@ -192,57 +296,55 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
                     away_score += 1
             snapshot_score = f"{home_score} - {away_score}"
 
-        # 이름들 (컬럼 이름 여러 형태 지원)
-        player = _first_non_empty(
-            r,
-            ["player_name", "player", "scorer_name", "player1", "name"],
-        )
-        assist = _first_non_empty(
-            r,
-            ["assist_name", "assist", "assist1"],
-        )
-        player_in = _first_non_empty(
-            r,
-            ["player_in_name", "in_player_name", "sub_in_name"],
-        )
-        player_out = _first_non_empty(
-            r,
-            ["player_out_name", "out_player_name", "sub_out_name"],
-        )
+        # line1 / line2
+        line1: str
+        line2: str | None = None
 
-        # line1 / line2 구성
-        if t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
-            base_name = player or "Unknown"
-            suffix = ""
+        if t_canon == "SUB":
+            in_nm = prefer_name(in_id, in_name_raw)
+            out_nm = name_for(player_id)
+            line1 = f"In {in_nm}" if in_nm else "Substitution"
+            line2 = f"Out {out_nm}" if out_nm else None
+
+            # In / Out 이름이 같으면 line2 숨김
+            if line2:
+                a = _normalize_name_light(line1.replace("In", "", 1).strip())
+                b = _normalize_name_light(line2.replace("Out", "", 1).strip())
+                if a == b:
+                    line2 = None
+
+        elif t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
+            scorer = name_for(player_id)
             if t_canon == "OWN_GOAL":
-                suffix = " (OG)"
+                line1 = " ".join([x for x in [scorer, "(OG)"] if x])
             elif t_canon == "PEN_GOAL":
-                suffix = " (P)"
-
-            line1 = f"{base_name}{suffix}"
-            line2 = f"Assist {assist}" if assist else None
-
-        elif t_canon in ("YELLOW", "RED"):
-            name = player or "Unknown"
-            line1 = name
-            line2 = "Yellow card" if t_canon == "YELLOW" else "Red card"
-
-        elif t_canon == "SUB":
-            if player_in:
-                line1 = f"In {player_in}"
+                line1 = " ".join([x for x in [scorer, "(P)"] if x])
             else:
-                line1 = "Substitution"
+                line1 = scorer or (detail or "Goal")
 
-            line2 = f"Out {player_out}" if player_out else None
+            assist_nm = prefer_name(assist_id, assist_name_raw)
+            if assist_nm:
+                line2 = f"Assist {assist_nm}"
 
         elif t_canon == "PEN_MISSED":
-            name = player or "Unknown"
-            line1 = name
-            line2 = "Penalty missed"
+            who = name_for(player_id)
+            line1 = " ".join([x for x in [who, "(P Missed)"] if x])
+
+        elif t_canon == "YELLOW":
+            who = name_for(player_id)
+            line1 = who or "Card"
+
+        elif t_canon == "RED":
+            who = name_for(player_id)
+            line1 = who or "Card"
 
         else:
-            line1 = detail or type_raw or "Event"
-            line2 = None
+            # CANCELLED_GOAL 등 기타
+            who = name_for(player_id)
+            if t_canon == "CANCELLED_GOAL":
+                line1 = " ".join([x for x in [who, "Goal cancelled"] if x])
+            else:
+                line1 = who or (detail or "Event")
 
         events.append(
             {
@@ -259,5 +361,17 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "minute_extra": minute_extra,
             }
         )
+
+    # Kotlin 과 동일한 정렬 규칙
+    order_map = {"H1": 0, "H2": 1, "ET": 2, "PEN": 3}
+
+    events.sort(
+        key=lambda e: (
+            order_map.get(e["period"], 9),
+            e["minute"],
+            e.get("minute_extra") or 0,
+            e["id_stable"],
+        )
+    )
 
     return events
