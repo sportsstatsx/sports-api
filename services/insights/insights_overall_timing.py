@@ -308,6 +308,3 @@ def enrich_overall_timing(
             "home": fmt_pct(concede_8090_h, half_mt_home or half_mt_tot),
             "away": fmt_pct(concede_8090_a, half_mt_away or half_mt_tot),
         }
-
-    # Timing 계산에 사용된 경기 샘플 수
-    insights["events_sample"] = half_mt_tot
