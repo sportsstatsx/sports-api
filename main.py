@@ -28,6 +28,9 @@ from services.home_service import (
 )
 from routers.home_router import home_bp
 
+from matchdetail.matchdetail_router import router as matchdetail_router
+app.include_router(matchdetail_router)
+
 
 # ─────────────────────────────────────────
 # 기본 설정
@@ -287,3 +290,4 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
