@@ -27,9 +27,7 @@ from services.home_service import (
     get_team_info,
 )
 from routers.home_router import home_bp
-
-from matchdetail.matchdetail_router import router as matchdetail_router
-app.include_router(matchdetail_router)
+from routers.matchdetail_router import matchdetail_bp
 
 
 # ─────────────────────────────────────────
@@ -40,6 +38,7 @@ SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.0.0")
 
 app = Flask(__name__)
 app.register_blueprint(home_bp)
+app.register_blueprint(matchdetail_bp)
 
 
 # ─────────────────────────────────────────
@@ -290,4 +289,5 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
