@@ -1,7 +1,5 @@
-# routers/matchdetail_router.py
-
 from flask import Blueprint, request, jsonify
-from services.matchdetail.bundle_service import get_match_detail_bundle
+from matchdetail.bundle_service import get_match_detail_bundle  # ← 여기!
 
 matchdetail_bp = Blueprint("matchdetail", __name__)
 
@@ -43,5 +41,4 @@ def match_detail_bundle():
         return jsonify({"ok": True, "data": bundle})
 
     except Exception as e:
-        # 여기서 굳이 500 찍고 끝내는 정도만 해도 충분
         return jsonify({"ok": False, "error": str(e)}), 500
