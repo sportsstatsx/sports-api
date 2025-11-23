@@ -1,13 +1,14 @@
-# service/matchdetail/insights_block.py
+# services/matchdetail/insights_block.py
 
 from typing import Any, Dict, Optional
+# 나중에: from services.insights... import ...  로 재사용 예정
 
 
-async def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    TODO: team_insights_overall 서비스(or 이미 있는 insights 서비스)를 호출하거나
-    내부 로직을 재사용해서, 매치디테일에서 쓸 overall 인사이트 블록을 구성.
+    TODO: 기존 insights_overall 서비스 재사용해서
+    매치디테일에서 쓸 overall 인사이트 블록 구성.
 
-    1단계: 일단 None.
+    1단계: None.
     """
     return None
