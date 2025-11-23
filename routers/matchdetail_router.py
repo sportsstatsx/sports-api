@@ -1,18 +1,35 @@
+# routers/matchdetail_router.py
+
 from flask import Blueprint, request, jsonify
-from service.matchdetail.bundle_service import get_match_detail_bundle
+from services.matchdetail.bundle_service import get_match_detail_bundle
 
 matchdetail_bp = Blueprint("matchdetail", __name__)
 
 
 @matchdetail_bp.route("/api/match_detail_bundle", methods=["GET"])
 def match_detail_bundle():
+    """
+    매치디테일 화면에서 한 번만 호출하는 번들 엔드포인트.
+    Query:
+      - fixture_id (int, 필수)
+      - league_id  (int, 필수)
+      - season     (int, 필수)
+    """
     try:
         fixture_id = request.args.get("fixture_id", type=int)
         league_id = request.args.get("league_id", type=int)
         season = request.args.get("season", type=int)
 
-        if not fixture_id or not league_id or not season:
-            return jsonify({"ok": False, "error": "Missing required params"}), 400
+        if fixture_id is None or league_id is None or season is None:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "fixture_id, league_id, season are required",
+                    }
+                ),
+                400,
+            )
 
         bundle = get_match_detail_bundle(
             fixture_id=fixture_id,
@@ -20,14 +37,11 @@ def match_detail_bundle():
             season=season,
         )
 
-        # async 함수면 await 필요 → 너 db 헬퍼는 sync니까 sync 버전 사용해야 함
-        if hasattr(bundle, "__await__"):
-            bundle = asyncio.run(bundle)
-
         if not bundle:
             return jsonify({"ok": False, "error": "Match not found"}), 404
 
         return jsonify({"ok": True, "data": bundle})
 
     except Exception as e:
+        # 여기서 굳이 500 찍고 끝내는 정도만 해도 충분
         return jsonify({"ok": False, "error": str(e)}), 500
