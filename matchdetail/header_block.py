@@ -1,4 +1,4 @@
-# services/matchdetail/header_block.py
+# matchdetail/header_block.py
 
 from typing import Any, Dict, Optional
 from db import fetch_one
@@ -10,38 +10,56 @@ def build_header_block(
     season: int,
 ) -> Optional[Dict[str, Any]]:
     """
-    matches 테이블에서 매치디테일 상단에 필요한 정보만 추출해서 header 블록을 만든다.
+    matches 테이블 + teams + leagues 를 이용해서
+    매치디테일 상단에 필요한 정보(header 블록)를 만든다.
 
-    컬럼 이름은 지금 네가 쓰던 스타일 기준으로 가정:
-      - fixture_id, league_id, season
-      - date_utc, status_short, elapsed
-      - home_id, home_name, home_logo, home_goals, home_red_cards
-      - away_id, away_name, away_logo, away_goals, away_red_cards
+    컬럼 구성은 main.py 의 /api/fixtures 쿼리와 최대한 맞춘다.
     """
 
     row = fetch_one(
         """
         SELECT
-          m.fixture_id,
-          m.league_id,
-          m.season,
-          m.date_utc,
-          m.status_short,
-          m.elapsed,
-          m.home_id,
-          m.home_name,
-          m.home_logo,
-          m.home_goals,
-          m.home_red_cards,
-          m.away_id,
-          m.away_name,
-          m.away_logo,
-          m.away_goals,
-          m.away_red_cards
-        FROM matches AS m
+            m.fixture_id,
+            m.league_id,
+            m.season,
+            m.date_utc,
+            m.status_group,
+            m.status,
+            m.elapsed,
+            m.home_id,
+            m.away_id,
+            m.home_ft,
+            m.away_ft,
+            th.name  AS home_name,
+            ta.name  AS away_name,
+            th.logo  AS home_logo,
+            ta.logo  AS away_logo,
+            l.name   AS league_name,
+            l.logo   AS league_logo,
+            l.country AS league_country,
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail = 'Red Card'
+            ) AS home_red_cards,
+            (
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail = 'Red Card'
+            ) AS away_red_cards
+        FROM matches m
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
+        JOIN leagues l ON l.id = m.league_id
         WHERE m.fixture_id = %s
-          AND m.league_id = %s
-          AND m.season = %s
+          AND m.league_id  = %s
+          AND m.season     = %s
         """,
         (fixture_id, league_id, season),
     )
@@ -53,16 +71,23 @@ def build_header_block(
         "fixture_id": row["fixture_id"],
         "league_id": row["league_id"],
         "season": row["season"],
-        "kickoff_utc": row["date_utc"],   # 앱에서 로컬 타임으로 변환
-        "status": row["status_short"],    # NS / 1H / HT / 2H / FT ...
-        "minute": row["elapsed"],         # 진행 중일 때만 의미
+        "kickoff_utc": row["date_utc"],          # 앱에서 로컬 타임 변환
+        "status_group": row["status_group"],     # upcoming / live / finished 등
+        "status": row["status"],                 # NS / 1H / HT / 2H / FT ...
+        "minute": row["elapsed"],                # 진행 중일 때만 의미
+
+        "league": {
+            "name": row.get("league_name"),
+            "logo": row.get("league_logo"),
+            "country": row.get("league_country"),
+        },
 
         "home": {
             "id": row["home_id"],
             "name": row["home_name"],
-            "short_name": row["home_name"],  # 나중에 약칭 컬럼 있으면 거기로 교체
+            "short_name": row["home_name"],      # 나중에 약칭 컬럼 생기면 교체
             "logo": row["home_logo"],
-            "score": row["home_goals"],
+            "score": row["home_ft"],             # 최종 스코어
             "red_cards": row["home_red_cards"],
         },
         "away": {
@@ -70,7 +95,7 @@ def build_header_block(
             "name": row["away_name"],
             "short_name": row["away_name"],
             "logo": row["away_logo"],
-            "score": row["away_goals"],
+            "score": row["away_ft"],
             "red_cards": row["away_red_cards"],
         },
     }
