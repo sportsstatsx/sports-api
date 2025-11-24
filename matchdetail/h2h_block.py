@@ -1,5 +1,3 @@
-# services/matchdetail/h2h_block.py
-
 from typing import Any, Dict, Optional, List
 
 from db import fetch_all
@@ -18,13 +16,10 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     맞대결(H2H) / 최근 경기 요약 블록.
 
-    - scope: 현재는 항상 H2H_ONLY (두 팀 맞대결만)
+    - scope: H2H_ONLY (두 팀 맞대결만)
     - sample: 기본 LAST10 (최근 10경기)
-    - venue: ALL (홈/원정 구분 없음)
-    - competition: ALL (리그/컵/대륙컵 전체)
-
-    추후 앱에서 필터(UI)가 붙으면 scope/sample/venue/competition 을
-    쿼리 파라미터로 받아서 이 함수에 넘기는 형태로 확장하면 됨.
+    - venue: ALL
+    - competition: ALL
     """
     fixture_id = header.get("fixture_id")
     league_id = header.get("league_id")
@@ -36,11 +31,10 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     home_id = _safe_int(home.get("id"))
     away_id = _safe_int(away.get("id"))
 
-    # 기본 방어: 필수 키가 하나라도 없으면 H2H 블록은 생성하지 않음
     if not home_id or not away_id:
         return None
 
-    # 최근 H2H 10경기 (양 팀이 서로 상대했던 경기만, FT 기준)
+    # 최근 H2H 10경기 (두 팀 맞대결 + FT 경기만)
     sql = f"""
         SELECT
             m.fixture_id,
@@ -64,7 +58,7 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 OR
                 (m.home_id = {away_id} AND m.away_id = {home_id})
             )
-            AND m.status_group = 'FT'
+            AND m.status = 'FT'          -- 🔥 여기 수정: status_group 이 아니라 status = 'FT'
         ORDER BY m.date_utc DESC
         LIMIT 10
     """
@@ -74,9 +68,7 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not rows_raw:
         return None
 
-    # ─────────────────────────────────────
-    #  요약 통계 계산 (header.home.id 기준 시점)
-    # ─────────────────────────────────────
+    # ─ 요약 통계 계산 ─
     sample_count = 0
     wins = draws = losses = 0
     total_goals = 0
@@ -89,20 +81,18 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         h_id = _safe_int(r.get("home_id"))
         a_id = _safe_int(r.get("away_id"))
 
-        # 득점 정보 없으면 요약 계산에서는 제외
         if hf is None or af is None:
             continue
 
         sample_count += 1
         total_goals += hf + af
 
-        # header 기준 home(team_id) 입장에서 W/D/L 계산
+        # header.home.id 기준 승무패
         if h_id == home_id:
             my_goals, opp_goals = hf, af
         elif a_id == home_id:
             my_goals, opp_goals = af, hf
         else:
-            # 이론상 발생하면 안 되지만, 혹시나 잘못된 데이터가 섞였을 때 방어
             continue
 
         if my_goals > opp_goals:
@@ -124,7 +114,6 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             clean_sheet_any += 1
 
     if sample_count == 0:
-        # 득점 정보가 하나도 없으면 rows 는 그대로 내려주되 summary 는 0 세트
         avg_goals = 0.0
         btts_rate = ou15_rate = ou25_rate = ou35_rate = clean_rate = 0
     else:
@@ -148,9 +137,7 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "clean_sheet_rate": clean_rate,
     }
 
-    # ─────────────────────────────────────
-    #  원시 행 → 클라이언트용 구조
-    # ─────────────────────────────────────
+    # ─ 행 리스트 변환 ─
     rows: List[Dict[str, Any]] = []
     for r in rows_raw:
         hf = _safe_int(r.get("home_ft"))
@@ -170,7 +157,6 @@ def build_h2h_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "away_name": r.get("away_name"),
                 "home_ft": hf,
                 "away_ft": af,
-                # header 기준 홈팀이 이 경기에서 어느 쪽(home/away)이었는지
                 "is_home_side": bool(h_id == home_id),
             }
         )
