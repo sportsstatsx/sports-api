@@ -1,143 +1,111 @@
 # services/matchdetail/stats_block.py
+"""
+Match Detail – Stats 블록 빌더
+
+A방식:
+  - 매치디테일 번들(/api/match_detail_bundle) 안에서
+    "stats": { ... }
+  블록을 만들어주는 역할만 담당한다.
+
+1단계 구현 범위
+  - match_team_stats 기준 팀 스탯만 내려준다.
+  - 선수별 스탯(match_player_stats)은 이후 단계에서 확장한다.
+
+응답 구조 예시 (Python dict 기준):
+
+  {
+      "team": {
+          "home_team_id": 40,
+          "away_team_id": 41,
+          "home": { ... match_team_stats row ... } | null,
+          "away": { ... match_team_stats row ... } | null,
+          "rows": [ { ... }, { ... } ]   # 원본 row 전체 (디버깅/향후 확장용)
+      },
+      "players": null
+  }
+
+Kotlin 쪽 StatsBlock:
+  data class StatsBlock(
+      val team: Any? = null,
+      val players: Any? = null
+  )
+
+과 그대로 호환된다.
+"""
 
 from typing import Any, Dict, Optional
 
 from db import fetch_all
 
 
-def _extract_fixture_id(header: Dict[str, Any]) -> Optional[int]:
+def _get_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
     """
-    header 블록에서 fixture_id 를 최대한 안전하게 추출.
-    header_block 구현에 따라 키가 조금씩 다를 수 있으니 여러 패턴을 지원.
+    header 블록에서 fixture_id 를 최대한 단순하게 추출.
+    HeaderBlock 정의:
+      fixture_id: Long,
+      league_id: Long,
+      season: Int,
+      home: { id: Long, ... },
+      away: { id: Long, ... }
+
+    을 그대로 따른다고 가정한다.
     """
-    # 1) 가장 단순한 케이스
-    if "fixture_id" in header and header["fixture_id"] is not None:
-        return int(header["fixture_id"])
-
-    # 2) 혹시 fixture 객체 안에 들어있는 형태라면
-    fixture = header.get("fixture") or {}
-    if isinstance(fixture, dict):
-        if "fixture_id" in fixture and fixture["fixture_id"] is not None:
-            return int(fixture["fixture_id"])
-        if "id" in fixture and fixture["id"] is not None:
-            return int(fixture["id"])
-
-    # 3) 마지막 fallback
-    return None
+    raw = header.get("fixture_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
-def _extract_team_ids(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
+def _get_team_ids_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
     """
-    header 블록에서 home/away 팀 id 를 최대한 안전하게 추출.
+    header.home.id / header.away.id 를 읽어서 반환.
     """
     home_id: Optional[int] = None
     away_id: Optional[int] = None
 
-    # 1) 직관적인 키들 먼저
-    if "home_team_id" in header:
+    home = header.get("home") or {}
+    away = header.get("away") or {}
+
+    if isinstance(home, dict):
         try:
-            home_id = int(header["home_team_id"])
+            home_id = int(home.get("id")) if home.get("id") is not None else None
         except (TypeError, ValueError):
             home_id = None
-    if "away_team_id" in header:
+
+    if isinstance(away, dict):
         try:
-            away_id = int(header["away_team_id"])
+            away_id = int(away.get("id")) if away.get("id") is not None else None
         except (TypeError, ValueError):
             away_id = None
-
-    # 2) teams/home, teams/away 형태
-    teams = header.get("teams") or {}
-    if isinstance(teams, dict):
-        home_info = teams.get("home") or {}
-        away_info = teams.get("away") or {}
-        if home_id is None and isinstance(home_info, dict):
-            tid = home_info.get("team_id") or home_info.get("id")
-            if tid is not None:
-                try:
-                    home_id = int(tid)
-                except (TypeError, ValueError):
-                    pass
-        if away_id is None and isinstance(away_info, dict):
-            tid = away_info.get("team_id") or away_info.get("id")
-            if tid is not None:
-                try:
-                    away_id = int(tid)
-                except (TypeError, ValueError):
-                    pass
 
     return {"home_team_id": home_id, "away_team_id": away_id}
 
 
-def _safe_get(row: Dict[str, Any], key: str) -> Any:
-    """
-    row 딕셔너리에서 key 가 없으면 None 반환.
-    match_team_stats 컬럼 이름이 조금씩 달라도 터지지 않게 방어적으로 처리.
-    """
-    return row[key] if key in row else None
-
-
-def _build_team_stats_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    match_team_stats 한 row 를 기반으로, UI에서 쓰기 좋은 형태의 팀 스탯 딕셔너리 생성.
-
-    컬럼 이름은 프로젝트마다 차이가 있을 수 있으므로,
-    존재 여부를 체크해서 있으면 그대로 사용, 없으면 None 으로 둔다.
-    필요하면 나중에 여기 컬럼 매핑만 수정해도 됨.
-    """
-    return {
-        "team_id": _safe_get(row, "team_id"),
-        # 팀 이름 컬럼이 있으면 사용 (없으면 헤더 쪽에서 팀 이름을 가져다 쓰면 됨)
-        "team_name": _safe_get(row, "team_name"),
-        # 슈팅 관련
-        "shots_total": _safe_get(row, "shots_total") or _safe_get(row, "shots_all"),
-        "shots_on_target": _safe_get(row, "shots_on_target") or _safe_get(
-            row, "shots_on_goal"
-        ),
-        "shots_off_target": _safe_get(row, "shots_off_target") or _safe_get(
-            row, "shots_off_goal"
-        ),
-        "shots_blocked": _safe_get(row, "shots_blocked") or _safe_get(
-            row, "blocked_shots"
-        ),
-        # 패스 / 패스 성공률
-        "passes": _safe_get(row, "passes") or _safe_get(row, "total_passes"),
-        "pass_accuracy": _safe_get(row, "pass_accuracy") or _safe_get(
-            row, "passes_accuracy"
-        ),
-        # 점유율
-        "possession": _safe_get(row, "possession")
-        or _safe_get(row, "ball_possession"),
-        # 세트피스 / 파울
-        "corners": _safe_get(row, "corners"),
-        "offsides": _safe_get(row, "offsides"),
-        "fouls": _safe_get(row, "fouls"),
-        "yellow_cards": _safe_get(row, "yellow_cards"),
-        "red_cards": _safe_get(row, "red_cards"),
-        "goalkeeper_saves": _safe_get(row, "goalkeeper_saves"),
-        # xG 류 (있으면 사용)
-        "xg": _safe_get(row, "xg") or _safe_get(row, "expected_goals"),
-        # 필요하면 나중에 더 추가 (shots_inside_box, shots_outside_box 등)
-    }
-
-
 def build_stats_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    match_team_stats / match_player_stats 기반 팀/선수 스탯 구현.
+    match_team_stats 기반 팀 스탯 블록 생성.
 
-    1단계: 팀 스탯만 구현 (match_team_stats).
-    나중에 필요하면 match_player_stats 기반 선수 스탯 섹션을 확장.
+    - header 에서 fixture_id / home_id / away_id 를 읽는다.
+    - match_team_stats 에서 해당 fixture 의 모든 row 를 SELECT * 한다.
+      (컬럼 스키마는 추후 필요 시 구체적으로 매핑 가능)
+    - home/away team_id 와 매칭해서 home / away 슬롯에 채워 넣는다.
+    - 아무 데이터도 없으면 None 반환.
     """
-    fixture_id = _extract_fixture_id(header)
+    fixture_id = _get_fixture_id_from_header(header)
     if fixture_id is None:
-        # fixture_id 가 없으면 스탯을 만들 수 없음
+        # fixture_id 없으면 스탯을 만들 수 없다
         return None
 
-    team_ids = _extract_team_ids(header)
+    team_ids = _get_team_ids_from_header(header)
     home_team_id = team_ids["home_team_id"]
     away_team_id = team_ids["away_team_id"]
 
-    # 1) match_team_stats 에서 이 fixture 의 팀 스탯 조회
-    #    컬럼 이름이 프로젝트마다 약간 다를 수 있으므로 SELECT * 후에 Python 쪽에서 매핑
+    # match_team_stats 에서 이 경기의 팀 스탯 전부 읽기
+    # 컬럼 이름은 SELECT * 로 그대로 가져오고,
+    # Python dict 그대로를 JSON 으로 내려보내는 방식으로 1차 구현.
     sql = """
         SELECT *
         FROM match_team_stats
@@ -146,32 +114,51 @@ def build_stats_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rows = fetch_all(sql, (fixture_id,))
 
     if not rows:
-        # 해당 경기의 팀 스탯이 아직 수집되지 않았으면 None 반환
+        # 아직 이 경기의 스탯이 수집되지 않았을 수 있음
         return None
 
     home_block: Optional[Dict[str, Any]] = None
     away_block: Optional[Dict[str, Any]] = None
 
     for row in rows:
-        team_id = _safe_get(row, "team_id")
-        stats = _build_team_stats_from_row(row)
+        # team_id 컬럼이 있다는 가정 하에, home/away 매칭을 시도한다.
+        team_id = row.get("team_id")
 
-        # home / away 매핑
-        if home_team_id is not None and team_id == home_team_id:
-            home_block = stats
-        elif away_team_id is not None and team_id == away_team_id:
-            away_block = stats
-        else:
-            # header 에서 home/away 를 못 찾았거나 team_id 가 안 맞을 때:
-            # 아직 비어 있는 쪽에 순서대로 채워 넣는 fallback 처리
-            if home_block is None:
-                home_block = stats
-            elif away_block is None:
-                away_block = stats
+        if team_id is not None:
+            # header 의 home/away 팀 id 와 우선 매칭
+            try:
+                tid = int(team_id)
+            except (TypeError, ValueError):
+                tid = None
 
-    return {
+            if tid is not None:
+                if home_team_id is not None and tid == home_team_id:
+                    home_block = row
+                    continue
+                if away_team_id is not None and tid == away_team_id:
+                    away_block = row
+                    continue
+
+        # 혹시 header 에 팀 id 가 없거나 매칭이 안 되는 경우,
+        # 아직 비어 있는 쪽에 순서대로 채워 넣는 fallback 처리
+        if home_block is None:
+            home_block = row
+        elif away_block is None:
+            away_block = row
+
+    team_block: Dict[str, Any] = {
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
         "home": home_block,
         "away": away_block,
-        # 2단계에서 선수 스탯(match_player_stats) 섹션을 붙이고 싶다면,
-        # 여기 예: "players": {"home": [...], "away": [...]} 형태로 확장 가능.
+        # 디버깅/향후 확장을 위한 전체 row 목록
+        "rows": rows,
+    }
+
+    # 선수 스탯은 이후 단계에서 match_player_stats 를 붙이는 형태로 확장 예정
+    players_block: Optional[Dict[str, Any]] = None
+
+    return {
+        "team": team_block,
+        "players": players_block,
     }
