@@ -26,6 +26,10 @@ from services.insights.insights_overall_resultscombos_draw import (
 from services.insights.utils import parse_last_n
 
 
+# ─────────────────────────────────────
+#  공통 파서
+# ─────────────────────────────────────
+
 def _extract_int(value: Any) -> Optional[int]:
     """헤더에서 넘어오는 값이 str/int 섞여 있어도 안전하게 int로 변환."""
     if value is None:
@@ -36,45 +40,77 @@ def _extract_int(value: Any) -> Optional[int]:
         return None
 
 
-def _get_team_ids_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """header 구조 변화에 어느 정도 대응할 수 있게 방어적으로 파싱."""
-    teams = header.get("teams") or {}
-
-    home_team_id: Optional[int] = None
-    away_team_id: Optional[int] = None
-
-    # 1) header["teams"]["home"]["id"] / ["away"]["id"] 패턴 시도
-    if isinstance(teams, dict):
-        home_team_id = _extract_int((teams.get("home") or {}).get("id"))
-        away_team_id = _extract_int((teams.get("away") or {}).get("id"))
-
-    # 2) fallback: header["home_team_id"] / ["away_team_id"]
-    if home_team_id is None:
-        home_team_id = _extract_int(header.get("home_team_id"))
-    if away_team_id is None:
-        away_team_id = _extract_int(header.get("away_team_id"))
-
-    return {
-        "home_team_id": home_team_id,
-        "away_team_id": away_team_id,
-    }
-
-
 def _get_league_and_season_from_header(
     header: Dict[str, Any]
 ) -> Dict[str, Optional[int]]:
+    """
+    header 구조가 바뀌어도 최대한 따라가도록,
+    top-level 과 fixture 블록 둘 다 보면서 league_id/season 을 찾는다.
+    """
     league_id = header.get("league_id")
-    if league_id is None:
-        league = header.get("league") or {}
-        league_id = league.get("id")
+    season = header.get("season_int") or header.get("season")
 
-    season = header.get("season_int")
-    if season is None:
-        season = header.get("season")
+    # 1차 시도: top-level 에 없다면 fixture 블록 확인
+    fixture = header.get("fixture") or {}
+    if isinstance(fixture, dict):
+        if league_id is None:
+            league_id = fixture.get("league_id") or fixture.get("leagueId")
+        if season is None:
+            season = fixture.get("season_int") or fixture.get("season")
+
+    # 2차 시도: league 서브블록에 season 이 따로 있을 수도 있음
+    league_block = header.get("league") or {}
+    if isinstance(league_block, dict):
+        if league_id is None:
+            league_id = league_block.get("league_id") or league_block.get("id")
+        if season is None:
+            season = league_block.get("season") or league_block.get("season_int")
 
     return {
         "league_id": _extract_int(league_id),
         "season_int": _extract_int(season),
+    }
+
+
+def _get_team_ids_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """
+    home/away 팀 ID를 최대한 다양한 패턴에서 찾아본다.
+
+    우선순위:
+      1) header["teams"]["home"]["id"] / ["away"]["id"]
+      2) header["home_team_id"] / ["away_team_id"]
+      3) header["fixture"]["home_id"] / ["away_id"]
+    """
+    home_team_id: Optional[int] = None
+    away_team_id: Optional[int] = None
+
+    # 1) teams 블록 우선
+    teams = header.get("teams") or {}
+    if isinstance(teams, dict):
+        home_team_id = _extract_int((teams.get("home") or {}).get("id"))
+        away_team_id = _extract_int((teams.get("away") or {}).get("id"))
+
+    # 2) top-level fallback
+    if home_team_id is None:
+        home_team_id = _extract_int(header.get("home_team_id") or header.get("home_id"))
+    if away_team_id is None:
+        away_team_id = _extract_int(header.get("away_team_id") or header.get("away_id"))
+
+    # 3) fixture 블록 fallback
+    fixture = header.get("fixture") or {}
+    if isinstance(fixture, dict):
+        if home_team_id is None:
+            home_team_id = _extract_int(
+                fixture.get("home_team_id") or fixture.get("home_id")
+            )
+        if away_team_id is None:
+            away_team_id = _extract_int(
+                fixture.get("away_team_id") or fixture.get("away_id")
+            )
+
+    return {
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
     }
 
 
@@ -93,6 +129,10 @@ def _get_last_n_from_header(header: Dict[str, Any]) -> int:
     )
     return parse_last_n(raw_last_n)
 
+
+# ─────────────────────────────────────
+#  한 팀(홈/원정) 인사이트 계산
+# ─────────────────────────────────────
 
 def _build_side_insights(
     *,
@@ -171,7 +211,7 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    # Result Combos & Draw (현재는 별도 작업 없음, 훅만 남겨둠)
+    # Result Combos & Draw (현재는 last_n 인자 없음)
     enrich_overall_resultscombos_draw(
         stats,
         insights,
@@ -183,6 +223,10 @@ def _build_side_insights(
 
     return insights
 
+
+# ─────────────────────────────────────
+#  전체 블록 빌더
+# ─────────────────────────────────────
 
 def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
