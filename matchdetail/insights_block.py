@@ -1,157 +1,74 @@
 # matchdetail/insights_block.py
 
 from __future__ import annotations
-
 from typing import Any, Dict, Optional
 
-from services.insights.insights_overall_outcome_totals import (
-    enrich_overall_outcome_totals,
-)
+from services.insights.insights_overall_outcome_totals import enrich_overall_outcome_totals
 from services.insights.insights_overall_timing import enrich_overall_timing
-from services.insights.insights_overall_firstgoal_momentum import (
-    enrich_overall_firstgoal_momentum,
-)
-from services.insights.insights_overall_shooting_efficiency import (
-    enrich_overall_shooting_efficiency,
-)
-from services.insights.insights_overall_discipline_setpieces import (
-    enrich_overall_discipline_setpieces,
-)
-from services.insights.insights_overall_goalsbytime import (
-    enrich_overall_goals_by_time,
-)
-from services.insights.insights_overall_resultscombos_draw import (
-    enrich_overall_resultscombos_draw,
-)
+from services.insights.insights_overall_firstgoal_momentum import enrich_overall_firstgoal_momentum
+from services.insights.insights_overall_shooting_efficiency import enrich_overall_shooting_efficiency
+from services.insights.insights_overall_discipline_setpieces import enrich_overall_discipline_setpieces
+from services.insights.insights_overall_goalsbytime import enrich_overall_goals_by_time
+from services.insights.insights_overall_resultscombos_draw import enrich_overall_resultscombos_draw
 from services.insights.utils import parse_last_n
 
 
 # ─────────────────────────────────────
-#  공통 파서
+#  안전한 int 변환
 # ─────────────────────────────────────
-
-def _extract_int(value: Any) -> Optional[int]:
-    """헤더에서 넘어오는 값이 str/int 섞여 있어도 안전하게 int로 변환."""
-    if value is None:
+def _extract_int(v: Any) -> Optional[int]:
+    if v is None:
         return None
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        return int(v)
+    except Exception:
         return None
 
 
-def _get_league_and_season_from_header(
-    header: Dict[str, Any]
-) -> Dict[str, Optional[int]]:
+# ─────────────────────────────────────
+#  header 구조 그대로 파싱
+# ─────────────────────────────────────
+def _get_meta_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
     """
-    header 구조가 바뀌어도 최대한 따라가도록,
-    top-level 과 fixture 블록 둘 다 보면서 league_id/season 을 찾는다.
+    header 스키마에 100% 맞게 파싱:
+      - league_id → header["league_id"]
+      - season → header["season"]
+      - home_team_id → header["home"]["id"]
+      - away_team_id → header["away"]["id"]
     """
-    league_id = header.get("league_id")
-    season = header.get("season_int") or header.get("season")
+    league_id = _extract_int(header.get("league_id"))
+    season = _extract_int(header.get("season"))
 
-    # 1차 시도: top-level 에 없다면 fixture 블록 확인
-    fixture = header.get("fixture") or {}
-    if isinstance(fixture, dict):
-        if league_id is None:
-            league_id = fixture.get("league_id") or fixture.get("leagueId")
-        if season is None:
-            season = fixture.get("season_int") or fixture.get("season")
+    # home/away 구조는 정확히 header["home"]["id"]
+    home_block = header.get("home") or {}
+    away_block = header.get("away") or {}
 
-    # 2차 시도: league 서브블록에 season 이 따로 있을 수도 있음
-    league_block = header.get("league") or {}
-    if isinstance(league_block, dict):
-        if league_id is None:
-            league_id = league_block.get("league_id") or league_block.get("id")
-        if season is None:
-            season = league_block.get("season") or league_block.get("season_int")
+    home_team_id = _extract_int(home_block.get("id"))
+    away_team_id = _extract_int(away_block.get("id"))
 
     return {
-        "league_id": _extract_int(league_id),
-        "season_int": _extract_int(season),
-    }
-
-
-def _get_team_ids_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """
-    home/away 팀 ID를 최대한 다양한 패턴에서 찾아본다.
-
-    우선순위:
-      1) header["teams"]["home"]["id"] / ["away"]["id"]
-      2) header["home_team_id"] / ["away_team_id"]
-      3) header["fixture"]["home_id"] / ["away_id"]
-    """
-    home_team_id: Optional[int] = None
-    away_team_id: Optional[int] = None
-
-    # 1) teams 블록 우선
-    teams = header.get("teams") or {}
-    if isinstance(teams, dict):
-        home_team_id = _extract_int((teams.get("home") or {}).get("id"))
-        away_team_id = _extract_int((teams.get("away") or {}).get("id"))
-
-    # 2) top-level fallback
-    if home_team_id is None:
-        home_team_id = _extract_int(header.get("home_team_id") or header.get("home_id"))
-    if away_team_id is None:
-        away_team_id = _extract_int(header.get("away_team_id") or header.get("away_id"))
-
-    # 3) fixture 블록 fallback
-    fixture = header.get("fixture") or {}
-    if isinstance(fixture, dict):
-        if home_team_id is None:
-            home_team_id = _extract_int(
-                fixture.get("home_team_id") or fixture.get("home_id")
-            )
-        if away_team_id is None:
-            away_team_id = _extract_int(
-                fixture.get("away_team_id") or fixture.get("away_id")
-            )
-
-    return {
+        "league_id": league_id,
+        "season_int": season,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
     }
 
 
 def _get_last_n_from_header(header: Dict[str, Any]) -> int:
-    """
-    헤더 안에 필터 정보가 있다면 last_n (정수) 로 변환.
-    없으면 0 (시즌 전체)로 처리.
-    """
     filters = header.get("filters") or {}
-    # 키 이름이 last_n / lastN 둘 중 무엇이든 최대한 대응
-    raw_last_n = (
-        filters.get("last_n")
-        or filters.get("lastN")
-        or header.get("last_n")
-        or header.get("lastN")
-    )
+    raw_last_n = filters.get("last_n") or header.get("last_n")
     return parse_last_n(raw_last_n)
 
 
 # ─────────────────────────────────────
-#  한 팀(홈/원정) 인사이트 계산
+#  한 팀(홈/원정) 계산
 # ─────────────────────────────────────
-
-def _build_side_insights(
-    *,
-    league_id: int,
-    season_int: Optional[int],
-    team_id: int,
-    last_n: int,
-) -> Dict[str, Any]:
-    """
-    한 팀(홈/원정)에 대해 overall insights 를 계산해서 dict 로 리턴.
-    stats 딕셔너리는 섹션들에서 공통으로 사용할 메타/필터 저장소로 활용 가능.
-    """
+def _build_side_insights(*, league_id: int, season_int: int, team_id: int, last_n: int):
     stats: Dict[str, Any] = {}
     insights: Dict[str, Any] = {}
 
-    # Outcome & Totals / Goal Diff / Clean Sheet / No Goals / 일부 Result Combos
     enrich_overall_outcome_totals(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
@@ -159,30 +76,24 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    # Timing (득점/실점 시간대)
     enrich_overall_timing(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
         last_n=last_n,
     )
 
-    # First Goal / Momentum
     enrich_overall_firstgoal_momentum(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
         last_n=last_n,
     )
 
-    # Shooting & Efficiency
     enrich_overall_shooting_efficiency(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
@@ -190,10 +101,8 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    # Discipline & Set Pieces
     enrich_overall_discipline_setpieces(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
@@ -201,20 +110,16 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    # Goals by Time
     enrich_overall_goals_by_time(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
         last_n=last_n,
     )
 
-    # Result Combos & Draw (현재는 last_n 인자 없음)
     enrich_overall_resultscombos_draw(
-        stats,
-        insights,
+        stats, insights,
         league_id=league_id,
         season_int=season_int,
         team_id=team_id,
@@ -225,53 +130,32 @@ def _build_side_insights(
 
 
 # ─────────────────────────────────────
-#  전체 블록 빌더
+#  전체 insights 블록 생성
 # ─────────────────────────────────────
-
 def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    매치 디테일 번들에서 사용할 전체 Insights Overall 블록 생성.
-
-    입력: header_block 에서 만들어준 header 딕셔너리
-    출력: league/season/필터 + 홈/원정 인사이트가 들어있는 딕셔너리
-
-      예시:
-      {
-          "league_id": 39,
-          "season": 2025,
-          "last_n": 10,
-          "home_team_id": 40,
-          "away_team_id": 33,
-          "home": { ... },
-          "away": { ... },
-      }
-    """
     if not header:
         return None
 
-    meta = _get_league_and_season_from_header(header)
+    meta = _get_meta_from_header(header)
+
     league_id = meta["league_id"]
     season_int = meta["season_int"]
+    home_team_id = meta["home_team_id"]
+    away_team_id = meta["away_team_id"]
 
-    teams = _get_team_ids_from_header(header)
-    home_team_id = teams["home_team_id"]
-    away_team_id = teams["away_team_id"]
-
-    # 필수 값이 하나라도 없으면 인사이트 블록을 만들 수 없으므로 None
-    if league_id is None or season_int is None:
-        return None
-    if home_team_id is None or away_team_id is None:
+    # 값 못 찾으면 None
+    if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
     last_n = _get_last_n_from_header(header)
 
-    home_insights = _build_side_insights(
+    home_ins = _build_side_insights(
         league_id=league_id,
         season_int=season_int,
         team_id=home_team_id,
         last_n=last_n,
     )
-    away_insights = _build_side_insights(
+    away_ins = _build_side_insights(
         league_id=league_id,
         season_int=season_int,
         team_id=away_team_id,
@@ -284,6 +168,6 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "last_n": last_n,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
-        "home": home_insights,
-        "away": away_insights,
+        "home": home_ins,
+        "away": away_ins,
     }
