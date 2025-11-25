@@ -1,5 +1,3 @@
-# matchdetail/insights_block.py
-
 from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
@@ -334,6 +332,148 @@ def _build_side_insights(
 
 
 # ─────────────────────────────────────
+#  필터 옵션용 헬퍼
+# ─────────────────────────────────────
+def _build_comp_options_for_team(
+    *, league_id: int, season_int: int, team_id: int
+) -> List[str]:
+    """
+    이 팀이 해당 시즌에 실제로 뛴 대회를 기준으로
+    Competition 드롭다운 옵션을 만든다.
+    (All / League / Cup / Europe (UEFA) / Continental + 개별 대회명)
+    """
+    if season_int is None or team_id is None:
+        return []
+
+    rows = fetch_all(
+        """
+        SELECT DISTINCT
+            m.league_id,
+            l.name      AS league_name
+        FROM matches m
+        JOIN leagues l ON l.id = m.league_id
+        WHERE m.season = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+        """,
+        (season_int, team_id, team_id),
+    )
+
+    if not rows:
+        return []
+
+    comp_options: List[str] = ["All", "League"]
+
+    has_cup = False
+    has_uefa = False
+    has_acl = False
+    league_names: List[str] = []
+
+    for r in rows:
+        name = (r.get("league_name") or "").strip()
+        if not name:
+            continue
+        league_names.append(name)
+        lower = name.lower()
+
+        if (
+            "cup" in lower
+            or "copa" in lower
+            or "컵" in lower
+            or "taça" in lower
+            or "杯" in lower
+        ):
+            has_cup = True
+
+        if (
+            "uefa" in lower
+            or "champions league" in lower
+            or "europa league" in lower
+            or "conference league" in lower
+        ):
+            has_uefa = True
+
+        if "afc" in lower or "acl" in lower or "afc champions league" in lower:
+            has_acl = True
+
+    if has_cup and "Cup" not in comp_options:
+        comp_options.append("Cup")
+    if has_uefa and "Europe (UEFA)" not in comp_options:
+        comp_options.append("Europe (UEFA)")
+    if has_acl and "Continental" not in comp_options:
+        comp_options.append("Continental")
+
+    # 개별 대회명 추가
+    for name in league_names:
+        if name not in comp_options:
+            comp_options.append(name)
+
+    return comp_options
+
+
+def _build_last_n_options_for_match(
+    *, home_team_id: int, away_team_id: int
+) -> List[str]:
+    """
+    두 팀이 가진 시즌 목록을 기반으로 Last N 옵션 뒤에
+    Season YYYY 옵션들을 붙여서 내려준다.
+    (교집합이 비면 합집합을 사용)
+    """
+    base_options: List[str] = ["Last 3", "Last 5", "Last 7", "Last 10"]
+
+    if home_team_id is None or away_team_id is None:
+        return base_options
+
+    def _load_seasons(team_id: int) -> List[int]:
+        rows = fetch_all(
+            """
+            SELECT DISTINCT season
+            FROM matches
+            WHERE home_id = %s OR away_id = %s
+            ORDER BY season DESC
+            """,
+            (team_id, team_id),
+        )
+        seasons: List[int] = []
+        for r in rows:
+            s = r.get("season")
+            if s is None:
+                continue
+            try:
+                seasons.append(int(s))
+            except (TypeError, ValueError):
+                continue
+        return seasons
+
+    home_seasons = set(_load_seasons(home_team_id))
+    away_seasons = set(_load_seasons(away_team_id))
+
+    inter = home_seasons & away_seasons
+    if inter:
+        seasons_sorted = sorted(inter, reverse=True)
+    else:
+        seasons_sorted = sorted(home_seasons | away_seasons, reverse=True)
+
+    for s in seasons_sorted:
+        label = f"Season {s}"
+        if label not in base_options:
+            base_options.append(label)
+
+    return base_options
+
+
+def _merge_options(*lists: List[str]) -> List[str]:
+    seen = set()
+    merged: List[str] = []
+    for lst in lists:
+        for v in lst:
+            if v in seen:
+                continue
+            seen.add(v)
+            merged.append(v)
+    return merged
+
+
+# ─────────────────────────────────────
 #  전체 insights 블록 생성
 # ─────────────────────────────────────
 def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -350,7 +490,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
-    # 선택된 last_n (라벨 → 숫자) 파싱 → 실제 계산용
+    # 선택된 last_n (라벨 → 숫자) 파싱
     last_n = _get_last_n_from_header(header)
 
     # 헤더의 필터 블록 (라벨 그대로, comp / last_n 문자열 등)
@@ -377,53 +517,30 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     )
 
     # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
+    comp_opts_home = _build_comp_options_for_team(
+        league_id=league_id,
+        season_int=season_int,
+        team_id=home_team_id,
+    )
+    comp_opts_away = _build_comp_options_for_team(
+        league_id=league_id,
+        season_int=season_int,
+        team_id=away_team_id,
+    )
 
-    # 1) comp 옵션 동적 생성
-    comp_options: List[str] = ["All", "League"]
+    comp_options = _merge_options(comp_opts_home, comp_opts_away)
+    if not comp_options:
+        comp_options = ["All", "League"]
 
-    # 개별 league 목록 추가
-    league_name_map = { lid: name for lid, name in name_pairs }
-
-    # Cup / UEFA / ACL 자동 추가
-    if cup_ids:
-        comp_options.append("Cup")
-    if uefa_ids:
-        comp_options.append("UEFA")
-    if acl_ids:
-        comp_options.append("ACL")
-
-    # 개별 대회명 옵션으로 추가
-    for lid, name in name_pairs:
-        clean_name = name.strip()
-        if clean_name not in comp_options:
-            comp_options.append(clean_name)
-
-    # 현재 선택된 comp 라벨
     comp_label = (filters_block.get("comp") or "All").strip() or "All"
     if comp_label not in comp_options:
         comp_options.insert(0, comp_label)
 
-    # 2) last_n 옵션 동적 생성
-    last_n_options: List[str] = ["Last 3", "Last 5", "Last 7", "Last 10"]
-
-    # 시즌 목록 → Season YYYY
-    season_rows = fetch_all(
-        """
-        SELECT DISTINCT season
-        FROM matches
-        WHERE home_id = %s OR away_id = %s
-        ORDER BY season DESC
-        """,
-        (home_team_id, home_team_id),
+    last_n_options = _build_last_n_options_for_match(
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
     )
-    for r in season_rows:
-        s = r.get("season")
-        if s:
-            label = f"Season {s}"
-            if label not in last_n_options:
-                last_n_options.append(label)
-
-    last_n_label = (filters_block.get("last_n") or "Last 10").strip()
+    last_n_label = (filters_block.get("last_n") or "Last 10").strip() or "Last 10"
     if last_n_label not in last_n_options:
         last_n_options.insert(0, last_n_label)
 
@@ -438,7 +555,6 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         },
     }
 
-
     return {
         "league_id": league_id,
         "season": season_int,
@@ -451,4 +567,3 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "home": home_ins,
         "away": away_ins,
     }
-
