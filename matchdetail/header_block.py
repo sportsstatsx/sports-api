@@ -71,10 +71,10 @@ def build_header_block(
         "fixture_id": row["fixture_id"],
         "league_id": row["league_id"],
         "season": row["season"],
-        "kickoff_utc": row["date_utc"],          # 앱에서 로컬 타임 변환
-        "status_group": row["status_group"],     # upcoming / live / finished 등
-        "status": row["status"],                 # NS / 1H / HT / 2H / FT ...
-        "minute": row["elapsed"],                # 진행 중일 때만 의미
+        "kickoff_utc": row["date_utc"],
+        "status_group": row["status_group"],
+        "status": row["status"],
+        "minute": row["elapsed"],
 
         "league": {
             "name": row.get("league_name"),
@@ -85,9 +85,9 @@ def build_header_block(
         "home": {
             "id": row["home_id"],
             "name": row["home_name"],
-            "short_name": row["home_name"],      # 나중에 약칭 컬럼 생기면 교체
+            "short_name": row["home_name"],
             "logo": row["home_logo"],
-            "score": row["home_ft"],             # 최종 스코어
+            "score": row["home_ft"],
             "red_cards": row["home_red_cards"],
         },
         "away": {
@@ -97,5 +97,11 @@ def build_header_block(
             "logo": row["away_logo"],
             "score": row["away_ft"],
             "red_cards": row["away_red_cards"],
+        },
+
+        # 🔥 필터 블록 추가 (기존 로직 보존)
+        "filters": {
+            "last_n": "Last 10",   # 기본값
+            "comp": "All",         # 기본값
         },
     }
