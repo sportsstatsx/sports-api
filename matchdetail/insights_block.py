@@ -14,63 +14,8 @@ from services.insights.utils import parse_last_n
 
 
 # ─────────────────────────────────────
-#  Header → 공통 메타 추출
+#  last_n 파싱
 # ─────────────────────────────────────
-
-def _get_meta_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """
-    header 블록에서 league_id / season / home_team_id / away_team_id 추출.
-    값이 없으면 None.
-    (⚠️ 현재 header 구조:
-        - league_id, season 은 top-level
-        - home.id / away.id 에 팀 ID 가 들어있음)
-    """
-    league_id = header.get("league_id")
-    season = header.get("season")
-
-    # 팀 ID는 중첩 구조 안에 있음
-    home = header.get("home") or {}
-    away = header.get("away") or {}
-
-    home_team_id = home.get("id")
-    away_team_id = away.get("id")
-
-    league_id_int: Optional[int] = None
-    season_int: Optional[int] = None
-    home_id_int: Optional[int] = None
-    away_id_int: Optional[int] = None
-
-    try:
-        if league_id is not None:
-            league_id_int = int(league_id)
-    except (TypeError, ValueError):
-        league_id_int = None
-
-    try:
-        if season is not None:
-            season_int = int(season)
-    except (TypeError, ValueError):
-        season_int = None
-
-    try:
-        if home_team_id is not None:
-            home_id_int = int(home_team_id)
-    except (TypeError, ValueError):
-        home_id_int = None
-
-    try:
-        if away_team_id is not None:
-            away_id_int = int(away_team_id)
-    except (TypeError, ValueError):
-        away_id_int = None
-
-    return {
-        "league_id": league_id_int,
-        "season_int": season_int,
-        "home_team_id": home_id_int,
-        "away_team_id": away_id_int,
-    }
-
 
 def _get_last_n_from_header(header: Dict[str, Any]) -> int:
     """
@@ -90,16 +35,19 @@ def _get_last_n_from_header(header: Dict[str, Any]) -> int:
 
 def _build_side_insights(
     *,
-    league_id: int,
+    league_id: Optional[int],
     season_int: Optional[int],
-    team_id: int,
+    team_id: Optional[int],
     last_n: int,
 ) -> Dict[str, Any]:
     """
-    한 팀(홈/원정)에 대한 전체 insights를 계산해서 합쳐서 반환.
-    stats / insights 딕셔너리를 shared 버퍼로 사용하고,
-    각 섹션별 enrich 함수가 거기에 값을 채워 넣는 구조.
+    한 팀(홈/원정)에 대한 전체 insights 계산.
+    league_id / season_int / team_id 가 하나라도 None 이면
+    그냥 빈 dict 반환해서 앱이 죽지 않게 한다.
     """
+    if league_id is None or team_id is None:
+        return {}
+
     stats: Dict[str, Any] = {}
     insights: Dict[str, Any] = {}
 
@@ -186,42 +134,70 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     """
     Match Detail 번들에서 사용할 insights_overall 블록을 생성한다.
     (home/away 각각에 대해 _build_side_insights 호출)
+    절대 None 을 반환하지 않고, 최소한 빈 home/away 객체라도 내려보낸다.
     """
     if not header:
         return None
 
-    meta = _get_meta_from_header(header)
+    # header 구조에 맞게 값 가져오기
+    league_id = header.get("league_id")
+    season = header.get("season")
 
-    league_id = meta["league_id"]
-    season_int = meta["season_int"]
-    home_team_id = meta["home_team_id"]
-    away_team_id = meta["away_team_id"]
+    home = header.get("home") or {}
+    away = header.get("away") or {}
 
-    # 필수 값 없으면 None
-    if None in (league_id, season_int, home_team_id, away_team_id):
-        return None
+    home_team_id = home.get("id")
+    away_team_id = away.get("id")
+
+    # 안전하게 int 캐스팅 (실패해도 None 으로 두고 빈 dict 반환)
+    league_id_int: Optional[int]
+    season_int: Optional[int]
+    home_id_int: Optional[int]
+    away_id_int: Optional[int]
+
+    try:
+        league_id_int = int(league_id) if league_id is not None else None
+    except (TypeError, ValueError):
+        league_id_int = None
+
+    try:
+        season_int = int(season) if season is not None else None
+    except (TypeError, ValueError):
+        season_int = None
+
+    try:
+        home_id_int = int(home_team_id) if home_team_id is not None else None
+    except (TypeError, ValueError):
+        home_id_int = None
+
+    try:
+        away_id_int = int(away_team_id) if away_team_id is not None else None
+    except (TypeError, ValueError):
+        away_id_int = None
 
     last_n = _get_last_n_from_header(header)
 
+    # 실제 계산 (값이 None 이면 _build_side_insights 내부에서 빈 dict 반환)
     home_ins = _build_side_insights(
-        league_id=league_id,
+        league_id=league_id_int,
         season_int=season_int,
-        team_id=home_team_id,
+        team_id=home_id_int,
         last_n=last_n,
     )
     away_ins = _build_side_insights(
-        league_id=league_id,
+        league_id=league_id_int,
         season_int=season_int,
-        team_id=away_team_id,
+        team_id=away_id_int,
         last_n=last_n,
     )
 
+    # ✅ 여기서는 절대 None 안 돌려줌
     return {
-        "league_id": league_id,
+        "league_id": league_id_int,
         "season": season_int,
         "last_n": last_n,
-        "home_team_id": home_team_id,
-        "away_team_id": away_team_id,
+        "home_team_id": home_id_int,
+        "away_team_id": away_id_int,
         "home": home_ins,
         "away": away_ins,
     }
