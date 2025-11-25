@@ -1,5 +1,3 @@
-# matchdetail/insights_block.py
-
 from __future__ import annotations
 from typing import Any, Dict, Optional
 
@@ -58,6 +56,26 @@ def _get_last_n_from_header(header: Dict[str, Any]) -> int:
     filters = header.get("filters") or {}
     raw_last_n = filters.get("last_n") or header.get("last_n")
     return parse_last_n(raw_last_n)
+
+
+def _get_filters_from_header(header: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    헤더에 이미 들어있는 filters 블록을 그대로 옮겨오되,
+    last_n 값은 항상 존재하도록 정리해서 insights_overall.filters 로 내려준다.
+    (실제 comp/last_n 옵션 목록/로직은 다음 단계에서 확장 예정)
+    """
+    header_filters = header.get("filters") or {}
+
+    # 방어적으로 복사
+    filters: Dict[str, Any] = dict(header_filters)
+
+    # 선택된 last_n 라벨을 헤더에서 확보
+    raw_last_n = header_filters.get("last_n") or header.get("last_n")
+    if raw_last_n is not None:
+        filters["last_n"] = raw_last_n
+
+    # comp 같은 다른 필터 값이 header.filters 안에 있으면 그대로 유지
+    return filters
 
 
 # ─────────────────────────────────────
@@ -147,7 +165,11 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
+    # 선택된 last_n (라벨 → 숫자) 파싱
     last_n = _get_last_n_from_header(header)
+
+    # 필터 블록은 header 기준으로 그대로 옮겨온다.
+    filters_block = _get_filters_from_header(header)
 
     home_ins = _build_side_insights(
         league_id=league_id,
@@ -168,6 +190,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "last_n": last_n,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
+        "filters": filters_block,  # 🔹 새로 추가된 필터 블록
         "home": home_ins,
         "away": away_ins,
     }
