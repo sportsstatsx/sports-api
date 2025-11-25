@@ -1,42 +1,37 @@
 # ==============================================================
-# matchdetail_router.py  (A방식 + comp/last_n 지원 완전체)
+# matchdetail_router.py (Flask 버전 + comp/last_n 지원)
 # ==============================================================
 
-from fastapi import APIRouter, Request
+from flask import Blueprint, request, jsonify
 from services.bundle_service import build_match_detail_bundle
 
-router = APIRouter()
+matchdetail_bp = Blueprint("matchdetail", __name__)
 
 
-@router.get("/match_detail_bundle")
-async def match_detail_bundle(request: Request):
+@matchdetail_bp.route("/match_detail_bundle", methods=["GET"])
+def match_detail_bundle():
     """
-    API:
+    Flask A방식:
       /api/match_detail_bundle?fixture_id=xxx&league_id=xxx&season=2025
                               &comp=League&last_n=Last%205
-
-    A방식: 여기서는 DB만 보고, 모든 insights 계산을 서버에서 수행.
     """
+    fixture_id = request.args.get("fixture_id")
+    league_id = request.args.get("league_id")
+    season = request.args.get("season")
 
-    q = request.query_params
-
-    fixture_id = q.get("fixture_id")
-    league_id = q.get("league_id")
-    season = q.get("season")
-
-    # 🔥 새 필터
-    comp = q.get("comp", "All")
-    last_n = q.get("last_n", "Last 10")
+    # 🔥 신규 필터
+    comp = request.args.get("comp", "All")
+    last_n = request.args.get("last_n", "Last 10")
 
     if not fixture_id or not league_id or not season:
-        return {"ok": False, "error": "fixture_id / league_id / season required"}
+        return jsonify({"ok": False, "error": "fixture_id / league_id / season required"})
 
     try:
         fixture_id_int = int(fixture_id)
         league_id_int = int(league_id)
         season_int = int(season)
     except:
-        return {"ok": False, "error": "Invalid fixture_id/league_id/season"}
+        return jsonify({"ok": False, "error": "Invalid fixture_id/league_id/season"})
 
     data = build_match_detail_bundle(
         fixture_id=fixture_id_int,
@@ -46,4 +41,4 @@ async def match_detail_bundle(request: Request):
         last_n=last_n
     )
 
-    return {"ok": True, "data": data}
+    return jsonify({"ok": True, "data": data})
