@@ -1,308 +1,219 @@
-# ============================================================
-#  insights_block.py (A방식 완전 구현본)
-# ============================================================
+# matchdetail/insights_block.py
 
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from __future__ import annotations
+from typing import Any, Dict, Optional
 
-from services.insights.insights_overall_outcome_totals import enrich_outcome_totals
-from services.insights.insights_overall_resultscombos_draw import enrich_resultscombos_draw
-from services.insights.insights_overall_timing import enrich_timing
-from services.insights.insights_overall_firstgoal_momentum import enrich_firstgoal_momentum
-from services.insights.insights_overall_shooting_efficiency import enrich_shooting_efficiency
-from services.insights.insights_overall_discipline_setpieces import enrich_discipline_setpieces
-from services.insights.insights_overall_goalsbytime import enrich_goals_by_time
-
-from database.db import db
-
-# ============================================================
-#   필터 파싱 함수들
-# ============================================================
-
-LAST_N_LIST = ["Last 3", "Last 5", "Last 7", "Last 10"]
+from services.insights.insights_overall_outcome_totals import enrich_overall_outcome_totals
+from services.insights.insights_overall_timing import enrich_overall_timing
+from services.insights.insights_overall_firstgoal_momentum import enrich_overall_firstgoal_momentum
+from services.insights.insights_overall_shooting_efficiency import enrich_overall_shooting_efficiency
+from services.insights.insights_overall_discipline_setpieces import enrich_overall_discipline_setpieces
+from services.insights.insights_overall_goalsbytime import enrich_overall_goals_by_time
+from services.insights.insights_overall_resultscombos_draw import enrich_overall_resultscombos_draw
+from services.insights.utils import parse_last_n
 
 
-def parse_last_n(raw: Optional[str]) -> Optional[int]:
-    """기존 last_n 파싱 (Last 3 → 3)"""
-    if not raw:
-        return None
-    if raw.startswith("Last"):
-        try:
-            n = int(raw.split(" ")[1])
-            return n
-        except:
-            return None
-    return None
+# ─────────────────────────────────────
+#  Header → 공통 메타 추출
+# ─────────────────────────────────────
 
-
-def parse_last_n_or_season(raw: Optional[str], season_list: List[int]) -> Dict[str, Any]:
+def _get_meta_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
     """
-    lastN 또는 시즌 필터 파싱.
-    return:
-      {
-        "mode": "last_n" or "season",
-        "value": int
-      }
+    header 블록에서 league_id / season / home_team_id / away_team_id 추출.
+    값이 없으면 None.
     """
-    if not raw:
-        # 서버 기본값: Last 10
-        return {"mode": "last_n", "value": 10}
+    league_id = header.get("league_id")
+    season = header.get("season")
+    home_team_id = header.get("home_team_id")
+    away_team_id = header.get("away_team_id")
 
-    if raw.startswith("Last"):
-        n = parse_last_n(raw)
-        return {"mode": "last_n", "value": n}
+    league_id_int = None
+    season_int = None
+    home_id_int = None
+    away_id_int = None
 
-    # 시즌이면?
     try:
-        yr = int(raw)
-        if yr in season_list:
-            return {"mode": "season", "value": yr}
-        # 시즌 리스트에 없어도 그냥 시즌으로 취급
-        return {"mode": "season", "value": yr}
-    except:
-        pass
+        if league_id is not None:
+            league_id_int = int(league_id)
+    except (TypeError, ValueError):
+        league_id_int = None
 
-    # default fallback
-    return {"mode": "last_n", "value": 10}
+    try:
+        if season is not None:
+            season_int = int(season)
+    except (TypeError, ValueError):
+        season_int = None
 
+    try:
+        if home_team_id is not None:
+            home_id_int = int(home_team_id)
+    except (TypeError, ValueError):
+        home_id_int = None
 
-# ============================================================
-#   COMP 옵션 만들기
-# ============================================================
-
-def fetch_team_competitions(team_id: int) -> List[str]:
-    """
-    팀이 참여한 모든 competition 명칭을 가져온다.
-    League, Cup, Europe 등.
-    """
-    q = """
-        SELECT DISTINCT competition_name
-        FROM match_team_stats
-        WHERE team_id = %s
-    """
-    rows = db.fetch_all(q, (team_id,))
-    comps = [r["competition_name"] for r in rows if r.get("competition_name")]
-    return comps
-
-
-def normalize_comp_options(home_id: int, away_id: int) -> List[str]:
-    """
-    홈/어웨이 두 팀의 competition 을 합쳐서 옵션 생성.
-    All 은 항상 포함.
-    League 은 항상 포함.
-    나머지는 DB에 있는 competition_name 들을 그대로 포함.
-    """
-    home_comps = fetch_team_competitions(home_id)
-    away_comps = fetch_team_competitions(away_id)
-
-    combined = set(home_comps + away_comps)
-
-    # League 는 무조건 추가
-    base = ["All", "League"]
-
-    # 나머지 컵 / 대륙컵 합치기
-    others = [c for c in combined if c not in ("League", "")]
-
-    return base + sorted(others)
-
-
-# ============================================================
-#   LAST_N 옵션 만들기 (Last 3/5/7/10 + 시즌 목록)
-# ============================================================
-
-def fetch_team_seasons(team_id: int) -> List[int]:
-    q = """
-        SELECT DISTINCT season
-        FROM match_team_stats
-        WHERE team_id = %s
-        ORDER BY season ASC
-    """
-    rows = db.fetch_all(q, (team_id,))
-    lst = []
-    for r in rows:
-        try:
-            lst.append(int(r["season"]))
-        except:
-            pass
-    return sorted(list(set(lst)))
-
-
-def build_last_n_options(team_id: int) -> List[str]:
-    """
-    Last 3/5/7/10 + 시즌 목록 (2024, 2025 등)
-    """
-    seasons = fetch_team_seasons(team_id)
-    season_opts = [str(s) for s in seasons]
-    return LAST_N_LIST + season_opts
-
-
-# ============================================================
-#   Matches 필터링
-# ============================================================
-
-def load_team_matches(team_id: int) -> List[Dict[str, Any]]:
-    """
-    team_id 의 모든 matches 를 가져온다.
-    """
-    q = """
-        SELECT *
-        FROM matches
-        WHERE home_id = %s OR away_id = %s
-        ORDER BY date DESC
-    """
-    return db.fetch_all(q, (team_id, team_id))
-
-
-def filter_matches_by_comp(matches: List[Dict[str, Any]], comp: str) -> List[Dict[str, Any]]:
-    if not comp or comp == "All":
-        return matches
-    # comp = "League" or specific cup name
-    if comp == "League":
-        return [m for m in matches if m.get("competition_name") == "League"]
-    else:
-        return [m for m in matches if m.get("competition_name") == comp]
-
-
-def filter_matches_by_last_n(matches: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    return matches[:n]
-
-
-def filter_matches_by_season(matches: List[Dict[str, Any]], season: int) -> List[Dict[str, Any]]:
-    return [m for m in matches if int(m.get("season", 0)) == season]
-
-
-# ============================================================
-#   Team Insights 계산 (home/away 각각)
-# ============================================================
-
-def compute_team_insights(team_id: int, comp: str, last_n_raw: str) -> Dict[str, Any]:
-    """
-    team_id 기준으로 comp / last_n / season 기반 필터 적용해서
-    전체 insights 계산.
-    """
-    # 1) 모든 경기 로드
-    matches = load_team_matches(team_id)
-    if not matches:
-        return {}
-
-    # 2) comp 옵션 적용
-    matches = filter_matches_by_comp(matches, comp)
-
-    # 3) last_n or season 파싱
-    seasons_owned = fetch_team_seasons(team_id)
-    parsed = parse_last_n_or_season(last_n_raw, seasons_owned)
-
-    if parsed["mode"] == "last_n":
-        n = parsed["value"]
-        matches = filter_matches_by_last_n(matches, n)
-    else:
-        yr = parsed["value"]
-        matches = filter_matches_by_season(matches, yr)
-
-    if not matches:
-        # 경기 없으면 빈 구조
-        return {
-            "events_sample": 0,
-            "first_goal_sample": 0,
-            "goals_by_time_for": [0]*10,
-            "goals_by_time_against": [0]*10,
-        }
-
-    # 4) team match list 로 enrich_* 함수들 호출
-    #    각 함수 내부에서 team_id 기반 match filtering/aggregating 수행
-    
-    outcome = enrich_outcome_totals(team_id, matches)
-    combos = enrich_resultscombos_draw(team_id, matches)
-    timing = enrich_timing(team_id, matches)
-    firstgoal = enrich_firstgoal_momentum(team_id, matches)
-    shooting = enrich_shooting_efficiency(team_id, matches)
-    discipline = enrich_discipline_setpieces(team_id, matches)
-    goals = enrich_goals_by_time(team_id, matches)
-
-    # sample count
-    events_sample = len(matches)
-
-    # first_goal_sample 은 firstgoal 모듈에서 반환하도록 했을 것으로 가정
-    first_goal_sample = firstgoal.get("first_goal_sample", events_sample)
+    try:
+        if away_team_id is not None:
+            away_id_int = int(away_team_id)
+    except (TypeError, ValueError):
+        away_id_int = None
 
     return {
-        **outcome,
-        **combos,
-        **timing,
-        **firstgoal,
-        **shooting,
-        **discipline,
-        **goals,
-        "events_sample": events_sample,
-        "first_goal_sample": first_goal_sample
+        "league_id": league_id_int,
+        "season_int": season_int,
+        "home_team_id": home_id_int,
+        "away_team_id": away_id_int,
     }
 
 
-# ============================================================
-#   PUBLIC: Insights 전체 생성 (MatchDetailBundle 에서 호출)
-# ============================================================
+def _get_last_n_from_header(header: Dict[str, Any]) -> int:
+    """
+    header 에 last_n 문자열(예: 'Last 5') 이 있으면 파싱해서 int 로 반환.
+    없으면 기본 10.
+    """
+    raw = header.get("last_n")
+    n = parse_last_n(raw)
+    if not n:
+        n = 10
+    return n
 
-def build_insights_overall_block(
+
+# ─────────────────────────────────────
+#  한 팀(home/away) Insights 계산
+# ─────────────────────────────────────
+
+def _build_side_insights(
+    *,
     league_id: int,
-    season_int: int,
-    home_team_id: int,
-    away_team_id: int,
-    comp: str,
-    last_n_raw: str
+    season_int: Optional[int],
+    team_id: int,
+    last_n: int,
 ) -> Dict[str, Any]:
     """
-    서버가 최종적으로 match_detail_bundle 에 넣을 insights_overall 블록 생성.
+    한 팀(홈/원정)에 대한 전체 insights를 계산해서 합쳐서 반환.
+    stats / insights 딕셔너리를 shared 버퍼로 사용하고,
+    각 섹션별 enrich 함수가 거기에 값을 채워 넣는 구조.
     """
+    stats: Dict[str, Any] = {}
+    insights: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------
-    # 1) comp 옵션 생성
-    # ------------------------------------------------------------
-    comp_options = normalize_comp_options(home_team_id, away_team_id)
+    # Outcome & Totals
+    enrich_overall_outcome_totals(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+        matches_total_api=0,
+    )
 
-    # selected comp 기본값 처리
-    selected_comp = comp
-    if selected_comp not in comp_options:
-        selected_comp = "All"
+    # Results Combos & Draw
+    enrich_overall_resultscombos_draw(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+        matches_total_api=0,
+    )
 
-    # ------------------------------------------------------------
-    # 2) last_n 옵션 생성
-    # ------------------------------------------------------------
-    lastn_options = build_last_n_options(home_team_id)  # away 기준으로도 가능함 (둘이 시즌 거의 동일)
-    if last_n_raw not in lastn_options:
-        # 기본값
-        selected_last_n = "Last 10"
-    else:
-        selected_last_n = last_n_raw
+    # Timing
+    enrich_overall_timing(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
 
-    # ------------------------------------------------------------
-    # 3) home / away insights 계산
-    # ------------------------------------------------------------
-    home_block = compute_team_insights(home_team_id, selected_comp, selected_last_n)
-    away_block = compute_team_insights(away_team_id, selected_comp, selected_last_n)
+    # First Goal / Momentum
+    enrich_overall_firstgoal_momentum(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
 
-    # ------------------------------------------------------------
-    # 4) 반환 JSON
-    # ------------------------------------------------------------
+    # Shooting & Efficiency
+    enrich_overall_shooting_efficiency(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
+
+    # Discipline & Set Pieces
+    enrich_overall_discipline_setpieces(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
+
+    # Goals by Time
+    enrich_overall_goals_by_time(
+        stats=stats,
+        insights=insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
+
+    return insights
+
+
+# ─────────────────────────────────────
+#  전체 insights 블록 생성
+# ─────────────────────────────────────
+
+def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Match Detail 번들에서 사용할 insights_overall 블록을 생성한다.
+    (home/away 각각에 대해 _build_side_insights 호출)
+    """
+    if not header:
+        return None
+
+    meta = _get_meta_from_header(header)
+
+    league_id = meta["league_id"]
+    season_int = meta["season_int"]
+    home_team_id = meta["home_team_id"]
+    away_team_id = meta["away_team_id"]
+
+    # 값 못 찾으면 None
+    if None in (league_id, season_int, home_team_id, away_team_id):
+        return None
+
+    last_n = _get_last_n_from_header(header)
+
+    home_ins = _build_side_insights(
+        league_id=league_id,
+        season_int=season_int,
+        team_id=home_team_id,
+        last_n=last_n,
+    )
+    away_ins = _build_side_insights(
+        league_id=league_id,
+        season_int=season_int,
+        team_id=away_team_id,
+        last_n=last_n,
+    )
+
     return {
         "league_id": league_id,
         "season": season_int,
-        "comp": selected_comp,
-        "last_n": selected_last_n,
-
-        "filters": {
-            "comp": {
-                "options": comp_options,
-                "selected": selected_comp
-            },
-            "last_n": {
-                "options": lastn_options,
-                "selected": selected_last_n
-            }
-        },
-
+        "last_n": last_n,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
-
-        "home": home_block,
-        "away": away_block
+        "home": home_ins,
+        "away": away_ins,
     }
