@@ -376,24 +376,56 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         header_filters=filters_block,
     )
 
-    # ───────── UI에서 쓸 필터 옵션 리스트 구성 ─────────
-    # (지금은 일단 정적인 옵션 + 선택값만 내려주고,
-    #  나중에 필요하면 comp_options 를 동적으로 확장하면 됨)
+    # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
 
-    # 선택된 라벨 (없으면 기본값)
-    comp_label = (filters_block.get("comp") or "All").strip() or "All"
-    last_n_label = (filters_block.get("last_n") or "Last 10").strip() or "Last 10"
-
-    # Competition 옵션 (기본: All / League)
+    # 1) comp 옵션 동적 생성
     comp_options: List[str] = ["All", "League"]
-    if comp_label not in comp_options:
-        # 서버에서 기본값이 아닌 다른 값이 들어온 경우 옵션에 추가
-        comp_options = comp_options + [comp_label]
 
-    # Last N 옵션 (기본: Last 3/5/7/10)
+    # 개별 league 목록 추가
+    league_name_map = { lid: name for lid, name in name_pairs }
+
+    # Cup / UEFA / ACL 자동 추가
+    if cup_ids:
+        comp_options.append("Cup")
+    if uefa_ids:
+        comp_options.append("UEFA")
+    if acl_ids:
+        comp_options.append("ACL")
+
+    # 개별 대회명 옵션으로 추가
+    for lid, name in name_pairs:
+        clean_name = name.strip()
+        if clean_name not in comp_options:
+            comp_options.append(clean_name)
+
+    # 현재 선택된 comp 라벨
+    comp_label = (filters_block.get("comp") or "All").strip() or "All"
+    if comp_label not in comp_options:
+        comp_options.insert(0, comp_label)
+
+    # 2) last_n 옵션 동적 생성
     last_n_options: List[str] = ["Last 3", "Last 5", "Last 7", "Last 10"]
+
+    # 시즌 목록 → Season YYYY
+    season_rows = fetch_all(
+        """
+        SELECT DISTINCT season
+        FROM matches
+        WHERE home_id = %s OR away_id = %s
+        ORDER BY season DESC
+        """,
+        (home_team_id, home_team_id),
+    )
+    for r in season_rows:
+        s = r.get("season")
+        if s:
+            label = f"Season {s}"
+            if label not in last_n_options:
+                last_n_options.append(label)
+
+    last_n_label = (filters_block.get("last_n") or "Last 10").strip()
     if last_n_label not in last_n_options:
-        last_n_options.append(last_n_label)
+        last_n_options.insert(0, last_n_label)
 
     filters_for_client: Dict[str, Any] = {
         "comp": {
@@ -405,6 +437,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
             "selected": last_n_label,
         },
     }
+
 
     return {
         "league_id": league_id,
