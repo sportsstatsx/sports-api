@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from matchdetail.bundle_service import get_match_detail_bundle  # ← 여기!
+from matchdetail.bundle_service import get_match_detail_bundle
 
 matchdetail_bp = Blueprint("matchdetail", __name__)
 
@@ -12,11 +12,17 @@ def match_detail_bundle():
       - fixture_id (int, 필수)
       - league_id  (int, 필수)
       - season     (int, 필수)
+      - comp       (string, 선택)   ← 추가됨
+      - last_n     (string, 선택)   ← 추가됨
     """
     try:
         fixture_id = request.args.get("fixture_id", type=int)
         league_id = request.args.get("league_id", type=int)
         season = request.args.get("season", type=int)
+
+        # 🔥 새로 추가된 필터
+        comp = request.args.get("comp")     # e.g. "League", "Cup", "All"
+        last_n = request.args.get("last_n") # e.g. "Last 5", "Last 10"
 
         if fixture_id is None or league_id is None or season is None:
             return (
@@ -29,10 +35,13 @@ def match_detail_bundle():
                 400,
             )
 
+        # 🔥 필터를 bundle_service로 전달해야 함
         bundle = get_match_detail_bundle(
             fixture_id=fixture_id,
             league_id=league_id,
             season=season,
+            comp=comp,
+            last_n=last_n,
         )
 
         if not bundle:
