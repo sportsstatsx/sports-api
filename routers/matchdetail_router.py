@@ -1,44 +1,67 @@
-# ==============================================================
-# matchdetail_router.py (Flask 버전 + comp/last_n 지원)
-# ==============================================================
-
 from flask import Blueprint, request, jsonify
-from services.bundle_service import build_match_detail_bundle
+from matchdetail.bundle_service import get_match_detail_bundle  # ← 원래 구조 그대로
 
 matchdetail_bp = Blueprint("matchdetail", __name__)
 
 
-@matchdetail_bp.route("/match_detail_bundle", methods=["GET"])
+@matchdetail_bp.route("/api/match_detail_bundle", methods=["GET"])
 def match_detail_bundle():
     """
-    Flask A방식:
-      /api/match_detail_bundle?fixture_id=xxx&league_id=xxx&season=2025
-                              &comp=League&last_n=Last%205
+    매치디테일 화면에서 한 번만 호출하는 번들 엔드포인트.
+    Query:
+      - fixture_id (int, 필수)
+      - league_id  (int, 필수)
+      - season     (int, 필수)
+      - comp       (str, 선택)   ← 지금은 읽기만 하고, 서버 계산에는 아직 안씀
+      - last_n     (str, 선택)   ← 마찬가지
     """
-    fixture_id = request.args.get("fixture_id")
-    league_id = request.args.get("league_id")
-    season = request.args.get("season")
-
-    # 🔥 신규 필터
-    comp = request.args.get("comp", "All")
-    last_n = request.args.get("last_n", "Last 10")
-
-    if not fixture_id or not league_id or not season:
-        return jsonify({"ok": False, "error": "fixture_id / league_id / season required"})
-
     try:
-        fixture_id_int = int(fixture_id)
-        league_id_int = int(league_id)
-        season_int = int(season)
-    except:
-        return jsonify({"ok": False, "error": "Invalid fixture_id/league_id/season"})
+        fixture_id_raw = request.args.get("fixture_id")
+        league_id_raw = request.args.get("league_id")
+        season_raw = request.args.get("season")
 
-    data = build_match_detail_bundle(
-        fixture_id=fixture_id_int,
-        league_id=league_id_int,
-        season_int=season_int,
-        comp=comp,
-        last_n=last_n
-    )
+        if not fixture_id_raw or not league_id_raw or not season_raw:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "fixture_id, league_id, season are required",
+                    }
+                ),
+                400,
+            )
 
-    return jsonify({"ok": True, "data": data})
+        try:
+            fixture_id = int(fixture_id_raw)
+            league_id = int(league_id_raw)
+            season = int(season_raw)
+        except ValueError:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "Invalid fixture_id/league_id/season",
+                    }
+                ),
+                400,
+            )
+
+        # 🔥 나중에 쓸 comp / last_n (지금은 읽기만 하고 무시)
+        comp = request.args.get("comp")     # e.g. "All", "League", "UCL" ...
+        last_n = request.args.get("last_n") # e.g. "Last 5", "2024" ...
+
+        # 현재 get_match_detail_bundle 시그니처는
+        # fixture_id / league_id / season 만 받으니까 일단 그대로 유지
+        bundle = get_match_detail_bundle(
+            fixture_id=fixture_id,
+            league_id=league_id,
+            season=season,
+        )
+
+        if not bundle:
+            return jsonify({"ok": False, "error": "Match not found"}), 404
+
+        return jsonify({"ok": True, "data": bundle})
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
