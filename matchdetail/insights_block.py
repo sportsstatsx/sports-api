@@ -350,13 +350,15 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
-    # 선택된 last_n (라벨 → 숫자) 파싱
+    # 선택된 last_n (라벨 → 숫자) 파싱 → 실제 계산용
     last_n = _get_last_n_from_header(header)
 
     # 헤더의 필터 블록 (라벨 그대로, comp / last_n 문자열 등)
     filters_block = _get_filters_from_header(header)
     comp_raw = filters_block.get("comp")
 
+    # 🔥 여기에서 comp + last_n 교집합 기준으로
+    #    home / away 둘 다 같은 샘플을 쓰도록 이미 구현되어 있음
     home_ins = _build_side_insights(
         league_id=league_id,
         season_int=season_int,
@@ -374,13 +376,46 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         header_filters=filters_block,
     )
 
+    # ───────── UI에서 쓸 필터 옵션 리스트 구성 ─────────
+    # (지금은 일단 정적인 옵션 + 선택값만 내려주고,
+    #  나중에 필요하면 comp_options 를 동적으로 확장하면 됨)
+
+    # 선택된 라벨 (없으면 기본값)
+    comp_label = (filters_block.get("comp") or "All").strip() or "All"
+    last_n_label = (filters_block.get("last_n") or "Last 10").strip() or "Last 10"
+
+    # Competition 옵션 (기본: All / League)
+    comp_options: List[str] = ["All", "League"]
+    if comp_label not in comp_options:
+        # 서버에서 기본값이 아닌 다른 값이 들어온 경우 옵션에 추가
+        comp_options = comp_options + [comp_label]
+
+    # Last N 옵션 (기본: Last 3/5/7/10)
+    last_n_options: List[str] = ["Last 3", "Last 5", "Last 7", "Last 10"]
+    if last_n_label not in last_n_options:
+        last_n_options.append(last_n_label)
+
+    filters_for_client: Dict[str, Any] = {
+        "comp": {
+            "options": comp_options,
+            "selected": comp_label,
+        },
+        "last_n": {
+            "options": last_n_options,
+            "selected": last_n_label,
+        },
+    }
+
     return {
         "league_id": league_id,
         "season": season_int,
-        "last_n": last_n,
+        "last_n": last_n,  # 숫자형 (실제 샘플 계산용)
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
-        "filters": filters_block,  # 선택된 comp / last_n 라벨 그대로
+        # 🔥 여기부터는 앱 UI용 필터 메타
+        "filters": filters_for_client,
+        # 실제 섹션 데이터
         "home": home_ins,
         "away": away_ins,
     }
+
