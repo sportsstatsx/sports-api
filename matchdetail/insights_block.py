@@ -21,16 +21,24 @@ def _get_meta_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
     """
     header 블록에서 league_id / season / home_team_id / away_team_id 추출.
     값이 없으면 None.
+    (⚠️ 현재 header 구조:
+        - league_id, season 은 top-level
+        - home.id / away.id 에 팀 ID 가 들어있음)
     """
     league_id = header.get("league_id")
     season = header.get("season")
-    home_team_id = header.get("home_team_id")
-    away_team_id = header.get("away_team_id")
 
-    league_id_int = None
-    season_int = None
-    home_id_int = None
-    away_id_int = None
+    # 팀 ID는 중첩 구조 안에 있음
+    home = header.get("home") or {}
+    away = header.get("away") or {}
+
+    home_team_id = home.get("id")
+    away_team_id = away.get("id")
+
+    league_id_int: Optional[int] = None
+    season_int: Optional[int] = None
+    home_id_int: Optional[int] = None
+    away_id_int: Optional[int] = None
 
     try:
         if league_id is not None:
@@ -189,7 +197,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     home_team_id = meta["home_team_id"]
     away_team_id = meta["away_team_id"]
 
-    # 값 못 찾으면 None
+    # 필수 값 없으면 None
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
