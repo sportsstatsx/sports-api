@@ -639,42 +639,60 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
-    # 선택된 last_n (라벨 → 숫자) 파싱
+    # 1) 선택된 last_n (라벨 → 숫자) 파싱
     last_n = _get_last_n_from_header(header)
 
-    # 헤더의 필터 블록 (라벨 그대로, comp / last_n 문자열 등)
+    # 2) 헤더의 필터 블록 (라벨 그대로, comp / last_n 문자열 등)
     filters_block = _get_filters_from_header(header)
     comp_raw = filters_block.get("comp")
 
-    # 🔥 여기에서 comp + last_n 교집합 기준으로
-    #    home / away 둘 다 같은 샘플을 쓰도록 이미 구현되어 있음
+    # 3) Season YYYY 라벨이면 시즌을 바꾸고 last_n 은 0(전체 시즌)으로 사용
+    season_for_calc = season_int
+    last_n_for_calc = last_n
+
+    raw_last_n_label = filters_block.get("last_n") or header.get("last_n")
+    if isinstance(raw_last_n_label, str):
+        s = raw_last_n_label.strip()
+        lower = s.lower()
+        if lower.startswith("season"):
+            # 예: "Season 2024" → 2024
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits:
+                try:
+                    season_override = int(digits)
+                    season_for_calc = season_override
+                    last_n_for_calc = 0  # 전체 시즌 모드
+                except ValueError:
+                    pass
+
+    # ───────── 홈 / 어웨이 인사이트 계산 ─────────
     home_ins = _build_side_insights(
         league_id=league_id,
-        season_int=season_int,
+        season_int=season_for_calc,
         team_id=home_team_id,
-        last_n=last_n,
+        last_n=last_n_for_calc,
         comp_raw=comp_raw,
         header_filters=filters_block,
     )
     away_ins = _build_side_insights(
         league_id=league_id,
-        season_int=season_int,
+        season_int=season_for_calc,
         team_id=away_team_id,
-        last_n=last_n,
+        last_n=last_n_for_calc,
         comp_raw=comp_raw,
         header_filters=filters_block,
     )
 
     # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
-    # 1) 팀별 comp 옵션
+    # 1) 팀별 comp 옵션  → 시즌 기준은 season_for_calc 사용
     comp_opts_home = _build_comp_options_for_team(
         league_id=league_id,
-        season_int=season_int,
+        season_int=season_for_calc,
         team_id=home_team_id,
     )
     comp_opts_away = _build_comp_options_for_team(
         league_id=league_id,
-        season_int=season_int,
+        season_int=season_for_calc,
         team_id=away_team_id,
     )
 
@@ -718,7 +736,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
             "options": comp_options_union,
             "selected": comp_label,
         },
-        # 🔥 새로 추가: 팀별 comp 옵션
+        # 팀별 comp 옵션
         "comp_home": {
             "options": comp_opts_home,
             "selected": comp_label_home,
@@ -735,13 +753,13 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
 
     return {
         "league_id": league_id,
-        "season": season_int,
-        "last_n": last_n,  # 숫자형 (실제 샘플 계산용)
+        # 🔥 실제 계산에 사용된 시즌 / last_n 을 내려준다.
+        "season": season_for_calc,
+        "last_n": last_n_for_calc,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
-        # 🔥 여기부터는 앱 UI용 필터 메타
         "filters": filters_for_client,
-        # 실제 섹션 데이터
         "home": home_ins,
         "away": away_ins,
     }
+
