@@ -532,9 +532,36 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     if not comp_options:
         comp_options = ["All", "League"]
 
+    # 🔥 여기서 중복/불필요 그룹 라벨 정리
+    GROUP_LABELS = {"League", "Cup", "Europe (UEFA)", "Continental"}
+
+    # 1) 그룹 라벨 제거 + 중복 제거
+    filtered: List[str] = []
+    for opt in comp_options:
+        if opt in GROUP_LABELS:
+            continue
+        if opt not in filtered:
+            filtered.append(opt)
+
+    # 2) All 을 항상 맨 앞에 두기
+    if "All" in filtered:
+        filtered.remove("All")
+    filtered.insert(0, "All")
+
+    comp_options = filtered
+
     comp_label = (filters_block.get("comp") or "All").strip() or "All"
+
+    # 3) 현재 선택값이 그룹 라벨이면 All 로 폴백
+    if comp_label in GROUP_LABELS:
+        comp_label = "All"
+
+    # 4) comp_label 이 옵션 리스트에 없으면 All 다음에 추가
     if comp_label not in comp_options:
-        comp_options.insert(0, comp_label)
+        if comp_label == "All":
+            comp_options.insert(0, comp_label)
+        else:
+            comp_options.insert(1, comp_label)
 
     last_n_options = _build_last_n_options_for_match(
         home_team_id=home_team_id,
