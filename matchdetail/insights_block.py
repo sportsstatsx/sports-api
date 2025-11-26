@@ -1,3 +1,5 @@
+# matchdetail/insights_block.py
+
 from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
@@ -517,6 +519,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     )
 
     # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
+    # 1) 팀별 comp 옵션
     comp_opts_home = _build_comp_options_for_team(
         league_id=league_id,
         season_int=season_int,
@@ -528,55 +531,54 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         team_id=away_team_id,
     )
 
-    GROUP_LABELS = {"League", "Cup", "Europe (UEFA)", "Continental"}
+    # 두 팀 합친(옛날과 동일한) 전체 리스트
+    comp_options_union = _merge_options(comp_opts_home, comp_opts_away)
+    if not comp_options_union:
+        comp_options_union = ["All", "League"]
 
-    # 각 팀별 "실제 대회 이름"만 추출 (All / 그룹 라벨 제외)
-    names_home = [
-        opt for opt in comp_opts_home
-        if opt not in GROUP_LABELS and opt != "All"
-    ]
-    names_away = [
-        opt for opt in comp_opts_away
-        if opt not in GROUP_LABELS and opt != "All"
-    ]
+    # 팀별 리스트가 비어 있으면 최소 기본값은 보장
+    if not comp_opts_home:
+        comp_opts_home = ["All", "League"]
+    if not comp_opts_away:
+        comp_opts_away = ["All", "League"]
 
-    # ✅ 양 팀 중 한 팀이라도 뛴 대회(합집합)를 사용
-    all_names = sorted(set(names_home) | set(names_away))
+    # 현재 선택된 comp 라벨
+    comp_label_raw = filters_block.get("comp") or "All"
+    comp_label = str(comp_label_raw).strip() or "All"
 
-    # 혹시라도 아무 것도 없으면 최소 Premier League 같은 기본값이라도 나오도록
-    if not all_names:
-        # 그래도 완전 비어 있지는 않게, home 쪽 기준으로 한 번 더 폴백
-        all_names = sorted(set(names_home or names_away))
+    def _pick_selected(options: List[str]) -> str:
+        if comp_label in options:
+            return comp_label
+        return options[0] if options else "All"
 
-    # 최종 comp 옵션: All + 실제 대회 이름들
-    comp_options = ["All"] + all_names
+    comp_label_home = _pick_selected(comp_opts_home)
+    comp_label_away = _pick_selected(comp_opts_away)
 
-    comp_label = (filters_block.get("comp") or "All").strip() or "All"
-
-    # 이전에 League / Cup / Europe (UEFA) 같은 그룹이 선택돼 있었다면 All 로 폴백
-    if comp_label in GROUP_LABELS:
-        comp_label = "All"
-
-    # comp_label 이 옵션 리스트에 없으면 All 다음에 추가
-    if comp_label not in comp_options:
-        if comp_label == "All":
-            pass  # 이미 맨 앞
-        else:
-            comp_options.insert(1, comp_label)
-
-    # last_n 옵션은 기존 로직 그대로
+    # 2) last_n 옵션 (두 팀 시즌 정보를 기반으로)
     last_n_options = _build_last_n_options_for_match(
         home_team_id=home_team_id,
         away_team_id=away_team_id,
     )
-    last_n_label = (filters_block.get("last_n") or "Last 10").strip() or "Last 10"
+
+    last_n_label_raw = filters_block.get("last_n") or "Last 10"
+    last_n_label = str(last_n_label_raw).strip() or "Last 10"
     if last_n_label not in last_n_options:
         last_n_options.insert(0, last_n_label)
 
     filters_for_client: Dict[str, Any] = {
+        # 예전과 동일한 전체 comp 옵션 (두 팀 합친 집합)
         "comp": {
-            "options": comp_options,
+            "options": comp_options_union,
             "selected": comp_label,
+        },
+        # 🔥 새로 추가: 팀별 comp 옵션
+        "comp_home": {
+            "options": comp_opts_home,
+            "selected": comp_label_home,
+        },
+        "comp_away": {
+            "options": comp_opts_away,
+            "selected": comp_label_away,
         },
         "last_n": {
             "options": last_n_options,
