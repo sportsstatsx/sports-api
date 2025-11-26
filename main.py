@@ -290,4 +290,17 @@ def list_fixtures():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
 
+import traceback
+import sys
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # 콘솔에 Traceback 강제 출력
+    print("=== SERVER EXCEPTION ===", file=sys.stderr)
+    traceback.print_exc()
+    print("=== END EXCEPTION ===", file=sys.stderr)
+
+    # 기존 응답 유지
+    return jsonify({"error": str(e)}), 500
+
 
