@@ -295,6 +295,11 @@ def enrich_overall_outcome_totals(
         "home": fmt_pct(draw_h, eff_home),
         "away": fmt_pct(draw_a, eff_away),
     }
+    insights["loss_pct"] = {
+        "total": fmt_pct(loss_t, eff_tot),
+        "home": fmt_pct(loss_h, eff_home),
+        "away": fmt_pct(loss_a, eff_away),
+    }
     insights["btts_pct"] = {
         "total": fmt_pct(btts_t, eff_tot),
         "home": fmt_pct(btts_h, eff_home),
