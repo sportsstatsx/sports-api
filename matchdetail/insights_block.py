@@ -98,9 +98,13 @@ def _build_insights_filters_for_team(
     if season_int is None or team_id is None:
         return filters
 
-    # last_n == 0 이면 시즌 전체 모드 → 각 섹션에서 기본 리그 한 개만 사용하도록 둔다.
-    if not last_n or last_n <= 0:
-        return filters
+    # 🔥 변경점:
+    # 예전에는 last_n == 0 (Season 모드) 이면 바로 return 해서
+    # 각 섹션이 league_id 한 개만 보도록 만들었다.
+    # 이제는 Season 모드에서도 comp 필터 기준으로
+    # 이 팀이 뛴 모든 league_id 집합을 만들어서 사용한다.
+    # (last_n=0 은 "경기 수 자르지 않고 전체 시즌" 이라는 의미만 가지고,
+    #  사용 대회 범위는 comp_std / target_league_ids_last_n 으로 제어)
 
     comp_std = normalize_comp(comp_raw)
 
