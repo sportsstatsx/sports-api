@@ -1,7 +1,7 @@
 # services/insights/utils.py
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List, Optional
 
 
 # ─────────────────────────────────────
@@ -162,3 +162,56 @@ def parse_last_n(raw: Any) -> int:
         return n if n > 0 else 0
 
     return 0
+
+
+# ─────────────────────────────────────
+#  공통 league_ids_for_query 헬퍼
+#   - insights_filters.target_league_ids_last_n 를 우선 사용
+#   - 비어있으면 fallback_league_id 한 개 사용
+# ─────────────────────────────────────
+
+def build_league_ids_for_query(
+    stats: Any,
+    fallback_league_id: Optional[int],
+) -> List[int]:
+    """
+    insights_filters.target_league_ids_last_n 에 들어있는
+    리그 ID 리스트를 표준화해서 반환.
+
+    - target_league_ids_last_n 이 list/tuple 이고 비어있지 않으면 → 그 값들 정수화해서 사용
+    - 그렇지 않으면 fallback_league_id 가 있으면 [fallback_league_id]
+    - 최종적으로 항상 List[int] 반환
+    """
+    league_ids: List[int] = []
+
+    filters = stats.get("insights_filters") if isinstance(stats, dict) else None
+    target_ids = None
+    if isinstance(filters, dict):
+        target_ids = filters.get("target_league_ids_last_n")
+
+    # 1) target_league_ids_last_n 우선 사용
+    if isinstance(target_ids, (list, tuple)):
+        for v in target_ids:
+            try:
+                league_ids.append(int(v))
+            except (TypeError, ValueError):
+                continue
+        # 중복 제거 (순서 유지)
+        if league_ids:
+            seen = set()
+            deduped: List[int] = []
+            for lid in league_ids:
+                if lid in seen:
+                    continue
+                seen.add(lid)
+                deduped.append(lid)
+            league_ids = deduped
+
+    # 2) 폴백: 기본 league_id 한 개
+    if not league_ids and fallback_league_id is not None:
+        try:
+            league_ids = [int(fallback_league_id)]
+        except (TypeError, ValueError):
+            league_ids = []
+
+    return league_ids
