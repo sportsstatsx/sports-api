@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from db import fetch_all
-from .utils import fmt_pct, fmt_avg
+from .utils import fmt_pct, fmt_avg, build_league_ids_for_query
 
 
 def enrich_overall_outcome_totals(
@@ -44,27 +44,19 @@ def enrich_overall_outcome_totals(
     if season_int is None:
         return
 
-        # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
-    league_ids_for_query: list[Any]
-    filters = stats.get("insights_filters") if isinstance(stats, dict) else None
-    target_ids = None
-    if filters and isinstance(filters, dict):
-        target_ids = filters.get("target_league_ids_last_n")
+    # Competition 필터 + Last N 에서 사용할 league_id 집합 결정
+    #   - insights_block 쪽에서 이미 comp + last_n 조합에 맞춰
+    #     stats["insights_filters"]["target_league_ids_last_n"] 를 세팅해주고 있음
+    #   - 여기서는 last_n 이 0(Season 모드) 이더라도
+    #     항상 그 target_league_ids_last_n 를 우선 사용
+    league_ids_for_query = build_league_ids_for_query(
+        stats,
+        fallback_league_id=league_id,
+    )
 
-    if last_n and last_n > 0 and isinstance(target_ids, list):
-        league_ids_for_query = []
-        for v in target_ids:
-            try:
-                league_ids_for_query.append(int(v))
-            except (TypeError, ValueError):
-                continue
-        # 혹시라도 잘못된 값만 들어오면 베이스 리그 한 개로 폴백
-        if not league_ids_for_query:
-            league_ids_for_query = [league_id]
-    else:
-        # 시즌 전체(Last N 없음) 이거나 필터 정보가 없으면 기존처럼 베이스 리그만 사용
-        league_ids_for_query = [league_id]
-
+    if not league_ids_for_query:
+        # 리그 ID 를 전혀 못 구하면 아무 것도 하지 않음
+        return
 
     # ─────────────────────────────────────
     # 1) 샘플 매치 로딩 (시즌 전체 or 최근 N경기)
@@ -267,7 +259,6 @@ def enrich_overall_outcome_totals(
             else:
                 draw_btts_a += 1
 
-
     if mt_tot == 0:
         return
 
@@ -284,7 +275,6 @@ def enrich_overall_outcome_totals(
 
     eff_home = mh_tot or eff_tot
     eff_away = ma_tot or eff_tot
-
 
     # 4-1) 샘플 수(events_sample) 기록
     #      - 이미 다른 곳에서 유효한 값이 들어있으면 그대로 두고
@@ -383,7 +373,6 @@ def enrich_overall_outcome_totals(
         "home": diff_h,
         "away": diff_a,
     }
-
 
     # ─────────────────────────────────────
     # 7) 콤보 지표
