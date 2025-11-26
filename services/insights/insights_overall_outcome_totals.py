@@ -118,6 +118,8 @@ def enrich_overall_outcome_totals(
 
     win_o25_t = win_o25_h = win_o25_a = 0
     lose_btts_t = lose_btts_h = lose_btts_a = 0
+    win_btts_t = win_btts_h = win_btts_a = 0
+    draw_btts_t = draw_btts_h = draw_btts_a = 0
 
     cs_t = cs_h = cs_a = 0
     ng_t = ng_h = ng_a = 0
@@ -249,6 +251,23 @@ def enrich_overall_outcome_totals(
             else:
                 lose_btts_a += 1
 
+        # 🔹 Win & BTTS
+        if gf > ga and is_btts:
+            win_btts_t += 1
+            if is_home:
+                win_btts_h += 1
+            else:
+                win_btts_a += 1
+
+        # 🔹 Draw & BTTS
+        if gf == ga and is_btts:
+            draw_btts_t += 1
+            if is_home:
+                draw_btts_h += 1
+            else:
+                draw_btts_a += 1
+
+
     if mt_tot == 0:
         return
 
@@ -378,4 +397,14 @@ def enrich_overall_outcome_totals(
         "total": fmt_pct(lose_btts_t, eff_tot),
         "home": fmt_pct(lose_btts_h, eff_home),
         "away": fmt_pct(lose_btts_a, eff_away),
+    }
+    insights["win_and_btts_pct"] = {
+        "total": fmt_pct(win_btts_t, eff_tot),
+        "home": fmt_pct(win_btts_h, eff_home),
+        "away": fmt_pct(win_btts_a, eff_away),
+    }
+    insights["draw_and_btts_pct"] = {
+        "total": fmt_pct(draw_btts_t, eff_tot),
+        "home": fmt_pct(draw_btts_h, eff_home),
+        "away": fmt_pct(draw_btts_a, eff_away),
     }
