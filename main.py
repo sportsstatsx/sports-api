@@ -41,15 +41,6 @@ app.register_blueprint(home_bp)
 app.register_blueprint(matchdetail_bp)
 
 
-# ─────────────────────────────────────────
-# 에러 핸들러
-# ─────────────────────────────────────────
-@app.errorhandler(Exception)
-def handle_error(e):
-    if isinstance(e, HTTPException):
-        return jsonify({"ok": False, "error": e.description}), e.code
-    return jsonify({"ok": False, "error": str(e)}), 500
-
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -303,6 +294,7 @@ def handle_all_exceptions(e):
 
     # 그 외 예외는 500
     return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
