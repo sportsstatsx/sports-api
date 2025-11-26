@@ -540,15 +540,16 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         if opt not in GROUP_LABELS and opt != "All"
     ]
 
-    # 양 팀이 둘 다 뛴 대회(교집합)만 사용
-    common_names = sorted(set(names_home) & set(names_away))
+    # ✅ 양 팀 중 한 팀이라도 뛴 대회(합집합)를 사용
+    all_names = sorted(set(names_home) | set(names_away))
 
-    # 혹시라도 교집합이 완전히 비면, 최소한 합집합이라도 보여주기 (안전장치)
-    if not common_names:
-        common_names = sorted(set(names_home) | set(names_away))
+    # 혹시라도 아무 것도 없으면 최소 Premier League 같은 기본값이라도 나오도록
+    if not all_names:
+        # 그래도 완전 비어 있지는 않게, home 쪽 기준으로 한 번 더 폴백
+        all_names = sorted(set(names_home or names_away))
 
-    # 최종 comp 옵션: All + 공통 대회들
-    comp_options = ["All"] + common_names
+    # 최종 comp 옵션: All + 실제 대회 이름들
+    comp_options = ["All"] + all_names
 
     comp_label = (filters_block.get("comp") or "All").strip() or "All"
 
