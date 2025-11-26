@@ -1,4 +1,4 @@
-# services/matchdetail/form_block.py
+# matchdetail/form_block.py
 
 from typing import Any, Dict, List, Tuple
 
@@ -71,19 +71,22 @@ def _build_team_form(
         # 필수 정보가 없으면 빈 값 반환
         return [], 0, 0
 
-    # 해당 팀이 참가한 "종료된 경기" 중 가장 최근 경기들을 기준으로 폼 계산
+    # ✅ 이 팀이 참가한 "종료된 경기"들 중에서
+    #    가장 최근 경기들을 기준으로 폼 계산
     rows = fetch_all(
         """
         SELECT
             m.date_utc,
             m.home_id,
             m.away_id,
-            m.goals_home,
-            m.goals_away
+            m.home_ft,
+            m.away_ft,
+            m.status_group
         FROM matches m
         WHERE (m.home_id = %s OR m.away_id = %s)
-          AND m.goals_home IS NOT NULL
-          AND m.goals_away IS NOT NULL
+          AND m.status_group = 'FINISHED'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
         ORDER BY m.date_utc DESC
         LIMIT %s
         """,
@@ -95,8 +98,8 @@ def _build_team_form(
     goals_against = 0
 
     for r in rows:
-        gh = r.get("goals_home")
-        ga = r.get("goals_away")
+        gh = r.get("home_ft")
+        ga = r.get("away_ft")
 
         # 방어: 혹시라도 None 섞여 있으면 스킵
         if gh is None or ga is None:
@@ -156,7 +159,7 @@ def build_form_block(header: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "home_last5": home_last5,
-            "away_last5": away_last5,
+        "away_last5": away_last5,
         "home_goals_for": home_gf,
         "home_goals_against": home_ga,
         "away_goals_for": away_gf,
