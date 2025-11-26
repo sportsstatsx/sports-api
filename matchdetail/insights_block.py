@@ -340,12 +340,10 @@ def _build_comp_options_for_team(
     *, league_id: int, season_int: int, team_id: int
 ) -> List[str]:
     """
-    이 팀이 해당 시즌에 실제로 뛴 대회를 기준으로
-    Competition 드롭다운 옵션을 만든다.
-    (All / League / Cup / Europe (UEFA) / Continental + 개별 대회명)
-
-    ⚠ Europe (UEFA)는 서로 다른 UEFA 대회가 2개 이상 있을 때만 추가해서
-      UEFA Europa League 같은 단일 대회와의 중복을 줄인다.
+    이 팀이 해당 시즌에 실제로 뛴 Competition 옵션 생성.
+    
+    - 리그: "League" 제거 → 실제 리그 이름 1개만 포함
+    - 컵 / UEFA / ACL: 개별 대회명 + 그룹 라벨 조건부 추가
     """
     if season_int is None or team_id is None:
         return []
@@ -366,58 +364,63 @@ def _build_comp_options_for_team(
     if not rows:
         return []
 
-    comp_options: List[str] = ["All", "League"]
+    comp_options: List[str] = ["All"]
 
-    has_cup = False
-    has_acl = False
+    league_name_for_team: Optional[str] = None
 
-    league_names: List[str] = []
-    uefa_comp_names: List[str] = []  # ← UEFA 대회 이름들만 따로 모음
+    cup_names = []
+    uefa_names = []
+    acl_names = []
 
     for r in rows:
         name = (r.get("league_name") or "").strip()
         if not name:
             continue
-        league_names.append(name)
         lower = name.lower()
 
-        # Cup 계열
-        if (
-            "cup" in lower
-            or "copa" in lower
-            or "컵" in lower
-            or "taça" in lower
-            or "杯" in lower
-        ):
-            has_cup = True
+        # 리그 이름 저장 (League 문구 대신 실제 리그명만)
+        if league_name_for_team is None:
+            league_name_for_team = name
 
-        # UEFA 계열 대회 (챔스/유로파/컨퍼런스 등)
-        if (
-            "uefa" in lower
-            or "champions league" in lower
-            or "europa league" in lower
-            or "conference league" in lower
-        ):
-            uefa_comp_names.append(name)
+        # 컵 계열
+        if ("cup" in lower or "copa" in lower or "컵" in lower or
+            "taça" in lower or "杯" in lower):
+            cup_names.append(name)
 
-        # ACL / AFC 챔피언스리그 계열
-        if "afc" in lower or "acl" in lower or "afc champions league" in lower:
-            has_acl = True
+        # UEFA 계열
+        if ("uefa" in lower or "champions league" in lower or
+            "europa league" in lower or "conference league" in lower):
+            uefa_names.append(name)
 
-    if has_cup and "Cup" not in comp_options:
+        # ACL 계열
+        if ("afc" in lower or "acl" in lower or "afc champions league" in lower):
+            acl_names.append(name)
+
+    # 리그 추가 (League 고정 문구 대신 실제 리그 이름)
+    if league_name_for_team and league_name_for_team not in comp_options:
+        comp_options.append(league_name_for_team)
+
+    # 컵: 개별 컵 이름 + 필요한 경우 "Cup"
+    if cup_names:
         comp_options.append("Cup")
+        for n in cup_names:
+            if n not in comp_options:
+                comp_options.append(n)
 
-    # 🔥 서로 다른 UEFA 대회가 2개 이상 있을 때만 Europe (UEFA) 추가
-    if len(set(uefa_comp_names)) >= 2 and "Europe (UEFA)" not in comp_options:
-        comp_options.append("Europe (UEFA)")
+    # UEFA: 개별 대회 + Europe (UEFA)
+    if uefa_names:
+        if len(set(uefa_names)) >= 2:
+            comp_options.append("Europe (UEFA)")
+        for n in uefa_names:
+            if n not in comp_options:
+                comp_options.append(n)
 
-    if has_acl and "Continental" not in comp_options:
+    # ACL: 개별 + Continental
+    if acl_names:
         comp_options.append("Continental")
-
-    # 개별 대회명 추가 (UEFA 포함해서 모두)
-    for name in league_names:
-        if name not in comp_options:
-            comp_options.append(name)
+        for n in acl_names:
+            if n not in comp_options:
+                comp_options.append(n)
 
     return comp_options
 
