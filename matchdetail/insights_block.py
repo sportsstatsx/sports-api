@@ -343,6 +343,9 @@ def _build_comp_options_for_team(
     이 팀이 해당 시즌에 실제로 뛴 대회를 기준으로
     Competition 드롭다운 옵션을 만든다.
     (All / League / Cup / Europe (UEFA) / Continental + 개별 대회명)
+
+    ⚠ Europe (UEFA)는 서로 다른 UEFA 대회가 2개 이상 있을 때만 추가해서
+      UEFA Europa League 같은 단일 대회와의 중복을 줄인다.
     """
     if season_int is None or team_id is None:
         return []
@@ -366,9 +369,10 @@ def _build_comp_options_for_team(
     comp_options: List[str] = ["All", "League"]
 
     has_cup = False
-    has_uefa = False
     has_acl = False
+
     league_names: List[str] = []
+    uefa_comp_names: List[str] = []  # ← UEFA 대회 이름들만 따로 모음
 
     for r in rows:
         name = (r.get("league_name") or "").strip()
@@ -377,6 +381,7 @@ def _build_comp_options_for_team(
         league_names.append(name)
         lower = name.lower()
 
+        # Cup 계열
         if (
             "cup" in lower
             or "copa" in lower
@@ -386,25 +391,30 @@ def _build_comp_options_for_team(
         ):
             has_cup = True
 
+        # UEFA 계열 대회 (챔스/유로파/컨퍼런스 등)
         if (
             "uefa" in lower
             or "champions league" in lower
             or "europa league" in lower
             or "conference league" in lower
         ):
-            has_uefa = True
+            uefa_comp_names.append(name)
 
+        # ACL / AFC 챔피언스리그 계열
         if "afc" in lower or "acl" in lower or "afc champions league" in lower:
             has_acl = True
 
     if has_cup and "Cup" not in comp_options:
         comp_options.append("Cup")
-    if has_uefa and "Europe (UEFA)" not in comp_options:
+
+    # 🔥 서로 다른 UEFA 대회가 2개 이상 있을 때만 Europe (UEFA) 추가
+    if len(set(uefa_comp_names)) >= 2 and "Europe (UEFA)" not in comp_options:
         comp_options.append("Europe (UEFA)")
+
     if has_acl and "Continental" not in comp_options:
         comp_options.append("Continental")
 
-    # 개별 대회명 추가
+    # 개별 대회명 추가 (UEFA 포함해서 모두)
     for name in league_names:
         if name not in comp_options:
             comp_options.append(name)
