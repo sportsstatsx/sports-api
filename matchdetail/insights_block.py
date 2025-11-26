@@ -98,14 +98,11 @@ def _build_insights_filters_for_team(
     if season_int is None or team_id is None:
         return filters
 
-    # 🔥 변경점:
-    # 예전에는 last_n == 0 (Season 모드) 이면 바로 return 해서
-    # 각 섹션이 league_id 한 개만 보도록 만들었다.
-    # 이제는 Season 모드에서도 comp 필터 기준으로
-    # 이 팀이 뛴 모든 league_id 집합을 만들어서 사용한다.
-    # (last_n=0 은 "경기 수 자르지 않고 전체 시즌" 이라는 의미만 가지고,
-    #  사용 대회 범위는 comp_std / target_league_ids_last_n 으로 제어)
-
+    # 🔥 중요:
+    #   last_n == 0 (Season 2025 같은 시즌 모드) 여도 여기서는
+    #   "이 팀이 그 시즌에 뛴 league_id 집합"을 반드시 만든다.
+    #   - last_n 은 나중에 경기 수 자를 때만 쓰고
+    #   - 어떤 대회들을 포함할지는 comp_std / target_league_ids_last_n 로 제어한다.
     comp_std = normalize_comp(comp_raw)
 
     # 이 팀이 해당 시즌에 실제로 뛴 경기들의 league_id 목록 + league 이름 로딩
@@ -124,6 +121,9 @@ def _build_insights_filters_for_team(
     )
 
     if not rows:
+        # 그래도 comp / last_n 정보는 채워서 내려주자
+        filters["comp_std"] = comp_std
+        filters["last_n_int"] = int(last_n)
         return filters
 
     all_ids: List[int] = []
@@ -157,7 +157,7 @@ def _build_insights_filters_for_team(
         ):
             cup_ids.append(lid_int)
 
-        # UEFA 계열 대회 (챔스/유로파/컨퍼런스 등)
+        # UEFA 계열 (UCL, UEL, UECL 등)
         if (
             "uefa" in lower
             or "champions league" in lower
@@ -201,9 +201,8 @@ def _build_insights_filters_for_team(
     else:
         # 개별 대회 이름: 먼저 완전 일치, 없으면 부분 일치로 검색
         target_ids = []
-        comp_lower = str(comp_std).strip().lower()
+        comp_lower = (comp_raw or "").strip().lower()
 
-        # 완전 일치
         for lid_int, name in name_pairs:
             if name.lower() == comp_lower:
                 target_ids.append(lid_int)
@@ -233,6 +232,7 @@ def _build_insights_filters_for_team(
     filters["last_n_int"] = int(last_n)
 
     return filters
+
 
 
 # ─────────────────────────────────────
