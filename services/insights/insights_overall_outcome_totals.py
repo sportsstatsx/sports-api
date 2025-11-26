@@ -338,6 +338,18 @@ def enrich_overall_outcome_totals(
     gf_avg_a = fmt_avg(gf_sum_a, ma_tot)
     ga_avg_a = fmt_avg(ga_sum_a, ma_tot)
 
+    # 🔥 새로 추가: AVG GF / AVG GA (total / home / away)
+    insights["avg_gf"] = {
+        "total": gf_avg_t,
+        "home": gf_avg_h,
+        "away": gf_avg_a,
+    }
+    insights["avg_ga"] = {
+        "total": ga_avg_t,
+        "home": ga_avg_h,
+        "away": ga_avg_a,
+    }
+
     diff_t = round(gf_avg_t - ga_avg_t, 2)
     diff_h = round(gf_avg_h - ga_avg_h, 2)
     diff_a = round(gf_avg_a - ga_avg_a, 2)
@@ -347,6 +359,7 @@ def enrich_overall_outcome_totals(
         "home": diff_h,
         "away": diff_a,
     }
+
 
     # ─────────────────────────────────────
     # 7) 콤보 지표
