@@ -341,9 +341,9 @@ def _build_comp_options_for_team(
 ) -> List[str]:
     """
     이 팀이 해당 시즌에 실제로 뛴 Competition 옵션 생성.
-    
-    - 리그: "League" 제거 → 실제 리그 이름 1개만 포함
-    - 컵 / UEFA / ACL: 개별 대회명 + 그룹 라벨 조건부 추가
+
+    - 리그: 현재 경기 league_id 에 해당하는 리그 이름 1개만 추가
+    - 컵 / UEFA / ACL: 개별 대회명 + 조건부 그룹 라벨(Cup / Europe (UEFA) / Continental)
     """
     if season_int is None or team_id is None:
         return []
@@ -366,61 +366,96 @@ def _build_comp_options_for_team(
 
     comp_options: List[str] = ["All"]
 
-    league_name_for_team: Optional[str] = None
+    # 리그 / 컵 / UEFA / ACL 를 분리해서 모아두기
+    league_names: List[str] = []
+    league_name_by_id: Dict[int, str] = {}
 
-    cup_names = []
-    uefa_names = []
-    acl_names = []
+    cup_names: List[str] = []
+    uefa_names: List[str] = []
+    acl_names: List[str] = []
 
     for r in rows:
+        lid = r.get("league_id")
         name = (r.get("league_name") or "").strip()
-        if not name:
+        if not name or lid is None:
             continue
+        try:
+            lid_int = int(lid)
+        except (TypeError, ValueError):
+            continue
+
         lower = name.lower()
 
-        # 리그 이름 저장 (League 문구 대신 실제 리그명만)
-        if league_name_for_team is None:
-            league_name_for_team = name
+        is_cup = (
+            "cup" in lower
+            or "copa" in lower
+            or "컵" in lower
+            or "taça" in lower
+            or "杯" in lower
+        )
+        is_uefa = (
+            "uefa" in lower
+            or "champions league" in lower
+            or "europa league" in lower
+            or "conference league" in lower
+        )
+        is_acl = (
+            "afc" in lower
+            or "acl" in lower
+            or "afc champions league" in lower
+        )
 
-        # 컵 계열
-        if ("cup" in lower or "copa" in lower or "컵" in lower or
-            "taça" in lower or "杯" in lower):
+        # 리그(국내 대회) 후보
+        if not (is_cup or is_uefa or is_acl):
+            league_names.append(name)
+            league_name_by_id[lid_int] = name
+
+        # 컵 / UEFA / ACL 후보 목록
+        if is_cup:
             cup_names.append(name)
-
-        # UEFA 계열
-        if ("uefa" in lower or "champions league" in lower or
-            "europa league" in lower or "conference league" in lower):
+        if is_uefa:
             uefa_names.append(name)
-
-        # ACL 계열
-        if ("afc" in lower or "acl" in lower or "afc champions league" in lower):
+        if is_acl:
             acl_names.append(name)
 
-    # 리그 추가 (League 고정 문구 대신 실제 리그 이름)
+    # ── 리그 이름 선택: 현재 match 의 league_id 를 최우선 ──
+    league_name_for_team: Optional[str] = None
+    try:
+        match_league_id = int(league_id)
+    except (TypeError, ValueError):
+        match_league_id = None
+
+    if match_league_id is not None and match_league_id in league_name_by_id:
+        league_name_for_team = league_name_by_id[match_league_id]
+    elif league_names:
+        league_name_for_team = league_names[0]
+
     if league_name_for_team and league_name_for_team not in comp_options:
         comp_options.append(league_name_for_team)
 
-    # 컵: 개별 컵 이름 + 필요한 경우 "Cup"
+    # 중복 없이 추가하는 헬퍼
+    def _append_unique(names: List[str]) -> None:
+        for n in names:
+            if n not in comp_options:
+                comp_options.append(n)
+
+    # 컵: "Cup" + 개별 컵 이름들
     if cup_names:
-        comp_options.append("Cup")
-        for n in cup_names:
-            if n not in comp_options:
-                comp_options.append(n)
+        if "Cup" not in comp_options:
+            comp_options.append("Cup")
+        _append_unique(sorted(set(cup_names)))
 
-    # UEFA: 개별 대회 + Europe (UEFA)
+    # UEFA: Europe (UEFA) + UCL/UEL/Conference 개별 이름
     if uefa_names:
-        if len(set(uefa_names)) >= 2:
+        if len(set(uefa_names)) >= 2 and "Europe (UEFA)" not in comp_options:
             comp_options.append("Europe (UEFA)")
-        for n in uefa_names:
-            if n not in comp_options:
-                comp_options.append(n)
+        _append_unique(sorted(set(uefa_names)))
 
-    # ACL: 개별 + Continental
+    # ACL: Continental + ACL 관련 대회명들
     if acl_names:
-        comp_options.append("Continental")
-        for n in acl_names:
-            if n not in comp_options:
-                comp_options.append(n)
+        if "Continental" not in comp_options:
+            comp_options.append("Continental")
+        _append_unique(sorted(set(acl_names)))
 
     return comp_options
 
