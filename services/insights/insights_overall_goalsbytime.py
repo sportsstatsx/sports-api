@@ -33,29 +33,24 @@ def enrich_overall_goals_by_time(
     if season_int is None:
         return
 
-    # ─────────────────────────────────────
-    # 0) Competition / Last N 에 따른 league_id 집합 결정
-    # ─────────────────────────────────────
-    league_ids_for_query: List[int]
+        # Competition / Last N에 따른 league_id 집합 결정
     filters = stats.get("insights_filters") if isinstance(stats, dict) else None
     target_ids = None
-    if filters and isinstance(filters, dict):
+    if isinstance(filters, dict):
         target_ids = filters.get("target_league_ids_last_n")
 
-    if last_n and last_n > 0 and isinstance(target_ids, list):
-        league_ids_for_query = []
+    league_ids_for_query: List[int] = []
+    if isinstance(target_ids, list):
         for v in target_ids:
             try:
                 league_ids_for_query.append(int(v))
             except (TypeError, ValueError):
-                # 잘못된 값은 건너뛴다.
                 continue
-        # 비어 있으면 안전하게 기본 리그만 사용
-        if not league_ids_for_query:
-            league_ids_for_query = [league_id]
-    else:
-        # 시즌 전체 모드 또는 필터 정보 없음 → 기본 리그만
+
+    # target이 비어있으면 현재 리그 한 개로 폴백
+    if not league_ids_for_query:
         league_ids_for_query = [league_id]
+
 
     # ─────────────────────────────────────
     # 1) Competition + Last N 기준으로 이 팀의 경기 목록(fixture_id) 뽑기
