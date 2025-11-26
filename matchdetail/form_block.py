@@ -17,11 +17,11 @@ def _extract_team_ids(header: Dict[str, Any]) -> Tuple[int, int]:
     header 구조가 약간 달라도 최대한 안전하게
     home / away 팀 ID 를 뽑아내기 위한 헬퍼.
     """
-    # 가장 단순한 형태: header["home_team_id"], header["away_team_id"]
+    # 1) 가장 단순한 형태: header["home_team_id"], header["away_team_id"]
     home_id = header.get("home_team_id")
     away_id = header.get("away_team_id")
 
-    # 혹시 header["home_team"]["id"] 형태일 수도 있어서 대비
+    # 2) 혹시 header["home_team"]["id"] 형태일 수도 있어서 대비
     if home_id is None:
         home_team = header.get("home_team") or {}
         home_id = home_team.get("id")
@@ -45,23 +45,18 @@ def _build_team_form(
       - goals_for:    최근 limit 경기 총 득점
       - goals_against:최근 limit 경기 총 실점
     """
-    league_id = _safe_int(header.get("league_id"))
-    season = _safe_int(header.get("season"))
-
     home_team_id, away_team_id = _extract_team_ids(header)
     if team_side == "home":
         team_id = home_team_id
     else:
         team_id = away_team_id
 
-    if league_id <= 0 or season <= 0 or team_id <= 0:
+    if team_id <= 0:
         # 필수 정보가 없으면 빈 값 반환
         return [], 0, 0
 
-    # matches 테이블에서 해당 리그/시즌/팀의 최근 경기들을 가져온다.
-    # 여기서는 status_short 같은 컬럼에 의존하지 않고,
-    # 득점/실점 컬럼(goals_home/goals_away)이 있는 경기만 사용해서
-    # '종료된 경기'로 간주한다.
+    # ✅ 리그/시즌 상관없이, 해당 팀이 참가한 "종료된 경기" 중
+    #    가장 최근 경기들을 기준으로 폼 계산
     rows = fetch_all(
         """
         SELECT
@@ -71,13 +66,13 @@ def _build_team_form(
             m.goals_home,
             m.goals_away
         FROM matches m
-        WHERE m.league_id = %s
-          AND m.season    = %s
-          AND (m.home_id = %s OR m.away_id = %s)
+        WHERE (m.home_id = %s OR m.away_id = %s)
+          AND m.goals_home IS NOT NULL
+          AND m.goals_away IS NOT NULL
         ORDER BY m.date_utc DESC
         LIMIT %s
         """,
-        (league_id, season, team_id, team_id, limit * 2),
+        (team_id, team_id, limit * 2),
     )
 
     last_results: List[str] = []
@@ -88,7 +83,7 @@ def _build_team_form(
         gh = r.get("goals_home")
         ga = r.get("goals_away")
 
-        # 골 정보가 없는(아직 안 끝난) 경기는 스킵
+        # 방어: 혹시라도 None 섞여 있으면 스킵
         if gh is None or ga is None:
             continue
 
@@ -103,7 +98,7 @@ def _build_team_form(
             gf = _safe_int(ga)
             ga_ = _safe_int(gh)
         else:
-            # 방어코드: 혹시라도 where 조건과 불일치하는 row 가 들어온 경우
+            # where 조건과 안 맞는 경우 방어적으로 스킵
             continue
 
         # W / D / L 결정
