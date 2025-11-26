@@ -57,6 +57,7 @@ def get_match_detail_bundle(
     # 🔥 여기서부터 comp + last_n 필터를 사용하는 insights 계산
     insights_overall = build_insights_overall_block(header)
 
+    # 🔥 insights_overall 를 이용한 AI Predictions 블록
     ai_predictions = build_ai_predictions_block(header, insights_overall)
 
     return {
