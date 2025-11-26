@@ -232,6 +232,90 @@ def _build_insights_filters_for_team(
 
 
 # ─────────────────────────────────────
+#  Game Sample 홈/원정 분포 계산
+# ─────────────────────────────────────
+def _compute_events_sample_home_away(
+    *,
+    season_int: Optional[int],
+    team_id: Optional[int],
+    league_id: Optional[int],
+    filters: Dict[str, Any],
+    events_sample: Optional[int],
+) -> Dict[str, Optional[int]]:
+    """
+    stats["insights_filters"]["target_league_ids_last_n"] 기준으로
+    해당 팀의 시즌 경기들 중 홈/원정 개수를 세고,
+    그 비율을 events_sample 에 맞게 스케일링해서
+    events_sample_home / events_sample_away 로 내려준다.
+    """
+    out: Dict[str, Optional[int]] = {
+        "events_sample_home": None,
+        "events_sample_away": None,
+    }
+
+    if not season_int or not team_id or not events_sample or events_sample <= 0:
+        return out
+
+    # comp 필터에서 사용하는 리그 집합
+    target_league_ids = filters.get("target_league_ids_last_n")
+
+    # 비어 있으면 현재 리그만이라도 사용
+    if not target_league_ids:
+        if league_id is not None:
+            try:
+                target_league_ids = [int(league_id)]
+            except (TypeError, ValueError):
+                target_league_ids = []
+        else:
+            target_league_ids = []
+
+    if not target_league_ids:
+        return out
+
+    placeholders = ", ".join(["%s"] * len(target_league_ids))
+    sql = f"""
+        SELECT home_id, away_id
+        FROM matches
+        WHERE season = %s
+          AND league_id IN ({placeholders})
+          AND (home_id = %s OR away_id = %s)
+    """
+
+    params: List[Any] = [season_int]
+    params.extend(target_league_ids)
+    params.extend([team_id, team_id])
+
+    rows = fetch_all(sql, tuple(params))
+
+    raw_home = 0
+    raw_away = 0
+    for r in rows:
+        hid = r.get("home_id")
+        aid = r.get("away_id")
+        if hid == team_id:
+            raw_home += 1
+        elif aid == team_id:
+            raw_away += 1
+
+    raw_total = raw_home + raw_away
+    if raw_total <= 0:
+        return out
+
+    total = int(events_sample)
+    # 비율 유지하면서 total 에 맞게 스케일링
+    factor = float(total) / float(raw_total)
+
+    est_home = int(round(raw_home * factor))
+    # 라운딩으로 인해 합이 안맞는 것 보정
+    est_home = max(0, min(est_home, total))
+    est_away = max(0, total - est_home)
+
+    out["events_sample_home"] = est_home
+    out["events_sample_away"] = est_away
+    return out
+
+
+# ─────────────────────────────────────
 #  한 팀(홈/원정) 계산
 # ─────────────────────────────────────
 def _build_side_insights(
@@ -329,6 +413,21 @@ def _build_side_insights(
         team_id=team_id,
         matches_total_api=0,
     )
+
+    # ───────── Game Sample 홈/원정 분포 계산 ─────────
+    events_sample = insights.get("events_sample")
+    if isinstance(events_sample, (int, float)) and events_sample > 0:
+        sample_split = _compute_events_sample_home_away(
+            season_int=season_int,
+            team_id=team_id,
+            league_id=league_id,
+            filters=stats.get("insights_filters", {}),
+            events_sample=int(events_sample),
+        )
+        if sample_split.get("events_sample_home") is not None:
+            insights["events_sample_home"] = sample_split["events_sample_home"]
+        if sample_split.get("events_sample_away") is not None:
+            insights["events_sample_away"] = sample_split["events_sample_away"]
 
     return insights
 
