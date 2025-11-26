@@ -528,41 +528,42 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         team_id=away_team_id,
     )
 
-    comp_options = _merge_options(comp_opts_home, comp_opts_away)
-    if not comp_options:
-        comp_options = ["All", "League"]
-
-    # 🔥 여기서 중복/불필요 그룹 라벨 정리
     GROUP_LABELS = {"League", "Cup", "Europe (UEFA)", "Continental"}
 
-    # 1) 그룹 라벨 제거 + 중복 제거
-    filtered: List[str] = []
-    for opt in comp_options:
-        if opt in GROUP_LABELS:
-            continue
-        if opt not in filtered:
-            filtered.append(opt)
+    # 각 팀별 "실제 대회 이름"만 추출 (All / 그룹 라벨 제외)
+    names_home = [
+        opt for opt in comp_opts_home
+        if opt not in GROUP_LABELS and opt != "All"
+    ]
+    names_away = [
+        opt for opt in comp_opts_away
+        if opt not in GROUP_LABELS and opt != "All"
+    ]
 
-    # 2) All 을 항상 맨 앞에 두기
-    if "All" in filtered:
-        filtered.remove("All")
-    filtered.insert(0, "All")
+    # 양 팀이 둘 다 뛴 대회(교집합)만 사용
+    common_names = sorted(set(names_home) & set(names_away))
 
-    comp_options = filtered
+    # 혹시라도 교집합이 완전히 비면, 최소한 합집합이라도 보여주기 (안전장치)
+    if not common_names:
+        common_names = sorted(set(names_home) | set(names_away))
+
+    # 최종 comp 옵션: All + 공통 대회들
+    comp_options = ["All"] + common_names
 
     comp_label = (filters_block.get("comp") or "All").strip() or "All"
 
-    # 3) 현재 선택값이 그룹 라벨이면 All 로 폴백
+    # 이전에 League / Cup / Europe (UEFA) 같은 그룹이 선택돼 있었다면 All 로 폴백
     if comp_label in GROUP_LABELS:
         comp_label = "All"
 
-    # 4) comp_label 이 옵션 리스트에 없으면 All 다음에 추가
+    # comp_label 이 옵션 리스트에 없으면 All 다음에 추가
     if comp_label not in comp_options:
         if comp_label == "All":
-            comp_options.insert(0, comp_label)
+            pass  # 이미 맨 앞
         else:
             comp_options.insert(1, comp_label)
 
+    # last_n 옵션은 기존 로직 그대로
     last_n_options = _build_last_n_options_for_match(
         home_team_id=home_team_id,
         away_team_id=away_team_id,
