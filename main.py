@@ -287,20 +287,22 @@ def list_fixtures():
 # ─────────────────────────────────────────
 # 실행
 # ─────────────────────────────────────────
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
 import traceback
 import sys
 
 @app.errorhandler(Exception)
-def handle_exception(e):
-    # 콘솔에 Traceback 강제 출력
-    print("=== SERVER EXCEPTION ===", file=sys.stderr)
+def handle_all_exceptions(e):
+    # 무조건 콘솔에 Traceback 출력
+    print("\n=== SERVER EXCEPTION ===", file=sys.stderr)
     traceback.print_exc()
-    print("=== END EXCEPTION ===", file=sys.stderr)
+    print("=== END EXCEPTION ===\n", file=sys.stderr)
 
-    # 기존 응답 유지
-    return jsonify({"error": str(e)}), 500
+    # HTTPException 인 경우 코드 유지
+    if isinstance(e, HTTPException):
+        return jsonify({"ok": False, "error": e.description}), e.code
+
+    # 그 외 예외는 500
+    return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
