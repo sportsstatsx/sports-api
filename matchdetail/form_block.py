@@ -14,14 +14,30 @@ def _safe_int(val: Any) -> int:
 
 def _extract_team_ids(header: Dict[str, Any]) -> Tuple[int, int]:
     """
-    header 구조가 약간 달라도 최대한 안전하게
-    home / away 팀 ID 를 뽑아내기 위한 헬퍼.
+    header에서 home/away 팀 ID를 최대한 유연하게 뽑는 헬퍼.
+
+    현재 header 예시:
+      'home': {'id': 40, ...}
+      'away': {'id': 65, ...}
+
+    과거/다른 형태도 같이 대응:
+      'home_team_id': 40
+      'home_team': {'id': 40, ...}
     """
-    # 1) 가장 단순한 형태: header["home_team_id"], header["away_team_id"]
+
+    # 1) 가장 먼저 home_team_id / away_team_id 키를 시도
     home_id = header.get("home_team_id")
     away_id = header.get("away_team_id")
 
-    # 2) 혹시 header["home_team"]["id"] 형태일 수도 있어서 대비
+    # 2) header["home"]["id"] / header["away"]["id"] 형태 지원
+    if home_id is None:
+        home = header.get("home") or {}
+        home_id = home.get("id")
+    if away_id is None:
+        away = header.get("away") or {}
+        away_id = away.get("id")
+
+    # 3) 혹시 header["home_team"]["id"] 형태도 있을 수 있으니 백업
     if home_id is None:
         home_team = header.get("home_team") or {}
         home_id = home_team.get("id")
@@ -55,8 +71,7 @@ def _build_team_form(
         # 필수 정보가 없으면 빈 값 반환
         return [], 0, 0
 
-    # ✅ 리그/시즌 상관없이, 해당 팀이 참가한 "종료된 경기" 중
-    #    가장 최근 경기들을 기준으로 폼 계산
+    # 해당 팀이 참가한 "종료된 경기" 중 가장 최근 경기들을 기준으로 폼 계산
     rows = fetch_all(
         """
         SELECT
@@ -141,7 +156,7 @@ def build_form_block(header: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "home_last5": home_last5,
-        "away_last5": away_last5,
+            "away_last5": away_last5,
         "home_goals_for": home_gf,
         "home_goals_against": home_ga,
         "away_goals_for": away_gf,
