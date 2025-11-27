@@ -16,24 +16,23 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
     """
 
     rows_db = fetch_all(
-    """
-       SELECT
-        NULL::bigint        AS fixture_id,
-        m.league_id         AS league_id,   -- 각 경기의 진짜 league_id
-        m.season            AS season,
-        m.date_utc          AS date_utc,
-        th.name             AS home_team_name,
-        ta.name             AS away_team_name,
-        m.home_ft           AS home_goals,
-        m.away_ft           AS away_goals,
-
+        """
+        SELECT
+            m.fixture_id       AS fixture_id,   -- 🔥 이전: NULL::bigint AS fixture_id
+            m.league_id        AS league_id,    -- 각 경기의 리그 ID (진짜 league_id)
+            m.season           AS season,
+            m.date_utc         AS date_utc,
+            th.name            AS home_team_name,
+            ta.name            AS away_team_name,
+            m.home_ft          AS home_goals,
+            m.away_ft          AS away_goals,
             CASE
                 WHEN m.home_ft IS NULL OR m.away_ft IS NULL THEN NULL
                 WHEN m.home_ft = m.away_ft THEN 'D'
                 WHEN (m.home_id = %s AND m.home_ft > m.away_ft)
                   OR (m.away_id = %s AND m.away_ft > m.home_ft) THEN 'W'
                 ELSE 'L'
-            END                 AS result_code
+            END               AS result_code
         FROM matches AS m
         JOIN teams   AS th ON th.id = m.home_id
         JOIN teams   AS ta ON ta.id = m.away_id
@@ -43,16 +42,15 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
           AND m.away_ft IS NOT NULL
         ORDER BY m.date_utc DESC
         LIMIT 50
-    """,
-    (
-        team_id,  # 1) CASE 안의 home 쪽
-        team_id,  # 2) CASE 안의 away 쪽
-        season,   # 3) WHERE m.season = %s
-        team_id,  # 4) WHERE m.home_id = %s
-        team_id,  # 5) WHERE m.away_id = %s
-    ),
-)
-
+        """,
+        (
+            team_id,  # 1) CASE 안의 home 쪽
+            team_id,  # 2) CASE 안의 away 쪽
+            season,   # 3) WHERE m.season = %s
+            team_id,  # 4) WHERE m.home_id = %s
+            team_id,  # 5) WHERE m.away_id = %s
+        ),
+    )
 
     rows: List[Dict[str, Any]] = []
 
@@ -64,7 +62,7 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
 
         rows.append(
             {
-                "fixture_id": r["fixture_id"],           # 지금은 항상 NULL
+                "fixture_id": r["fixture_id"],        # ← 이제 진짜 fixture_id
                 "league_id": r["league_id"],
                 "season": r["season"],
                 "date_utc": date_utc,
