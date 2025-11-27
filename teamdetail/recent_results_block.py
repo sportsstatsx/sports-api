@@ -17,16 +17,15 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
 
     rows_db = fetch_all(
         """
-        SELECT
-            NULL::bigint        AS fixture_id,      -- 아직 필요 없으므로 NULL 로 채움
-            %s::bigint          AS league_id,       -- 현재 화면의 league_id 를 그대로 내려줌
-            %s::int             AS season,          -- 현재 시즌
-
-            m.date_utc          AS date_utc,
-            th.name             AS home_team_name,
-            ta.name             AS away_team_name,
-            m.home_ft           AS home_goals,
-            m.away_ft           AS away_goals,
+       SELECT
+        NULL::bigint        AS fixture_id,
+        m.league_id         AS league_id,   -- 🔥 각 경기의 진짜 league_id 사용
+        m.season            AS season,      -- 시즌도 테이블 값 사용
+        m.date_utc          AS date_utc,
+        th.name             AS home_team_name,
+        ta.name             AS away_team_name,
+        m.home_ft           AS home_goals,
+        m.away_ft           AS away_goals,
 
             CASE
                 WHEN m.home_ft IS NULL OR m.away_ft IS NULL THEN NULL
@@ -46,10 +45,6 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         LIMIT 50
         """,
         (
-            league_id,
-            season,
-            team_id,
-            team_id,
             season,
             team_id,
             team_id,
