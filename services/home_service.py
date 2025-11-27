@@ -1,209 +1,996 @@
-# src/teamdetail/header_block.py
-
 from __future__ import annotations
-from typing import Dict, Any, List
+
 import json
+from datetime import datetime, date as date_cls, time as time_cls
+from typing import Any, Dict, List, Optional, Tuple
 
-from db import fetch_all  # ✅ 프로젝트 공통 DB 헬퍼
+import pytz
+
+from db import fetch_all
+
+from .insights.insights_overall_shooting_efficiency import (
+    enrich_overall_shooting_efficiency,
+)
+from .insights.insights_overall_outcome_totals import (
+    enrich_overall_outcome_totals,
+)
+from .insights.insights_overall_goalsbytime import (
+    enrich_overall_goals_by_time,
+)
+from .insights.insights_overall_timing import enrich_overall_timing
+from .insights.insights_overall_firstgoal_momentum import (
+    enrich_overall_firstgoal_momentum,
+)
+from .insights.insights_overall_discipline_setpieces import (
+    enrich_overall_discipline_setpieces,
+)
+from .insights.utils import normalize_comp, parse_last_n
+from .league_directory_service import build_league_directory
 
 
-def _safe_get(d: Dict, *keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur if cur is not None else default
+
+# ─────────────────────────────────────
+#  공통: 날짜 파싱/정규화
+# ─────────────────────────────────────
 
 
-def _fetch_team(team_id: int) -> Dict[str, Any] | None:
+def _normalize_date(date_str: Optional[str]) -> str:
+    """
+    다양한 형태(YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS 등)의 문자열을
+    안전하게 'YYYY-MM-DD' 로 정규화한다.
+    """
+    if not date_str:
+        # 오늘 날짜 (UTC 기준)
+        return datetime.utcnow().date().isoformat()
+
+    if isinstance(date_str, date_cls):
+        return date_str.isoformat()
+
+    try:
+        dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        return dt.date().isoformat()
+    except Exception:
+        return datetime.utcnow().date().isoformat()
+
+
+def _to_iso_or_str(val: Any) -> Optional[str]:
+    """
+    DB에서 가져온 date_utc가 datetime 일 수도, 문자열일 수도 있어서
+    안전하게 문자열로 변환해주는 유틸.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (datetime, date_cls)):
+        return val.isoformat()
+    # 이미 문자열이거나 다른 타입이면 str()로 통일
+    return str(val)
+
+
+def _get_utc_range_for_local_date(
+    date_str: Optional[str],
+    timezone_str: str,
+) -> Tuple[datetime, datetime]:
+    """
+    date_str(YYYY-MM-DD)을 timezone_str (예: 'Asia/Seoul') 기준 '하루'로 보고,
+    그 하루가 커버하는 UTC 시작/끝 datetime 을 반환한다.
+
+    - DB matches.date_utc 는 항상 UTC로 저장되어 있고,
+    - 여기서 계산한 utc_start ~ utc_end 범위로 필터링하면
+      "사용자 로컬 Today" 기준으로 경기를 가져올 수 있다.
+    """
+    try:
+        tz = pytz.timezone(timezone_str)
+    except Exception:
+        tz = pytz.UTC
+
+    if not date_str:
+        local_now = datetime.now(tz)
+        local_date = local_now.date()
+    else:
+        try:
+            local_date = datetime.fromisoformat(str(date_str)).date()
+        except Exception:
+            local_date = datetime.now(tz).date()
+
+    local_start = tz.localize(datetime.combine(local_date, time_cls(0, 0, 0)))
+    local_end = tz.localize(datetime.combine(local_date, time_cls(23, 59, 59)))
+
+    utc_start = local_start.astimezone(pytz.UTC)
+    utc_end = local_end.astimezone(pytz.UTC)
+    return utc_start, utc_end
+
+
+# ─────────────────────────────────────
+#  공통: Insights Overall 필터 메타
+# ─────────────────────────────────────
+
+
+def build_insights_filter_meta(
+    comp_raw: Optional[str],
+    last_n_raw: Optional[str],
+) -> Dict[str, Any]:
+    """
+    클라이언트에서 넘어오는 competition / lastN 값을
+    서버 내부 표준 형태로 정규화해서 메타데이터 딕셔너리로 돌려준다.
+
+    현재 단계에서는:
+      - 실제 계산에는 last_n (정수)만 쓰고,
+      - comp 값은 응답 메타(insights_filters)로만 내려보낸다.
+    """
+    comp_norm = normalize_comp(comp_raw)
+    last_n = parse_last_n(last_n_raw)
+
+    return {
+        "competition": comp_norm,
+        "last_n": last_n,
+    }
+
+    return {
+        "competition": comp_norm,
+        "last_n": last_n,
+    }
+
+
+def _get_team_competitions_for_season(
+    team_id: int,
+    base_league_id: int,
+    season_int: int,
+) -> Dict[str, Any]:
+    """
+    주어진 시즌에서 특정 팀이 실제로 뛴 대회(리그/국내컵/대륙컵)를
+    DB 기준으로 분류해서 돌려준다.
+
+    반환 형태 예시:
+
+    {
+        "base_league": {"league_id": 39, "name": "...", "country": "..."},
+        "all_league_ids": [39, 45, 100, ...],
+        "cup_league_ids": [100, 101, ...],
+        "uefa_league_ids": [...],
+        "acl_league_ids": [...],
+        "other_continental_league_ids": [...],
+        "competitions": [
+            {"league_id": 39, "name": "...", "country": "...", "category": "league"},
+            {"league_id": 100, "name": "...", "country": "...", "category": "cup"},
+            {"league_id": 2, "name": "...", "country": "...", "category": "uefa"},
+            ...
+        ],
+    }
+    """
+
+    # 1) 베이스 리그 메타 정보 (나라 비교용)
+    base_rows = fetch_all(
+        """
+        SELECT id, name, country
+        FROM leagues
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (base_league_id,),
+    )
+    base_name: Optional[str] = None
+    base_country: Optional[str] = None
+    if base_rows:
+        base_name = (base_rows[0].get("name") or "").strip() or None
+        base_country = (base_rows[0].get("country") or "").strip() or None
+
+    # 2) 이 팀이 해당 시즌에 실제로 뛴 모든 대회 목록
     rows = fetch_all(
-        "SELECT id, name, country, logo FROM teams WHERE id=%s",
+        """
+        SELECT DISTINCT
+            m.league_id,
+            l.name   AS league_name,
+            l.country AS country
+        FROM matches m
+        JOIN leagues l
+          ON m.league_id = l.id
+        WHERE m.season = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+        """,
+        (season_int, team_id, team_id),
+    )
+
+    all_ids: set[int] = set()
+    cup_ids: set[int] = set()
+    uefa_ids: set[int] = set()
+    acl_ids: set[int] = set()
+    other_cont_ids: set[int] = set()
+    competitions: List[Dict[str, Any]] = []
+
+    for r in rows:
+        lid = r["league_id"]
+        name = (r.get("league_name") or "").strip()
+        country = (r.get("country") or "").strip()
+
+        all_ids.add(lid)
+
+        if lid == base_league_id:
+            # 현재 화면의 베이스 리그
+            category = "league"
+        else:
+            lower_name = name.lower()
+            lower_country = country.lower()
+
+            # 같은 나라면 → 그 나라 컵대회로 본다.
+            if base_country and country and country == base_country:
+                category = "cup"
+                cup_ids.add(lid)
+            else:
+                # 유럽 계열 대륙컵 (UCL/UEL/UECL/Conference/UEFA 등) → UEFA 그룹
+                if (
+                    "uefa" in lower_name
+                    or "ucl" in lower_name
+                    or "champions league" in lower_name
+                    or "europa" in lower_name
+                    or "conference" in lower_name
+                    or "europe" in lower_country
+                ):
+                    category = "uefa"
+                    uefa_ids.add(lid)
+                # 아시아 계열 대륙컵 (AFC Champions League / ACL 등) → ACL 그룹
+                elif (
+                    "afc" in lower_name
+                    or "asia" in lower_name
+                    or "asian" in lower_name
+                    or "acl" in lower_name
+                    or "afc" in lower_country
+                    or "asia" in lower_country
+                ):
+                    category = "acl"
+                    acl_ids.add(lid)
+                else:
+                    # 그 외 대륙컵 (CONMEBOL/CONCACAF 등)
+                    category = "other_continental"
+                    other_cont_ids.add(lid)
+
+        competitions.append(
+            {
+                "league_id": lid,
+                "name": name or None,
+                "country": country or None,
+                "category": category,
+            }
+        )
+
+    return {
+        "base_league": {
+            "league_id": base_league_id,
+            "name": base_name,
+            "country": base_country,
+        },
+        # 이 시즌에 이 팀이 실제로 뛴 모든 대회 ID
+        "all_league_ids": sorted(all_ids),
+        # 같은 나라의 컵대회들
+        "cup_league_ids": sorted(cup_ids),
+        # 유럽 계열 대륙컵 (UCL/UEL/UECL 등)
+        "uefa_league_ids": sorted(uefa_ids),
+        # 아시아 계열 대륙컵 (ACL 등)
+        "acl_league_ids": sorted(acl_ids),
+        # 그 외 대륙컵
+        "other_continental_league_ids": sorted(other_cont_ids),
+        # 디버깅/확인용 전체 목록
+        "competitions": competitions,
+    }
+
+def _resolve_target_league_ids_for_last_n(
+    base_league_id: int,
+    comp_norm: str,
+    comp_detail: Dict[str, Any],
+) -> List[int]:
+    """
+    Competition 필터(comp_norm)와 competition_detail 메타 정보를 이용해서
+    Last N 계산에 사용할 리그 ID 목록을 결정한다.
+
+    - base_league_id: 현재 화면의 베이스 리그 (예: EPL, K League 1)
+    - comp_norm: normalize_comp() 로 정규화된 competition 값
+    - comp_detail: _get_team_competitions_for_season() 이 내려준 딕셔너리
+    """
+    # 안전장치: comp_detail 이 없으면 항상 베이스 리그만 사용
+    if not isinstance(comp_detail, dict):
+        return [base_league_id]
+
+    comp_norm_str = (comp_norm or "All") if isinstance(comp_norm, str) else "All"
+    comp_norm_lower = comp_norm_str.strip().lower()
+
+    all_ids = comp_detail.get("all_league_ids") or []
+    cup_ids = comp_detail.get("cup_league_ids") or []
+    uefa_ids = comp_detail.get("uefa_league_ids") or []
+    acl_ids = comp_detail.get("acl_league_ids") or []
+    other_cont_ids = comp_detail.get("other_continental_league_ids") or []
+    competitions = comp_detail.get("competitions") or []
+
+    def _fallback(ids: List[int]) -> List[int]:
+        ids_clean: List[int] = []
+        for x in ids:
+            try:
+                ids_clean.append(int(x))
+            except (TypeError, ValueError):
+                continue
+        if ids_clean:
+            return ids_clean
+        return [base_league_id]
+
+    # 1) All → 이 시즌 이 팀이 출전한 모든 대회
+    if comp_norm_lower in ("all", "", "전체"):
+        return _fallback(all_ids)
+
+    # 2) League → 항상 베이스 리그 한 개만
+    if comp_norm_lower in ("league", "리그"):
+        return [base_league_id]
+
+    # 3) UEFA 대륙컵 그룹
+    if comp_norm_lower in ("uefa", "europe (uefa)", "ucl", "champions league"):
+        return _fallback(uefa_ids)
+
+    # 4) ACL (아시아 대륙컵 그룹)
+    if comp_norm_lower in ("acl", "asia (acl)", "afc champions league", "afc"):
+        return _fallback(acl_ids)
+
+    # 5) Domestic Cup 전체 (특정 이름 없이 "Cup" 만 들어온 경우)
+    if comp_norm_lower in ("cup", "domestic cup", "국내컵"):
+        return _fallback(cup_ids)
+
+    # 6) 그 외에는 comp_norm 이 "FA Cup", "Emperor's Cup" 처럼
+    #    특정 대회 이름과 같다고 보고, competitions 목록에서 매칭을 시도한다.
+    for comp_row in competitions:
+        name = (comp_row.get("name") or "").strip()
+        category = comp_row.get("category")
+        lid = comp_row.get("league_id")
+        if not name or lid is None:
+            continue
+        if name.strip().lower() == comp_norm_lower:
+            try:
+                return [int(lid)]
+            except (TypeError, ValueError):
+                return [base_league_id]
+
+    # 매칭되는 게 없으면 최종 fallback: 베이스 리그 한 개
+    return [base_league_id]
+
+
+
+# ─────────────────────────────────────
+#  1) 홈 화면: 상단 리그 탭용 목록
+# ─────────────────────────────────────
+
+
+def get_home_leagues(
+    date_str: Optional[str],
+    timezone_str: str,
+    league_ids: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    주어진 날짜(date_str)를 'timezone_str 기준 로컬 날짜'로 보고,
+    그 하루(00:00~23:59)가 커버하는 UTC 구간에 실제 경기가 편성된
+    리그 목록을 돌려준다.
+
+    - DB matches.date_utc 는 UTC 기준이고,
+    - 여기서 계산한 utc_start ~ utc_end 사이에 있는 경기만 Today 로 본다.
+    - league_ids 가 주어지면 해당 리그들만 필터링.
+    """
+    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+
+    params: List[Any] = [utc_start, utc_end]
+    where_clause = "m.date_utc::timestamptz BETWEEN %s AND %s"
+
+    if league_ids:
+        placeholders = ", ".join(["%s"] * len(league_ids))
+        where_clause += f" AND m.league_id IN ({placeholders})"
+        params.extend(league_ids)
+
+    rows = fetch_all(
+        f"""
+        SELECT
+            m.league_id,
+            l.name    AS league_name,
+            l.country AS country,
+            l.logo    AS league_logo,
+            m.season
+        FROM matches m
+        JOIN leagues l
+          ON m.league_id = l.id
+        WHERE {where_clause}
+        GROUP BY
+            m.league_id,
+            l.name,
+            l.country,
+            l.logo,
+            m.season
+        ORDER BY
+            l.country,
+            l.name
+        """,
+        tuple(params),
+    )
+
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        result.append(
+            {
+                "league_id": r["league_id"],
+                "name": r["league_name"],
+                "country": r["country"],
+                "logo": r["league_logo"],
+                "season": r["season"],
+            }
+        )
+    return result
+
+
+# ─────────────────────────────────────
+#  2) 홈 화면: 리그 선택 바텀시트용 디렉터리
+# ─────────────────────────────────────
+
+
+def get_home_league_directory(
+    date_str: Optional[str],
+    timezone_str: str,
+) -> List[Dict[str, Any]]:
+    """
+    홈 리그 디렉터리(필터용)는 전부 league_directory_service 쪽에서 계산한다.
+    여기서는 날짜/타임존만 넘겨주는 얇은 래퍼 역할만 한다.
+    """
+    return build_league_directory(date_str=date_str, timezone_str=timezone_str)
+
+
+
+# ─────────────────────────────────────
+#  3) 다음/이전 매치데이
+# ─────────────────────────────────────
+
+
+def _find_matchday(date_str: str, league_id: Optional[int], direction: str) -> Optional[str]:
+    """
+    direction: 'next' or 'prev'
+    """
+    norm_date = _normalize_date(date_str)
+
+    params: List[Any] = []
+    where_clause = "1=1"
+    if league_id and league_id > 0:
+        where_clause += " AND m.league_id = %s"
+        params.append(league_id)
+
+    rows = fetch_all(
+        f"""
+        SELECT
+            m.date_utc::date AS match_date,
+            COUNT(*)         AS matches
+        FROM matches m
+        WHERE {where_clause}
+        GROUP BY match_date
+        ORDER BY match_date ASC
+        """,
+        tuple(params),
+    )
+
+    target = datetime.fromisoformat(norm_date).date()
+    nearest: Optional[date_cls] = None
+
+    for r in rows:
+        md: date_cls = r["match_date"]
+        if direction == "next":
+            if md > target and (nearest is None or md < nearest):
+                nearest = md
+        else:
+            if md < target and (nearest is None or md > nearest):
+                nearest = md
+
+    if not nearest:
+        return None
+    return nearest.isoformat()
+
+
+def get_next_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
+    return _find_matchday(date_str, league_id, direction="next")
+
+
+def get_prev_matchday(date_str: str, league_id: Optional[int]) -> Optional[str]:
+    return _find_matchday(date_str, league_id, direction="prev")
+
+
+# ─────────────────────────────────────
+#  4) 팀 시즌 스탯 + Insights Overall (시즌 전체 기준)
+# ─────────────────────────────────────
+
+
+def get_team_season_stats(
+    team_id: int,
+    league_id: int,
+    season: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    team_season_stats 테이블에서 (league_id, team_id)에 해당하는
+    한 시즌에 대한 한 줄을 가져오고,
+    stats["value"] 안의 insights_overall 블록을
+    섹션별 모듈(enrich_overall_*)을 통해 채워서 반환한다.
+
+    season 이 None 이면 기존처럼 가장 최신 season 1개를 사용하고,
+    season 이 지정되면 해당 season 만 사용한다.
+    """
+    # ─────────────────────────────────────
+    # 1) team_season_stats 원본 row 조회
+    # ─────────────────────────────────────
+    where_clause = """
+        WHERE league_id = %s
+          AND team_id   = %s
+    """
+    params: list[Any] = [league_id, team_id]
+
+    # season 이 지정되면 해당 시즌만 필터링
+    if season is not None:
+        where_clause += "\n          AND season   = %s"
+        params.append(season)
+
+    order_limit = ""
+    if season is None:
+        # season 이 지정되지 않은 경우에만 "가장 최신 시즌 1개" 규칙 적용
+        order_limit = "\n        ORDER BY season DESC\n        LIMIT 1"
+
+    rows = fetch_all(
+        f"""
+        SELECT
+            league_id,
+            season,
+            team_id,
+            name,
+            value
+        FROM team_season_stats
+        {where_clause}
+        {order_limit}
+        """,
+        tuple(params),
+    )
+    if not rows:
+        return None
+
+    row = rows[0]
+    raw_value = row.get("value")
+
+    # value(JSON) 파싱
+    if isinstance(raw_value, str):
+        try:
+            stats: Dict[str, Any] = json.loads(raw_value)
+        except Exception:
+            stats = {}
+    elif isinstance(raw_value, dict):
+        stats = raw_value
+    else:
+        stats = {}
+
+    if not isinstance(stats, dict):
+        stats = {}
+
+    # insights_overall 블록 보장
+    insights = stats.get("insights_overall")
+    if not isinstance(insights, dict):
+        insights = {}
+        stats["insights_overall"] = insights
+
+    # ✅ 서버에서 다시 계산하는 지표인데,
+    #    원래 JSON 안에서 null 로 들어온 값은 미리 지워준다.
+    for k in [
+        "win_pct",
+        "btts_pct",
+        "team_over05_pct",
+        "team_over15_pct",
+        "over15_pct",
+        "over25_pct",
+        "clean_sheet_pct",
+        "no_goals_pct",
+        "score_1h_pct",
+        "score_2h_pct",
+        "concede_1h_pct",
+        "concede_2h_pct",
+        "score_0_15_pct",
+        "concede_0_15_pct",
+        "score_80_90_pct",
+        "concede_80_90_pct",
+        "first_to_score_pct",
+        "first_conceded_pct",
+        "when_leading_win_pct",
+        "when_leading_draw_pct",
+        "when_leading_loss_pct",
+        "when_trailing_win_pct",
+        "when_trailing_draw_pct",
+        "when_trailing_loss_pct",
+        "shots_per_match",
+        "shots_on_target_pct",
+        "win_and_over25_pct",
+        "lose_and_btts_pct",
+        "goal_diff_avg",
+        "corners_per_match",
+        "yellow_per_match",
+        "red_per_match",
+        "opp_red_sample",
+        "opp_red_scored_pct",
+        "opp_red_goals_after_avg",
+        "own_red_sample",
+        "own_red_conceded_pct",
+        "own_red_goals_after_avg",
+        "goals_by_time_for",
+        "goals_by_time_against",
+    ]:
+        if k in insights and insights[k] is None:
+            del insights[k]
+
+    # fixtures.played.total (API에서 온 경기수) 추출
+    fixtures = stats.get("fixtures") or {}
+    played = fixtures.get("played") or {}
+    matches_total_api = played.get("total") or 0
+
+    # 시즌 값
+    season_val = row.get("season")
+    try:
+        season_int = int(season_val)
+    except (TypeError, ValueError):
+        season_int = None
+
+    # season_int 가 있어야 나머지 enrich_* 계산 가능
+    if season_int is not None:
+        # Shooting & Efficiency
+        try:
+            enrich_overall_shooting_efficiency(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                matches_total_api=matches_total_api,
+            )
+        except Exception:
+            pass
+
+        # Outcome & Totals + Result Combos & Draw
+        try:
+            enrich_overall_outcome_totals(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # Goals by Time (For / Against)
+        try:
+            enrich_overall_goals_by_time(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # Discipline & Set Pieces
+        try:
+            enrich_overall_discipline_setpieces(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                matches_total_api=matches_total_api,
+            )
+        except Exception:
+            pass
+
+        # Timing
+        try:
+            enrich_overall_timing(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+        # First Goal & Momentum
+        try:
+            enrich_overall_firstgoal_momentum(
+                stats,
+                insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+            )
+        except Exception:
+            pass
+
+    # 최종 결과 row 형태로 반환
+    return {
+        "league_id": row["league_id"],
+        "season": row["season"],
+        "team_id": row["team_id"],
+        "name": row["name"],
+        "value": stats,
+    }
+
+
+# ─────────────────────────────────────
+#  4-1) 팀 인사이트 (필터 메타 + 필터 적용 Outcome)
+# ─────────────────────────────────────
+
+
+def get_team_insights_overall_with_filters(
+    team_id: int,
+    league_id: int,
+    *,
+    season: Optional[int] = None,
+    comp: Optional[str] = None,
+    last_n: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Insights Overall 탭에서 Season / Competition / Last N 필터를 적용하기 위한
+    서비스 함수.
+
+    동작 순서:
+      1) get_team_season_stats() 를 호출해서
+         (season 이 지정되면 해당 시즌, 아니면 최신 시즌) 기준으로
+         시즌 전체 insights_overall 을 먼저 계산하고,
+      2) 필터 메타(insights_filters)를 value 에 붙여준다.
+         - competition / last_n
+         - competition_detail (이 시즌에 이 팀이 출전한 리그/컵/대륙컵 목록)
+         - target_league_ids_last_n (Last N 계산에 사용할 league_id 리스트)
+      3) last_n > 0 인 경우에만 일부 섹션을
+         해당 시즌의 '최근 N경기' 기준으로 다시 계산해서 덮어쓴다.
+         - Outcome & Totals / Result Combos & Draw
+         - Timing
+         - First Goal & Momentum
+         - Shooting & Efficiency
+         - Discipline & Set Pieces
+         - Goals by Time
+    """
+    # 1) 필터 메타 정규화
+    filters_meta = build_insights_filter_meta(comp, last_n)
+    comp_norm = filters_meta.get("competition", "All")
+    last_n_int = filters_meta.get("last_n", 0)
+
+    # 2) 시즌 전체 기준 기본 데이터 로드
+    base = get_team_season_stats(
+        team_id=team_id,
+        league_id=league_id,
+        season=season,  # 🔹 시즌 필터 반영: 2025 / 2024 등
+    )
+    if base is None:
+        return None
+
+    # 2-1) 시즌 값 정규화 (competition_detail / Last N 계산에 모두 사용)
+    season_val = base.get("season")
+    try:
+        season_int_meta = int(season_val) if season_val is not None else None
+    except (TypeError, ValueError):
+        season_int_meta = None
+
+    # 2-2) 이 시즌에 팀이 실제로 뛴 대회(리그/국내컵/대륙컵) 메타 정보 계산
+    comp_detail: Optional[Dict[str, Any]] = None
+    if season_int_meta is not None:
+        try:
+            comp_detail = _get_team_competitions_for_season(
+                team_id=team_id,
+                base_league_id=league_id,
+                season_int=season_int_meta,
+            )
+        except Exception:
+            comp_detail = None
+
+        if comp_detail is not None:
+            filters_meta["competition_detail"] = comp_detail
+
+    # 2-3) Last N 계산에 사용할 리그 ID 리스트를 competition 필터에 맞게 선택
+    target_league_ids_last_n = _resolve_target_league_ids_for_last_n(
+        base_league_id=league_id,
+        comp_norm=str(comp_norm) if comp_norm is not None else "All",
+        comp_detail=comp_detail or filters_meta.get("competition_detail") or {},
+    )
+    filters_meta["target_league_ids_last_n"] = target_league_ids_last_n
+
+    # 2-4) value / insights 초기화 및 필터 메타 부착
+    value = base.get("value")
+    if not isinstance(value, dict):
+        value = {}
+    insights = value.get("insights_overall")
+    if not isinstance(insights, dict):
+        insights = {}
+        value["insights_overall"] = insights
+
+    value["insights_filters"] = filters_meta
+    base["value"] = value
+
+    # 🔥 2-5) 기본 시즌 경기 수(fixtures.played.total)에서 샘플 수 베이스를 만든다.
+    fixtures = value.get("fixtures") or {}
+    played = fixtures.get("played") or {}
+    matches_total_api = played.get("total") or 0
+    try:
+        matches_total_int = int(matches_total_api)
+    except (TypeError, ValueError):
+        matches_total_int = 0
+
+    # 3) last_n > 0 이면 일부 섹션을 최근 N경기 기준으로 다시 계산
+    #    (섹션 내부에서는 stats["insights_filters"]["target_league_ids_last_n"]
+    #     값을 읽어서 league_id IN (...) 조건으로 사용하게 된다.)
+    if last_n_int and last_n_int > 0 and season_int_meta is not None:
+        season_int = season_int_meta
+
+        # Outcome & Totals / Result Combos & Draw
+        try:
+            enrich_overall_outcome_totals(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # 필터 샘플에서는 분모를 실제 매치 수로 쓰기 위해 0으로 넘긴다.
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # 필터 계산에 실패해도 기본 시즌 전체 값은 이미 들어가 있으므로 응답은 유지
+            pass
+
+        # Timing
+        try:
+            enrich_overall_timing(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Timing 계산 실패 시에도 기본 시즌 값은 유지
+            pass
+
+        # First Goal & Momentum
+        try:
+            enrich_overall_firstgoal_momentum(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # First Goal 계산 실패 시에도 기본 시즌 값은 유지
+            pass
+
+        # Shooting & Efficiency
+        try:
+            enrich_overall_shooting_efficiency(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # Last N 모드에서는 분모를 내부 total_matches 로만 사용
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Shooting 계산 실패 시에도 기본 시즌 값은 유지
+            pass
+
+        # Discipline & Set Pieces: 최근 N경기 기준으로 다시 계산
+        try:
+            enrich_overall_discipline_setpieces(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                # Last N 모드에서는 분모용 matches_total_api 는 사용하지 않으므로 0
+                matches_total_api=0,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Discipline 계산 실패 시에도 기본 시즌 값은 유지
+            pass
+
+        # Goals by Time (For / Against): 최근 N경기 기준으로 다시 계산
+        try:
+            enrich_overall_goals_by_time(
+                stats=value,
+                insights=insights,
+                league_id=league_id,
+                season_int=season_int,
+                team_id=team_id,
+                last_n=last_n_int,
+            )
+        except Exception:
+            # Goals by Time 계산 실패 시에도 기본 시즌 값은 유지
+            pass
+
+    # 🔥 3-1) Events / First Goal sample 수를 insights_overall 에 넣어준다.
+    #        - 섹션(enrich_overall_outcome_totals)에서 이미 기록해 둔 값이 있으면 우선 사용
+    #        - 없으면 기존 시즌 전체 / lastN 기반 로직을 그대로 사용
+    existing_events_sample = insights.get("events_sample")
+    if isinstance(existing_events_sample, int) and existing_events_sample > 0:
+        events_sample = existing_events_sample
+    else:
+        # 기존 로직 그대로 유지
+        #   - last_n 이 없으면 시즌 전체 경기 수
+        #   - last_n 이 있으면 min(last_n, 시즌 전체 경기 수)를 사용
+        if last_n_int and last_n_int > 0:
+            if matches_total_int > 0:
+                events_sample = min(last_n_int, matches_total_int)
+            else:
+                # fixtures 정보가 없으면 일단 last_n 을 그대로 사용 (보수적 추정)
+                events_sample = last_n_int
+        else:
+            events_sample = matches_total_int
+
+    # first_goal_sample 은 현재는 별도의 분모를 쓰지 않고,
+    # 일단 events_sample 과 동일하게 내려준다. (나중에 필요시 분리 가능)
+    first_goal_sample = events_sample
+
+    insights["events_sample"] = events_sample
+    insights["first_goal_sample"] = first_goal_sample
+
+
+    # (competition 필터(comp_norm)는 현재 단계에서는
+    #  계산에 직접 사용되는 것은 target_league_ids_last_n 뿐이고,
+    #  나머지는 메타(insights_filters)로만 내려보낸다.
+    #  -> 각 섹션 모듈에서 stats["insights_filters"]["target_league_ids_last_n"]
+    #     를 참고해서 league_id IN (...) 조건을 적용하게 된다.)
+    return base
+
+
+
+# ─────────────────────────────────────
+#  X) 팀별 사용 가능한 시즌 목록
+# ─────────────────────────────────────
+
+
+def get_team_seasons(league_id: int, team_id: int) -> List[int]:
+    """
+    team_season_stats 테이블에서 해당 리그/팀의 시즌 목록만 뽑아서
+    최신순으로 돌려준다. (예: [2025, 2024])
+    """
+    rows = fetch_all(
+        """
+        SELECT DISTINCT season
+        FROM team_season_stats
+        WHERE league_id = %s
+          AND team_id   = %s
+        ORDER BY season DESC
+        """,
+        (league_id, team_id),
+    )
+    seasons: List[int] = []
+    for r in rows:
+        try:
+            seasons.append(int(r["season"]))
+        except (TypeError, ValueError):
+            continue
+    return seasons
+
+
+# ─────────────────────────────────────
+#  5) 팀 기본 정보
+# ─────────────────────────────────────
+
+
+def get_team_info(team_id: int) -> Optional[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT
+            id,
+            name,
+            country,
+            logo
+        FROM teams
+        WHERE id = %s
+        LIMIT 1
+        """,
         (team_id,),
     )
     if not rows:
         return None
-    row = rows[0]
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "country": row["country"],
-        "logo": row["logo"],
-    }
-
-
-def _fetch_league(league_id: int) -> Dict[str, Any] | None:
-    rows = fetch_all(
-        "SELECT id, name, country, logo FROM leagues WHERE id=%s",
-        (league_id,),
-    )
-    if not rows:
-        return None
-    row = rows[0]
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "country": row["country"],
-        "logo": row["logo"],
-    }
-
-
-def _fetch_team_season_stats(team_id: int, season: int) -> List[Dict[str, Any]]:
-    """
-    team_season_stats 테이블에서 name='full_json' 인 row들만 가져와서 파싱.
-    한 팀이 리그 + 챔스 둘 다 뛰면 row가 2개 있을 수 있음.
-    """
-    rows = fetch_all(
-        """
-        SELECT tss.league_id,
-               tss.value,
-               l.name AS league_name
-        FROM team_season_stats AS tss
-        JOIN leagues AS l ON l.id = tss.league_id
-        WHERE tss.team_id = %s
-          AND tss.season  = %s
-          AND tss.name    = 'full_json'
-        """,
-        (team_id, season),
-    )
-
-    results: List[Dict[str, Any]] = []
-    for r in rows:
-        js = r["value"]
-        if isinstance(js, str):
-            js = json.loads(js)
-        results.append(
-            {
-                "league_id": r["league_id"],
-                "league_name": r["league_name"],
-                "full_json": js,
-            }
-        )
-    return results
-
-
-def _build_recent_form(team_id: int, season: int, limit: int = 10) -> List[str]:
-    """
-    matches 테이블에서 해당 시즌, 해당 팀의 최근 경기들을 가져와서
-    ["W", "D", "L", ...] 리스트로 만든다.
-
-    - 리그/대륙컵 모두 포함
-    - 종료된 경기(home_ft/away_ft 있는 것만)
-    - 화면은 왼쪽=오래된, 오른쪽=최신이 되도록 역순 리턴
-    """
-    rows = fetch_all(
-        """
-        SELECT home_id, away_id, home_ft, away_ft
-        FROM matches
-        WHERE season = %s
-          AND (home_id = %s OR away_id = %s)
-          AND home_ft IS NOT NULL
-          AND away_ft IS NOT NULL
-        ORDER BY date_utc DESC
-        LIMIT %s
-        """,
-        (season, team_id, team_id, limit),
-    )
-
-    codes: List[str] = []
-
-    for r in rows:
-        home_id = r["home_id"]
-        away_id = r["away_id"]
-        home_ft = r["home_ft"]
-        away_ft = r["away_ft"]
-
-        if home_ft is None or away_ft is None:
-            continue
-
-        # 무승부
-        if home_ft == away_ft:
-            codes.append("D")
-            continue
-
-        is_home = team_id == home_id
-        team_goals = home_ft if is_home else away_ft
-        opp_goals = away_ft if is_home else home_ft
-
-        codes.append("W" if team_goals > opp_goals else "L")
-
-    # DB에서 최신 → 오래된 순으로 가져왔으니, 화면은 오래된 → 최신 순서가 되도록 역순
-    return list(reversed(codes))
-
-
-def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, Any]:
-    """
-    Team Detail 상단 헤더 영역에 쓸 정보.
-
-    - 팀/리그 기본 정보: teams / leagues
-    - 리그/대륙컵 시즌 통계: team_season_stats (full_json)
-    - 최근 폼: matches 에서 최근 10경기 (리그+대륙컵 합산)
-    """
-    team_row = _fetch_team(team_id)
-    league_row = _fetch_league(league_id)
-    stats_rows = _fetch_team_season_stats(team_id, season)
-    recent_form = _build_recent_form(team_id, season, limit=10)
-
-    # 기본값
-    played = wins = draws = losses = 0
-    goals_for = goals_against = 0
-    domestic_league_name = None
-    continental_league_name = None
-    continental_matches = 0
-
-    # team_season_stats 에서 리그 / 대륙컵 분리
-    for row in stats_rows:
-        js = row["full_json"]
-        fixtures = js.get("fixtures", {})
-        played_total = _safe_get(fixtures, "played", "total", default=0)
-        wins_total = _safe_get(fixtures, "wins", "total", default=0)
-        draws_total = _safe_get(fixtures, "draws", "total", default=0)
-        loses_total = _safe_get(fixtures, "loses", "total", default=0)
-        gf_total = _safe_get(js, "goals", "for", "total", "total", default=0)
-        ga_total = _safe_get(js, "goals", "against", "total", "total", default=0)
-
-        if row["league_id"] == league_id:
-            # 요청 들어온 리그 (예: 프리미어리그, 라리가)
-            domestic_league_name = row["league_name"]
-            played = int(played_total or 0)
-            wins = int(wins_total or 0)
-            draws = int(draws_total or 0)
-            losses = int(loses_total or 0)
-            goals_for = int(gf_total or 0)
-            goals_against = int(ga_total or 0)
-        else:
-            # 그 외 리그 하나를 "대륙컵" 쪽으로 사용 (챔스 / 유로파 등)
-            if continental_league_name is None:
-                continental_league_name = row["league_name"]
-                continental_matches = int(played_total or 0)
-
-    goal_diff = goals_for - goals_against
-
-    return {
-        "team_id": team_id,
-        "league_id": league_id,
-        "season": season,
-        "team_name": (team_row or {}).get("name"),
-        "team_short_name": (team_row or {}).get("name"),
-        "team_logo": (team_row or {}).get("logo"),
-        "league_name": (league_row or {}).get("name"),
-        "season_label": str(season),
-        "position": None,  # 나중에 standings_block 쪽이랑 연결해서 채울 수 있음
-
-        "played": played,
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "goals_for": goals_for,
-        "goals_against": goals_against,
-        "goal_diff": goal_diff,
-
-        # 👉 팀 전체 최근 10경기 (리그 + 대륙컵 합산)
-        "recent_form": recent_form,
-
-        # 매치 수 요약 (헤더 "Matches" 섹션용)
-        "domestic_league_name": domestic_league_name,
-        "domestic_matches": played,
-        "continental_league_name": continental_league_name,
-        "continental_matches": continental_matches,
-    }
+    return rows[0]
