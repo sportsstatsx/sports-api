@@ -3,7 +3,8 @@
 from __future__ import annotations
 from typing import Dict, Any, List
 
-from db import fetch_all  # ✅ home_service 와 같은 DB 헬퍼 사용
+import json
+from db import fetch_all  # home_service 와 같은 DB 헬퍼 사용
 
 
 def _default_header(team_id: int, league_id: int, season: int) -> Dict[str, Any]:
@@ -22,7 +23,7 @@ def _default_header(team_id: int, league_id: int, season: int) -> Dict[str, Any]
         "league_name": None,
         "season_label": str(season),
 
-        "position": None,
+        "position": None,  # 나중에 standings 에서 가져오고 싶으면 추가
         "played": 0,
         "wins": 0,
         "draws": 0,
@@ -40,26 +41,23 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
     """
     Team Detail 상단 헤더 영역에 쓸 정보.
 
-    - teams          : 팀명 / 축약명 / 로고
-    - leagues        : 리그 이름
-    - team_season_stats : 시즌 경기수, 승무패, 득점/실점, 순위
-    - match_team_stats  : 최근 폼(W/D/L)
-
-    ⚠️ 테이블 / 컬럼 이름은 실제 스키마에 맞게 필요하면 수정해 줘야 한다.
+    - teams               : 팀명 / 로고
+    - leagues             : 리그 이름
+    - team_season_stats   : 시즌 경기수, 승무패, 득점/실점, 최근 폼(form)
     """
 
     header: Dict[str, Any] = _default_header(team_id, league_id, season)
 
     # ─────────────────────────────────────────────
-    # 1) 팀 정보: 이름 / 축약명 / 로고
+    # 1) 팀 정보: 이름 / 로고
+    #    테이블: public.teams(id, name, country, logo)
     # ─────────────────────────────────────────────
     try:
         rows = fetch_all(
             """
             SELECT
-                name       AS team_name,
-                short_name AS team_short_name,
-                logo       AS team_logo
+                name,
+                logo
             FROM teams
             WHERE id = %s
             """,
@@ -67,20 +65,22 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
         )
         row = rows[0] if rows else None
         if row:
-            # fetch_all 이 dict 를 돌려준다고 가정 (home_service 와 동일 패턴)
-            header["team_name"] = row.get("team_name")
-            header["team_short_name"] = row.get("team_short_name")
-            header["team_logo"] = row.get("team_logo")
+            header["team_name"] = row.get("name")
+            # short_name 은 별도 컬럼이 없으니, 일단 팀명 그대로 쓰거나
+            # 나중에 team_name_key 테이블 생기면 거기서 가져오자.
+            header["team_short_name"] = row.get("name")
+            header["team_logo"] = row.get("logo")
     except Exception as e:
         print(f"[teamdetail.header_block] team query failed: {e}")
 
     # ─────────────────────────────────────────────
     # 2) 리그 이름
+    #    테이블: public.leagues(id, name, country, logo, flag)
     # ─────────────────────────────────────────────
     try:
         rows = fetch_all(
             """
-            SELECT name AS league_name
+            SELECT name
             FROM leagues
             WHERE id = %s
             """,
@@ -88,83 +88,70 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
         )
         row = rows[0] if rows else None
         if row:
-            header["league_name"] = row.get("league_name")
+            header["league_name"] = row.get("name")
     except Exception as e:
         print(f"[teamdetail.header_block] league query failed: {e}")
 
     # ─────────────────────────────────────────────
-    # 3) 시즌 누적 스탯 (played / WDL / GF / GA / position)
+    # 3) 시즌 누적 스탯 + 최근 폼
+    #    테이블: public.team_season_stats
+    #    컬럼 : league_id, season, team_id, name, value
+    #    - name='full_json' 인 row 의 value 가 API-Football team stats 전체 JSON
     # ─────────────────────────────────────────────
     try:
         rows = fetch_all(
             """
-            SELECT
-                played,
-                wins,
-                draws,
-                losses,
-                goals_for,
-                goals_against,
-                position
+            SELECT value
             FROM team_season_stats
-            WHERE team_id  = %s
-              AND league_id = %s
+            WHERE league_id = %s
               AND season    = %s
+              AND team_id   = %s
+              AND name      = 'full_json'
             """,
-            (team_id, league_id, season),
+            (league_id, season, team_id),
         )
         row = rows[0] if rows else None
         if row:
-            played = row.get("played") or 0
-            wins = row.get("wins") or 0
-            draws = row.get("draws") or 0
-            losses = row.get("losses") or 0
-            gf = row.get("goals_for") or 0
-            ga = row.get("goals_against") or 0
-            pos = row.get("position")
+            raw_json = row.get("value")
+            if isinstance(raw_json, str) and raw_json:
+                data = json.loads(raw_json)
 
-            header["played"] = played
-            header["wins"] = wins
-            header["draws"] = draws
-            header["losses"] = losses
-            header["goals_for"] = gf
-            header["goals_against"] = ga
-            header["goal_diff"] = gf - ga
-            if pos is not None:
-                header["position"] = pos
+                # --- fixtures / wins / draws / loses / played ---
+                fixtures = (data.get("fixtures") or {})
+                played_total = ((fixtures.get("played") or {}).get("total")) or 0
+                wins_total = ((fixtures.get("wins") or {}).get("total")) or 0
+                draws_total = ((fixtures.get("draws") or {}).get("total")) or 0
+                loses_total = ((fixtures.get("loses") or {}).get("total")) or 0
+
+                header["played"] = int(played_total)
+                header["wins"] = int(wins_total)
+                header["draws"] = int(draws_total)
+                header["losses"] = int(loses_total)
+
+                # --- goals for/against ---
+                goals = (data.get("goals") or {})
+                goals_for_total = (
+                    ((goals.get("for") or {}).get("total") or {}).get("total")
+                ) or 0
+                goals_against_total = (
+                    ((goals.get("against") or {}).get("total") or {}).get("total")
+                ) or 0
+
+                header["goals_for"] = int(goals_for_total)
+                header["goals_against"] = int(goals_against_total)
+                header["goal_diff"] = int(goals_for_total) - int(goals_against_total)
+
+                # --- recent_form: "WDLLWW..." 문자열 -> ["W","D","L",...]
+                form_str = (data.get("form") or "").upper()
+                # W, D, L 문자만 추출
+                codes: List[str] = [c for c in form_str if c in ("W", "D", "L")]
+                # 최근 경기부터 앞쪽일 가능성이 높으니, 앞에서 최대 10개만 사용
+                header["recent_form"] = codes[:10]
     except Exception as e:
-        print(f"[teamdetail.header_block] team_season_stats query failed: {e}")
+        print(f"[teamdetail.header_block] team_season_stats(full_json) parse failed: {e}")
 
-    # ─────────────────────────────────────────────
-    # 4) 최근 폼 (최근 10경기 result → W/D/L)
-    # ─────────────────────────────────────────────
-    try:
-        recent_codes: List[str] = []
-
-        rows = fetch_all(
-            """
-            SELECT result
-            FROM match_team_stats
-            WHERE team_id  = %s
-              AND league_id = %s
-              AND season    = %s
-            ORDER BY match_date DESC
-            LIMIT 10
-            """,
-            (team_id, league_id, season),
-        )
-
-        for row in rows or []:
-            # row 가 dict 라고 가정
-            result_code = row.get("result")
-            if not result_code:
-                continue
-            code = str(result_code).upper()
-            if code in ("W", "D", "L"):
-                recent_codes.append(code)
-
-        header["recent_form"] = recent_codes
-    except Exception as e:
-        print(f"[teamdetail.header_block] recent_form query failed: {e}")
+    # position(순위)는 standings 테이블에서 가져올 수 있지만,
+    # 지금 UI 에서는 꼭 필요하지 않으니 일단 생략.
+    # 나중에 필요하면 standings 에서 team_id 매칭해서 rank 만 추가하면 됨.
 
     return header
