@@ -1,75 +1,67 @@
 # src/teamdetail/upcoming_block.py
 
-from __future__ import annotations
-
-from typing import Dict, Any, List
-
-from db import fetch_all  # ← header_block / recent_results_block 와 동일한 헬퍼 사용
+from typing import Any, Dict, List
+from db import fetch_all
 
 
-def build_upcoming_block(
-    team_id: int,
-    league_id: int,
-    season: int,
-) -> Dict[str, Any]:
+def build_upcoming_block(team_id: int, league_id: int, season: int) -> Dict[str, Any]:
     """
-    앞으로 예정된 경기들(Upcoming Fixtures) 블록.
+    Team Detail 화면의 'Upcoming fixtures' 블록.
 
-    기준:
-      - fixtures 테이블 기준
-      - 해당 팀이 홈이거나 원정인 경기
-      - 같은 season
-      - 상태가 아직 시작 전인 경기들만 (NS / TBD / UPCOMING 등)
-      - 날짜 오름차순 정렬
-      - 최대 10경기 정도까지
+    - 기준: matches 테이블
+    - 조건:
+        * 해당 시즌
+        * 내가 홈이거나 원정인 경기
+        * 아직 끝나지 않은 경기 (home_ft/away_ft 가 NULL 이거나 status 가 예정 상태)
+        * 현재 시각 이후 킥오프 (date_utc >= NOW())
+    - 정렬: date_utc 오름차순
     """
-
-    sql = """
+    rows_sql = """
         SELECT
-            f.fixture_id,
-            f.league_id,
-            f.season,
-            f.date_utc,
-            f.home_team_id,
-            f.away_team_id,
-            f.home_team_name,
-            f.away_team_name,
-            f.league_name
-        FROM fixtures AS f
+            m.fixture_id              AS fixture_id,
+            m.league_id               AS league_id,
+            m.season                  AS season,
+            m.date_utc                AS date_utc,
+            m.home_id                 AS home_team_id,
+            m.away_id                 AS away_team_id,
+            th.name                   AS home_team_name,
+            ta.name                   AS away_team_name,
+            l.name                    AS league_name
+        FROM matches AS m
+        JOIN teams   AS th ON th.id = m.home_id
+        JOIN teams   AS ta ON ta.id = m.away_id
+        JOIN leagues AS l  ON l.id  = m.league_id
         WHERE
-            (f.home_team_id = %(team_id)s OR f.away_team_id = %(team_id)s)
-            AND f.season = %(season)s
-            -- 필요하면 league_id 로 더 좁힐 수도 있음 (지금은 전체 대회 기준으로 둠)
-            -- AND f.league_id = %(league_id)s
-            AND f.status IN ('NS', 'TBD', 'UPCOMING')
-        ORDER BY f.date_utc ASC
-        LIMIT 10;
+            m.season = %s
+            AND (m.home_id = %s OR m.away_id = %s)
+            -- 이미 끝난 경기는 제외 (FT 스코어가 NULL 인 경기 = 아직 안 끝난 경기)
+            AND (m.home_ft IS NULL OR m.away_ft IS NULL)
+            -- 과거에 잡혀 있지만 이미 지난 킥오프는 제외
+            AND m.date_utc >= NOW()
+        ORDER BY
+            m.date_utc ASC
+        LIMIT 50;
     """
 
-    rows = fetch_all(
-        sql,
-        {
-            "team_id": team_id,
-            "season": season,
-            "league_id": league_id,
-        },
+    rows_db: List[Dict[str, Any]] = fetch_all(
+        rows_sql,
+        (season, team_id, team_id),
     )
 
-    upcoming_rows: List[Dict[str, Any]] = []
-    for r in rows:
-        # date_utc 가 datetime 이라면 ISO 문자열로 변환
-        date_utc = r.get("date_utc")
-        if hasattr(date_utc, "isoformat"):
-            date_utc_str = date_utc.isoformat()
-        else:
-            date_utc_str = date_utc
+    rows: List[Dict[str, Any]] = []
 
-        upcoming_rows.append(
+    for r in rows_db:
+        date_utc = r.get("date_utc")
+        # psycopg2 timestamp → isoformat 문자열 변환
+        if hasattr(date_utc, "isoformat"):
+            date_utc = date_utc.isoformat()
+
+        rows.append(
             {
                 "fixture_id": r.get("fixture_id"),
                 "league_id": r.get("league_id"),
                 "season": r.get("season"),
-                "date_utc": date_utc_str,
+                "date_utc": date_utc,
                 "home_team_id": r.get("home_team_id"),
                 "away_team_id": r.get("away_team_id"),
                 "home_team_name": r.get("home_team_name"),
@@ -82,5 +74,5 @@ def build_upcoming_block(
         "team_id": team_id,
         "league_id": league_id,
         "season": season,
-        "rows": upcoming_rows,
+        "rows": rows,
     }
