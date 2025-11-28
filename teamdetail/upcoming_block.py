@@ -1,9 +1,10 @@
 # src/teamdetail/upcoming_block.py
 
 from __future__ import annotations
+
 from typing import Dict, Any, List
 
-from db import fetch_all  # 기존 다른 블록들과 동일한 헬퍼 사용한다고 가정
+from db import fetch_all  # ← header_block / recent_results_block 와 동일한 헬퍼 사용
 
 
 def build_upcoming_block(
@@ -14,14 +15,14 @@ def build_upcoming_block(
     """
     앞으로 예정된 경기들(Upcoming Fixtures) 블록.
 
-    - fixtures 테이블에서 status 가 'UPCOMING' / 'NS' / 'TBD' 인
-      해당 팀의 경기를 날짜 오름차순으로 가져온다.
-    - 한 시즌 기준으로만 조회.
-    - 리그는 한 팀이 여러 대회에 나갈 수 있으니까 league_id 로는
-      WHERE 를 걸지 않고, 각 row 에 league_name 을 같이 내려준다.
+    기준:
+      - fixtures 테이블 기준
+      - 해당 팀이 홈이거나 원정인 경기
+      - 같은 season
+      - 상태가 아직 시작 전인 경기들만 (NS / TBD / UPCOMING 등)
+      - 날짜 오름차순 정렬
+      - 최대 10경기 정도까지
     """
-
-    upcoming_rows: List[Dict[str, Any]] = []
 
     sql = """
         SELECT
@@ -31,41 +32,37 @@ def build_upcoming_block(
             f.date_utc,
             f.home_team_id,
             f.away_team_id,
-            th.name AS home_team_name,
-            ta.name AS away_team_name,
-            COALESCE(l.short_name, l.name) AS league_name
+            f.home_team_name,
+            f.away_team_name,
+            f.league_name
         FROM fixtures AS f
-        JOIN teams   AS th ON th.id = f.home_team_id
-        JOIN teams   AS ta ON ta.id = f.away_team_id
-        JOIN leagues AS l  ON l.id = f.league_id
         WHERE
             (f.home_team_id = %(team_id)s OR f.away_team_id = %(team_id)s)
             AND f.season = %(season)s
+            -- 필요하면 league_id 로 더 좁힐 수도 있음 (지금은 전체 대회 기준으로 둠)
+            -- AND f.league_id = %(league_id)s
             AND f.status IN ('NS', 'TBD', 'UPCOMING')
         ORDER BY f.date_utc ASC
-        LIMIT 20
+        LIMIT 10;
     """
 
-    try:
-        rows = fetch_all(
-            sql,
-            {
-                "team_id": team_id,
-                "season": season,
-            },
-        )
-    except Exception as e:
-        # 문제 생겨도 전체 번들이 죽지 않도록 하고, 서버 로그만 남김
-        print(f"[teamdetail.upcoming_block] DB error: {e}")
-        rows = []
+    rows = fetch_all(
+        sql,
+        {
+            "team_id": team_id,
+            "season": season,
+            "league_id": league_id,
+        },
+    )
 
+    upcoming_rows: List[Dict[str, Any]] = []
     for r in rows:
-        dt = r.get("date_utc")
-        if dt is not None:
-            # psycopg2 RealDictCursor 기준: datetime → ISO 문자열
-            date_utc_str = dt.isoformat()
+        # date_utc 가 datetime 이라면 ISO 문자열로 변환
+        date_utc = r.get("date_utc")
+        if hasattr(date_utc, "isoformat"):
+            date_utc_str = date_utc.isoformat()
         else:
-            date_utc_str = None
+            date_utc_str = date_utc
 
         upcoming_rows.append(
             {
