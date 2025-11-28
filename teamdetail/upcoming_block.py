@@ -15,7 +15,13 @@ def build_upcoming_block(
     Team Detail 화면의 'Upcoming fixtures' 섹션에 내려줄 데이터.
 
     recent_results_block 과 같은 matches/teams 스키마를 사용하고,
-    조건만 '미래 + 아직 끝나지 않은 경기'로 바꾼다.
+    조건만 "앞으로 예정된 경기"로 바꾼다.
+
+    ⚠️ 주의:
+      - 일부 리그에서는 킥오프 전에도 home_ft / away_ft 를 0으로
+        채워놓는 경우가 있어서, 여기서는 굳이 IS NULL 체크를 안 한다.
+      - 단순히 date_utc 기준으로 "지금 이후" 경기만 가져오고,
+        시즌 + 팀 ID로만 필터링한다.
     """
 
     rows_db = fetch_all(
@@ -34,9 +40,7 @@ def build_upcoming_block(
         JOIN teams   AS ta ON ta.id = m.away_id
         WHERE m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          -- ✅ recent 와 반대로: 아직 끝나지 않은 경기만
-          AND (m.home_ft IS NULL OR m.away_ft IS NULL)
-          -- ✅ 과거 킥오프는 제외하고, 앞으로 예정된 경기만
+          -- ✅ "앞으로 예정된 경기"만
           AND m.date_utc >= NOW()
         ORDER BY m.date_utc ASC
         LIMIT 50
