@@ -18,21 +18,21 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
     rows_db = fetch_all(
         """
         SELECT
-            m.fixture_id       AS fixture_id,   -- 🔥 이전: NULL::bigint AS fixture_id
-            m.league_id        AS league_id,    -- 각 경기의 리그 ID (진짜 league_id)
-            m.season           AS season,
-            m.date_utc         AS date_utc,
-            th.name            AS home_team_name,
-            ta.name            AS away_team_name,
-            m.home_ft          AS home_goals,
-            m.away_ft          AS away_goals,
+            m.fixture_id        AS fixture_id,   -- ✅ 각 경기의 진짜 fixture_id
+            m.league_id         AS league_id,    -- 각 경기의 진짜 league_id
+            m.season            AS season,
+            m.date_utc          AS date_utc,
+            th.name             AS home_team_name,
+            ta.name             AS away_team_name,
+            m.home_ft           AS home_goals,
+            m.away_ft           AS away_goals,
             CASE
                 WHEN m.home_ft IS NULL OR m.away_ft IS NULL THEN NULL
                 WHEN m.home_ft = m.away_ft THEN 'D'
                 WHEN (m.home_id = %s AND m.home_ft > m.away_ft)
                   OR (m.away_id = %s AND m.away_ft > m.home_ft) THEN 'W'
                 ELSE 'L'
-            END               AS result_code
+            END                 AS result_code
         FROM matches AS m
         JOIN teams   AS th ON th.id = m.home_id
         JOIN teams   AS ta ON ta.id = m.away_id
@@ -56,13 +56,12 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
 
     for r in rows_db:
         date_utc = r["date_utc"]
-        # datetime 이면 문자열로 바꿔서 내려보내기 (앱은 String 으로 받음)
         if hasattr(date_utc, "isoformat"):
             date_utc = date_utc.isoformat()
 
         rows.append(
             {
-                "fixture_id": r["fixture_id"],        # ← 이제 진짜 fixture_id
+                "fixture_id": r["fixture_id"],
                 "league_id": r["league_id"],
                 "season": r["season"],
                 "date_utc": date_utc,
