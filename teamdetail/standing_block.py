@@ -10,13 +10,12 @@ def build_standing_block(team_id: int, league_id: int, season: int) -> Dict[str,
     """
     해당 팀이 속한 리그 standings에서 이 팀이 어떤 위치인지 보여주는 블록.
 
-    - standings 테이블(또는 동일 스키마)을 사용해서
-      해당 league_id / season 의 전체 리그 테이블을 가져온다.
-    - 그 전체 테이블을 그대로 내려주면,
-      앱 쪽에서 이 팀 한 줄만 보여주거나, Show all 로 전체를 펼치는 방식으로 사용한다.
+    - standings 테이블을 사용해서 league_id / season 의 테이블을 가져온다.
+    - 팀당 중복 row(스플릿 라운드 등)는 played 가 가장 큰 row만 남긴다.
+    - group_name 이 여러 개인 리그(예: MLS 컨퍼런스)는
+      이 팀이 속한 group 의 테이블만 내려준다.
     """
 
-    # league_id / season 이 없으면 그냥 빈 껍데기 반환
     if not league_id or not season:
         return {
             "league_id": league_id,
@@ -39,7 +38,8 @@ def build_standing_block(team_id: int, league_id: int, season: int) -> Dict[str,
                 s.goals_for,
                 s.goals_against,
                 s.goals_diff AS goal_diff,
-                s.points
+                s.points,
+                s.group_name
             FROM standings AS s
             JOIN teams     AS t ON t.id = s.team_id
             WHERE s.league_id = %s
@@ -49,7 +49,6 @@ def build_standing_block(team_id: int, league_id: int, season: int) -> Dict[str,
             (league_id, season),
         )
     except Exception:
-        # 여기서 에러 나더라도 Team Detail 전체가 죽지 않도록
         return {
             "league_id": league_id,
             "season": season,
@@ -71,17 +70,53 @@ def build_standing_block(team_id: int, league_id: int, season: int) -> Dict[str,
         except (TypeError, ValueError):
             return default
 
-    table: List[Dict[str, Any]] = []
+    # 1) 팀당 중복 row 정리 (played 가장 큰 row만 남기기)
+    rows_by_team: Dict[int, Dict[str, Any]] = {}
     for r in rows:
+        tid = _coalesce_int(r.get("team_id"), 0)
+        if tid == 0:
+            continue
+        prev = rows_by_team.get(tid)
+        if prev is None:
+            rows_by_team[tid] = r
+        else:
+            prev_played = _coalesce_int(prev.get("played"), 0)
+            cur_played = _coalesce_int(r.get("played"), 0)
+            if cur_played > prev_played:
+                rows_by_team[tid] = r
+
+    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
+
+    # 2) group_name 이 여러 개인 경우 (예: MLS 컨퍼런스) → 이 팀이 속한 그룹만 사용
+    group_names = {
+        (r.get("group_name") or "").strip()
+        for r in dedup_rows
+        if r.get("group_name") is not None
+    }
+    if len(group_names) > 1:
+        main_group = None
+        for r in dedup_rows:
+            if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(team_id, 0):
+                main_group = (r.get("group_name") or "").strip()
+                break
+
+        if main_group:
+            dedup_rows = [
+                r
+                for r in dedup_rows
+                if (r.get("group_name") or "").strip() == main_group
+            ]
+
+    # 3) rank 기준 정렬 후 Kotlin 모델 형태에 맞게 매핑
+    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0))
+
+    table: List[Dict[str, Any]] = []
+    for r in dedup_rows:
         table.append(
             {
-                # Kotlin StandingRow.position
                 "position": _coalesce_int(r.get("rank"), 0),
-                # Kotlin StandingRow.teamId
                 "team_id": _coalesce_int(r.get("team_id"), 0),
-                # Kotlin StandingRow.teamName
                 "team_name": r.get("team_name") or "",
-                # 이하: played / wins / draws / losses / goals_for / goals_against / goal_diff / points
                 "played": _coalesce_int(r.get("played"), 0),
                 "wins": _coalesce_int(r.get("wins"), 0),
                 "draws": _coalesce_int(r.get("draws"), 0),
