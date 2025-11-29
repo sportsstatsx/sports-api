@@ -1,6 +1,5 @@
-# leaguedetail/fixtures_block.py
+# src/leaguedetail/fixtures_block.py
 from __future__ import annotations
-
 from typing import Any, Dict, List, Optional
 
 from db import fetch_all
@@ -10,13 +9,11 @@ def build_fixtures_block(league_id: int, season: Optional[int]) -> Dict[str, Any
     """
     League Detail 화면의 'Fixtures' 탭 데이터.
 
-    - 해당 리그 + 시즌의 '다가오는 경기'만 내려준다.
-    - 아직 시작하지 않은 경기 = kickoff_time 이 지금 이후인 경기라고 가정한다.
+    - 해당 리그 + 시즌의 '예정된 경기(아직 FT 스코어 없음)'만 내려준다.
+    - Team Detail 의 upcoming_block 과 같은 기준을 리그 단위로 확장한 버전.
     """
 
-    rows: List[Dict[str, Any]] = []
-
-    # 시즌이 정해지지 않았으면 아무 것도 내려줄 수 없음
+    # 시즌이 정해지지 않았으면 그냥 빈 리스트 반환
     if season is None:
         return {
             "league_id": league_id,
@@ -24,64 +21,55 @@ def build_fixtures_block(league_id: int, season: Optional[int]) -> Dict[str, Any
             "matches": [],
         }
 
-    try:
-        # ⚽ matches 테이블에서
-        #  - league_id / season 필터
-        #  - kickoff_time 이 현재 시각 이후(미래 경기)
-        #  기준으로 가져온다.
-        #
-        #  status_short 같은 컬럼을 안 쓰고,
-        #  단순히 kickoff_time 기준으로만 "다가오는 경기"를 정의해서
-        #  컬럼 이름 문제로 인한 오류를 피한다.
-        rows = fetch_all(
-            """
-            SELECT
-                fixture_id,
-                league_id,
-                season,
-                kickoff_time,
-                home_team_id,
-                home_team_name,
-                home_team_logo,
-                away_team_id,
-                away_team_name,
-                away_team_logo,
-                home_goals,
-                away_goals
-            FROM matches
-            WHERE league_id = %s
-              AND season    = %s
-              AND kickoff_time >= NOW()
-            ORDER BY kickoff_time ASC
-            LIMIT 200
-            """,
-            (league_id, season),
+    rows_db: List[Dict[str, Any]] = fetch_all(
+        """
+        SELECT
+            m.fixture_id        AS fixture_id,
+            m.league_id         AS league_id,
+            m.season            AS season,
+            m.date_utc          AS date_utc,
+            m.home_id           AS home_team_id,
+            m.away_id           AS away_team_id,
+            th.name             AS home_team_name,
+            ta.name             AS away_team_name
+        FROM matches AS m
+        JOIN teams   AS th ON th.id = m.home_id
+        JOIN teams   AS ta ON ta.id = m.away_id
+        WHERE m.league_id = %s
+          AND m.season    = %s
+          -- ✅ TeamDetail upcoming 과 동일: 아직 FT 스코어가 없는 경기 = 예정/진행 중
+          AND m.home_ft IS NULL
+          AND m.away_ft IS NULL
+        ORDER BY m.date_utc ASC
+        LIMIT 200
+        """,
+        (
+            league_id,  # 1) WHERE m.league_id = %s
+            season,     # 2) WHERE m.season    = %s
+        ),
+    )
+
+    matches: List[Dict[str, Any]] = []
+
+    for r in rows_db:
+        date_utc = r["date_utc"]
+        # psycopg timestamp → ISO 문자열
+        if hasattr(date_utc, "isoformat"):
+            date_utc = date_utc.isoformat()
+
+        matches.append(
+            {
+                "fixture_id": r["fixture_id"],
+                "league_id": r["league_id"],
+                "season": r["season"],
+                "date_utc": date_utc,
+                "home_team_id": r["home_team_id"],
+                "away_team_id": r["away_team_id"],
+                "home_team_name": r["home_team_name"],
+                "away_team_name": r["away_team_name"],
+                # 필요하면 나중에 league_name, 로고 등 추가 가능
+            }
         )
-
-    except Exception as e:
-        print(f"[build_fixtures_block] ERROR league_id={league_id}, season={season}: {e}")
-        rows = []
-
-    # 앱에서 쓰기 좋은 형태로 필드 매핑
-    matches: List[Dict[str, Any]] = [
-        {
-            "fixture_id": r.get("fixture_id"),
-            "kickoff_time": r.get("kickoff_time"),
-            "league_id": r.get("league_id"),
-            "season": r.get("season"),
-            "home_team_id": r.get("home_team_id"),
-            "home_team_name": r.get("home_team_name"),
-            "home_team_logo": r.get("home_team_logo"),
-            "away_team_id": r.get("away_team_id"),
-            "away_team_name": r.get("away_team_name"),
-            "away_team_logo": r.get("away_team_logo"),
-            # 미래 경기라 득점은 실제로는 안 쓰지만,
-            # 혹시 모를 사용을 위해 그대로 내려준다.
-            "home_goals": r.get("home_goals"),
-            "away_goals": r.get("away_goals"),
-        }
-        for r in rows
-    ]
 
     return {
         "league_id": league_id,
