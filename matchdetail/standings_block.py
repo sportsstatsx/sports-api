@@ -9,58 +9,26 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Match Detail용 Standings 블록.
 
-    - header 블록에 있는 league_id / season / home.id / away.id 기준으로
-      standings 테이블 + teams 테이블을 조회해서 리그 테이블을 만든다.
-    - JSON 형태는 대략:
-
-      "standings": {
-        "league": {
-          "league_id": 39,
-          "season": 2025,
-          "name": "Premier League"
-        },
-        "rows": [
-          {
-            "position": 1,
-            "team_id": 40,
-            "team_name": "Liverpool",
-            "team_logo": "https://...",
-            "played": 10,
-            "win": 8,
-            "draw": 1,
-            "loss": 1,
-            "goals_for": 24,
-            "goals_against": 8,
-            "goal_diff": 16,
-            "points": 25,
-            "description": "Champions League",
-            "group_name": "Overall",
-            "form": "W W D W W",
-            "is_home": false,
-            "is_away": true
-          },
-          ...
-        ]
-      }
+    - league_id / season / home.id / away.id 를 기반으로 standings 테이블 조회.
+    - 팀당 중복 row(스플릿 라운드 등)는 played 가 가장 큰 row만 남긴다.
+    - group_name 이 여러 개(컨퍼런스 등)면, 우선 home 팀이 속한 그룹
+      (없으면 away 팀 그룹)의 테이블만 사용한다.
     """
 
     league_id = header.get("league_id")
     season = header.get("season")
 
-    # header.league.name (Kotlin HeaderBlock 기준)
     league_name = None
     league_info = header.get("league") or {}
     if isinstance(league_info, dict):
         league_name = league_info.get("name")
 
-    # header.home.id / header.away.id (Kotlin TeamSideHeader 기준)
     def _extract_team_id(side_key: str) -> Optional[int]:
         side = header.get(side_key) or {}
         if not isinstance(side, dict):
             return None
         tid = side.get("id")
         try:
-            # Long → int 캐스팅
             return int(tid) if tid is not None else None
         except (TypeError, ValueError):
             return None
@@ -69,7 +37,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     away_team_id = _extract_team_id("away")
 
     if not league_id or not season:
-        # 리그/시즌이 없으면 standings를 만들 수 없다.
         return None
 
     try:
@@ -100,7 +67,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             (league_id, season),
         )
     except Exception:
-        # DB 에러가 나더라도 match_detail_bundle 전체가 죽지 않도록 None 리턴
         return None
 
     if not rows:
@@ -112,10 +78,59 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         except (TypeError, ValueError):
             return default
 
-    table: List[Dict[str, Any]] = []
+    # 1) 팀당 중복 row 정리 (played 가장 큰 row만)
+    rows_by_team: Dict[int, Dict[str, Any]] = {}
     for r in rows:
-        team_id = _coalesce_int(r.get("team_id"), 0)
+        tid = _coalesce_int(r.get("team_id"), 0)
+        if tid == 0:
+            continue
+        prev = rows_by_team.get(tid)
+        if prev is None:
+            rows_by_team[tid] = r
+        else:
+            prev_played = _coalesce_int(prev.get("played"), 0)
+            cur_played = _coalesce_int(r.get("played"), 0)
+            if cur_played > prev_played:
+                rows_by_team[tid] = r
 
+    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
+
+    # 2) group_name 이 여러 개면, home/away 팀이 속한 group 하나만 사용
+    group_names = {
+        (r.get("group_name") or "").strip()
+        for r in dedup_rows
+        if r.get("group_name") is not None
+    }
+    if len(group_names) > 1:
+        main_group = None
+
+        # 먼저 home 팀이 속한 그룹
+        if home_team_id is not None:
+            for r in dedup_rows:
+                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(home_team_id, 0):
+                    main_group = (r.get("group_name") or "").strip()
+                    break
+
+        # 없으면 away 팀 기준
+        if main_group is None and away_team_id is not None:
+            for r in dedup_rows:
+                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(away_team_id, 0):
+                    main_group = (r.get("group_name") or "").strip()
+                    break
+
+        if main_group:
+            dedup_rows = [
+                r
+                for r in dedup_rows
+                if (r.get("group_name") or "").strip() == main_group
+            ]
+
+    # 3) position 기준 정렬 후 JSON 매핑
+    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0))
+
+    table: List[Dict[str, Any]] = []
+    for r in dedup_rows:
+        team_id = _coalesce_int(r.get("team_id"), 0)
         table.append(
             {
                 "position": _coalesce_int(r.get("rank"), 0),
