@@ -129,24 +129,28 @@ def enrich_overall_goals_by_time(
 
     def bucket_index(minute: int) -> int:
         if minute < 10:
-            return 0
-        if minute < 20:
-            return 1
-        if minute < 30:
-            return 2
-        if minute < 40:
-            return 3
-        if minute < 45:
+            return 0          # 0–9
+        elif minute < 20:
+            return 1          # 10–19
+        elif minute < 30:
+            return 2          # 20–29
+        elif minute < 40:
+            return 3          # 30–39
+        elif minute <= 45:
+            # ✅ 40–45+ (전반 종료 + 추가시간까지 전부 전반으로)
             return 4
-        if minute < 50:
+        elif minute < 50:
+            # 46–49 (실제 후반 시작 이후)
             return 5
-        if minute < 60:
+        elif minute < 60:
             return 6
-        if minute < 70:
+        elif minute < 70:
             return 7
-        if minute < 80:
+        elif minute < 80:
             return 8
-        return 9
+        else:
+            # 80–90+
+            return 9
 
     for gr in goal_rows:
         minute = gr.get("minute")
