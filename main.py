@@ -29,6 +29,7 @@ from services.home_service import (
 from routers.home_router import home_bp
 from routers.matchdetail_router import matchdetail_bp
 from teamdetail.routes import teamdetail_bp
+from leaguedetail.routes import leaguedetail_bp
 
 import traceback
 import sys
@@ -44,6 +45,7 @@ app = Flask(__name__)
 app.register_blueprint(home_bp)
 app.register_blueprint(matchdetail_bp)
 app.register_blueprint(teamdetail_bp)
+app.register_blueprint(leaguedetail_bp)
 
 
 # ─────────────────────────────────────────
@@ -283,4 +285,5 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
