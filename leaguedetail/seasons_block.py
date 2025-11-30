@@ -1,4 +1,3 @@
-# leaguedetail/seasons_block.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -10,20 +9,20 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     """
     League Detail 화면의 'Seasons' 탭 + 기본 시즌 선택에 사용할 시즌 목록.
 
-    반환 형태 예시:
+    반환 예시:
     {
-        "league_id": 39,
-        "seasons": [2025, 2024, 2023],
+        "league_id": 188,
+        "seasons": [2025, 2024],
         "season_champions": [
-            {"season": 2025, "team_id": 40, "team_name": "Arsenal", "points": 89},
-            ...
+            {"season": 2025, "team_id": 943, "team_name": "Some Club", "points": 12},
+            {"season": 2024, "team_id": 24608, "team_name": "Another Club", "points": 53}
         ]
     }
     """
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
 
-    # 1) 사용 가능한 시즌 목록 (기존 로직)
+    # 1) 사용 가능한 시즌 목록 (기존 matches 기준)
     try:
         rows = fetch_all(
             """
@@ -39,17 +38,15 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] ERROR league_id={league_id}: {e}")
         seasons = []
 
-    # 2) 시즌별 우승 팀 (standings 테이블 기준)
-    #    - 표준 스키마:
-    #        league_id, season, group_name, rank, team_id, points, ...
-    #    - 우승 팀 정의:
-    #        group_name = 'Overall' AND rank = 1
-    #
-    #    팀 이름은 teams 테이블에서 조인해서 가져온다고 가정.
+    # 2) 시즌별 우승 팀 (standings 기준)
+    #    - league_id = X
+    #    - rank = 1
+    #    - 같은 시즌에 여러 group_name 이 있을 수 있으니
+    #      → DISTINCT ON (season) 으로 시즌당 한 팀만 선택
     try:
         champ_rows = fetch_all(
             """
-            SELECT
+            SELECT DISTINCT ON (s.season)
                 s.season,
                 s.team_id,
                 COALESCE(t.name, '') AS team_name,
@@ -58,9 +55,8 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             LEFT JOIN teams AS t
               ON t.id = s.team_id
             WHERE s.league_id = %s
-              AND s.group_name = 'Overall'
               AND s.rank = 1
-            ORDER BY s.season DESC
+            ORDER BY s.season DESC, s.rank ASC;
             """,
             (league_id,),
         )
@@ -79,14 +75,12 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 }
             )
     except Exception as e:
-        # 만약 teams 테이블이 없거나 스키마가 달라도 전체 API가 죽지 않도록 방어
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         season_champions = []
 
     return {
         "league_id": league_id,
         "seasons": seasons,
-        # 🔥 시즌별 우승 팀 정보 (앱 Seasons 탭에서 사용)
         "season_champions": season_champions,
     }
 
@@ -115,5 +109,4 @@ def resolve_season_for_league(league_id: int, season: Optional[int]) -> Optional
     except Exception as e:
         print(f"[resolve_season_for_league] ERROR league_id={league_id}: {e}")
 
-    # 시즌 정보가 전혀 없을 경우
     return None
