@@ -14,8 +14,14 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         "league_id": 188,
         "seasons": [2025, 2024],
         "season_champions": [
-            {"season": 2025, "team_id": 943, "team_name": "Some Club", "points": 12},
-            {"season": 2024, "team_id": 24608, "team_name": "Another Club", "points": 53}
+            {
+              "season": 2025,
+              "team_id": 943,
+              "team_name": "Some Club",
+              "logo_url": "https://.../logo.png",
+              "points": 12
+            },
+            ...
         ]
     }
     """
@@ -50,6 +56,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 s.season,
                 s.team_id,
                 COALESCE(t.name, '') AS team_name,
+                t.logo AS team_logo,         -- 🔥 로고 추가
                 s.points
             FROM standings AS s
             LEFT JOIN teams AS t
@@ -71,6 +78,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "season": int(season_val),
                     "team_id": r.get("team_id"),
                     "team_name": r.get("team_name") or "",
+                    "logo_url": r.get("team_logo"),   # 🔥 클라이언트로 넘겨줄 로고 URL
                     "points": r.get("points"),
                 }
             )
