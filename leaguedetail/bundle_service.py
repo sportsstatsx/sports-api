@@ -1,4 +1,3 @@
-# leaguedetail/bundle_service.py
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -20,7 +19,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     - season: 쿼리에서 넘어온 시즌 (없으면 DB에서 최신 시즌 선택)
 
     ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
-       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons)를 추가로 내려준다.
+       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons, season_champions)를 추가로 내려준다.
     """
     # 1) 시즌 결정 (없으면 최신 시즌)
     resolved_season = resolve_season_for_league(league_id=league_id, season=season)
@@ -43,14 +42,19 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         standings_rows = []
 
     seasons_list: Any = []
+    season_champions: Any = []
+
     if isinstance(seasons_block, dict):
-        # build_seasons_block 결과가 {"seasons": [...]} 형태라고 가정
+        # build_seasons_block 결과가 {"seasons": [...], "season_champions": [...]} 형태라고 가정
         seasons_list = seasons_block.get("seasons", []) or []
+        season_champions = seasons_block.get("season_champions", []) or []
     elif isinstance(seasons_block, list):
         # 혹시 리스트 형태면 그대로 사용
         seasons_list = seasons_block
+        season_champions = []
     else:
         seasons_list = []
+        season_champions = []
 
     # 4) 최종 번들
     return {
@@ -61,6 +65,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "league_name": league_name,
         "standings": standings_rows,
         "seasons": seasons_list,
+        "season_champions": season_champions,
 
         # 🔹 기존에 이미 사용하던(또는 나중에 쓸 수 있는) 블록 구조는 그대로 유지
         "results_block": results_block,
