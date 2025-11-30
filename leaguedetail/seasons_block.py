@@ -14,21 +14,15 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         "league_id": 188,
         "seasons": [2025, 2024],
         "season_champions": [
-            {
-              "season": 2025,
-              "team_id": 943,
-              "team_name": "Some Club",
-              "logo_url": "https://.../logo.png",
-              "points": 12
-            },
-            ...
+            {"season": 2025, "team_id": 943, "team_name": "Some Club", "points": 12},
+            {"season": 2024, "team_id": 24608, "team_name": "Another Club", "points": 53}
         ]
     }
     """
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
 
-    # 1) 사용 가능한 시즌 목록 (기존 matches 기준)
+    # 1) 사용 가능한 시즌 목록 (matches 기준)
     try:
         rows = fetch_all(
             """
@@ -56,7 +50,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 s.season,
                 s.team_id,
                 COALESCE(t.name, '') AS team_name,
-                t.logo AS team_logo,         -- 🔥 로고 추가
                 s.points
             FROM standings AS s
             LEFT JOIN teams AS t
@@ -78,13 +71,27 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "season": int(season_val),
                     "team_id": r.get("team_id"),
                     "team_name": r.get("team_name") or "",
-                    "logo_url": r.get("team_logo"),   # 🔥 클라이언트로 넘겨줄 로고 URL
                     "points": r.get("points"),
                 }
             )
     except Exception as e:
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         season_champions = []
+
+    # 3) 현재 진행 중인 시즌(가장 최신 시즌)은 챔피언 목록에서 제외
+    try:
+        latest_season = resolve_season_for_league(league_id, None)
+    except Exception as e:
+        latest_season = None
+        print(
+            f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}"
+        )
+
+    if latest_season is not None and len(season_champions) > 1:
+        season_champions = [
+            c for c in season_champions
+            if c.get("season") != latest_season
+        ]
 
     return {
         "league_id": league_id,
