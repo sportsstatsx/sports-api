@@ -1,3 +1,4 @@
+# leaguedetail/seasons_block.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
@@ -22,7 +23,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
 
-    # 1) 사용 가능한 시즌 목록
+    # 1) 사용 가능한 시즌 목록 (기존 로직)
     try:
         rows = fetch_all(
             """
@@ -38,19 +39,32 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] ERROR league_id={league_id}: {e}")
         seasons = []
 
-    # 2) 시즌별 우승 팀 (standings 테이블에서 position=1 기준)
-    #    테이블/컬럼 구조가 다르면 이 쿼리는 실패하고, season_champions 는 빈 리스트로 남는다.
+    # 2) 시즌별 우승 팀 (standings 테이블 기준)
+    #    - 표준 스키마:
+    #        league_id, season, group_name, rank, team_id, points, ...
+    #    - 우승 팀 정의:
+    #        group_name = 'Overall' AND rank = 1
+    #
+    #    팀 이름은 teams 테이블에서 조인해서 가져온다고 가정.
     try:
         champ_rows = fetch_all(
             """
-            SELECT season, team_id, team_name, points
-            FROM standings
-            WHERE league_id = %s
-              AND position = 1
-            ORDER BY season DESC
+            SELECT
+                s.season,
+                s.team_id,
+                COALESCE(t.name, '') AS team_name,
+                s.points
+            FROM standings AS s
+            LEFT JOIN teams AS t
+              ON t.id = s.team_id
+            WHERE s.league_id = %s
+              AND s.group_name = 'Overall'
+              AND s.rank = 1
+            ORDER BY s.season DESC
             """,
             (league_id,),
         )
+
         season_champions = []
         for r in champ_rows:
             season_val = r.get("season")
@@ -65,13 +79,14 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 }
             )
     except Exception as e:
+        # 만약 teams 테이블이 없거나 스키마가 달라도 전체 API가 죽지 않도록 방어
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         season_champions = []
 
     return {
         "league_id": league_id,
         "seasons": seasons,
-        # 🔹 시즌별 우승 팀 정보 (앱에서 Season 탭에서 사용)
+        # 🔥 시즌별 우승 팀 정보 (앱 Seasons 탭에서 사용)
         "season_champions": season_champions,
     }
 
