@@ -19,7 +19,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     - season: 쿼리에서 넘어온 시즌 (없으면 DB에서 최신 시즌 선택)
 
     ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
-       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons, season_champions)를 추가로 내려준다.
+       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons, season_champions, league_logo)를 추가로 내려준다.
     """
     # 1) 시즌 결정 (없으면 최신 시즌)
     resolved_season = resolve_season_for_league(league_id=league_id, season=season)
@@ -32,11 +32,13 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
 
     # 3) 평탄화용 필드 준비 (새로 추가)
     league_name: Optional[str] = None
+    league_logo: Optional[str] = None
     standings_rows: Any = []
 
     if isinstance(standings_block, dict):
-        # leaguedetail/standings_block.py 에서 league_name / rows 형태로 내려준다고 가정
+        # leaguedetail/standings_block.py 에서 league_name / rows / league_logo 형태로 내려준다고 가정
         league_name = standings_block.get("league_name")
+        league_logo = standings_block.get("league_logo")
         standings_rows = standings_block.get("rows", []) or []
     else:
         standings_rows = []
@@ -63,6 +65,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
 
         # 🔹 새로 추가된 평탄화 필드
         "league_name": league_name,
+        "league_logo": league_logo,
         "standings": standings_rows,
         "seasons": seasons_list,
         "season_champions": season_champions,
