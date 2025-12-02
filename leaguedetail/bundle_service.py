@@ -65,7 +65,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
 
         # 🔹 새로 추가된 평탄화 필드
         "league_name": league_name,
-        "league_logo": league_logo,
+        "league_logo": standings_block.get("league_logo") if isinstance(standings_block, dict) else None,
         "standings": standings_rows,
         "seasons": seasons_list,
         "season_champions": season_champions,
@@ -76,3 +76,4 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "standings_block": standings_block,
         "seasons_block": seasons_block,
     }
+
