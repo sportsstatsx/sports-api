@@ -72,6 +72,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "season": int(season_val),
                     "team_id": r.get("team_id"),
                     "team_name": r.get("team_name") or "",
+                    "team_logo": r.get("team_logo"),
                     "points": r.get("points"),
                 }
             )
