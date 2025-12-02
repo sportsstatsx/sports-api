@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from db import fetch_one
 from leaguedetail.results_block import build_results_block
 from leaguedetail.fixtures_block import build_fixtures_block
 from leaguedetail.standings_block import build_standings_block
@@ -58,6 +59,21 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         seasons_list = []
         season_champions = []
 
+    # 🔥 standings_block 에 league_logo 가 없으면 DB 에서 한 번 더 가져오기
+    if not league_logo:
+        row = fetch_one(
+            """
+            SELECT logo
+            FROM leagues
+            WHERE league_id = %s
+            LIMIT 1
+            """,
+            (league_id,),
+        )
+        if row:
+            # row 가 dict 형태라고 가정
+            league_logo = row.get("logo") or row.get("league_logo")
+
     # 4) 최종 번들
     return {
         "league_id": league_id,
@@ -65,7 +81,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
 
         # 🔹 새로 추가된 평탄화 필드
         "league_name": league_name,
-        "league_logo": standings_block.get("league_logo") if isinstance(standings_block, dict) else None,
+        "league_logo": league_logo,
         "standings": standings_rows,
         "seasons": seasons_list,
         "season_champions": season_champions,
@@ -76,4 +92,3 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "standings_block": standings_block,
         "seasons_block": seasons_block,
     }
-
