@@ -21,7 +21,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
 
     ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
        앱에서 바로 쓰기 편한 평탄화 필드
-       (league_name, standings, seasons, season_champions, league_logo)를 추가로 내려준다.
+       (league_name, league_logo, standings, seasons, season_champions)를 추가로 내려준다.
     """
     # 1) 시즌 결정 (없으면 최신 시즌)
     resolved_season = resolve_season_for_league(league_id=league_id, season=season)
@@ -38,13 +38,26 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     standings_rows: Any = []
 
     if isinstance(standings_block, dict):
-        # leaguedetail/standings_block.py 에서 league_name / rows 형태로 내려준다고 가정
         league_name = standings_block.get("league_name")
-        standings_rows = standings_block.get("rows", []) or []
-        # 혹시 나중에 standings_block 쪽에서 league_logo 를 내려주게 되면 여기에서 우선 사용
         league_logo = standings_block.get("league_logo")
+        standings_rows = standings_block.get("rows", []) or []
+    else:
+        standings_rows = []
 
-    # 3-1) standings_block 에서 못 가져온 경우 → DB(leagues)에서 logo 컬럼 조회
+    seasons_list: Any = []
+    season_champions: Any = []
+
+    if isinstance(seasons_block, dict):
+        seasons_list = seasons_block.get("seasons", []) or []
+        season_champions = seasons_block.get("season_champions", []) or []
+    elif isinstance(seasons_block, list):
+        seasons_list = seasons_block
+        season_champions = []
+    else:
+        seasons_list = []
+        season_champions = []
+
+    # 3-1) standings_block 에 league_logo 가 없으면 → leagues 테이블에서 logo 가져오기
     if not league_logo:
         row = fetch_one(
             """
@@ -60,20 +73,41 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
             if logo_from_db:
                 league_logo = logo_from_db
 
-    seasons_list: Any = []
-    season_champions: Any = []
+    # 3-2) 시즌 챔피언에 team_logo 채워넣기
+    # standings_rows 에는 team_id / team_logo 가 들어 있으므로,
+    # 같은 team_id 를 가진 챔피언에게 team_logo 를 복사해준다.
+    if isinstance(season_champions, list) and isinstance(standings_rows, list):
+        # team_id → team_logo 매핑 생성
+        logo_by_team_id: Dict[int, str] = {}
+        for row in standings_rows:
+            if not isinstance(row, dict):
+                continue
+            tid = row.get("team_id")
+            tlogo = row.get("team_logo")
+            if tid is not None and tlogo:
+                logo_by_team_id[int(tid)] = tlogo
 
-    if isinstance(seasons_block, dict):
-        # build_seasons_block 결과가 {"seasons": [...], "season_champions": [...]} 형태라고 가정
-        seasons_list = seasons_block.get("seasons", []) or []
-        season_champions = seasons_block.get("season_champions", []) or []
-    elif isinstance(seasons_block, list):
-        # 혹시 리스트 형태면 그대로 사용
-        seasons_list = seasons_block
-        season_champions = []
-    else:
-        seasons_list = []
-        season_champions = []
+        enriched_champions: list[Any] = []
+        for champ in season_champions:
+            if not isinstance(champ, dict):
+                enriched_champions.append(champ)
+                continue
+
+            tid = champ.get("team_id")
+            existing_logo = champ.get("team_logo")
+            logo = existing_logo
+
+            if not logo and tid is not None:
+                logo = logo_by_team_id.get(int(tid))
+
+            if logo and logo != existing_logo:
+                new_champ = dict(champ)
+                new_champ["team_logo"] = logo
+                enriched_champions.append(new_champ)
+            else:
+                enriched_champions.append(champ)
+
+        season_champions = enriched_champions
 
     # 4) 최종 번들
     return {
@@ -87,7 +121,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "seasons": seasons_list,
         "season_champions": season_champions,
 
-        # 🔹 기존에 이미 사용하던(또는 나중에 쓸 수 있는) 블록 구조는 그대로 유지
+        # 🔹 기존 블록 구조도 그대로 유지
         "results_block": results_block,
         "fixtures_block": fixtures_block,
         "standings_block": standings_block,
