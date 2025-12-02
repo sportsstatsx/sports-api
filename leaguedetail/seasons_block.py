@@ -50,6 +50,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 s.season,
                 s.team_id,
                 COALESCE(t.name, '') AS team_name,
+                t.logo AS team_logo,
                 s.points
             FROM standings AS s
             LEFT JOIN teams AS t
