@@ -1,211 +1,91 @@
-# leaguedetail/standings_block.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from db import fetch_all
+from leaguedetail.results_block import build_results_block
+from leaguedetail.fixtures_block import build_fixtures_block
+from leaguedetail.standings_block import build_standings_block
+from leaguedetail.seasons_block import (
+    build_seasons_block,
+    resolve_season_for_league,
+)
 
 
-def _coalesce_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
+def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str, Any]:
     """
-    fetch_all 래핑해서 첫 번째 row만 돌려주는 헬퍼.
+    League Detail 화면에서 한 번만 호출하는 번들 빌더.
+
+    - league_id: 리그 ID (필수)
+    - season: 쿼리에서 넘어온 시즌 (없으면 DB에서 최신 시즌 선택)
+
+    ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
+       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons, season_champions, league_logo)를 추가로 내려준다.
     """
-    rows = fetch_all(query, params)
-    return rows[0] if rows else None
+    # 1) 시즌 결정 (없으면 최신 시즌)
+    resolved_season = resolve_season_for_league(league_id=league_id, season=season)
 
+    # 2) 블록별 데이터 조립 (기존 구조 유지)
+    seasons_block = build_seasons_block(league_id=league_id)
+    results_block = build_results_block(league_id=league_id, season=resolved_season)
+    fixtures_block = build_fixtures_block(league_id=league_id, season=resolved_season)
+    standings_block = build_standings_block(league_id=league_id, season=resolved_season)
 
-def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
-    """
-    season 이 None 이면:
-      1) standings 에서 해당 리그의 MAX(season)
-      2) 없으면 fixtures 에서 MAX(season)
-    순서대로 시도해서 하나라도 찾으면 그 값 리턴.
-    """
-    if season is not None:
-        return season
-
-    # 1) standings 기준
-    row = _fetch_one(
-        """
-        SELECT MAX(season) AS season
-        FROM standings
-        WHERE league_id = %s
-        """,
-        (league_id,),
-    )
-    if row is not None:
-        s = _coalesce_int(row.get("season"), 0)
-        if s > 0:
-            return s
-
-    # 2) fixtures 기준
-    row = _fetch_one(
-        """
-        SELECT MAX(season) AS season
-        FROM fixtures
-        WHERE league_id = %s
-        """,
-        (league_id,),
-    )
-    if row is not None:
-        s = _coalesce_int(row.get("season"), 0)
-        if s > 0:
-            return s
-
-    return None
-
-
-def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, Any]:
-    """
-    League Detail 화면의 'Standings' 탭 데이터.
-
-    - league_id / season 기반으로 standings 조회
-    - season 이 None 이면 standings → fixtures 순서대로 최신 시즌 추론
-    - 팀당 여러 row(스플릿 라운드 등)가 있으면, played 가 가장 큰 row만 남김
-    - (지금은 컨퍼런스/그룹 로직 없이 전체 테이블만 내려주고,
-       MLS/K리그 스플릿 같은 세부 로직은 나중에 이 블록 안에서 확장)
-    """
-
-    if not league_id:
-        # league_id 가 없으면 아예 빈 값 리턴
-        return {
-            "league_id": None,
-            "season": None,
-            "rows": [],
-        }
-
-    # season 자동 추론
-    season_resolved = _resolve_season(league_id, season)
-    if season_resolved is None:
-        # season 을 끝까지 못 찾은 경우
-        print(
-            f"[build_standings_block] WARN: no season found for league_id={league_id}"
-        )
-        return {
-            "league_id": league_id,
-            "season": None,
-            "rows": [],
-        }
-
-    # 리그 이름도 있으면 같이 내려주기 (선택 사항)
+    # 3) 평탄화용 필드 준비
     league_name: Optional[str] = None
-    try:
-        league_row = _fetch_one(
-            """
-            SELECT name
-            FROM leagues
-            WHERE id = %s
-            """,
-            (league_id,),
-        )
-        if league_row is not None:
-            league_name = (league_row.get("name") or "").strip() or None
-    except Exception as e:
-        print(
-            f"[build_standings_block] WARN: failed to load league name "
-            f"league_id={league_id}: {e}"
-        )
+    league_logo: Optional[str] = None
+    standings_rows: Any = []
 
-    # standings 원본 조회
-    try:
-        rows_raw: List[Dict[str, Any]] = fetch_all(
-            """
-            SELECT
-                s.rank,
-                s.team_id,
-                t.name       AS team_name,
-                t.logo       AS team_logo,
-                s.played,
-                s.win,
-                s.draw,
-                s.lose,
-                s.goals_for,
-                s.goals_against,
-                s.goals_diff,
-                s.points,
-                s.description,
-                s.group_name,
-                s.form
-            FROM standings AS s
-            JOIN teams     AS t ON t.id = s.team_id
-            WHERE s.league_id = %s
-              AND s.season    = %s
-            ORDER BY
-                s.group_name NULLS FIRST,
-                s.rank       NULLS LAST,
-                t.name       ASC
-            """,
-            (league_id, season_resolved),
-        )
-    except Exception as e:
-        print(
-            f"[build_standings_block] ERROR league_id={league_id}, "
-            f"season={season_resolved}: {e}"
-        )
-        rows_raw = []
+    if isinstance(standings_block, dict):
+        # 3-1) league_name
+        league_name = standings_block.get("league_name")
+        if not league_name:
+            # standings_block 안에 league 객체가 있다면 거기서도 한 번 더 시도
+            league_info = standings_block.get("league") or {}
+            if isinstance(league_info, dict):
+                league_name = league_info.get("name") or league_name
 
-    if not rows_raw:
-        return {
-            "league_id": league_id,
-            "season": season_resolved,
-            "league_name": league_name,
-            "rows": [],
-        }
+        # 3-2) league_logo
+        league_logo = standings_block.get("league_logo")
+        if not league_logo:
+            league_info = standings_block.get("league") or {}
+            if isinstance(league_info, dict):
+                league_logo = league_info.get("logo") or league_logo
 
-    # ── 1) 팀당 중복 row 정리 (played 가장 큰 row만 사용) ─────────────────
-    rows_by_team: Dict[int, Dict[str, Any]] = {}
-    for r in rows_raw:
-        team_id = _coalesce_int(r.get("team_id"), 0)
-        if team_id == 0:
-            continue
+        # 3-3) standings rows
+        standings_rows = standings_block.get("rows", []) or []
+    else:
+        standings_rows = []
 
-        prev = rows_by_team.get(team_id)
-        if prev is None:
-            rows_by_team[team_id] = r
-        else:
-            prev_played = _coalesce_int(prev.get("played"), 0)
-            cur_played = _coalesce_int(r.get("played"), 0)
-            if cur_played > prev_played:
-                rows_by_team[team_id] = r
+    seasons_list: Any = []
+    season_champions: Any = []
 
-    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
+    if isinstance(seasons_block, dict):
+        # build_seasons_block 결과가 {"seasons": [...], "season_champions": [...]} 형태라고 가정
+        seasons_list = seasons_block.get("seasons", []) or []
+        season_champions = seasons_block.get("season_champions", []) or []
+    elif isinstance(seasons_block, list):
+        # 혹시 리스트 형태면 그대로 사용
+        seasons_list = seasons_block
+        season_champions = []
+    else:
+        seasons_list = []
+        season_champions = []
 
-    # ── 2) rank 기준 정렬 ────────────────────────────────────────────────
-    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0) or 999999)
-
-    # ── 3) JSON 매핑 (matchdetail standings 와 필드 구조 최대한 맞춤) ──────
-    out_rows: List[Dict[str, Any]] = []
-    for r in dedup_rows:
-        out_rows.append(
-            {
-                "position": _coalesce_int(r.get("rank"), 0),
-                "team_id": _coalesce_int(r.get("team_id"), 0),
-                "team_name": r.get("team_name") or "",
-                "team_logo": r.get("team_logo"),
-                "played": _coalesce_int(r.get("played"), 0),
-                "win": _coalesce_int(r.get("win"), 0),
-                "draw": _coalesce_int(r.get("draw"), 0),
-                "loss": _coalesce_int(r.get("lose"), 0),
-                "goals_for": _coalesce_int(r.get("goals_for"), 0),
-                "goals_against": _coalesce_int(r.get("goals_against"), 0),
-                "goal_diff": _coalesce_int(r.get("goals_diff"), 0),
-                "points": _coalesce_int(r.get("points"), 0),
-                "description": r.get("description"),
-                "group_name": r.get("group_name"),
-                "form": r.get("form"),
-            }
-        )
-
+    # 4) 최종 번들
     return {
         "league_id": league_id,
-        "season": season_resolved,
+        "season": resolved_season,
+
+        # 🔹 새로 추가된 평탄화 필드
         "league_name": league_name,
-        "rows": out_rows,
+        "league_logo": league_logo,
+        "standings": standings_rows,
+        "seasons": seasons_list,
+        "season_champions": season_champions,
+
+        # 🔹 기존에 이미 사용하던(또는 나중에 쓸 수 있는) 블록 구조는 그대로 유지
+        "results_block": results_block,
+        "fixtures_block": fixtures_block,
+        "standings_block": standings_block,
+        "seasons_block": seasons_block,
     }
