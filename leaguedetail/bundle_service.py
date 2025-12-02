@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from db import fetch_one
 from leaguedetail.results_block import build_results_block
 from leaguedetail.fixtures_block import build_fixtures_block
 from leaguedetail.standings_block import build_standings_block
@@ -19,7 +20,8 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     - season: 쿼리에서 넘어온 시즌 (없으면 DB에서 최신 시즌 선택)
 
     ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
-       앱에서 바로 쓰기 편한 평탄화 필드(league_name, standings, seasons, season_champions, league_logo)를 추가로 내려준다.
+       앱에서 바로 쓰기 편한 평탄화 필드
+       (league_name, standings, seasons, season_champions, league_logo)를 추가로 내려준다.
     """
     # 1) 시즌 결정 (없으면 최신 시즌)
     resolved_season = resolve_season_for_league(league_id=league_id, season=season)
@@ -36,25 +38,27 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     standings_rows: Any = []
 
     if isinstance(standings_block, dict):
-        # 3-1) league_name
+        # leaguedetail/standings_block.py 에서 league_name / rows 형태로 내려준다고 가정
         league_name = standings_block.get("league_name")
-        if not league_name:
-            # standings_block 안에 league 객체가 있다면 거기서도 한 번 더 시도
-            league_info = standings_block.get("league") or {}
-            if isinstance(league_info, dict):
-                league_name = league_info.get("name") or league_name
-
-        # 3-2) league_logo
-        league_logo = standings_block.get("league_logo")
-        if not league_logo:
-            league_info = standings_block.get("league") or {}
-            if isinstance(league_info, dict):
-                league_logo = league_info.get("logo") or league_logo
-
-        # 3-3) standings rows
         standings_rows = standings_block.get("rows", []) or []
-    else:
-        standings_rows = []
+        # 혹시 나중에 standings_block 쪽에서 league_logo 를 내려주게 되면 여기에서 우선 사용
+        league_logo = standings_block.get("league_logo")
+
+    # 3-1) standings_block 에서 못 가져온 경우 → DB(leagues)에서 logo 컬럼 조회
+    if not league_logo:
+        row = fetch_one(
+            """
+            SELECT logo
+            FROM leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (league_id,),
+        )
+        if row:
+            logo_from_db = row.get("logo")
+            if logo_from_db:
+                league_logo = logo_from_db
 
     seasons_list: Any = []
     season_champions: Any = []
