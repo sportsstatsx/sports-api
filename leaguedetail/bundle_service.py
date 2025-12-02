@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from db import fetch_one
 from leaguedetail.results_block import build_results_block
 from leaguedetail.fixtures_block import build_fixtures_block
 from leaguedetail.standings_block import build_standings_block
@@ -31,15 +30,28 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     fixtures_block = build_fixtures_block(league_id=league_id, season=resolved_season)
     standings_block = build_standings_block(league_id=league_id, season=resolved_season)
 
-    # 3) 평탄화용 필드 준비 (새로 추가)
+    # 3) 평탄화용 필드 준비
     league_name: Optional[str] = None
     league_logo: Optional[str] = None
     standings_rows: Any = []
 
     if isinstance(standings_block, dict):
-        # leaguedetail/standings_block.py 에서 league_name / rows / league_logo 형태로 내려준다고 가정
+        # 3-1) league_name
         league_name = standings_block.get("league_name")
+        if not league_name:
+            # standings_block 안에 league 객체가 있다면 거기서도 한 번 더 시도
+            league_info = standings_block.get("league") or {}
+            if isinstance(league_info, dict):
+                league_name = league_info.get("name") or league_name
+
+        # 3-2) league_logo
         league_logo = standings_block.get("league_logo")
+        if not league_logo:
+            league_info = standings_block.get("league") or {}
+            if isinstance(league_info, dict):
+                league_logo = league_info.get("logo") or league_logo
+
+        # 3-3) standings rows
         standings_rows = standings_block.get("rows", []) or []
     else:
         standings_rows = []
@@ -58,21 +70,6 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     else:
         seasons_list = []
         season_champions = []
-
-    # 🔥 standings_block 에 league_logo 가 없으면 DB 에서 한 번 더 가져오기
-    if not league_logo:
-        row = fetch_one(
-            """
-            SELECT logo
-            FROM leagues
-            WHERE league_id = %s
-            LIMIT 1
-            """,
-            (league_id,),
-        )
-        if row:
-            # row 가 dict 형태라고 가정
-            league_logo = row.get("logo") or row.get("league_logo")
 
     # 4) 최종 번들
     return {
