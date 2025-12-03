@@ -372,13 +372,26 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Kotlin 과 동일한 정렬 규칙
     order_map = {"H1": 0, "H2": 1, "ET": 2, "PEN": 3}
 
+    # ✅ 같은 시간대(분/추가시간)가 겹칠 때 타입 우선순위
+    #    - 패널티 실축(PEN_MISSED)은 실제 골보다 먼저 보이도록
+    type_order = {
+        "PEN_MISSED": -1,  # 실축이 항상 골보다 먼저
+    }
+
     events.sort(
         key=lambda e: (
+            # 1) 전/후반/연장/승부차기 순서
             order_map.get(e["period"], 9),
+            # 2) 분
             e["minute"],
+            # 3) 추가시간
             e.get("minute_extra") or 0,
+            # 4) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
+            type_order.get(e["type"], 0),
+            # 5) 마지막으로 id_stable 로 안정 정렬
             e["id_stable"],
         )
     )
 
     return events
+
