@@ -165,11 +165,40 @@ def enrich_overall_goals_by_time(
             continue
 
         idx = bucket_index(m_val)
-        is_for = (gr.get("team_id") == team_id)
+
+        raw_team_id = gr.get("team_id")
+        try:
+            ev_team_id = int(raw_team_id) if raw_team_id is not None else None
+        except (TypeError, ValueError):
+            continue
+
+        # 자책골 여부: detail 에 "own" + "goal" 이 들어있는지 체크
+        detail_str = (gr.get("detail") or "").lower()
+        is_own = ("own" in detail_str and "goal" in detail_str)
+
+        if ev_team_id is None:
+            continue
+
+        if is_own:
+            # 자책골
+            if ev_team_id == team_id:
+                # 우리가 자책골 → 실점
+                is_for = False
+                is_against = True
+            else:
+                # 상대가 자책골 → 득점
+                is_for = True
+                is_against = False
+        else:
+            # 일반 골 / PK 골
+            is_for = (ev_team_id == team_id)
+            is_against = not is_for
+
         if is_for:
             for_buckets[idx] += 1
-        else:
+        elif is_against:
             against_buckets[idx] += 1
+
 
     insights["goals_by_time_for"] = for_buckets
     insights["goals_by_time_against"] = against_buckets
