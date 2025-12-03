@@ -167,6 +167,13 @@ def enrich_overall_goals_by_time(
 
         idx = bucket_index(m_val)
 
+        # 👇 패널티 실축 / 골이 아닌 이벤트 거르기
+        detail_str = (gr.get("detail") or "").lower()
+        # "missed penalty", "penalty missed" 등 패턴을 전부 커버
+        if "miss" in detail_str and "pen" in detail_str:
+            # 골이 아니므로 득점/실점 집계에서 제외
+            continue
+
         raw_team_id = gr.get("team_id")
         try:
             ev_team_id = int(raw_team_id) if raw_team_id is not None else None
@@ -176,14 +183,14 @@ def enrich_overall_goals_by_time(
         if ev_team_id is None:
             continue
 
-        # ✅ 자책골 포함: match_events.team_id 는 항상 "득점 팀"이므로
-        #    단순히 우리 팀인지 여부만 보면 됨.
+        # ✅ 자책골 포함: team_id = 득점 팀 기준
         is_for = (ev_team_id == team_id)
 
         if is_for:
             for_buckets[idx] += 1
         else:
             against_buckets[idx] += 1
+
 
 
 
