@@ -112,7 +112,8 @@ def enrich_overall_timing(
             SELECT
                 e.fixture_id,
                 e.minute,
-                e.team_id
+                e.team_id,
+                e.detail
             FROM match_events e
             WHERE e.fixture_id IN ({placeholders})
               AND e.minute IS NOT NULL
@@ -123,6 +124,7 @@ def enrich_overall_timing(
         for ev in event_rows:
             fid = ev["fixture_id"]
             events_by_fixture.setdefault(fid, []).append(ev)
+
 
     # 샘플 수 (Timing 계산에 사용된 경기 수)
     half_mt_tot = half_mt_home = half_mt_away = 0
@@ -177,6 +179,14 @@ def enrich_overall_timing(
             if m_int < 0:
                 continue
 
+            # ✅ 패널티 실축 / 세이브는 득점/실점 타이밍 계산에서 제외
+            detail_str = (ev.get("detail") or "").lower()
+            if ("pen" in detail_str or "penalty" in detail_str) and (
+                "miss" in detail_str or "saved" in detail_str
+            ):
+                # 골이 아니므로 스킵
+                continue
+
             is_for_goal = (ev["team_id"] == team_id)
 
             # 전/후반
@@ -204,6 +214,7 @@ def enrich_overall_timing(
                     scored_8090 = True
                 else:
                     conceded_8090 = True
+
 
         # ref 래핑 유틸
         def _inc(flag: bool, total_ref, home_ref, away_ref):
