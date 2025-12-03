@@ -110,7 +110,8 @@ def enrich_overall_firstgoal_momentum(
             SELECT
                 e.fixture_id,
                 e.minute,
-                e.team_id
+                e.team_id,
+                e.detail
             FROM match_events e
             WHERE e.fixture_id IN ({placeholders})
               AND e.minute IS NOT NULL
@@ -121,6 +122,7 @@ def enrich_overall_firstgoal_momentum(
         for ev in event_rows:
             fid = ev["fixture_id"]
             events_by_fixture.setdefault(fid, []).append(ev)
+
 
     # First goal 샘플 수/카운터
     fg_sample_t = fg_sample_h = fg_sample_a = 0
@@ -169,12 +171,21 @@ def enrich_overall_firstgoal_momentum(
             if m_int < 0:
                 continue
 
+            # ✅ 패널티 실축 / 세이브는 첫 골에서 제외
+            detail_str = (ev.get("detail") or "").lower()
+            if ("pen" in detail_str or "penalty" in detail_str) and (
+                "miss" in detail_str or "saved" in detail_str
+            ):
+                # 골이 아니므로 스킵
+                continue
+
             is_for_goal = (ev["team_id"] == team_id)
 
             # 첫 골인지 판단 (가장 이른 분)
             if first_minute is None or m_int < first_minute:
                 first_minute = m_int
                 first_for = is_for_goal
+
 
         if first_minute is None or first_for is None:
             continue
