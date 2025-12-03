@@ -122,12 +122,19 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
 
+    # ✅ 1) 패널티 실축을 최우선으로 판별
+    if (("pen" in t or "pen" in d or "penalty" in d)
+            and ("miss" in d or "saved" in d)):
+        return "PEN_MISSED"
+
+    # ✅ 2) 자책골 / PK 골 / 일반 골
     if "goal" in t and "own" in d:
         return "OWN_GOAL"
     if "goal" in t and ("pen" in d or "penalty" in d):
         return "PEN_GOAL"
     if "goal" in t:
         return "GOAL"
+
 
     if "card" in t and "red" in d:
         return "RED"
@@ -144,6 +151,8 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
         return "VAR"
 
     # detail 만 보고 보정
+    if ("pen" in d or "penalty" in d) and ("miss" in d or "saved" in d):
+        return "PEN_MISSED"
     if "own" in d and "goal" in d:
         return "OWN_GOAL"
     if "pen" in d and "goal" in d:
