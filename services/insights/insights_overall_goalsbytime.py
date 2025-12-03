@@ -111,9 +111,10 @@ def enrich_overall_goals_by_time(
             e.detail
         FROM match_events e
         WHERE e.fixture_id IN ({fi_placeholders})
-          AND lower(e.type) = 'goal'
+          AND lower(e.type) IN ('goal','own goal','penalty','penalty goal')
           AND e.minute IS NOT NULL
     """
+
 
 
     goal_rows = fetch_all(goals_sql, tuple(fixture_ids))
@@ -172,32 +173,18 @@ def enrich_overall_goals_by_time(
         except (TypeError, ValueError):
             continue
 
-        # 자책골 여부: detail 에 "own" + "goal" 이 들어있는지 체크
-        detail_str = (gr.get("detail") or "").lower()
-        is_own = ("own" in detail_str and "goal" in detail_str)
-
         if ev_team_id is None:
             continue
 
-        if is_own:
-            # 자책골
-            if ev_team_id == team_id:
-                # 우리가 자책골 → 실점
-                is_for = False
-                is_against = True
-            else:
-                # 상대가 자책골 → 득점
-                is_for = True
-                is_against = False
-        else:
-            # 일반 골 / PK 골
-            is_for = (ev_team_id == team_id)
-            is_against = not is_for
+        # ✅ 자책골 포함: match_events.team_id 는 항상 "득점 팀"이므로
+        #    단순히 우리 팀인지 여부만 보면 됨.
+        is_for = (ev_team_id == team_id)
 
         if is_for:
             for_buckets[idx] += 1
-        elif is_against:
+        else:
             against_buckets[idx] += 1
+
 
 
     insights["goals_by_time_for"] = for_buckets
