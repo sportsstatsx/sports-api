@@ -114,16 +114,21 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "league_id": league_id,
         "season": resolved_season,
 
-        # 🔹 새로 추가된 평탄화 필드
+        # 평탄화 필드
         "league_name": league_name,
         "league_logo": league_logo,
         "standings": standings_rows,
         "seasons": seasons_list,
         "season_champions": season_champions,
 
-        # 🔹 기존 블록 구조도 그대로 유지
+        # 🔥 NEW — Standings의 컨텍스트 옵션을 리그디테일 번들로 직접 flatten
+        "standingsConferences": standings_block.get("context_options", {}).get("conferences", []),
+        "standingsGroups": standings_block.get("context_options", {}).get("groups", []),
+
+        # 기존 블록 유지
         "results_block": results_block,
         "fixtures_block": fixtures_block,
         "standings_block": standings_block,
         "seasons_block": seasons_block,
     }
+
