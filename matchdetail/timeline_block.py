@@ -284,17 +284,15 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         # 스코어 스냅샷 (득점 이벤트만)
         snapshot_score: str | None = None
         if t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
+            # API 기준: team_id = 득점 팀
+            # → side 가 home/away 어느 쪽이든 그대로 +1 만 해주면 된다
             if side == "home":
-                if t_canon == "OWN_GOAL":
-                    away_score += 1
-                else:
-                    home_score += 1
+                home_score += 1
             elif side == "away":
-                if t_canon == "OWN_GOAL":
-                    home_score += 1
-                else:
-                    away_score += 1
+                away_score += 1
+
             snapshot_score = f"{home_score} - {away_score}"
+
 
         # line1 / line2
         line1: str
