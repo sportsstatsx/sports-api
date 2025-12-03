@@ -107,12 +107,14 @@ def enrich_overall_goals_by_time(
         SELECT
             e.fixture_id,
             e.minute,
-            e.team_id
+            e.team_id,
+            e.detail
         FROM match_events e
         WHERE e.fixture_id IN ({fi_placeholders})
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
     """
+
 
     goal_rows = fetch_all(goals_sql, tuple(fixture_ids))
     if not goal_rows:
