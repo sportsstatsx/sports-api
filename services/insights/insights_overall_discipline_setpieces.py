@@ -251,7 +251,8 @@ def enrich_overall_discipline_setpieces(
         SELECT
             e.fixture_id,
             e.minute,
-            e.team_id
+            e.team_id,
+            e.detail
         FROM match_events e
         JOIN matches m ON m.fixture_id = e.fixture_id
         WHERE m.league_id IN ({placeholders_ev})
@@ -266,6 +267,7 @@ def enrich_overall_discipline_setpieces(
         """,
         (*league_ids_for_query, season_int, team_id, team_id),
     )
+
 
 
     # fixture 별 첫 레드카드 시각 (상대 / 자팀)
@@ -302,7 +304,7 @@ def enrich_overall_discipline_setpieces(
     for row in goal_rows:
         fid = row["fixture_id"]
         minute = row["minute"]
-        scorer_id = row["team_id"]
+        raw_team_id = row["team_id"]
 
         # 이 경기에서 우리 팀이 실제로 뛴 경우만
         if fid not in fixture_venue:
@@ -310,8 +312,36 @@ def enrich_overall_discipline_setpieces(
 
         venue = fixture_venue[fid]
 
-        # 상대 레드 이후 우리가 득점?
-        if fid in opp_red_min and minute > opp_red_min[fid] and scorer_id == team_id:
+        try:
+            ev_team_id = int(raw_team_id) if raw_team_id is not None else None
+        except (TypeError, ValueError):
+            continue
+
+        if ev_team_id is None:
+            continue
+
+        # 자책골 여부 판별
+        detail_str = (row.get("detail") or "").lower()
+        is_own = ("own" in detail_str and "goal" in detail_str)
+
+        # 이 골이 "우리 기준" 득점/실점인지
+        if is_own:
+            # 자책골
+            if ev_team_id == team_id:
+                # 우리가 자책골 → 실점
+                is_for = False
+                is_against = True
+            else:
+                # 상대가 자책골 → 득점
+                is_for = True
+                is_against = False
+        else:
+            # 일반 골 / PK 골
+            is_for = (ev_team_id == team_id)
+            is_against = not is_for
+
+        # 상대 레드 이후 "우리가 득점"한 경우만 카운트
+        if fid in opp_red_min and minute > opp_red_min[fid] and is_for:
             opp_scored_after[fid] = True
             opp_goals_after_t += 1
             if venue == "H":
@@ -319,14 +349,15 @@ def enrich_overall_discipline_setpieces(
             else:
                 opp_goals_after_a += 1
 
-        # 우리 레드 이후 우리가 실점?
-        if fid in own_red_min and minute > own_red_min[fid] and scorer_id != team_id:
+        # 우리 레드 이후 "우리가 실점"한 경우만 카운트
+        if fid in own_red_min and minute > own_red_min[fid] and is_against:
             own_conceded_after[fid] = True
             own_goals_after_t += 1
             if venue == "H":
                 own_goals_after_h += 1
             else:
                 own_goals_after_a += 1
+
 
     # 샘플 수 및 히트 수 (T/H/A) 집계
     opp_sample_t = opp_sample_h = opp_sample_a = 0
