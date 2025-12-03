@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import re
 
 from db import fetch_all
 
@@ -62,6 +63,67 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
     return None
 
 
+# ────────────────────────────────────────────────────────────
+#  컨퍼런스 / 그룹 / 스플릿 정보 추출 (context_options)
+# ────────────────────────────────────────────────────────────
+
+_RX_GROUP = re.compile(r"group\s+[A-Z]", re.IGNORECASE)
+_RX_CONF = re.compile(r"conference", re.IGNORECASE)
+_RX_EAST = re.compile(r"east", re.IGNORECASE)
+_RX_WEST = re.compile(r"west", re.IGNORECASE)
+_RX_CHAMP = re.compile(r"championship", re.IGNORECASE)
+_RX_RELEG = re.compile(r"relegation", re.IGNORECASE)
+_RX_PLAYOFF = re.compile(r"play[- ]?off", re.IGNORECASE)
+
+
+def _build_context_options_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """
+    standings row 들을 보고:
+      - MLS East/West 같은 컨퍼런스
+      - K리그 Championship / Relegation / Playoff 스플릿
+      - Group A / Group B 등 그룹
+    을 추출해서 context_options 로 내려준다.
+
+    클라이언트에서는:
+      conferences → StandingsContext.conferences
+      groups      → StandingsContext.groups
+    로 맵핑해서 칩 필터로 사용.
+    """
+
+    conferences: List[str] = []
+    groups: List[str] = []
+
+    for r in rows:
+        g = (r.get("group_name") or "").strip()
+        desc = (r.get("description") or "").strip()
+        text = f"{g} {desc}".strip()
+        if not text:
+            continue
+
+        # 1) 컨퍼런스/East/West (MLS 류)
+        if _RX_CONF.search(text) or _RX_EAST.search(text) or _RX_WEST.search(text):
+            label = g or desc
+            if label and label not in conferences:
+                conferences.append(label)
+            continue
+
+        # 2) 챔피언십/강등/플레이오프/그룹 → groups 로
+        if (
+            _RX_CHAMP.search(text)
+            or _RX_RELEG.search(text)
+            or _RX_PLAYOFF.search(text)
+            or _RX_GROUP.search(text)
+        ):
+            label = g or desc
+            if label and label not in groups:
+                groups.append(label)
+
+    return {
+        "conferences": conferences,
+        "groups": groups,
+    }
+
+
 def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, Any]:
     """
     League Detail 화면의 'Standings' 탭 데이터.
@@ -69,8 +131,7 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
     - league_id / season 기반으로 standings 조회
     - season 이 None 이면 standings → fixtures 순서대로 최신 시즌 추론
     - 팀당 여러 row(스플릿 라운드 등)가 있으면, played 가 가장 큰 row만 남김
-    - (지금은 컨퍼런스/그룹 로직 없이 전체 테이블만 내려주고,
-       MLS/K리그 스플릿 같은 세부 로직은 나중에 이 블록 안에서 확장)
+    - context_options 에 MLS/K리그 스플릿/그룹 정보까지 내려줌
     """
 
     if not league_id:
@@ -79,6 +140,10 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
             "league_id": None,
             "season": None,
             "rows": [],
+            "context_options": {
+                "conferences": [],
+                "groups": [],
+            },
         }
 
     # season 자동 추론
@@ -92,6 +157,10 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
             "league_id": league_id,
             "season": None,
             "rows": [],
+            "context_options": {
+                "conferences": [],
+                "groups": [],
+            },
         }
 
     # 리그 이름도 있으면 같이 내려주기 (선택 사항)
@@ -157,6 +226,10 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
             "season": season_resolved,
             "league_name": league_name,
             "rows": [],
+            "context_options": {
+                "conferences": [],
+                "groups": [],
+            },
         }
 
     # ── 1) 팀당 중복 row 정리 (played 가장 큰 row만 사용) ─────────────────
@@ -203,9 +276,13 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
             }
         )
 
+    # ── 4) context_options 생성 ─────────────────────────────────────────
+    context_options = _build_context_options_from_rows(dedup_rows)
+
     return {
         "league_id": league_id,
         "season": season_resolved,
         "league_name": league_name,
         "rows": out_rows,
+        "context_options": context_options,
     }
