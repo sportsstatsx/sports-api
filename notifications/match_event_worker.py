@@ -36,34 +36,60 @@ def get_subscribed_matches() -> List[int]:
 
 def load_current_match_state(match_id: int) -> MatchState | None:
     """
-    ⚠️ 여기 쿼리는 네 실제 스키마에 맞게 약간 수정해야 함.
-    예시는 matches 테이블이 있다고 가정.
+    현재 match_id 경기의 상태를 DB에서 읽어서 MatchState로 반환한다.
+
+    - 골 수는 matches.home_ft / matches.away_ft 사용
+    - 레드카드는 match_events 에서 type='Card' + detail 이 레드카드인 이벤트를
+      홈/원정팀별로 COUNT 해서 계산
     """
     row = fetch_one(
         """
         SELECT
-            fixture_id AS match_id,
-            status_short AS status,
-            goals_home AS home_goals,
-            goals_away AS away_goals,
-            red_cards_home AS home_red,
-            red_cards_away AS away_red
-        FROM matches
-        WHERE fixture_id = %s
+            m.fixture_id AS match_id,
+            m.status     AS status,
+            COALESCE(m.home_ft, 0) AS home_goals,
+            COALESCE(m.away_ft, 0) AS away_goals,
+            COALESCE(
+                (
+                    SELECT COUNT(*)
+                    FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.type = 'Card'
+                      AND e.detail IN ('Red Card', 'Second Yellow Card')
+                      AND e.team_id = m.home_id
+                ),
+                0
+            ) AS home_red,
+            COALESCE(
+                (
+                    SELECT COUNT(*)
+                    FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.type = 'Card'
+                      AND e.detail IN ('Red Card', 'Second Yellow Card')
+                      AND e.team_id = m.away_id
+                ),
+                0
+            ) AS away_red
+        FROM matches m
+        WHERE m.fixture_id = %s
         """,
         (match_id,),
     )
+
     if not row:
+        # 해당 match_id 경기 자체가 없으면 None
         return None
 
     return MatchState(
         match_id=int(row["match_id"]),
-        status=str(row["status"]),
+        status=str(row["status"]) if row["status"] is not None else "",
         home_goals=int(row["home_goals"] or 0),
         away_goals=int(row["away_goals"] or 0),
         home_red=int(row["home_red"] or 0),
         away_red=int(row["away_red"] or 0),
     )
+
 
 
 def load_last_state(match_id: int) -> MatchState | None:
