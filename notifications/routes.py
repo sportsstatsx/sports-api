@@ -8,6 +8,8 @@ from flask import Blueprint, request, jsonify
 
 from db import execute, fetch_all
 
+from notifications.fcm_client import FCMClient
+
 notifications_bp = Blueprint("notifications", __name__)
 
 
@@ -222,3 +224,60 @@ def list_subscriptions() -> Any:
     )
 
     return jsonify({"ok": True, "data": rows})
+
+@notifications_bp.route("/api/notifications/admin_broadcast", methods=["POST"])
+def admin_broadcast() -> Any:
+    """
+    관리자 임의 메시지 브로드캐스트.
+
+    body 예:
+    {
+        "admin_key": "환경변수와 같은 값",
+        "title": "공지 제목",
+        "body": "공지 내용",
+        "only_notifications_enabled": true
+    }
+    """
+
+    data: Dict[str, Any] = request.get_json(silent=True) or {}
+    admin_key = str(data.get("admin_key", "")).strip()
+    expected = os.getenv("ADMIN_BROADCAST_KEY") or ""
+
+    if not expected or admin_key != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    title = str(data.get("title", "")).strip()
+    body = str(data.get("body", "")).strip()
+    only_enabled = bool(data.get("only_notifications_enabled", True))
+
+    if not title or not body:
+        return jsonify({"ok": False, "error": "title and body required"}), 400
+
+    # 대상 디바이스 토큰 조회
+    if only_enabled:
+        rows = fetch_all(
+            """
+            SELECT fcm_token
+            FROM user_devices
+            WHERE notifications_enabled = TRUE
+            """
+        )
+    else:
+        rows = fetch_all("SELECT fcm_token FROM user_devices")
+
+    tokens = [str(r["fcm_token"]) for r in rows]
+
+    if not tokens:
+        return jsonify({"ok": True, "sent": 0})
+
+    fcm = FCMClient()
+
+    batch_size = 500
+    sent_total = 0
+    for i in range(0, len(tokens), batch_size):
+        batch = tokens[i : i + batch_size]
+        resp = fcm.send_to_tokens(batch, title, body, data={"type": "admin_broadcast"})
+        sent_total += len(batch)
+
+    return jsonify({"ok": True, "sent": sent_total})
+
