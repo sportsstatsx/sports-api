@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -304,8 +305,13 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     save_state(current)
 
 
-def main() -> None:
-    fcm = FCMClient()
+def run_once(fcm: FCMClient | None = None) -> None:
+    """
+    기존 main() 과 동일하게 한 번만 돌면서
+    즐겨찾기된 경기들의 변화만 체크해서 푸시를 보냄.
+    """
+    if fcm is None:
+        fcm = FCMClient()
 
     matches = get_subscribed_matches()
     if not matches:
@@ -317,5 +323,38 @@ def main() -> None:
         process_match(fcm, match_id)
 
 
+def run_forever(interval_seconds: int = 10) -> None:
+    """
+    Worker 모드: interval_seconds 간격으로 run_once 를 반복 실행.
+    """
+    fcm = FCMClient()
+    log.info(
+        "Starting match_event_worker in worker mode (interval=%s sec)",
+        interval_seconds,
+    )
+
+    while True:
+        try:
+            run_once(fcm)
+        except Exception:
+            # 에러가 나도 워커가 죽지 않도록 로그만 찍고 다음 루프로 진행
+            log.exception("Error while processing matches in worker loop")
+
+        time.sleep(interval_seconds)
+
+
 if __name__ == "__main__":
-    main()
+    # 환경변수 MATCH_WORKER_INTERVAL_SEC 이 설정되어 있으면
+    # 그 값을 초 단위로 사용해서 worker 모드로 실행.
+    # 없으면 예전처럼 한 번만 실행하고 종료(run_once).
+    interval = os.getenv("MATCH_WORKER_INTERVAL_SEC")
+
+    if interval:
+        try:
+            seconds = int(interval)
+        except ValueError:
+            seconds = 10  # 잘못된 값이면 기본 10초
+        run_forever(seconds)
+    else:
+        run_once()
+
