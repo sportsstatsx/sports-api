@@ -1,11 +1,12 @@
 # notifications/routes.py
 
-from datetime import datetime, timezone
+from __future__ import annotations
+
 from typing import Any, Dict
 
 from flask import Blueprint, request, jsonify
 
-from db import fetch_one, execute
+from db import execute
 
 notifications_bp = Blueprint("notifications", __name__)
 
@@ -13,96 +14,80 @@ notifications_bp = Blueprint("notifications", __name__)
 @notifications_bp.route("/api/notifications/register_device", methods=["POST"])
 def register_device() -> Any:
     """
-    앱에서 FCM 토큰을 보내오면
-    notification_devices 테이블에 upsert(있으면 UPDATE, 없으면 INSERT) 하는 엔드포인트.
+    앱에서 FCM 토큰/디바이스 정보를 보내면
+    user_devices 테이블에 upsert 하는 엔드포인트.
+
+    요청 JSON 예:
+    {
+        "device_id": "abc-uuid",
+        "fcm_token": "xxx",
+        "platform": "android",
+        "app_version": "1.6.0",
+        "timezone": "Asia/Seoul",
+        "language": "ko",
+        "notifications_enabled": true
+    }
     """
 
-    payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    data: Dict[str, Any] = request.get_json(silent=True) or {}
 
-    device_id = payload.get("device_id")
-    fcm_token = payload.get("fcm_token")
-    platform = payload.get("platform") or "android"
-    app_version = payload.get("app_version")
-    tz = payload.get("timezone")
+    device_id = str(data.get("device_id", "")).strip()
+    fcm_token = str(data.get("fcm_token", "")).strip()
+    platform = str(data.get("platform", "")).strip() or "android"
 
+    app_version = str(data.get("app_version", "")).strip() or None
+    timezone_str = str(data.get("timezone", "")).strip() or None
+    language = str(data.get("language", "")).strip() or None
+
+    notifications_enabled_raw = data.get("notifications_enabled")
+    notifications_enabled = (
+        bool(notifications_enabled_raw)
+        if notifications_enabled_raw is not None
+        else True
+    )
+
+    # 필수값 체크
     if not device_id or not fcm_token:
-        return (
-            jsonify(
-                {
-                    "ok": False,
-                    "error": "device_id and fcm_token are required",
-                }
-            ),
-            400,
+        return jsonify(
+            {"ok": False, "error": "device_id and fcm_token are required"}
+        ), 400
+
+    # ⚠️ 여기서는 항상 user_devices 테이블만 사용
+    sql = """
+        INSERT INTO user_devices (
+            device_id,
+            fcm_token,
+            platform,
+            app_version,
+            timezone,
+            language,
+            notifications_enabled,
+            created_at,
+            updated_at
         )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (device_id)
+        DO UPDATE SET
+            fcm_token = EXCLUDED.fcm_token,
+            platform = EXCLUDED.platform,
+            app_version = EXCLUDED.app_version,
+            timezone = EXCLUDED.timezone,
+            language = EXCLUDED.language,
+            notifications_enabled = EXCLUDED.notifications_enabled,
+            updated_at = NOW();
+    """
 
-    now_utc = datetime.now(timezone.utc)
-
-    # 이미 등록된 device 인지 확인
-    existing = fetch_one(
-        """
-        SELECT id, fcm_token, is_active
-        FROM notification_devices
-        WHERE device_id = %s
-        """,
-        (device_id,),
+    execute(
+        sql,
+        (
+            device_id,
+            fcm_token,
+            platform,
+            app_version,
+            timezone_str,
+            language,
+            notifications_enabled,
+        ),
     )
 
-    if existing:
-        # 기존 row 업데이트
-        execute(
-            """
-            UPDATE notification_devices
-            SET
-                fcm_token    = %s,
-                platform     = %s,
-                app_version  = %s,
-                timezone     = %s,
-                is_active    = TRUE,
-                updated_utc  = %s,
-                last_seen_utc = %s
-            WHERE device_id = %s
-            """,
-            (
-                fcm_token,
-                platform,
-                app_version,
-                tz,
-                now_utc,
-                now_utc,
-                device_id,
-            ),
-        )
-        device_pk = existing["id"]
-        created = False
-    else:
-        # 새 row 생성
-        row = fetch_one(
-            """
-            INSERT INTO notification_devices
-                (device_id, fcm_token, platform, app_version,
-                 timezone, is_active, created_utc, updated_utc, last_seen_utc)
-            VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                device_id,
-                fcm_token,
-                platform,
-                app_version,
-                tz,
-                now_utc,
-                now_utc,
-                now_utc,
-            ),
-        )
-        device_pk = row["id"]
-        created = True
-
-    return jsonify(
-        {
-            "ok": True,
-            "device_db_id": device_pk,
-            "created": created,
-        }
-    )
+    return jsonify({"ok": True})
