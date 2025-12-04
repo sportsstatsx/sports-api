@@ -4,145 +4,94 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-"""
-FCM 클라이언트 (Firebase Admin SDK 사용 버전)
-
-- 환경변수 FIREBASE_SERVICE_ACCOUNT_JSON 에
-  Firebase 서비스 계정 JSON 전체 내용을 문자열로 넣어두고 사용.
-- 더 이상 FCM_SERVER_KEY, 레거시 HTTP 엔드포인트는 사용하지 않음.
-
-사용 예시 (기존 match_event_worker 코드와 호환):
-
-    from notifications.fcm_client import FCMClient
-
-    fcm = FCMClient()
-    result = fcm.send_to_tokens(
-        tokens=["token1", "token2"],
-        title="Kickoff!",
-        body="경기가 곧 시작합니다.",
-        data={"match_id": "12345"}
-    )
-"""
-
-_FIREBASE_APP: Optional[firebase_admin.App] = None
+SERVICE_ENV_VAR = "FIREBASE_SERVICE_ACCOUNT_JSON"
 
 
-def _ensure_firebase_app() -> firebase_admin.App:
+def _init_firebase_app() -> firebase_admin.App:
     """
-    전역 Firebase App 싱글톤 초기화.
-    FIREBASE_SERVICE_ACCOUNT_JSON 이 없으면 예외 발생.
+    FIREBASE_SERVICE_ACCOUNT_JSON 환경변수에 들어있는
+    서비스 계정 JSON을 사용해서 Firebase Admin SDK를 초기화한다.
     """
-    global _FIREBASE_APP
-    if _FIREBASE_APP is not None:
-        return _FIREBASE_APP
+    # 이미 초기화되어 있으면 그대로 사용
+    if firebase_admin._apps:
+        return list(firebase_admin._apps.values())[0]
 
-    raw_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if not raw_json:
+    raw = os.environ.get(SERVICE_ENV_VAR)
+    if not raw:
         raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT_JSON 환경변수가 설정되어 있지 않습니다. "
-            "Firebase 콘솔에서 받은 서비스 계정 JSON 전체를 넣어주세요."
+            f"{SERVICE_ENV_VAR} 환경변수가 설정되어 있지 않습니다. "
+            "Render 서비스 환경변수에 서비스 계정 JSON 전체를 넣어 주세요."
         )
 
     try:
-        info = json.loads(raw_json)
+        service_account_info = json.loads(raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(
-            "FIREBASE_SERVICE_ACCOUNT_JSON 값이 유효한 JSON 이 아닙니다."
+            f"{SERVICE_ENV_VAR} 환경변수 내용이 올바른 JSON 형식이 아닙니다."
         ) from e
 
-    cred = credentials.Certificate(info)
-    _FIREBASE_APP = firebase_admin.initialize_app(cred)
-    return _FIREBASE_APP
+    cred = credentials.Certificate(service_account_info)
+    return firebase_admin.initialize_app(cred)
 
 
 class FCMClient:
     """
-    Firebase Admin SDK 를 이용해 FCM 메시지를 보내는 클라이언트.
+    Firebase Admin SDK를 이용해서 FCM 알림을 보내는 클라이언트.
 
-    기존 코드와의 호환을 위해 __init__ 에 인자를 받지 않지만,
-    내부적으로 FIREBASE_SERVICE_ACCOUNT_JSON 만 사용합니다.
+    ※ 더 이상 FCM_SERVER_KEY는 사용하지 않는다.
     """
 
     def __init__(self) -> None:
-        # 앱이 없으면 여기서 한 번 초기화
-        _ensure_firebase_app()
+        # 앱이 한 번만 초기화되도록 내부 함수 호출
+        _init_firebase_app()
 
-    # ------------------------------------------------------------------
-    # 내부 헬퍼
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _build_data_payload(data: Optional[Dict[str, Any]]) -> Dict[str, str]:
-        """
-        data 필드는 모두 문자열이어야 해서, 들어온 값을 str 로 캐스팅.
-        """
-        if not data:
-            return {}
-        return {str(k): str(v) for k, v in data.items()}
-
-    # ------------------------------------------------------------------
-    # 외부에서 쓰는 메인 메서드
-    # ------------------------------------------------------------------
     def send_to_tokens(
         self,
         tokens: List[str],
         title: str,
         body: str,
-        data: Optional[Dict[str, Any]] = None,
+        data: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
-        여러 기기 토큰으로 알림 전송.
-
-        :param tokens: FCM registration token 리스트
-        :param title: 알림 제목
-        :param body: 알림 내용
-        :param data: data payload (선택)
-        :return: 전송 결과 요약 딕셔너리
+        여러 FCM 토큰으로 멀티캐스트 알림 전송.
         """
         if not tokens:
-            return {
-                "success": 0,
-                "failure": 0,
-                "results": [],
-            }
+            return {"success_count": 0, "failure_count": 0}
 
-        app = _ensure_firebase_app()
+        # data 값은 모두 문자열이어야 해서 str()로 한 번 감싸준다.
+        data_str: Dict[str, str] | None = None
+        if data:
+            data_str = {k: str(v) for k, v in data.items()}
 
         message = messaging.MulticastMessage(
             tokens=tokens,
             notification=messaging.Notification(title=title, body=body),
-            data=self._build_data_payload(data),
+            data=data_str,
         )
 
-        response = messaging.send_multicast(message, app=app)
-
-        results: List[Dict[str, Any]] = []
-        for idx, resp in enumerate(response.responses):
-            results.append(
-                {
-                    "token": tokens[idx],
-                    "success": resp.success,
-                    "message_id": getattr(resp, "message_id", None),
-                    "exception": str(resp.exception) if resp.exception else None,
-                }
-            )
+        response = messaging.send_multicast(message)
 
         return {
-            "success": response.success_count,
-            "failure": response.failure_count,
-            "results": results,
+            "success_count": response.success_count,
+            "failure_count": response.failure_count,
         }
 
-    # 필요하면 단일 토큰용 헬퍼도 제공 (기존 코드에서 쓸 수도 있음)
-    def send_to_token(
-        self,
-        token: str,
-        title: str,
-        body: str,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        return self.send_to_tokens([token], title, body, data)
+
+if __name__ == "__main__":
+    # 간단한 수동 테스트용 (Render Shell에서 직접 돌릴 때 사용)
+    import sys
+
+    print("FCMClient self-test 시작")
+
+    try:
+        _init_firebase_app()
+    except Exception as e:  # noqa: BLE001
+        print("Firebase 초기화 실패:", e, file=sys.stderr)
+        sys.exit(1)
+
+    print("Firebase 초기화 성공 (실제 푸시는 여기서 보내지 않음)")
