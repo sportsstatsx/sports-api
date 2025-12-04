@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 from flask import Blueprint, request, jsonify
 
-from db import execute
+from db import execute, fetch_all
 
 notifications_bp = Blueprint("notifications", __name__)
 
@@ -91,3 +91,134 @@ def register_device() -> Any:
     )
 
     return jsonify({"ok": True})
+
+@notifications_bp.route("/api/notifications/subscribe_match", methods=["POST"])
+def subscribe_match() -> Any:
+    """
+    단일 경기 구독 (즐겨찾기 ON)
+    body 예:
+    {
+        "device_id": "ANDROID_ID...",
+        "match_id": 12345,
+        "notify_kickoff": true,
+        "notify_score": true,
+        "notify_redcard": true,
+        "notify_ft": true
+    }
+    """
+
+    data: Dict[str, Any] = request.get_json(silent=True) or {}
+
+    device_id = str(data.get("device_id", "")).strip()
+    match_id = data.get("match_id")
+
+    if not device_id or match_id is None:
+        return (
+            jsonify(
+                {"ok": False, "error": "device_id and match_id are required"}
+            ),
+            400,
+        )
+
+    notify_kickoff = bool(data.get("notify_kickoff", True))
+    notify_score = bool(data.get("notify_score", True))
+    notify_redcard = bool(data.get("notify_redcard", True))
+    notify_ft = bool(data.get("notify_ft", True))
+
+    sql = """
+        INSERT INTO match_notification_subscriptions (
+            device_id,
+            match_id,
+            notify_kickoff,
+            notify_score,
+            notify_redcard,
+            notify_ft,
+            created_at,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (device_id, match_id)
+        DO UPDATE SET
+            notify_kickoff = EXCLUDED.notify_kickoff,
+            notify_score   = EXCLUDED.notify_score,
+            notify_redcard = EXCLUDED.notify_redcard,
+            notify_ft      = EXCLUDED.notify_ft,
+            updated_at     = NOW();
+    """
+
+    execute(
+        sql,
+        (
+            device_id,
+            match_id,
+            notify_kickoff,
+            notify_score,
+            notify_redcard,
+            notify_ft,
+        ),
+    )
+
+    return jsonify({"ok": True})
+
+
+@notifications_bp.route("/api/notifications/unsubscribe_match", methods=["POST"])
+def unsubscribe_match() -> Any:
+    """
+    단일 경기 구독 해제 (즐겨찾기 OFF)
+    body 예:
+    {
+        "device_id": "ANDROID_ID...",
+        "match_id": 12345
+    }
+    """
+
+    data: Dict[str, Any] = request.get_json(silent=True) or {}
+
+    device_id = str(data.get("device_id", "")).strip()
+    match_id = data.get("match_id")
+
+    if not device_id or match_id is None:
+        return (
+            jsonify(
+                {"ok": False, "error": "device_id and match_id are required"}
+            ),
+            400,
+        )
+
+    execute(
+        "DELETE FROM match_notification_subscriptions WHERE device_id = %s AND match_id = %s",
+        (device_id, match_id),
+    )
+
+    return jsonify({"ok": True})
+
+
+@notifications_bp.route("/api/notifications/subscriptions", methods=["GET"])
+def list_subscriptions() -> Any:
+    """
+    디버깅용: 특정 device_id 의 구독 목록 조회
+    /api/notifications/subscriptions?device_id=ANDROID_ID...
+    """
+
+    device_id = str(request.args.get("device_id", "")).strip()
+    if not device_id:
+        return (
+            jsonify({"ok": False, "error": "device_id query param required"}),
+            400,
+        )
+
+    rows = fetch_all(
+        """
+        SELECT match_id,
+               notify_kickoff,
+               notify_score,
+               notify_redcard,
+               notify_ft
+        FROM match_notification_subscriptions
+        WHERE device_id = %s
+        ORDER BY match_id
+        """,
+        (device_id,),
+    )
+
+    return jsonify({"ok": True, "data": rows})
