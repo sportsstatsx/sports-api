@@ -30,7 +30,7 @@ from routers.home_router import home_bp
 from routers.matchdetail_router import matchdetail_bp
 from teamdetail.routes import teamdetail_bp
 from leaguedetail.routes import leaguedetail_bp
-from routers.notifications_router import notifications_bp
+from notifications.routes import notifications_bp 
 
 
 import traceback
@@ -288,6 +288,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
