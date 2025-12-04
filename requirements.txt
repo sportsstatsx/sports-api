@@ -5,5 +5,8 @@ psycopg_pool>=3.2,<4
 prometheus-client>=0.23.1,<1.0
 requests
 pytz
+firebase-admin
+
+
 
 
