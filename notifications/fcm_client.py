@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -15,10 +15,11 @@ SERVICE_ENV_VAR = "FIREBASE_SERVICE_ACCOUNT_JSON"
 def _init_firebase_app() -> firebase_admin.App:
     """
     FIREBASE_SERVICE_ACCOUNT_JSON 환경변수에 들어있는
-    서비스 계정 JSON을 사용해서 Firebase Admin SDK를 초기화한다.
+    서비스 계정 JSON으로 Firebase Admin SDK를 초기화한다.
     """
-    # 이미 초기화되어 있으면 그대로 사용
+    # 이미 초기화되어 있으면 그 앱을 그대로 사용
     if firebase_admin._apps:
+        # _apps 는 dict 이라 values()[0] 로 기본 앱 하나 꺼내면 됨
         return list(firebase_admin._apps.values())[0]
 
     raw = os.environ.get(SERVICE_ENV_VAR)
@@ -41,49 +42,96 @@ def _init_firebase_app() -> firebase_admin.App:
 
 class FCMClient:
     """
-    Firebase Admin SDK를 이용해서 FCM 알림을 보내는 클라이언트.
+    Firebase Admin SDK 를 이용해서 FCM 알림을 보내는 클라이언트.
 
-    ※ 더 이상 FCM_SERVER_KEY는 사용하지 않는다.
+    - 더 이상 FCM_SERVER_KEY 는 사용하지 않는다.
+    - FIREBASE_SERVICE_ACCOUNT_JSON 만 사용한다.
     """
 
     def __init__(self) -> None:
-        # 앱이 한 번만 초기화되도록 내부 함수 호출
         _init_firebase_app()
+
+    @staticmethod
+    def _build_data(data: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        """
+        data payload 는 모두 문자열이어야 해서 str() 로 캐스팅.
+        """
+        if not data:
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
 
     def send_to_tokens(
         self,
         tokens: List[str],
         title: str,
         body: str,
-        data: Dict[str, Any] | None = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        여러 FCM 토큰으로 멀티캐스트 알림 전송.
+        여러 FCM 토큰으로 알림 전송.
+        firebase_admin 버전이 낮아서 send_multicast 를 쓰지 않고,
+        messaging.send() 를 토큰마다 한 번씩 호출하는 방식으로 구현한다.
         """
         if not tokens:
-            return {"success_count": 0, "failure_count": 0}
+            return {"success_count": 0, "failure_count": 0, "results": []}
 
-        # data 값은 모두 문자열이어야 해서 str()로 한 번 감싸준다.
-        data_str: Dict[str, str] | None = None
-        if data:
-            data_str = {k: str(v) for k, v in data.items()}
+        _init_firebase_app()
+        payload_data = self._build_data(data)
 
-        message = messaging.MulticastMessage(
-            tokens=tokens,
-            notification=messaging.Notification(title=title, body=body),
-            data=data_str,
-        )
+        success_count = 0
+        failure_count = 0
+        results: List[Dict[str, Any]] = []
 
-        response = messaging.send_multicast(message)
+        for token in tokens:
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data=payload_data,
+            )
+
+            try:
+                message_id = messaging.send(msg)
+                results.append(
+                    {
+                        "token": token,
+                        "success": True,
+                        "message_id": message_id,
+                        "error": None,
+                    }
+                )
+                success_count += 1
+            except Exception as e:  # noqa: BLE001
+                results.append(
+                    {
+                        "token": token,
+                        "success": False,
+                        "message_id": None,
+                        "error": str(e),
+                    }
+                )
+                failure_count += 1
 
         return {
-            "success_count": response.success_count,
-            "failure_count": response.failure_count,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "results": results,
         }
+
+    def send_to_token(
+        self,
+        token: str,
+        title: str,
+        body: str,
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        단일 토큰용 헬퍼. 기존 코드에서 필요하면 사용 가능.
+        """
+        return self.send_to_tokens([token], title, body, data)
 
 
 if __name__ == "__main__":
-    # 간단한 수동 테스트용 (Render Shell에서 직접 돌릴 때 사용)
+    # Render Shell 에서 수동 테스트용
     import sys
 
     print("FCMClient self-test 시작")
