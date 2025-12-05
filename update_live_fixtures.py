@@ -21,12 +21,22 @@ from live_fixtures_a_group import (
     upsert_match_events_raw,
     fetch_team_stats_from_api,
     upsert_match_team_stats,
+    fetch_lineups_from_api,
+    upsert_match_lineups,
 )
 
-# 스탯 라이브 호출 쿨다운 (초 단위: 60초 = 1분)
-STATS_INTERVAL_SEC = 60.0
-# fixture_id 별 마지막 스탯 갱신 시각 (UNIX timestamp)
-LAST_STATS_SYNC = {}
+# ───────────────────────────────
+# 스탯 라이브 호출 쿨다운 (초 단위)
+# ───────────────────────────────
+STATS_INTERVAL_SEC = 60.0           # 팀 스탯: 1분에 한 번
+LAST_STATS_SYNC = {}                # fixture_id -> 마지막 스탯 갱신시각(UNIX ts)
+
+# ───────────────────────────────
+# 라인업 호출 여부 메모리 캐시
+# ───────────────────────────────
+# 라인업은 "킥오프 전/직후에 한 번만" 받으면 되므로,
+# 워커 프로세스 살아 있는 동안 fixture_id 를 기록해두고 중복 호출 방지.
+LINEUPS_FETCHED = set()
 
 
 def upsert_match_status_only(
@@ -68,8 +78,6 @@ def upsert_match_status_only(
         # 팀 ID 없으면 matches 에 넣지 않음
         return
 
-    # ❗ home_ft / away_ft 는 여기서 다루지 않는다.
-    #    (postmatch_backfill.py 에서만 세팅)
     execute(
         """
         INSERT INTO matches (
@@ -108,6 +116,81 @@ def upsert_match_status_only(
     )
 
 
+def _maybe_fetch_lineups_once(
+    fixture_id: int,
+    date_utc: Optional[str],
+    status_group: str,
+    elapsed: Optional[int],
+    now: dt.datetime,
+) -> None:
+    """
+    라인업 인입 정책:
+
+    - ❗ 경기당 1회만 호출 (LINEUPS_FETCHED 로 관리)
+    - 프리매치:
+        * status_group == 'NS' 이고
+        * 킥오프까지 남은 시간이 0~60분 사이면 (1시간 전~직전)
+          → 라인업 호출
+    - 킥오프 직후:
+        * status_group == 'INPLAY' 이고
+        * elapsed 가 5분 이하일 때
+          → 라인업 호출 (프리매치 타이밍을 놓쳤을 경우 대비)
+    - API 응답이 비어 있으면 (라인업 아직 안 풀린 상태)
+        → FETCHED 마킹 하지 않고 나중에 다시 시도
+    """
+    if fixture_id in LINEUPS_FETCHED:
+        return
+
+    if not date_utc:
+        # 킥오프 시간을 모르면 프리매치 윈도우 계산 불가 → INPLAY fallback만 사용
+        pass
+
+    should_call = False
+
+    # 1) 프리매치 윈도우 (NS + 킥오프 0~60분 전)
+    if date_utc and status_group == "NS":
+        try:
+            kickoff = dt.datetime.fromisoformat(date_utc)
+            # now, kickoff 는 둘 다 timezone-aware(UTC) 라고 가정
+            minutes_to_kickoff = (kickoff - now).total_seconds() / 60.0
+            # 예: 60분 전 ~ 직후 5분(-5분) 정도까지 허용해도 됨
+            if -5.0 <= minutes_to_kickoff <= 60.0:
+                should_call = True
+        except Exception as e:
+            print(
+                f"      [lineups] fixture_id={fixture_id} date_utc 파싱 에러: {e}",
+                file=sys.stderr,
+            )
+
+    # 2) 킥오프 직후 fallback (INPLAY + elapsed ≤ 5분)
+    if status_group == "INPLAY":
+        if elapsed is None or elapsed <= 5:
+            # elapsed 가 없으면, 그냥 초반으로 보고 한 번은 시도해준다
+            should_call = True
+
+    if not should_call:
+        return
+
+    try:
+        lineups = fetch_lineups_from_api(fixture_id)
+        if lineups:
+            upsert_match_lineups(fixture_id, lineups)
+            LINEUPS_FETCHED.add(fixture_id)
+            print(
+                f"      [lineups] fixture_id={fixture_id} fetched and saved"
+            )
+        else:
+            # 응답 비어 있음 → 아직 라인업이 안 풀린 상태. 나중에 다시 시도.
+            print(
+                f"      [lineups] fixture_id={fixture_id} response empty, will retry later"
+            )
+    except Exception as lu_err:
+        print(
+            f"      [lineups] fixture_id={fixture_id} 처리 중 에러: {lu_err}",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     """
     경량 라이브 워커.
@@ -116,15 +199,9 @@ def main() -> None:
         * 경기 상태(시작 / 하프타임 / 종료), elapsed, 기본 팀/리그 정보 업데이트
         * INPLAY 경기의 실시간 스코어 및 이벤트(골/카드/교체) 인입
         * INPLAY 경기의 팀 스탯을 최대 1분에 1번만 인입
-    - Api-Football 호출: /fixtures (+ /fixtures/events, /fixtures/statistics)
-    - DB 작업:
-        * fixtures 테이블: upsert_fixture_row
-        * matches 테이블: upsert_match_row (스코어 + 상태 + elapsed)
-        * match_events / match_events_raw: INPLAY 경기만 갱신
-        * match_team_stats: INPLAY 경기만 60초 쿨다운으로 갱신
-    - 절대 하지 않는 것:
-        * FINISHED 경기의 이벤트/스코어/스탯 재갱신 (postmatch_backfill.py 에서 최종 정리)
-        * standings / squads / players / transfers / toplists 등 정적 데이터
+        * 라인업:
+            - 킥오프 1시간 전 ~ 직전(프리매치)에 한 번
+            - 킥오프 직후(INPLAY 초반)에 한 번 (프리매치 못 받았을 때 대비)
     """
     target_date = get_target_date()
     live_leagues = parse_live_leagues(LIVE_LEAGUES_ENV)
@@ -180,16 +257,26 @@ def main() -> None:
 
                 fixture_id = basic["fixture_id"]
                 status_group = basic["status_group"]
+                date_utc = basic["date_utc"]
+                elapsed = basic.get("elapsed")
 
                 # 3) FINISHED 경기는 여기서 스킵 (불필요한 라이브 처리 방지)
                 if status_group == "FINISHED":
                     continue
 
-                # 4) INPLAY 외(NS, POSTPONED 등)도 matches row 자체는 업데이트해도 무방
-                #    (status / elapsed / 팀 정보 최신화 용도)
+                # 4) matches row 상태/스코어/elapsed 갱신 (NS, INPLAY 등 공통)
                 upsert_match_row(fx, lid, None)
 
-                # 5) INPLAY 경기만 이벤트(골/카드/교체) + 스탯 갱신
+                # 5) 라인업: 프리매치/직후 정책대로 한 번만 호출
+                _maybe_fetch_lineups_once(
+                    fixture_id=fixture_id,
+                    date_utc=date_utc,
+                    status_group=status_group,
+                    elapsed=elapsed,
+                    now=now,
+                )
+
+                # 6) INPLAY 경기만 이벤트/스탯 라이브 처리
                 if status_group == "INPLAY":
                     # ───────── EVENTS (10초마다)
                     try:
