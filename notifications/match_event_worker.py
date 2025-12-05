@@ -154,58 +154,79 @@ def save_state(state: MatchState) -> None:
     )
 
 
+# --- 여기부터 교체 ---
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
     """
-    상태 변화에서 어떤 이벤트가 발생했는지 계산.
-    리턴: [(event_type, extra_data), ...]
-      event_type: 'kickoff' | 'score' | 'redcard' | 'ht' | '2h_start' | 'ft'
+    API-FOOTBALL 상태 흐름 기준으로 모든 이벤트를 확실하게 감지하도록 수정한 버전.
     """
+
     events: List[Tuple[str, Dict[str, Any]]] = []
 
+    # 첫 저장은 baseline만 만들고 이벤트는 보내지 않음
     if old is None:
-        # 처음 상태 저장만 하고, 이벤트는 안 보냄
         return events
 
-    # status 변경
-    if old.status != new.status:
-        if old.status in ("NS", "TBD") and new.status in ("1H", "LIVE"):
-            events.append(("kickoff", {}))
-        elif new.status == "HT":
-            events.append(("ht", {}))
-        elif old.status == "HT" and new.status in ("2H", "LIVE"):
-            events.append(("2h_start", {}))
-        elif new.status in ("FT", "AET", "PEN"):
-            events.append(("ft", {}))
+    old_status = old.status or ""
+    new_status = new.status or ""
 
-    # 스코어 변경
-    if (old.home_goals, old.away_goals) != (new.home_goals, new.away_goals):
-        events.append(
-            (
-                "score",
-                {
-                    "old_home": old.home_goals,
-                    "old_away": old.away_goals,
-                    "new_home": new.home_goals,
-                    "new_away": new.away_goals,
-                },
-            )
-        )
+    # --------------------------
+    # 1) Kickoff 감지
+    # --------------------------
+    # API-FOOTBALL은 NS → 1H 또는 NS → LIVE 등으로 시작
+    if old_status in ("NS", "TBD", "") and new_status in ("1H", "LIVE"):
+        events.append(("kickoff", {}))
 
-    # 레드카드 변경
-    if (old.home_red, old.away_red) != (new.home_red, new.away_red):
-        events.append(
-            (
-                "redcard",
-                {
-                    "old_home": old.home_red,
-                    "old_away": old.away_red,
-                    "new_home": new.home_red,
-                    "new_away": new.away_red,
-                },
-            )
-        )
+    # --------------------------
+    # 2) 하프타임 감지
+    # --------------------------
+    # 1H → HT
+    if new_status == "HT" and old_status != "HT":
+        events.append(("ht", {}))
+
+    # --------------------------
+    # 3) 후반전 시작 감지
+    # --------------------------
+    # HT → 2H
+    if old_status == "HT" and new_status in ("2H", "LIVE"):
+        events.append(("2h_start", {}))
+
+    # --------------------------
+    # 4) 경기 종료 감지
+    # --------------------------
+    if new_status in ("FT", "AET", "PEN") and old_status not in ("FT", "AET", "PEN"):
+        events.append(("ft", {}))
+
+    # --------------------------
+    # 5) 스코어 변화 감지
+    # --------------------------
+    if (old.home_goals != new.home_goals) or (old.away_goals != new.away_goals):
+        events.append((
+            "score",
+            {
+                "old_home": old.home_goals,
+                "old_away": old.away_goals,
+                "new_home": new.home_goals,
+                "new_away": new.away_goals,
+            }
+        ))
+
+    # --------------------------
+    # 6) 레드카드 감지
+    # --------------------------
+    if (old.home_red != new.home_red) or (old.away_red != new.away_red):
+        events.append((
+            "redcard",
+            {
+                "old_home": old.home_red,
+                "old_away": old.away_red,
+                "new_home": new.home_red,
+                "new_away": new.away_red,
+            }
+        ))
 
     return events
+# --- 여기까지 교체 ---
+
 
 
 def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
