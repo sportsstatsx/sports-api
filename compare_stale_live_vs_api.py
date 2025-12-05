@@ -2,8 +2,9 @@
 #
 # 1) DB에서 "킥오프 후 5분이 지났는데 아직 NOT_STARTED 인 경기"를 찾아
 #    강제로 1H(INPLAY) 로 시작 처리.
-# 2) DB에서 "킥오프 후 2시간이 지났는데 아직 INPLAY인 경기"를 찾고
-#    해당 경기들을 DB에서 강제로 FT(종료) 상태로 업데이트.
+# 2) DB에서 "킥오프 후 3시간 이상이 지났는데 아직 INPLAY 인 경기" 중에서
+#    elapsed 가 없거나(공급사가 안 주는 경우) 105분 이상인 것만 골라
+#    DB에서 강제로 FT(종료) 상태로 업데이트.  ← ✅ 보수 버전
 #
 # ※ Api-Football 을 호출하지 않고, 우리 DB 값만 직접 고치는 "안전장치" 역할.
 #    - 나중에 라이브 워커나 다른 스크립트가 FT/상세 상태를 다시 써도 무방함
@@ -107,19 +108,25 @@ def process_overdue_not_started() -> None:
                 f"elapsed={elapsed_minutes} (강제 시작 처리)."
             )
         except Exception as e:
-            print(f"  [ERROR] fixture_id={fid} 강제 시작 중 오류 발생: {e}", file=sys.stderr)
+            print(
+                f"  [ERROR] fixture_id={fid} 강제 시작 중 오류 발생: {e}",
+                file=sys.stderr,
+            )
 
         print()
 
 
 # ─────────────────────────────────────
-# 2. 오래된 INPLAY 경기 → 강제 종료 (기존 기능)
+# 2. 오래된 INPLAY 경기 → 강제 종료 (보수 버전)
 # ─────────────────────────────────────
 
 def load_stale_inplay_rows() -> List[Dict[str, Any]]:
     """
-    킥오프 후 2시간이 지났는데 아직 INPLAY 인 경기들만 가져오기.
-    필요하면 interval '2 hours' 부분을 3시간 등으로 조정해서 사용.
+    ⚠ 보수 버전:
+    - 킥오프 후 **3시간 이상** 지났는데 아직 INPLAY 인 경기
+    - 그리고 elapsed 가 없거나(NULL) **105분 이상**인 것만 대상
+
+    → 즉, '진짜 말이 안 되게 오래 INPLAY로 남아 있는 경기'만 강제 종료.
     """
     sql = """
         SELECT
@@ -131,8 +138,9 @@ def load_stale_inplay_rows() -> List[Dict[str, Any]]:
             status_group,
             elapsed
         FROM matches
-        WHERE date_utc::timestamptz < now() - interval '2 hours'
+        WHERE date_utc::timestamptz < now() - interval '3 hours'
           AND status_group = 'INPLAY'
+          AND (elapsed IS NULL OR elapsed >= 105)
         ORDER BY date_utc;
     """
     return fetch_all(sql, ())
@@ -167,10 +175,13 @@ def force_close_fixture(fixture_id: int) -> None:
 def process_stale_inplay() -> None:
     rows = load_stale_inplay_rows()
     if not rows:
-        print("[INFO] 현재 '킥오프 +2h 이상인데 INPLAY' 인 경기가 없습니다.")
+        print(
+            "[INFO] 현재 '킥오프 +3h 이상이고 elapsed NULL 또는 105분 이상인데도 "
+            "여전히 INPLAY' 인 경기가 없습니다."
+        )
         return
 
-    print(f"[INFO] 강제 종료 대상 경기 수 = {len(rows)}\n")
+    print(f"[INFO] (보수 버전) 강제 종료 대상 경기 수 = {len(rows)}\n")
 
     for r in rows:
         fid = int(r["fixture_id"])
@@ -186,14 +197,19 @@ def process_stale_inplay() -> None:
 
         try:
             force_close_fixture(fid)
-            print("  AFTER  → status=FT, status_group=FINISHED, elapsed>=90 로 강제 종료 처리 시도.")
+            print(
+                "  AFTER  → status=FT, status_group=FINISHED, elapsed>=90 로 강제 종료 처리 시도."
+            )
         except Exception as e:
-            print(f"  [ERROR] fixture_id={fid} 업데이트 중 오류 발생: {e}", file=sys.stderr)
+            print(
+                f"  [ERROR] fixture_id={fid} 업데이트 중 오류 발생: {e}",
+                file=sys.stderr,
+            )
 
         print()
 
     print("=" * 60)
-    print("[DONE] 오래된 INPLAY 경기 강제 종료 작업 완료.")
+    print("[DONE] (보수 버전) 오래된 INPLAY 경기 강제 종료 작업 완료.")
 
 
 # ─────────────────────────────────────
@@ -204,7 +220,7 @@ def main() -> None:
     # 1) 아직 시작 안 된 경기 강제 시작
     process_overdue_not_started()
     print("\n" + "#" * 80 + "\n")
-    # 2) 오래된 INPLAY 경기 강제 종료
+    # 2) 오래된 INPLAY 경기 강제 종료 (보수 버전)
     process_stale_inplay()
 
 
