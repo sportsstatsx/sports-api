@@ -14,17 +14,46 @@ from notifications.fcm_client import FCMClient
 log = logging.getLogger("match_event_worker")
 logging.basicConfig(level=logging.INFO)
 
+# -------------------------------------------------------
+# MatchState dataclass
+# -------------------------------------------------------
 
 @dataclass
 class MatchState:
     match_id: int
-    status: str  # 예: 'NS', '1H', 'HT', '2H', 'FT'
+    status: str
     home_goals: int
     away_goals: int
     home_red: int
     away_red: int
 
 
+# -------------------------------------------------------
+# 추가: 경기의 리그명 + 팀명 로딩 함수
+# -------------------------------------------------------
+def load_match_basic_info(match_id: int):
+    row = fetch_one(
+        """
+        SELECT
+            m.fixture_id,
+            m.league_id,
+            l.name AS league_name,
+            h.name AS home_name,
+            a.name AS away_name
+        FROM matches m
+        JOIN leagues l ON l.league_id = m.league_id
+        JOIN teams   h ON h.team_id = m.home_id
+        JOIN teams   a ON a.team_id = m.away_id
+        WHERE m.fixture_id = %s
+        """,
+        (match_id,)
+    )
+    return row
+
+
+# -------------------------------------------------------
+# DB → 현재 MatchState 로딩
+# -------------------------------------------------------
 def get_subscribed_matches() -> List[int]:
     rows = fetch_all(
         """
@@ -36,13 +65,6 @@ def get_subscribed_matches() -> List[int]:
 
 
 def load_current_match_state(match_id: int) -> MatchState | None:
-    """
-    현재 match_id 경기의 상태를 DB에서 읽어서 MatchState로 반환한다.
-
-    - 골 수는 matches.home_ft / matches.away_ft 사용
-    - 레드카드는 match_events 에서 type='Card' + detail 이 레드카드인 이벤트를
-      홈/원정팀별로 COUNT 해서 계산
-    """
     row = fetch_one(
         """
         SELECT
@@ -50,41 +72,34 @@ def load_current_match_state(match_id: int) -> MatchState | None:
             m.status     AS status,
             COALESCE(m.home_ft, 0) AS home_goals,
             COALESCE(m.away_ft, 0) AS away_goals,
-            COALESCE(
-                (
-                    SELECT COUNT(*)
-                    FROM match_events e
-                    WHERE e.fixture_id = m.fixture_id
-                      AND e.type = 'Card'
-                      AND e.detail IN ('Red Card', 'Second Yellow Card')
-                      AND e.team_id = m.home_id
-                ),
-                0
-            ) AS home_red,
-            COALESCE(
-                (
-                    SELECT COUNT(*)
-                    FROM match_events e
-                    WHERE e.fixture_id = m.fixture_id
-                      AND e.type = 'Card'
-                      AND e.detail IN ('Red Card', 'Second Yellow Card')
-                      AND e.team_id = m.away_id
-                ),
-                0
-            ) AS away_red
+            COALESCE((
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.type = 'Card'
+                  AND e.detail IN ('Red Card', 'Second Yellow Card')
+                  AND e.team_id = m.home_id
+            ), 0) AS home_red,
+            COALESCE((
+                SELECT COUNT(*)
+                FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.type = 'Card'
+                  AND e.detail IN ('Red Card', 'Second Yellow Card')
+                  AND e.team_id = m.away_id
+            ), 0) AS away_red
         FROM matches m
         WHERE m.fixture_id = %s
         """,
-        (match_id,),
+        (match_id,)
     )
 
     if not row:
-        # 해당 match_id 경기 자체가 없으면 None
         return None
 
     return MatchState(
         match_id=int(row["match_id"]),
-        status=str(row["status"]) if row["status"] is not None else "",
+        status=str(row["status"] or ""),
         home_goals=int(row["home_goals"] or 0),
         away_goals=int(row["away_goals"] or 0),
         home_red=int(row["home_red"] or 0),
@@ -92,7 +107,9 @@ def load_current_match_state(match_id: int) -> MatchState | None:
     )
 
 
-
+# -------------------------------------------------------
+# match_notification_state 저장/로드
+# -------------------------------------------------------
 def load_last_state(match_id: int) -> MatchState | None:
     row = fetch_one(
         """
@@ -106,14 +123,15 @@ def load_last_state(match_id: int) -> MatchState | None:
         FROM match_notification_state
         WHERE match_id = %s
         """,
-        (match_id,),
+        (match_id,)
     )
+
     if not row:
         return None
 
     return MatchState(
         match_id=int(row["match_id"]),
-        status=str(row["status"]) if row["status"] is not None else "",
+        status=str(row["status"] or ""),
         home_goals=int(row["home_goals"] or 0),
         away_goals=int(row["away_goals"] or 0),
         home_red=int(row["home_red"] or 0),
@@ -154,51 +172,35 @@ def save_state(state: MatchState) -> None:
     )
 
 
-# --- 여기부터 교체 ---
+# -------------------------------------------------------
+# diff_events — 상태 변화 감지(개선 버전)
+# -------------------------------------------------------
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    API-FOOTBALL 상태 흐름 기준으로 모든 이벤트를 확실하게 감지하도록 수정한 버전.
-    """
+    events = []
 
-    events: List[Tuple[str, Dict[str, Any]]] = []
-
-    # 첫 저장은 baseline만 만들고 이벤트는 보내지 않음
     if old is None:
         return events
 
-    old_status = old.status or ""
-    new_status = new.status or ""
+    old_s = old.status or ""
+    new_s = new.status or ""
 
-    # --------------------------
-    # 1) Kickoff 감지
-    # --------------------------
-    # API-FOOTBALL은 NS → 1H 또는 NS → LIVE 등으로 시작
-    if old_status in ("NS", "TBD", "") and new_status in ("1H", "LIVE"):
+    # Kickoff
+    if old_s in ("NS", "TBD", "") and new_s in ("1H", "LIVE"):
         events.append(("kickoff", {}))
 
-    # --------------------------
-    # 2) 하프타임 감지
-    # --------------------------
-    # 1H → HT
-    if new_status == "HT" and old_status != "HT":
+    # Half-time
+    if new_s == "HT" and old_s != "HT":
         events.append(("ht", {}))
 
-    # --------------------------
-    # 3) 후반전 시작 감지
-    # --------------------------
-    # HT → 2H
-    if old_status == "HT" and new_status in ("2H", "LIVE"):
-        events.append(("2h_start", {}))
+    # Second half start
+    if old_s == "HT" and new_s in ("2H", "LIVE"):
+        events.append(("second_half", {}))
 
-    # --------------------------
-    # 4) 경기 종료 감지
-    # --------------------------
-    if new_status in ("FT", "AET", "PEN") and old_status not in ("FT", "AET", "PEN"):
+    # Full-time
+    if new_s in ("FT", "AET", "PEN") and old_s not in ("FT", "AET", "PEN"):
         events.append(("ft", {}))
 
-    # --------------------------
-    # 5) 스코어 변화 감지
-    # --------------------------
+    # Score change
     if (old.home_goals != new.home_goals) or (old.away_goals != new.away_goals):
         events.append((
             "score",
@@ -210,9 +212,7 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
             }
         ))
 
-    # --------------------------
-    # 6) 레드카드 감지
-    # --------------------------
+    # Red card
     if (old.home_red != new.home_red) or (old.away_red != new.away_red):
         events.append((
             "redcard",
@@ -225,20 +225,18 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         ))
 
     return events
-# --- 여기까지 교체 ---
 
 
-
+# -------------------------------------------------------
+# 구독자 FCM 토큰 가져오기 (옵션 분리됨)
+# -------------------------------------------------------
 def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
-    """
-    이벤트 종류에 따라 해당 옵션을 켜둔 구독자 토큰만 가져오기.
-    """
     option_column = {
         "kickoff": "notify_kickoff",
+        "ht": "notify_ht",
+        "second_half": "notify_second_half",
         "score": "notify_score",
         "redcard": "notify_redcard",
-        "ht": "notify_kickoff",   # HT/2H_start 는 kickoff 옵션에 묶을지, 필요하면 따로 분리
-        "2h_start": "notify_kickoff",
         "ft": "notify_ft",
     }[event_type]
 
@@ -251,131 +249,141 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
           AND s.{option_column} = TRUE
           AND u.notifications_enabled = TRUE
         """,
-        (match_id,),
+        (match_id,)
     )
 
     return [str(r["fcm_token"]) for r in rows]
 
 
-def build_message(event_type: str, match: MatchState, extra: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    이벤트별 FCM 제목/내용 문자열.
-    나중에 실제 팀 이름, 리그 이름까지 넣고 싶으면 쿼리 추가해서 확장하면 됨.
-    """
-    score_str = f"{match.home_goals} - {match.away_goals}"
+# -------------------------------------------------------
+# 알림 메시지 생성(팀/리그 이름 포함)
+# -------------------------------------------------------
+def build_message(event_type: str, match: MatchState, extra: Dict[str, Any],
+                  league_name: str, home_team: str, away_team: str) -> Tuple[str, str]:
+
+    score_str = f"{match.home_goals} : {match.away_goals}"
 
     if event_type == "kickoff":
-        return ("Kickoff", f"경기가 시작되었습니다. (현재 스코어 {score_str})")
+        return (f"[{league_name}] {home_team} vs {away_team}",
+                "경기가 시작되었습니다.")
+
     if event_type == "ht":
-        return ("Half-time", f"전반 종료: 스코어 {score_str}")
-    if event_type == "2h_start":
-        return ("Second half", "후반전이 시작되었습니다.")
+        return (f"[{league_name}] {home_team} vs {away_team}",
+                f"전반 종료 — 스코어 {score_str}")
+
+    if event_type == "second_half":
+        return (f"[{league_name}] {home_team} vs {away_team}",
+                "후반전이 시작되었습니다.")
+
     if event_type == "ft":
-        return ("Full-time", f"경기 종료: 최종 스코어 {score_str}")
+        return (f"[{league_name}] {home_team} vs {away_team}",
+                f"경기 종료 — 최종 스코어 {score_str}")
+
     if event_type == "score":
-        return ("Goal!", f"득점 발생: 스코어 {score_str}")
+        team = home_team if extra["new_home"] > extra["old_home"] else away_team
+        return (f"[{league_name}] 득점! {home_team} vs {away_team}",
+                f"{team} 득점!\n현재 스코어 {score_str}")
+
     if event_type == "redcard":
-        return ("Red card", f"레드카드 발생: 스코어 {score_str}")
+        return (f"[{league_name}] 레드카드 — {home_team} vs {away_team}",
+                "레드카드 발생")
 
-    return ("Match update", f"경기 업데이트: 스코어 {score_str}")
+    return ("Match update", f"스코어 {score_str}")
 
 
+# -------------------------------------------------------
+# match 처리
+# -------------------------------------------------------
 def process_match(fcm: FCMClient, match_id: int) -> None:
     current = load_current_match_state(match_id)
     if not current:
-        log.info("match_id=%s current state not found, skip", match_id)
+        log.info("match_id=%s current state not found", match_id)
         return
 
     last = load_last_state(match_id)
     events = diff_events(last, current)
 
     if not events:
-        # 변화 없음 → 상태만 저장
         save_state(current)
         return
 
+    # 추가: 경기 기본 정보 로딩 (리그명/팀명)
+    info = load_match_basic_info(match_id)
+    league_name = info["league_name"]
+    home_team = info["home_name"]
+    away_team = info["away_name"]
+
+    # 이벤트 반복 처리
     for event_type, extra in events:
         tokens = get_tokens_for_event(match_id, event_type)
         if not tokens:
             continue
 
-        title, body = build_message(event_type, current, extra)
-        data = {
-            "match_id": match_id,
-            "event_type": event_type,
-        }
+        title, body = build_message(
+            event_type,
+            current,
+            extra,
+            league_name,
+            home_team,
+            away_team
+        )
+
+        data = {"match_id": match_id, "event_type": event_type}
         data.update(extra)
 
-        # 너무 많이 쏘지 않도록 500개 단위로 잘라서 발송
+        # 500개 묶음으로 FCM 발송
         batch_size = 500
         for i in range(0, len(tokens), batch_size):
             batch = tokens[i : i + batch_size]
             try:
                 resp = fcm.send_to_tokens(batch, title, body, data)
-                log.info(
-                    "Sent %s notification for match %s to %s devices: %s",
-                    event_type,
-                    match_id,
-                    len(batch),
-                    resp,
-                )
-            except Exception as e:
-                log.exception("Failed to send %s notification for match %s", event_type, match_id)
+                log.info("Sent %s for match %s (%s devices): %s",
+                         event_type, match_id, len(batch), resp)
+            except Exception:
+                log.exception("Failed sending %s for %s", event_type, match_id)
 
-    # 모든 이벤트 처리 후 상태를 최신으로 업데이트
     save_state(current)
 
 
+# -------------------------------------------------------
+# run loop
+# -------------------------------------------------------
 def run_once(fcm: FCMClient | None = None) -> None:
-    """
-    기존 main() 과 동일하게 한 번만 돌면서
-    즐겨찾기된 경기들의 변화만 체크해서 푸시를 보냄.
-    """
     if fcm is None:
         fcm = FCMClient()
 
     matches = get_subscribed_matches()
     if not matches:
-        log.info("No subscribed matches, nothing to do.")
+        log.info("No subscribed matches.")
         return
 
-    log.info("Processing %s subscribed matches...", len(matches))
+    log.info("Processing %d subscribed matches...", len(matches))
+
     for match_id in matches:
         process_match(fcm, match_id)
 
 
 def run_forever(interval_seconds: int = 10) -> None:
-    """
-    Worker 모드: interval_seconds 간격으로 run_once 를 반복 실행.
-    """
     fcm = FCMClient()
-    log.info(
-        "Starting match_event_worker in worker mode (interval=%s sec)",
-        interval_seconds,
-    )
+    log.info("Starting worker (interval=%s sec)", interval_seconds)
 
     while True:
         try:
             run_once(fcm)
         except Exception:
-            # 에러가 나도 워커가 죽지 않도록 로그만 찍고 다음 루프로 진행
-            log.exception("Error while processing matches in worker loop")
+            log.exception("Worker loop error")
 
         time.sleep(interval_seconds)
 
 
 if __name__ == "__main__":
-    # 환경변수 MATCH_WORKER_INTERVAL_SEC 이 설정되어 있으면
-    # 그 값을 초 단위로 사용해서 worker 모드로 실행.
-    # 없으면 예전처럼 한 번만 실행하고 종료(run_once).
     interval = os.getenv("MATCH_WORKER_INTERVAL_SEC")
 
     if interval:
         try:
             seconds = int(interval)
         except ValueError:
-            seconds = 10  # 잘못된 값이면 기본 10초
+            seconds = 10
         run_forever(seconds)
     else:
         run_once()
-
