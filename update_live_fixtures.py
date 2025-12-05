@@ -14,7 +14,12 @@ from live_fixtures_a_group import (
     fetch_fixtures_from_api,
     upsert_fixture_row,
     _extract_fixture_basic,
+    upsert_match_row,
+    fetch_events_from_api,
+    upsert_match_events,
+    upsert_match_events_raw,
 )
+
 
 
 def upsert_match_status_only(
@@ -157,9 +162,32 @@ def main() -> None:
             for fx in fixtures:
                 # fixtures 테이블 기본 정보(upsert)
                 upsert_fixture_row(fx, lid, None)
-                # matches 테이블에는 상태만 upsert (스코어 제외)
-                upsert_match_status_only(fx, lid, None)
+
+                # 기본 필드 추출 (fixture_id, status_group 등)
+                basic = _extract_fixture_basic(fx)
+                if basic is None:
+                    continue
+
+                fixture_id = basic["fixture_id"]
+                status_group = basic["status_group"]
+
+                # ✅ matches 테이블에 스코어 + 상태 + elapsed + 팀 정보까지 모두 upsert
+                upsert_match_row(fx, lid, None)
+
+                # ✅ INPLAY / FINISHED 경기의 이벤트(골/카드 등)도 갱신
+                if status_group in ("INPLAY", "FINISHED"):
+                    try:
+                        events = fetch_events_from_api(fixture_id)
+                        upsert_match_events(fixture_id, events)
+                        upsert_match_events_raw(fixture_id, events)
+                    except Exception as ev_err:
+                        print(
+                            f"      [events] fixture_id={fixture_id} 처리 중 에러: {ev_err}",
+                            file=sys.stderr,
+                        )
+
                 total_updated += 1
+
 
         except Exception as e:
             print(f"  ! league {lid} 처리 중 에러: {e}", file=sys.stderr)
