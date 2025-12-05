@@ -21,7 +21,6 @@ from live_fixtures_a_group import (
 )
 
 
-
 def upsert_match_status_only(
     fixture,
     league_id: Optional[int],
@@ -105,16 +104,17 @@ def main() -> None:
     """
     경량 라이브 워커.
 
-    - 역할: 경기 상태(시작 / 하프타임 / 종료), elapsed, 기본 팀/리그 정보만 업데이트
-    - Api-Football 호출: /fixtures 만 사용
+    - 역할:
+        * 경기 상태(시작 / 하프타임 / 종료), elapsed, 기본 팀/리그 정보 업데이트
+        * INPLAY 경기의 실시간 스코어 및 이벤트(골/카드/교체) 인입
+    - Api-Football 호출: /fixtures (+ /fixtures/events)
     - DB 작업:
         * fixtures 테이블: upsert_fixture_row
-        * matches 테이블: upsert_match_status_only
+        * matches 테이블: upsert_match_row (스코어 + 상태 + elapsed)
+        * match_events / match_events_raw: INPLAY 경기만 갱신
     - 절대 하지 않는 것:
-        * 스코어(home_ft, away_ft)
-        * events / lineups / team stats / player stats
+        * FINISHED 경기의 이벤트/스코어 재갱신 (postmatch_backfill.py 에서 최종 정리)
         * standings / squads / players / transfers / toplists 등 정적 데이터
-          → 전부 postmatch_backfill.py 에서 처리
     """
     target_date = get_target_date()
     live_leagues = parse_live_leagues(LIVE_LEAGUES_ENV)
@@ -160,10 +160,10 @@ def main() -> None:
             print(f"    응답 경기 수: {len(fixtures)}")
 
             for fx in fixtures:
-                # fixtures 테이블 기본 정보(upsert)
+                # 1) fixtures 테이블 기본 정보(upsert) → 모든 경기 공통
                 upsert_fixture_row(fx, lid, None)
 
-                # 기본 필드 추출 (fixture_id, status_group 등)
+                # 2) 기본 필드 추출 (fixture_id, status_group 등)
                 basic = _extract_fixture_basic(fx)
                 if basic is None:
                     continue
@@ -171,11 +171,16 @@ def main() -> None:
                 fixture_id = basic["fixture_id"]
                 status_group = basic["status_group"]
 
-                # ✅ matches 테이블에 스코어 + 상태 + elapsed + 팀 정보까지 모두 upsert
+                # 3) FINISHED 경기는 여기서 스킵 (불필요한 라이브 처리 방지)
+                if status_group == "FINISHED":
+                    continue
+
+                # 4) INPLAY 외(NS, POSTPONED 등)도 matches row 자체는 업데이트해도 무방
+                #    (status / elapsed / 팀 정보 최신화 용도)
                 upsert_match_row(fx, lid, None)
 
-                # ✅ INPLAY / FINISHED 경기의 이벤트(골/카드 등)도 갱신
-                if status_group in ("INPLAY", "FINISHED"):
+                # 5) INPLAY 경기만 이벤트(골/카드/교체) 갱신
+                if status_group == "INPLAY":
                     try:
                         events = fetch_events_from_api(fixture_id)
                         upsert_match_events(fixture_id, events)
@@ -187,7 +192,6 @@ def main() -> None:
                         )
 
                 total_updated += 1
-
 
         except Exception as e:
             print(f"  ! league {lid} 처리 중 에러: {e}", file=sys.stderr)
