@@ -1,4 +1,5 @@
 import sys
+import time
 import datetime as dt
 from typing import Optional
 
@@ -18,7 +19,14 @@ from live_fixtures_a_group import (
     fetch_events_from_api,
     upsert_match_events,
     upsert_match_events_raw,
+    fetch_team_stats_from_api,
+    upsert_match_team_stats,
 )
+
+# 스탯 라이브 호출 쿨다운 (초 단위: 60초 = 1분)
+STATS_INTERVAL_SEC = 60.0
+# fixture_id 별 마지막 스탯 갱신 시각 (UNIX timestamp)
+LAST_STATS_SYNC = {}
 
 
 def upsert_match_status_only(
@@ -107,13 +115,15 @@ def main() -> None:
     - 역할:
         * 경기 상태(시작 / 하프타임 / 종료), elapsed, 기본 팀/리그 정보 업데이트
         * INPLAY 경기의 실시간 스코어 및 이벤트(골/카드/교체) 인입
-    - Api-Football 호출: /fixtures (+ /fixtures/events)
+        * INPLAY 경기의 팀 스탯을 최대 1분에 1번만 인입
+    - Api-Football 호출: /fixtures (+ /fixtures/events, /fixtures/statistics)
     - DB 작업:
         * fixtures 테이블: upsert_fixture_row
         * matches 테이블: upsert_match_row (스코어 + 상태 + elapsed)
         * match_events / match_events_raw: INPLAY 경기만 갱신
+        * match_team_stats: INPLAY 경기만 60초 쿨다운으로 갱신
     - 절대 하지 않는 것:
-        * FINISHED 경기의 이벤트/스코어 재갱신 (postmatch_backfill.py 에서 최종 정리)
+        * FINISHED 경기의 이벤트/스코어/스탯 재갱신 (postmatch_backfill.py 에서 최종 정리)
         * standings / squads / players / transfers / toplists 등 정적 데이터
     """
     target_date = get_target_date()
@@ -179,8 +189,9 @@ def main() -> None:
                 #    (status / elapsed / 팀 정보 최신화 용도)
                 upsert_match_row(fx, lid, None)
 
-                # 5) INPLAY 경기만 이벤트(골/카드/교체) 갱신
+                # 5) INPLAY 경기만 이벤트(골/카드/교체) + 스탯 갱신
                 if status_group == "INPLAY":
+                    # ───────── EVENTS (10초마다)
                     try:
                         events = fetch_events_from_api(fixture_id)
                         upsert_match_events(fixture_id, events)
@@ -190,6 +201,30 @@ def main() -> None:
                             f"      [events] fixture_id={fixture_id} 처리 중 에러: {ev_err}",
                             file=sys.stderr,
                         )
+
+                    # ───────── STATS (60초 쿨다운)
+                    now_ts = time.time()
+                    last_ts = LAST_STATS_SYNC.get(fixture_id)
+                    should_sync_stats = False
+
+                    if last_ts is None:
+                        should_sync_stats = True
+                    elif (now_ts - last_ts) >= STATS_INTERVAL_SEC:
+                        should_sync_stats = True
+
+                    if should_sync_stats:
+                        try:
+                            stats = fetch_team_stats_from_api(fixture_id)
+                            upsert_match_team_stats(fixture_id, stats)
+                            LAST_STATS_SYNC[fixture_id] = now_ts
+                            print(
+                                f"      [stats] fixture_id={fixture_id} updated"
+                            )
+                        except Exception as st_err:
+                            print(
+                                f"      [stats] fixture_id={fixture_id} 처리 중 에러: {st_err}",
+                                file=sys.stderr,
+                            )
 
                 total_updated += 1
 
