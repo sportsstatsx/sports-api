@@ -232,6 +232,20 @@ def _extract_fixture_basic(fixture: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     status_block = fixture_block.get("status") or {}
     status_short = status_block.get("short") or "NS"
     status_group = map_status_group(status_short)
+    # 🔽🔽🔽 여기부터 추가 (기존 코드 절대 삭제 X, 그대로 두고 "덧붙이기"만)
+    # Api-Football 특수 상태 보정
+    # - ABD, AWD, CANC, WO : 기권/몰수/취소 → 실질적으로는 "끝난 경기" 취급
+    # - PST, SUSP          : 연기/중단      → 여전히 "다가올 경기"지만, status 로 지연 표기
+    if status_short in ("ABD", "AWD", "CANC", "WO"):
+        # 앱에서는 status == 'ABD' 보고 "기권", "몰수승" 이런 텍스트로 표시하고
+        # 그룹은 FINISHED 로 둬서 라이브/대기중 리스트에서 빠지게
+        status_group = "FINISHED"
+    elif status_short in ("PST", "SUSP"):
+        # 지연/연기된 경기 → 시간은 지났어도 "UPCOMING" 그룹에 두고,
+        # 앱에서 status 값으로 "경기 지연" 같은 텍스트 처리
+        status_group = "UPCOMING"
+    # 🔼🔼🔼 여기까지 추가
+
     # ✅ 실제 진행 시간(분): Api-Football status.elapsed
     elapsed = status_block.get("elapsed")
 
