@@ -29,8 +29,8 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
             CASE
                 WHEN m.home_ft IS NULL OR m.away_ft IS NULL THEN NULL
                 WHEN m.home_ft = m.away_ft THEN 'D'
-                WHEN (m.home_id = %s AND m.home_ft > m.away_ft)
-                  OR (m.away_id = %s AND m.away_ft > m.home_ft) THEN 'W'
+                WHEN (m.home_ft > m.away_ft AND m.home_id = %s)
+                  OR (m.away_ft > m.home_ft AND m.away_id = %s) THEN 'W'
                 ELSE 'L'
             END                 AS result_code
         FROM matches AS m
@@ -38,8 +38,8 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         JOIN teams   AS ta ON ta.id = m.away_id
         WHERE m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          -- ✅ '완료된 경기'만: status_group = 'FT'
-          AND m.status_group = 'FT'
+          -- ✅ 여기서부터: '완료된 경기'만 Recent 에 보이도록 상태 기준으로 필터
+          AND m.status_group = 'FINISHED'
         ORDER BY m.date_utc DESC
         LIMIT 50
         """,
