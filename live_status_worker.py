@@ -4,6 +4,8 @@ import time
 import traceback
 
 from update_live_fixtures import main as run_update_live
+from live_events_updater import update_live_scores_from_events
+
 
 
 INTERVAL_SEC = 10  # 10초마다 라이브 상태 업데이트
@@ -13,7 +15,12 @@ def loop():
     print(f"[live_status_worker] 시작 (interval={INTERVAL_SEC} sec)")
     while True:
         try:
-            run_update_live()   # update_live_fixtures.py 1회 실행
+            # 1) 기존 라이브(fixtures 기반) 업데이트
+            run_update_live()
+
+            # 2) 이벤트 기반 스코어 보정
+            update_live_scores_from_events()
+
         except Exception:
             traceback.print_exc()
 
