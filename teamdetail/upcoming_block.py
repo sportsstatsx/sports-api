@@ -16,9 +16,9 @@ def build_upcoming_block(
 
     - recent_results_block 과 같은 matches / teams 스키마를 사용한다.
     - 차이점:
-        * recent_results   : status_group 이 FT/AET/PEN 인 '완료 경기'
-        * upcoming_fixtures: 아직 시작 전이거나 진행 중인 경기
-                            (status_group 이 NS / LIVE / HT 등)
+        * recent_results   : 이미 끝난 경기 (status_group = 'FT'), 날짜 내림차순
+        * upcoming_fixtures: 아직 안 끝난 경기 (status_group <> 'FT'), 날짜 오름차순
+          → LIVE / HT / NS(미개최) 전부 포함
     """
 
     rows_db = fetch_all(
@@ -37,8 +37,8 @@ def build_upcoming_block(
         JOIN teams   AS ta ON ta.id = m.away_id
         WHERE m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          -- ✅ '예정/진행 중' 경기만: status_group 으로 판별
-          AND m.status_group IN ('NS', 'LIVE', 'HT')
+          -- ✅ '아직 끝나지 않은 경기'만: FT가 아닌 모든 상태
+          AND m.status_group <> 'FT'
         ORDER BY m.date_utc ASC
         LIMIT 50
         """,
