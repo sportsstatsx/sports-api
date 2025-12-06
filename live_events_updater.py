@@ -98,17 +98,7 @@ def update_live_scores_from_events() -> None:
                 int(away_id),
             )
 
-            # 4) matches 스코어 업데이트
-            execute(
-                """
-                UPDATE matches
-                SET home_ft = %s,
-                    away_ft = %s
-                WHERE fixture_id = %s
-                """,
-                (home_goals, away_goals, fixture_id),
-            )
-
+            
             print(
                 f"[events] fixture_id={fixture_id}: "
                 f"{home_goals}-{away_goals} (from events)"
