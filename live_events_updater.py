@@ -98,12 +98,46 @@ def update_live_scores_from_events() -> None:
                 int(away_id),
             )
 
-            
+            # 👉 추가: 이벤트 기준 스코어를 matches 에 반영 (라이브 경기만)
+            try:
+                # 현재 DB에 저장된 스코어와 비교해서, 달라질 때만 UPDATE
+                current = fetch_all(
+                    """
+                    SELECT home_ft, away_ft
+                    FROM matches
+                    WHERE fixture_id = %s
+                      AND status_group = 'INPLAY'
+                    """,
+                    (fixture_id,),
+                )
+
+                if current:
+                    cur_home, cur_away = current[0]["home_ft"], current[0]["away_ft"]
+                    # None 처리
+                    if cur_home is None:
+                        cur_home = 0
+                    if cur_away is None:
+                        cur_away = 0
+
+                    if (cur_home, cur_away) != (home_goals, away_goals):
+                        execute(
+                            """
+                            UPDATE matches
+                            SET home_ft = %s,
+                                away_ft = %s
+                            WHERE fixture_id = %s
+                              AND status_group = 'INPLAY'
+                            """,
+                            (home_goals, away_goals, fixture_id),
+                        )
+
+            except Exception as e:
+                print(
+                    f"[events] fixture_id={fixture_id} 스코어 업데이트 중 에러: {e}"
+                )
+
             print(
                 f"[events] fixture_id={fixture_id}: "
                 f"{home_goals}-{away_goals} (from events)"
             )
 
-        except Exception as e:
-            # 이벤트 하나 실패해도 전체 루프는 계속
-            print(f"[events] fixture_id={fixture_id} 처리 중 에러: {e}")
