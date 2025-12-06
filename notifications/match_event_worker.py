@@ -188,6 +188,37 @@ def load_match_labels(match_id: int) -> Dict[str, str]:
         "league_name": str(row["league_name"] or ""),
     }
 
+def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
+    """
+    마지막 득점 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
+    - match_events 에서 type='Goal' 인 것만 대상으로,
+      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    """
+    row = fetch_one(
+        """
+        SELECT
+            minute,
+            COALESCE(extra, 0) AS extra
+        FROM match_events
+        WHERE fixture_id = %s
+          AND type = 'Goal'
+        ORDER BY minute DESC NULLS LAST,
+                 extra DESC NULLS LAST,
+                 id DESC
+        LIMIT 1
+        """,
+        (match_id,),
+    )
+
+    if not row or row["minute"] is None:
+        return None
+
+    return {
+        "minute": int(row["minute"]),
+        "extra": int(row["extra"] or 0),
+    }
+
+
 
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
     """
@@ -348,10 +379,20 @@ def build_message(
             # 동시에 2골 이상 업데이트되거나 애매한 상황 → 중립 문구
             scorer_team = "Goal"
 
+        # 여기서 process_match 쪽에서 넣어준 시간 문자열을 읽어옴
+        goal_minute_str = extra.get("goal_minute_str")
+
+        # 타이틀 포맷: "Liverpool Goal! ⚽ 67'"
         if scorer_team in (home_name, away_name):
-            title = f"{scorer_team} Goal! ⚽"
+            if goal_minute_str:
+                title = f"{scorer_team} Goal! ⚽ {goal_minute_str}"
+            else:
+                title = f"{scorer_team} Goal! ⚽"
         else:
-            title = "Goal! ⚽"
+            if goal_minute_str:
+                title = f"Goal! ⚽ {goal_minute_str}"
+            else:
+                title = "Goal! ⚽"
 
         body = score_line
         return (title, body)
@@ -401,7 +442,25 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     # 팀/리그 이름 라벨을 한 번만 로딩해서 여러 이벤트에 사용
     labels = load_match_labels(match_id)
 
-    for event_type, extra in events:
+        for event_type, extra in events:
+        # score 이벤트라면, 마지막 득점 시간(분+추가시간)을 extra 에 추가
+        if event_type == "score":
+            goal_time = load_last_goal_minute(match_id)
+            if goal_time:
+                minute = goal_time.get("minute", 0)
+                extra_min = goal_time.get("extra", 0) or 0
+
+                if extra_min:
+                    # 예: 45+2'
+                    goal_minute_str = f"{minute}+{extra_min}'"
+                else:
+                    # 예: 67'
+                    goal_minute_str = f"{minute}'"
+
+                # extra 가 튜플에서 온 dict 일 수 있으니 방어적으로 복사
+                extra = dict(extra)
+                extra["goal_minute_str"] = goal_minute_str
+
         tokens = get_tokens_for_event(match_id, event_type)
         if not tokens:
             continue
@@ -432,6 +491,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     event_type,
                     match_id,
                 )
+
 
     # 모든 이벤트 처리 후 상태를 최신으로 업데이트
     save_state(current)
