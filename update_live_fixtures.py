@@ -260,14 +260,16 @@ def main() -> None:
                 date_utc = basic["date_utc"]
                 elapsed = basic.get("elapsed")
 
-                # 3) FINISHED 경기는 여기서 스킵 (불필요한 라이브 처리 방지)
+                # 3) matches row 상태/스코어/elapsed 갱신 (NS / INPLAY / FINISHED 공통)
+                upsert_match_row(fx, lid, None)
+
+                # 4) FINISHED 경기는 여기서 라이브 처리만 스킵
+                #    (라인업 / 이벤트 / 스탯 같은 추가 작업만 막고, matches 갱신은 이미 위에서 한 번 수행)
                 if status_group == "FINISHED":
                     continue
 
-                # 4) matches row 상태/스코어/elapsed 갱신 (NS, INPLAY 등 공통)
-                upsert_match_row(fx, lid, None)
+                # 5) 라인업: 프리매치/직후 정책
 
-                # 5) 라인업: 프리매치/직후 정책대로 한 번만 호출
                 _maybe_fetch_lineups_once(
                     fixture_id=fixture_id,
                     date_utc=date_utc,
