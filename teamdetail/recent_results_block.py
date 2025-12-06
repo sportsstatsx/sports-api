@@ -11,8 +11,8 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
     Team Detail 화면의 'Recent results' 섹션에 내려줄 데이터.
 
     - matches 테이블에서 해당 시즌, 해당 팀이 뛴 '완료된 경기'만 가져온다.
-    - 완료 여부는 status_group 으로 판단한다.
-      * 최근 결과: status_group 이 FT(또는 연장/승부차기 등 최종 종료 상태) 인 경기
+    - 리그 / 대륙컵 구분은 하지 않고, 단순히 최근 경기 리스트만 보여준다.
+    - 앱 쪽 모델(RecentResultRow) 스키마에 맞춰서 JSON 필드를 구성한다.
     """
 
     rows_db = fetch_all(
@@ -38,8 +38,8 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         JOIN teams   AS ta ON ta.id = m.away_id
         WHERE m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          -- ✅ '완료된 경기'만: status_group 으로 판별
-          AND m.status_group IN ('FT', 'AET', 'PEN')
+          -- ✅ '완료된 경기'만: status_group = 'FT'
+          AND m.status_group = 'FT'
         ORDER BY m.date_utc DESC
         LIMIT 50
         """,
