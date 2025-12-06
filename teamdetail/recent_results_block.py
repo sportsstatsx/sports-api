@@ -38,8 +38,8 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         JOIN teams   AS ta ON ta.id = m.away_id
         WHERE m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          AND m.home_ft IS NOT NULL
-          AND m.away_ft IS NOT NULL
+          -- ✅ 진짜로 끝난 경기만: status_group = 'FT'
+          AND m.status_group = 'FT'
         ORDER BY m.date_utc DESC
         LIMIT 50
         """,
