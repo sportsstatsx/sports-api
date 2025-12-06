@@ -57,7 +57,6 @@ def update_live_scores_from_events() -> None:
     now = now_utc()
     today = now.date().isoformat()
 
-    # 오늘 날짜 + INPLAY 경기만 대상으로 최소한만 호출
     rows = fetch_all(
         """
         SELECT fixture_id, home_id, away_id
@@ -84,7 +83,6 @@ def update_live_scores_from_events() -> None:
             events = fetch_events_from_api(fixture_id)
 
             if not events:
-                # 아직 이벤트가 하나도 없을 수도 있음 (0:0 진행 중)
                 continue
 
             # 2) 이벤트 DB 반영
@@ -98,46 +96,42 @@ def update_live_scores_from_events() -> None:
                 int(away_id),
             )
 
-            # 👉 추가: 이벤트 기준 스코어를 matches 에 반영 (라이브 경기만)
-            try:
-                # 현재 DB에 저장된 스코어와 비교해서, 달라질 때만 UPDATE
-                current = fetch_all(
-                    """
-                    SELECT home_ft, away_ft
-                    FROM matches
-                    WHERE fixture_id = %s
-                      AND status_group = 'INPLAY'
-                    """,
-                    (fixture_id,),
-                )
+            # 4) 현재 DB 스코어와 비교 → 다를 때만 반영
+            current = fetch_all(
+                """
+                SELECT home_ft, away_ft
+                FROM matches
+                WHERE fixture_id = %s
+                  AND status_group = 'INPLAY'
+                """,
+                (fixture_id,),
+            )
 
-                if current:
-                    cur_home, cur_away = current[0]["home_ft"], current[0]["away_ft"]
-                    # None 처리
-                    if cur_home is None:
-                        cur_home = 0
-                    if cur_away is None:
-                        cur_away = 0
+            if current:
+                cur_home = current[0]["home_ft"] or 0
+                cur_away = current[0]["away_ft"] or 0
 
-                    if (cur_home, cur_away) != (home_goals, away_goals):
-                        execute(
-                            """
-                            UPDATE matches
-                            SET home_ft = %s,
-                                away_ft = %s
-                            WHERE fixture_id = %s
-                              AND status_group = 'INPLAY'
-                            """,
-                            (home_goals, away_goals, fixture_id),
-                        )
-
-            except Exception as e:
-                print(
-                    f"[events] fixture_id={fixture_id} 스코어 업데이트 중 에러: {e}"
-                )
+                if (cur_home, cur_away) != (home_goals, away_goals):
+                    execute(
+                        """
+                        UPDATE matches
+                        SET home_ft = %s,
+                            away_ft = %s
+                        WHERE fixture_id = %s
+                          AND status_group = 'INPLAY'
+                        """,
+                        (home_goals, away_goals, fixture_id),
+                    )
 
             print(
                 f"[events] fixture_id={fixture_id}: "
                 f"{home_goals}-{away_goals} (from events)"
             )
+
+        except Exception as e:
+            # ❗ 경기 하나 실패해도 다음 경기 계속 돌게 하는 게 핵심
+            print(
+                f"[events] fixture_id={fixture_id} 처리 중 에러: {e}"
+            )
+
 
