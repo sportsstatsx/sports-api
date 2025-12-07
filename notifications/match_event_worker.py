@@ -283,7 +283,6 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
                 {
                     "old_home": old.home_red,
                     "old_away": old.away_red,
-                    # 🔧 여기가 수정 포인트: 정의되지 않은 변수 대신 new 상태 사용
                     "new_home": new.home_red,
                     "new_away": new.away_red,
                 },
@@ -477,7 +476,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         # 너무 많이 쏘지 않도록 500개 단위로 잘라서 발송
         batch_size = 500
         for i in range(0, len(tokens), batch_size):
-            batch = tokens[i: i + batch_size]
+            batch = tokens[i : i + batch_size]
             try:
                 resp = fcm.send_to_tokens(batch, title, body, data)
                 log.info(
@@ -487,7 +486,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     len(batch),
                     resp,
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception:
                 log.exception(
                     "Failed to send %s notification for match %s",
                     event_type,
