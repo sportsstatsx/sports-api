@@ -21,8 +21,12 @@ def _calc_score_from_events(
 
     Api-Football 이벤트 구조에서:
       - type: "Goal"
-      - team.id: 득점 팀 ID
-    만 사용해서 단순 카운트.
+      - detail: "Normal Goal", "Penalty", "Own Goal"
+      - detail: "Missed Penalty", "Cancelled Goal" 등은 득점에서 제외
+
+    여기서는:
+      - type != "Goal"  → 무시
+      - detail 에서 실축/취소/VAR 취소는 득점에서 제외
     """
     home_goals = 0
     away_goals = 0
@@ -32,8 +36,22 @@ def _calc_score_from_events(
             continue
 
         type_ = (ev.get("type") or "").lower()
+        detail = (ev.get("detail") or "").lower()
+
+        # 1) 골 이벤트가 아니면 패스
         if type_ != "goal":
-            # 필요하면 나중에 Penalty, Own Goal 세부 처리 추가 가능
+            continue
+
+        # 2) 패널티 실축 / 골 취소 계열은 득점에서 제외
+        #    (API 실제 detail 값에 맞춰 필요한 키워드는 더 추가 가능)
+        if "missed" in detail and "penalty" in detail:
+            # Missed Penalty
+            continue
+        if "cancel" in detail or "disallowed" in detail:
+            # Cancelled goal / Disallowed goal
+            continue
+        if "var" in detail and ("no goal" in detail or "disallowed" in detail):
+            # VAR: goal cancelled
             continue
 
         team_block = ev.get("team") or {}
@@ -45,6 +63,7 @@ def _calc_score_from_events(
             away_goals += 1
 
     return home_goals, away_goals
+
 
 
 def update_live_scores_from_events() -> None:
