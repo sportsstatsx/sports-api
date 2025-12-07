@@ -283,8 +283,9 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
                 {
                     "old_home": old.home_red,
                     "old_away": old.away_red,
-                    "new_home": new_home_red,
-                    "new_away": new_away_red,
+                    # 🔧 여기가 수정 포인트: 정의되지 않은 변수 대신 new 상태 사용
+                    "new_home": new.home_red,
+                    "new_away": new.away_red,
                 },
             )
         )
