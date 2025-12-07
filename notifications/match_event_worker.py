@@ -25,6 +25,25 @@ class MatchState:
     away_red: int
 
 
+# 상태 진행 순서를 숫자로 매핑해서 "뒤로 가는 롤백"을 막기 위한 기준
+STATUS_ORDER: Dict[str, int] = {
+    "": 0,
+    "TBD": 0,
+    "NS": 0,
+    "PST": 1,   # 연기
+    "SUSP": 1,  # 중단
+    "1H": 10,
+    "LIVE": 15,  # 공급사에서 LIVE 로만 주는 경우 방지용
+    "HT": 20,
+    "2H": 30,
+    "ET": 40,
+    "P": 50,
+    "AET": 60,
+    "PEN": 70,
+    "FT": 80,
+}
+
+
 def get_subscribed_matches() -> List[int]:
     rows = fetch_all(
         """
@@ -220,9 +239,51 @@ def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
     }
 
 
+def apply_monotonic_state(
+    last: MatchState | None,
+    current: MatchState,
+) -> MatchState:
+    """
+    match_notification_state 를 기준으로
+    - status 는 STATUS_ORDER 를 기준으로 뒤로 가지 않게
+    - 골 / 레드카드는 절대 감소하지 않게
+    만든 "유효 상태"를 만들어낸다.
+
+    이렇게 만들어진 상태를 기준으로 diff 를 계산하고,
+    같은 값을 match_notification_state 에 저장해서
+    이후에도 항상 단조롭게 유지한다.
+    """
+    if last is None:
+        return current
+
+    old_status = last.status or ""
+    new_status = current.status or ""
+
+    old_rank = STATUS_ORDER.get(old_status, 0)
+    new_rank = STATUS_ORDER.get(new_status, 0)
+
+    # 상태가 뒤로 가면(랭크가 작아지면) 이전 상태를 유지
+    if new_rank < old_rank:
+        effective_status = old_status
+    else:
+        effective_status = new_status
+
+    return MatchState(
+        match_id=current.match_id,
+        status=effective_status,
+        home_goals=max(last.home_goals, current.home_goals),
+        away_goals=max(last.away_goals, current.away_goals),
+        home_red=max(last.home_red, current.home_red),
+        away_red=max(last.away_red, current.away_red),
+    )
+
+
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
     """
     API-FOOTBALL 상태 흐름 기준으로 모든 이벤트를 확실하게 감지하는 diff 로직.
+    - match_notification_state 를 통해 단조 상태를 보장한 new 를 입력으로 받는다는 전제.
+    - 이미 FT/AET/PEN 상태까지 간 이후에는 어떤 롤백/수정이 와도
+      추가 알림을 보내지 않는다.
     """
     events: List[Tuple[str, Dict[str, Any]]] = []
 
@@ -232,6 +293,10 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
 
     old_status = old.status or ""
     new_status = new.status or ""
+
+    # 이미 이전에 종료 상태였다면, 이후에는 어떤 변화도 알림 X
+    if old_status in ("FT", "AET", "PEN"):
+        return events
 
     # --------------------------
     # 1) Kickoff 감지
@@ -258,9 +323,11 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         events.append(("ft", {}))
 
     # --------------------------
-    # 5) 스코어 변화 감지
+    # 5) 스코어 변화 감지 (증가 방향만 의미 있음)
     # --------------------------
-    if (old.home_goals != new.home_goals) or (old.away_goals != new.away_goals):
+    home_diff = new.home_goals - old.home_goals
+    away_diff = new.away_goals - old.away_goals
+    if (home_diff > 0) or (away_diff > 0):
         events.append(
             (
                 "score",
@@ -274,9 +341,11 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         )
 
     # --------------------------
-    # 6) 레드카드 감지
+    # 6) 레드카드 감지 (증가 방향만 의미 있음)
     # --------------------------
-    if (old.home_red != new.home_red) or (old.away_red != new.away_red):
+    home_red_diff = new.home_red - old.home_red
+    away_red_diff = new.away_red - old.away_red
+    if (home_red_diff > 0) or (away_red_diff > 0):
         events.append(
             (
                 "redcard",
@@ -426,12 +495,16 @@ def build_message(
 
 
 def process_match(fcm: FCMClient, match_id: int) -> None:
-    current = load_current_match_state(match_id)
-    if not current:
+    current_raw = load_current_match_state(match_id)
+    if not current_raw:
         log.info("match_id=%s current state not found, skip", match_id)
         return
 
     last = load_last_state(match_id)
+
+    # match_notification_state 를 기준으로 단조 상태 강제
+    current = apply_monotonic_state(last, current_raw)
+
     events = diff_events(last, current)
 
     if not events:
