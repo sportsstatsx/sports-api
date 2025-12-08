@@ -101,13 +101,22 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
 
-    # 2) group_name 이 여러 개면, home/away 팀이 속한 group 하나만 사용
+    # 2) group_name 이 여러 개면, 보통은 home/away 팀이 속한 group 하나만 사용.
+    #    단, East/West 컨퍼런스 리그(MLS 등)는 ALL / East / West 탭이 필요하므로
+    #    전체 컨퍼런스 데이터를 그대로 유지한다.
     group_names = {
         (r.get("group_name") or "").strip()
         for r in dedup_rows
         if r.get("group_name") is not None
     }
-    if len(group_names) > 1:
+
+    def _is_east_west_split(names) -> bool:
+        lower = {g.lower() for g in names if g}
+        has_east = any("east" in g for g in lower)
+        has_west = any("west" in g for g in lower)
+        return has_east and has_west
+
+    if len(group_names) > 1 and not _is_east_west_split(group_names):
         main_group = None
 
         # 먼저 home 팀이 속한 그룹
@@ -130,6 +139,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 for r in dedup_rows
                 if (r.get("group_name") or "").strip() == main_group
             ]
+
 
     # 3) position 기준 정렬 후 JSON 매핑
     dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0))
