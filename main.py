@@ -30,7 +30,9 @@ from routers.home_router import home_bp
 from routers.matchdetail_router import matchdetail_bp
 from teamdetail.routes import teamdetail_bp
 from leaguedetail.routes import leaguedetail_bp
-from notifications.routes import notifications_bp 
+from notifications.routes import notifications_bp
+from routers.vip_routes import vip_bp
+
 
 
 import traceback
@@ -49,6 +51,7 @@ app.register_blueprint(matchdetail_bp)
 app.register_blueprint(teamdetail_bp)
 app.register_blueprint(leaguedetail_bp)
 app.register_blueprint(notifications_bp)
+app.register_blueprint(vip_bp)
 
 
 # ─────────────────────────────────────────
@@ -288,6 +291,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
