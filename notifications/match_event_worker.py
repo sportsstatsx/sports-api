@@ -605,7 +605,7 @@ if __name__ == "__main__":
         try:
             seconds = int(interval)
         except ValueError:
-            seconds = 10  # 잘못된 값이면 기본 10초
+            seconds = 5  # 잘못된 값이면 기본 10초
         run_forever(seconds)
     else:
         run_once()
