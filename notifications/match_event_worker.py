@@ -279,86 +279,73 @@ def apply_monotonic_state(
 
 
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    API-FOOTBALL 상태 흐름 기준으로 모든 이벤트를 확실하게 감지하는 diff 로직.
-    - match_notification_state 를 통해 단조 상태를 보장한 new 를 입력으로 받는다는 전제.
-    - 이미 FT/AET/PEN 상태까지 간 이후에는 어떤 롤백/수정이 와도
-      추가 알림을 보내지 않는다.
-    """
     events: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 첫 저장은 baseline만 만들고 이벤트는 보내지 않음
+    # 첫 상태 저장용 (알림 X)
     if old is None:
         return events
 
     old_status = old.status or ""
     new_status = new.status or ""
 
-    # 이미 이전에 종료 상태였다면, 이후에는 어떤 변화도 알림 X
+    # ✅ 이미 종료 알림 보낸 경기면 아무것도 안 함
     if old_status in ("FT", "AET", "PEN"):
         return events
 
-    # --------------------------
-    # 1) Kickoff 감지
-    # --------------------------
-    if old_status in ("NS", "TBD", "") and new_status in ("1H", "LIVE"):
+    # ==========================
+    # 1) Kickoff (완화된 기준)
+    # ==========================
+    if old_status in ("", "NS", "TBD") and new_status not in ("", "NS", "TBD"):
         events.append(("kickoff", {}))
 
-    # --------------------------
-    # 2) 하프타임 감지
-    # --------------------------
+    # ==========================
+    # 2) Half-time
+    # ==========================
     if new_status == "HT" and old_status != "HT":
         events.append(("ht", {}))
 
-    # --------------------------
-    # 3) 후반전 시작 감지
-    # --------------------------
+    # ==========================
+    # 3) Second half start
+    # ==========================
     if old_status == "HT" and new_status in ("2H", "LIVE"):
         events.append(("2h_start", {}))
 
-    # --------------------------
-    # 4) 경기 종료 감지
-    # --------------------------
+    # ==========================
+    # 4) Full-time
+    # ==========================
     if new_status in ("FT", "AET", "PEN") and old_status not in ("FT", "AET", "PEN"):
         events.append(("ft", {}))
 
-    # --------------------------
-    # 5) 스코어 변화 감지 (증가 방향만 의미 있음)
-    # --------------------------
-    home_diff = new.home_goals - old.home_goals
-    away_diff = new.away_goals - old.away_goals
-    if (home_diff > 0) or (away_diff > 0):
+    # ==========================
+    # 5) Goal (증가만 감지)
+    # ==========================
+    if new.home_goals > old.home_goals or new.away_goals > old.away_goals:
         events.append(
             (
                 "score",
                 {
                     "old_home": old.home_goals,
                     "old_away": old.away_goals,
-                    "new_home": new.home_goals,
-                    "new_away": new.away_goals,
                 },
             )
         )
 
-    # --------------------------
-    # 6) 레드카드 감지 (증가 방향만 의미 있음)
-    # --------------------------
-    home_red_diff = new.home_red - old.home_red
-    away_red_diff = new.away_red - old.away_red
-    if (home_red_diff > 0) or (away_red_diff > 0):
+    # ==========================
+    # 6) Red card (증가만 감지)
+    # ==========================
+    if new.home_red > old.home_red or new.away_red > old.away_red:
         events.append(
             (
                 "redcard",
                 {
                     "old_home": old.home_red,
                     "old_away": old.away_red,
-                    "new_home": new.home_red,
-                    "new_away": new.away_red,
                 },
             )
         )
 
     return events
+
 
 
 def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
