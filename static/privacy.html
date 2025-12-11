@@ -5,96 +5,224 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>개인정보처리방침 | Privacy Policy - SportsStatsX</title>
   <style>
-    body { font-family: Arial, sans-serif; line-height: 1.6; margin: 24px; max-width: 980px; }
-    h1,h2 { margin-top: 28px; }
-    .lang { padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 10px; margin: 18px 0; }
+    body { font-family: Arial, sans-serif; line-height: 1.65; margin: 24px; max-width: 980px; }
+    h1,h2,h3 { margin-top: 26px; }
     .muted { color: #6b7280; font-size: 0.95em; }
-    ul { margin-top: 8px; }
+    .box { padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 10px; margin: 14px 0; }
+    ul { margin: 8px 0 0 18px; }
+    li { margin: 6px 0; }
+    hr { margin: 28px 0; border: none; border-top: 1px solid #e5e7eb; }
+    code { background: #f3f4f6; padding: 1px 6px; border-radius: 6px; }
+    a { color: inherit; }
   </style>
 </head>
 <body>
+
   <h1>개인정보처리방침 (KOR)</h1>
-  <p class="muted">마지막 업데이트: 2025-12-12</p>
+  <p class="muted">최종 업데이트: 2025년 11월</p>
 
-  <div class="lang">
-    <p><strong>SportsStatsX</strong>(이하 “앱”)는 사용자의 개인정보를 중요하게 생각하며, 관련 법령 및 Google Play 정책을 준수합니다.</p>
-
-    <h2>1. 수집하는 정보</h2>
-    <ul>
-      <li><strong>기기/앱 정보</strong>: 앱 버전, OS 버전 등(서비스 안정성 및 오류 대응 목적)</li>
-      <li><strong>알림 토큰</strong>: 푸시 알림 전송을 위한 FCM 토큰(사용자가 알림을 켠 경우)</li>
-      <li><strong>기기 식별자(비개인식별 형태)</strong>: 알림/설정 저장 및 중복 방지 등 서비스 운영 목적의 식별값(예: 랜덤 UUID)</li>
-    </ul>
-
-    <h2>2. 이용 목적</h2>
-    <ul>
-      <li>경기/팀/리그 정보 제공 및 앱 기능 제공</li>
-      <li>푸시 알림(킥오프/골/카드 등) 전송</li>
-      <li>오류 분석 및 서비스 품질 개선</li>
-    </ul>
-
-    <h2>3. 제3자 서비스(처리 위탁/공유 가능성)</h2>
-    <p>앱은 기능 제공을 위해 다음과 같은 제3자 서비스를 사용할 수 있습니다.</p>
-    <ul>
-      <li><strong>Google Firebase</strong>(예: Cloud Messaging/FCM 등): 푸시 알림 전송 및 서비스 운영</li>
-      <li><strong>Google Play</strong>: 앱 배포/결제(향후 구독 기능 도입 시) 및 정책 준수</li>
-      <li><strong>스포츠 데이터 제공자/API</strong>: 경기 데이터 제공을 위한 외부 API</li>
-    </ul>
-
-    <h2>4. 보관 기간 및 삭제</h2>
-    <ul>
-      <li>수집된 정보는 서비스 제공에 필요한 기간 동안 보관하며, 목적 달성 시 지체 없이 삭제합니다.</li>
-      <li>사용자가 알림을 끄거나 앱을 삭제하는 경우, 관련 토큰/식별 정보는 더 이상 사용되지 않으며 서비스 정책에 따라 삭제될 수 있습니다.</li>
-    </ul>
-
-    <h2>5. 사용자 권리</h2>
-    <p>사용자는 개인정보 관련 문의를 통해 열람/정정/삭제 요청을 할 수 있습니다.</p>
-
-    <h2>6. 문의</h2>
-    <p>이메일: <a href="mailto:sportsstatsx@gmail.com">sportsstatsx@gmail.com</a></p>
+  <div class="box">
+    <p>
+      <strong>SportsStatsX</strong>(이하 “앱”)는 이용자의 개인정보를 중요하게 생각하며,
+      관련 법령 및 Google Play 정책을 준수합니다.
+      본 방침은 앱 사용 과정에서 수집·이용되는 정보, 보관 및 공유 방식, 이용자의 권리를 설명합니다.
+    </p>
   </div>
+
+  <h2>1. 요약</h2>
+  <p>
+    앱은 수집 데이터를 최소화합니다. 앱은 <strong>회원가입을 요구하지 않으며</strong>,
+    <strong>이름·이메일</strong> 등 직접적인 개인식별정보를 수집하지 않습니다.
+    로그인 없이 이용자를 구분하고(및 프리미엄 권한을 확인하기 위해) <strong>기기 식별자</strong>를 사용할 수 있습니다.
+  </p>
+
+  <h2>2. 수집하는 정보</h2>
+  <ul>
+    <li>
+      <strong>기기 식별자(Android ID)</strong>:
+      이용자 구분, 프리미엄 권한 확인(로그인 없이), 이상 사용 방지 목적의 기기 단위 식별자입니다.
+    </li>
+    <li>
+      <strong>푸시 알림 토큰(예: FCM 토큰)</strong>:
+      이용자가 선택적으로 허용한 경우에 한해 경기 알림, 서비스 메시지 등을 전송하기 위해 사용되는 기기별 토큰입니다.
+    </li>
+    <li>
+      <strong>기술 진단 정보</strong>:
+      OS 버전, 앱 버전, 기기 모델, 화면 정보(해상도 등), 기본 로그(날짜/시간), 네트워크 상태 등
+      앱 안정성 확보 및 장애 분석/트러블슈팅을 위한 정보입니다.
+    </li>
+    <li>
+      <strong>구매 메타데이터</strong>:
+      Google Play 구매 토큰, 상품 ID(SKU), 거래 시간 등 프리미엄 권한 확인을 위한 정보입니다.
+      <em>앱은 결제 카드/은행 계좌 등 결제수단 정보를 수집하지 않습니다.</em>
+    </li>
+  </ul>
+
+  <p class="muted">
+    참고: 앱은 <strong>정확한 위치 정보</strong>, <strong>주소록</strong>, <strong>전화번호</strong>, <strong>SMS</strong>,
+    <strong>IMEI</strong>, <strong>MAC 주소</strong> 등 민감한 정보를 수집하지 않습니다.
+  </p>
+
+  <h2>3. 정보 이용 목적</h2>
+  <ul>
+    <li>앱 제공 및 운영(데이터 제공, 설정 저장, 프리미엄 권한 확인)</li>
+    <li>부정 사용 방지 및 서비스 무결성/정책 준수</li>
+    <li>이용자가 알림을 허용한 경우에 한해, 경기 알림·서비스 안내 등 선택적 푸시 알림 제공</li>
+    <li>안정성 확보, 장애 분석 및 서비스 품질 개선</li>
+    <li>관련 법령 준수 및 정당한 법적 요청 대응</li>
+  </ul>
+
+  <h2>4. 보관 및 보유 기간</h2>
+  <ul>
+    <li>정보는 기기 내 또는 필요한 경우 보안이 적용된 서버에 저장될 수 있습니다.</li>
+    <li>기술 진단 정보는 즉시 또는 최대 30일 이내에 삭제될 수 있습니다.</li>
+    <li>구매 메타데이터는 법적 보존 기간 또는 프리미엄 권한 확인에 필요한 기간 동안만 보관됩니다.</li>
+    <li>앱을 삭제하면 기기에 저장된 데이터는 삭제됩니다(단, 서버에 저장된 정보는 목적 달성 시 또는 정책에 따라 삭제될 수 있습니다).</li>
+  </ul>
+
+  <h2>5. 공유 및 제3자 제공</h2>
+  <ul>
+    <li>당사는 이용자 데이터를 판매·임대·거래하지 않습니다.</li>
+    <li>
+      앱 운영을 위해 필요한 범위 내에서,
+      비밀유지 의무가 있는 서비스 제공업체와 정보를 공유할 수 있습니다
+      (예: 푸시 알림/장애 분석 등).
+    </li>
+    <li>법률상 요구되거나 권리 보호 및 서비스 안정성 유지를 위해 필요한 경우에 한하여 정보를 공개할 수 있습니다.</li>
+  </ul>
+
+  <h2>6. 보안</h2>
+  <p>
+    어떠한 시스템도 완전한 보안을 보장할 수는 없지만,
+    당사는 기술적·관리적 보호조치를 지속적으로 도입·개선하고 있습니다.
+    내부 접근은 업무상 필요한 최소 인원으로 제한될 수 있으며,
+    식별자는 상황에 따라 해시 또는 암호화될 수 있습니다.
+  </p>
+
+  <h2>7. 이용자의 권리</h2>
+  <ul>
+    <li>언제든지 앱을 삭제하여 기기에 저장된 데이터를 제거할 수 있습니다.</li>
+    <li>구매 복원, 구독 갱신, 환불 등은 Google Play 정책 및 지원센터를 통해 처리됩니다.</li>
+    <li>질문 또는 법적 요청이 있는 경우 아래 연락처로 문의할 수 있습니다.</li>
+  </ul>
+
+  <h2>8. 아동 보호</h2>
+  <p>
+    앱은 관련 법령상 부모 동의 없이 앱을 사용할 수 있는 최소 연령 미만의 아동을 대상으로 하지 않습니다.
+    해당 법령에 따라 이용이 허용되지 않는 경우 앱을 사용해서는 안 됩니다.
+  </p>
+
+  <h2>9. 방침 변경</h2>
+  <p>
+    당사는 필요에 따라 본 개인정보처리방침을 변경할 수 있습니다.
+    개정 공지 이후에도 앱을 계속 사용하는 경우, 변경된 방침에 동의한 것으로 간주됩니다.
+  </p>
+
+  <h2>10. 문의</h2>
+  <p>
+    이메일: <a href="mailto:sportsstatsx@gmail.com">sportsstatsx@gmail.com</a>
+  </p>
 
   <hr />
 
   <h1>Privacy Policy (ENG)</h1>
-  <p class="muted">Last Updated: 2025-12-12</p>
+  <p class="muted">Last Updated: November 2025</p>
 
-  <div class="lang">
-    <p><strong>SportsStatsX</strong> (the “App”) values your privacy and complies with applicable laws and Google Play policies.</p>
-
-    <h2>1. Information We Collect</h2>
-    <ul>
-      <li><strong>Device/App Info</strong>: app version, OS version (for stability and troubleshooting)</li>
-      <li><strong>Notification Token</strong>: FCM token for push notifications (only if notifications are enabled)</li>
-      <li><strong>Non-personal Identifier</strong>: an operational identifier (e.g., random UUID) for saving settings and preventing duplicates</li>
-    </ul>
-
-    <h2>2. Purpose of Use</h2>
-    <ul>
-      <li>Provide match/team/league information and core app features</li>
-      <li>Send push notifications (kickoff/goals/cards, etc.)</li>
-      <li>Improve quality and diagnose issues</li>
-    </ul>
-
-    <h2>3. Third-Party Services</h2>
-    <p>The App may use third-party services to provide features, including:</p>
-    <ul>
-      <li><strong>Google Firebase</strong> (e.g., Cloud Messaging/FCM) for push notifications and operations</li>
-      <li><strong>Google Play</strong> for distribution and (future) billing/subscriptions</li>
-      <li><strong>Sports data providers/APIs</strong> to retrieve match data</li>
-    </ul>
-
-    <h2>4. Retention & Deletion</h2>
-    <ul>
-      <li>We retain information only as long as needed to provide the service and delete it when no longer necessary.</li>
-      <li>If you disable notifications or uninstall the app, related tokens/identifiers may be removed according to our operational policy.</li>
-    </ul>
-
-    <h2>5. Your Rights</h2>
-    <p>You may request access, correction, or deletion by contacting us.</p>
-
-    <h2>6. Contact</h2>
-    <p>Email: <a href="mailto:sportsstatsx@gmail.com">sportsstatsx@gmail.com</a></p>
+  <div class="box">
+    <p>
+      <strong>SportsStatsX</strong> (the “App”) values your privacy and complies with applicable laws
+      and Google Play policies. This policy explains what we collect, how we use it, how long we keep it,
+      and your rights.
+    </p>
   </div>
+
+  <h2>1. Summary</h2>
+  <p>
+    We minimize data collection. The App does <strong>not require registration</strong> and does not collect
+    directly identifying personal information such as <strong>name or email</strong>.
+    A <strong>device identifier</strong> may be used to differentiate users and verify premium entitlements without login.
+  </p>
+
+  <h2>2. Data We Collect</h2>
+  <ul>
+    <li>
+      <strong>Device Identifier (Android ID)</strong>:
+      used for user differentiation, premium entitlement verification (without login), and abuse prevention.
+    </li>
+    <li>
+      <strong>Push Notification Token (e.g., FCM token)</strong>:
+      used only to deliver optional notifications (match alerts, service messages) when you have enabled notifications.
+    </li>
+    <li>
+      <strong>Technical Diagnostics</strong>:
+      OS/app version, device model, screen metrics, basic logs (dates/times), and network state
+      for stability and troubleshooting.
+    </li>
+    <li>
+      <strong>Purchase Metadata</strong>:
+      Google Play purchase token, product ID (SKU), and transaction time used only to verify premium access.
+      <em>The App does not collect payment card or bank details.</em>
+    </li>
+  </ul>
+
+  <p class="muted">
+    We do not collect sensitive data such as precise location, contacts, phone number, SMS, IMEI, or MAC address.
+  </p>
+
+  <h2>3. How We Use Information</h2>
+  <ul>
+    <li>Operate and provide the App (including premium entitlement verification and integrity/abuse prevention)</li>
+    <li>Deliver optional push notifications where you have allowed notifications</li>
+    <li>Diagnostics and service improvement</li>
+    <li>Compliance with law and responding to lawful requests</li>
+  </ul>
+
+  <h2>4. Storage and Retention</h2>
+  <ul>
+    <li>Data may be stored locally on your device and, if necessary, on secure servers.</li>
+    <li>Diagnostic data may be deleted immediately or within 30 days.</li>
+    <li>Purchase metadata is retained only as required by law or as needed for entitlement verification.</li>
+    <li>Uninstalling the App removes locally stored data (server-side data may be deleted according to purpose/policy).</li>
+  </ul>
+
+  <h2>5. Sharing and Disclosure</h2>
+  <ul>
+    <li>We do not sell, rent, or trade user data.</li>
+    <li>
+      We may share data with service providers solely to operate core functions
+      (e.g., push delivery, diagnostics) under confidentiality obligations.
+    </li>
+    <li>We may disclose information only when required by law or to protect rights and service integrity.</li>
+  </ul>
+
+  <h2>6. Security</h2>
+  <p>
+    While no system can guarantee absolute security, we implement and improve safeguards.
+    Internal access may be restricted to operational necessity, and identifiers may be hashed or encrypted where appropriate.
+  </p>
+
+  <h2>7. Your Rights</h2>
+  <ul>
+    <li>You can uninstall the App at any time to delete local data.</li>
+    <li>Purchase restoration, renewals, and refunds are handled by Google Play policies and support.</li>
+    <li>If you have questions or lawful requests, contact us below.</li>
+  </ul>
+
+  <h2>8. Children</h2>
+  <p>
+    The App is not directed to children under the minimum age required by local law to use apps without parental consent.
+    Do not use the App if local law does not permit you to do so.
+  </p>
+
+  <h2>9. Changes to This Policy</h2>
+  <p>
+    We may update this Privacy Policy. Continued use after publication indicates your acceptance of the revised policy.
+  </p>
+
+  <h2>10. Contact</h2>
+  <p>
+    Email: <a href="mailto:sportsstatsx@gmail.com">sportsstatsx@gmail.com</a>
+  </p>
+
 </body>
 </html>
