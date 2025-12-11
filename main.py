@@ -153,22 +153,22 @@ STATIC_DIR = os.path.join(app.root_path, "static")
 
 @app.route("/privacy")
 def privacy_en():
-    # EN main: ./static/privacy.html
+    # EN main
     return send_from_directory(STATIC_DIR, "privacy.html")
 
-@app.route("/privacy")
+@app.route("/privacy/ko")
 def privacy_ko():
-    # KO: ./static/privacy_ko.html
+    # KO
     return send_from_directory(STATIC_DIR, "privacy_ko.html")
 
 @app.route("/terms")
 def terms_en():
-    # EN main: ./static/terms.html
+    # EN main
     return send_from_directory(STATIC_DIR, "terms.html")
 
-@app.route("/terms")
+@app.route("/terms/ko")
 def terms_ko():
-    # KO: ./static/terms_ko.html
+    # KO
     return send_from_directory(STATIC_DIR, "terms_ko.html")
 
 
@@ -317,6 +317,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
