@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Dict, List, Any
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 from werkzeug.exceptions import HTTPException
 import pytz  # 타임존 계산용
 
@@ -145,6 +145,15 @@ def health():
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+# ─────────────────────────────────────────
+# Policy: Privacy Policy (Korean + English)
+# ─────────────────────────────────────────
+@app.route("/privacy")
+def privacy_policy():
+    # main.py와 같은 폴더 기준으로 ./static/privacy.html
+    static_dir = os.path.join(app.root_path, "static")
+    return send_from_directory(static_dir, "privacy.html")
 
 
 # ─────────────────────────────────────────
@@ -291,6 +300,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
