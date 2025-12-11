@@ -147,13 +147,30 @@ def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 # ─────────────────────────────────────────
-# Policy: Privacy Policy (Korean + English)
+# Policy: Privacy Policy / Terms (EN main + KO split)
 # ─────────────────────────────────────────
+STATIC_DIR = os.path.join(app.root_path, "static")
+
 @app.route("/privacy")
-def privacy_policy():
-    # main.py와 같은 폴더 기준으로 ./static/privacy.html
-    static_dir = os.path.join(app.root_path, "static")
-    return send_from_directory(static_dir, "privacy.html")
+def privacy_en():
+    # EN main: ./static/privacy.html
+    return send_from_directory(STATIC_DIR, "privacy.html")
+
+@app.route("/privacy/ko")
+def privacy_ko():
+    # KO: ./static/privacy_ko.html
+    return send_from_directory(STATIC_DIR, "privacy_ko.html")
+
+@app.route("/terms")
+def terms_en():
+    # EN main: ./static/terms.html
+    return send_from_directory(STATIC_DIR, "terms.html")
+
+@app.route("/terms/ko")
+def terms_ko():
+    # KO: ./static/terms_ko.html
+    return send_from_directory(STATIC_DIR, "terms_ko.html")
+
 
 
 # ─────────────────────────────────────────
@@ -300,6 +317,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
