@@ -76,10 +76,7 @@ def enrich_overall_outcome_totals(
         WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          AND (
-                lower(m.status_group) IN ('finished','ft','fulltime')
-             OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-          )
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
         ORDER BY m.date_utc DESC
     """
 
