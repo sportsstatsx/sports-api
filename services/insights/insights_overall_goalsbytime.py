@@ -67,10 +67,8 @@ def enrich_overall_goals_by_time(
         WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
-          AND (
-                lower(m.status_group) IN ('finished','ft','fulltime')
-             OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-          )
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
+
         ORDER BY m.date_utc DESC
     """
 
