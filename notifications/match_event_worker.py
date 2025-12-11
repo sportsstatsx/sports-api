@@ -506,6 +506,86 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         # extra(튜플에서 온 dict-like)를 방어적으로 복사
         extra = dict(extra)
 
+        # --- 이벤트 중복 방지를 위한 플래그 체크 로직 ---
+        state_row = fetch_one(
+            """
+            SELECT
+                kickoff_sent,
+                kickoff_10m_sent,
+                halftime_sent,
+                secondhalf_sent,
+                fulltime_sent,
+                extra_time_start_sent,
+                extra_time_halftime_sent,
+                extra_time_secondhalf_sent,
+                extra_time_end_sent,
+                penalties_start_sent,
+                penalties_end_sent
+            FROM match_notification_state
+            WHERE match_id = %s
+            """,
+            (match_id,),
+        )
+
+        # match_notification_state 에 row 가 없을 일은 거의 없지만,
+        # 방어적으로 기본값 dict 하나 만들어둔다.
+        if not state_row:
+            state_row = {
+                "kickoff_sent": False,
+                "kickoff_10m_sent": False,
+                "halftime_sent": False,
+                "secondhalf_sent": False,
+                "fulltime_sent": False,
+                "extra_time_start_sent": False,
+                "extra_time_halftime_sent": False,
+                "extra_time_secondhalf_sent": False,
+                "extra_time_end_sent": False,
+                "penalties_start_sent": False,
+                "penalties_end_sent": False,
+            }
+
+        flag_updates: List[str] = []
+
+        # Kickoff
+        if event_type == "kickoff":
+            if state_row["kickoff_sent"]:
+                # 이미 킥오프 알림 보냈으면 이번 이벤트는 skip
+                continue
+            flag_updates.append("kickoff_sent = TRUE")
+
+        # Half-time (HT)
+        if event_type == "ht":
+            if state_row["halftime_sent"]:
+                continue
+            flag_updates.append("halftime_sent = TRUE")
+
+        # Second half (2H)
+        if event_type == "2h_start":
+            if state_row["secondhalf_sent"]:
+                continue
+            flag_updates.append("secondhalf_sent = TRUE")
+
+        # Full-time (FT)
+        if event_type == "ft":
+            if state_row["fulltime_sent"]:
+                continue
+            flag_updates.append("fulltime_sent = TRUE")
+
+        # TODO: 필요하면 나중에 연장/승부차기 알림도 별도 event_type 만들고
+        #       아래 extra_time_* / penalties_* 플래그를 같이 쓰면 됨.
+
+        # 플래그 DB 적용 (row 가 있을 때만 실제로 업데이트가 일어남)
+        if flag_updates:
+            execute(
+                f"""
+                UPDATE match_notification_state
+                SET {", ".join(flag_updates)}
+                WHERE match_id = %s
+                """,
+                (match_id,),
+            )
+ 
+
         # score 이벤트라면, 마지막 득점 시간(분+추가시간)을 extra 에 추가
         if event_type == "score":
             goal_time = load_last_goal_minute(match_id)
