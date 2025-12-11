@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -317,6 +318,28 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         events.append(("ft", {}))
 
     # ==========================
+    # 4-1) Extra time start / end
+    # ==========================
+    # 예: 2H → ET 진입
+    if old_status not in ("ET", "AET") and new_status == "ET":
+        events.append(("et_start", {}))
+
+    # 예: ET → AET / PEN / FT 로 넘어갈 때 "연장 종료" 처리
+    if old_status == "ET" and new_status in ("AET", "P", "PEN", "FT"):
+        events.append(("et_end", {}))
+
+    # ==========================
+    # 4-2) Penalty shoot-out start / end
+    # ==========================
+    # 승부차기 시작 (P 또는 PEN 으로 진입)
+    if old_status not in ("P", "PEN") and new_status in ("P", "PEN"):
+        events.append(("pen_start", {}))
+
+    # 승부차기 종료 → 최종 결과 확정(FT / AET)
+    if old_status in ("P", "PEN") and new_status in ("FT", "AET"):
+        events.append(("pen_end", {}))
+
+    # ==========================
     # 5) Goal (증가만 감지)
     # ==========================
     if new.home_goals > old.home_goals or new.away_goals > old.away_goals:
@@ -353,13 +376,26 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
     이벤트 종류에 따라 해당 옵션을 켜둔 구독자 토큰만 가져오기.
     """
     option_column = {
+        # 킥오프 관련
+        "kickoff_10m": "notify_kickoff",  # 🔹 킥오프 10분 전
         "kickoff": "notify_kickoff",
+
+        # 득점 / 카드
         "score": "notify_score",
         "redcard": "notify_redcard",
+
+        # 전/후반
         "ht": "notify_ht",          # 하프타임 전용 옵션
         "2h_start": "notify_2h",    # 후반 시작 전용 옵션
+
+        # 경기 종료 및 연장/승부차기 관련
         "ft": "notify_ft",
+        "et_start": "notify_ft",    # 연장도 일단 FT 알림 옵션에 묶기
+        "et_end": "notify_ft",
+        "pen_start": "notify_ft",
+        "pen_end": "notify_ft",
     }[event_type]
+
 
     rows = fetch_all(
         f"""
@@ -416,6 +452,30 @@ def build_message(
     # Full-time
     if event_type == "ft":
         title = "— Full-time —"
+        body = score_line
+        return (title, body)
+
+    # Extra time start
+    if event_type == "et_start":
+        title = "— Extra Time —"
+        body = score_line
+        return (title, body)
+
+    # Extra time end
+    if event_type == "et_end":
+        title = "— Extra Time End —"
+        body = score_line
+        return (title, body)
+
+    # Penalty shoot-out start
+    if event_type == "pen_start":
+        title = "— Penalties —"
+        body = score_line
+        return (title, body)
+
+    # Penalty shoot-out end
+    if event_type == "pen_end":
+        title = "— Penalties End —"
         body = score_line
         return (title, body)
 
@@ -481,6 +541,105 @@ def build_message(
     return (title, body)
 
 
+def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
+    """
+    킥오프 10분 전 알림:
+    - status 가 아직 NS/TBD 일 때만
+    - match_notification_state.kickoff_10m_sent 가 FALSE 일 때만
+    - date_utc 기준으로 지금 시각과의 차이가 0~600초(10분) 사이면 발송
+    """
+    # 이미 시작한 경기면 10분 전 알림은 의미 없음
+    if match.status not in ("", "NS", "TBD"):
+        return
+
+    # 경기 킥오프 시간 가져오기
+    row = fetch_one(
+        """
+        SELECT date_utc
+        FROM matches
+        WHERE fixture_id = %s
+        """,
+        (match.match_id,),
+    )
+    if not row or not row["date_utc"]:
+        return
+
+    try:
+        # 예: "2025-12-11T17:45:00+00:00"
+        kickoff_dt = datetime.fromisoformat(str(row["date_utc"]))
+    except Exception:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    diff_sec = (kickoff_dt - now_utc).total_seconds()
+
+    # 지금 시각 기준으로 0~600초(10분) 이내만 허용
+    if not (0 <= diff_sec <= 600):
+        return
+
+    # 이미 10분 전 알림을 보냈는지 확인
+    state_row = fetch_one(
+        """
+        SELECT kickoff_10m_sent
+        FROM match_notification_state
+        WHERE match_id = %s
+        """,
+        (match.match_id,),
+    )
+    if not state_row:
+        # 아직 state row 없는 경우엔 스킵 (다음 루프에서 다시 확인)
+        return
+
+    if state_row["kickoff_10m_sent"]:
+        return
+
+    # 구독 토큰 가져오기 (킥오프와 동일 옵션 사용)
+    tokens = get_tokens_for_event(match.match_id, "kickoff_10m")
+    if not tokens:
+        return
+
+    labels = load_match_labels(match.match_id)
+    home_name = labels.get("home_name", "Home")
+    away_name = labels.get("away_name", "Away")
+
+    title = "Kickoff in 10 minutes"
+    body = f"{home_name} vs {away_name}"
+
+    data: Dict[str, Any] = {
+        "match_id": match.match_id,
+        "event_type": "kickoff_10m",
+    }
+
+    # 500개 단위로 잘라서 발송
+    batch_size = 500
+    for i in range(0, len(tokens), batch_size):
+        batch = tokens[i : i + batch_size]
+        try:
+            resp = fcm.send_to_tokens(batch, title, body, data)
+            log.info(
+                "Sent kickoff_10m notification for match %s to %s devices: %s",
+                match.match_id,
+                len(batch),
+                resp,
+            )
+        except Exception:
+            log.exception(
+                "Failed to send kickoff_10m notification for match %s",
+                match.match_id,
+            )
+
+    # 플래그 ON
+    execute(
+        """
+        UPDATE match_notification_state
+        SET kickoff_10m_sent = TRUE,
+            updated_at = NOW()
+        WHERE match_id = %s
+        """,
+        (match.match_id,),
+    )
+
+
 def process_match(fcm: FCMClient, match_id: int) -> None:
     current_raw = load_current_match_state(match_id)
     if not current_raw:
@@ -492,12 +651,19 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     # match_notification_state 를 기준으로 단조 상태 강제
     current = apply_monotonic_state(last, current_raw)
 
+    # 🔹 킥오프 10분 전 알림 시도 (status 가 NS/TBD 인 경우에만 내부에서 처리)
+    try:
+        maybe_send_kickoff_10m(fcm, current)
+    except Exception:
+        log.exception("Error while processing kickoff_10m for match %s", match_id)
+
     events = diff_events(last, current)
 
     if not events:
         # 변화 없음 → 상태만 저장
         save_state(current)
         return
+
 
     # 팀/리그 이름 라벨을 한 번만 로딩해서 여러 이벤트에 사용
     labels = load_match_labels(match_id)
@@ -571,8 +737,29 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 continue
             flag_updates.append("fulltime_sent = TRUE")
 
-        # TODO: 필요하면 나중에 연장/승부차기 알림도 별도 event_type 만들고
-        #       아래 extra_time_* / penalties_* 플래그를 같이 쓰면 됨.
+        # Extra time start
+        if event_type == "et_start":
+            if state_row["extra_time_start_sent"]:
+                continue
+            flag_updates.append("extra_time_start_sent = TRUE")
+
+        # Extra time end
+        if event_type == "et_end":
+            if state_row["extra_time_end_sent"]:
+                continue
+            flag_updates.append("extra_time_end_sent = TRUE")
+
+        # Penalties start
+        if event_type == "pen_start":
+            if state_row["penalties_start_sent"]:
+                continue
+            flag_updates.append("penalties_start_sent = TRUE")
+
+        # Penalties end
+        if event_type == "pen_end":
+            if state_row["penalties_end_sent"]:
+                continue
+            flag_updates.append("penalties_end_sent = TRUE")
 
         # 플래그 DB 적용 (row 가 있을 때만 실제로 업데이트가 일어남)
         if flag_updates:
@@ -584,6 +771,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 """,
                 (match_id,),
             )
+
  
 
         # score 이벤트라면, 마지막 득점 시간(분+추가시간)을 extra 에 추가
