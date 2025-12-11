@@ -322,8 +322,9 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
     old_status = old.status or ""
     new_status = new.status or ""
 
-    # ✅ 이미 종료 알림 보낸 경기면 아무것도 안 함
-    if old_status in ("FT", "AET", "PEN"):
+    # ✅ 이미 진짜로 끝난 경기(FT/AET)이면 아무 것도 안 함
+    # PEN 은 여기서 제외해야 PEN → FT/AET 전환 시 알림을 보낼 수 있음
+    if old_status in ("FT", "AET"):
         return events
 
     # ==========================
@@ -345,32 +346,39 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         events.append(("2h_start", {}))
 
     # ==========================
-    # 4) Full-time
+    # 4) 연장 / 승부차기 / 최종 종료 흐름
+    #
+    # 의도한 플로우
+    #  - 2H → FT        → ft만
+    #  - 2H → ET        → et_start만
+    #  - ET → AET       → et_end → ft
+    #  - ET → PEN       → et_end → pen_start
+    #  - PEN → FT/AET   → pen_end → ft
     # ==========================
-    if new_status in ("FT", "AET", "PEN") and old_status not in ("FT", "AET", "PEN"):
-        events.append(("ft", {}))
 
-    # ==========================
-    # 4-1) Extra time start / end
-    # ==========================
-    # 예: 2H → ET 진입
-    if old_status not in ("ET", "AET") and new_status == "ET":
+    # 4-1) 2H(또는 기타) → ET : 연장 시작
+    if old_status not in ("ET", "AET", "P", "PEN") and new_status == "ET":
         events.append(("et_start", {}))
 
-    # 예: ET → AET / PEN / FT 로 넘어갈 때 "연장 종료" 처리
-    if old_status == "ET" and new_status in ("AET", "P", "PEN", "FT"):
+    # 4-2) ET → AET/FT : 연장 종료 + 최종 종료
+    if old_status == "ET" and new_status in ("AET", "FT"):
         events.append(("et_end", {}))
+        events.append(("ft", {}))
 
-    # ==========================
-    # 4-2) Penalty shoot-out start / end
-    # ==========================
-    # 승부차기 시작 (P 또는 PEN 으로 진입)
-    if old_status not in ("P", "PEN") and new_status in ("P", "PEN"):
+    # 4-3) ET → P/PEN : 연장 종료 + 승부차기 시작
+    if old_status == "ET" and new_status in ("P", "PEN"):
+        events.append(("et_end", {}))
         events.append(("pen_start", {}))
 
-    # 승부차기 종료 → 최종 결과 확정(FT / AET)
+    # 4-4) P/PEN → FT/AET : 승부차기 종료 + 최종 종료
     if old_status in ("P", "PEN") and new_status in ("FT", "AET"):
         events.append(("pen_end", {}))
+        events.append(("ft", {}))
+
+    # 4-5) 연장/승부차기 없이 바로 끝나는 경기:
+    #      위 케이스들에서 아무 이벤트도 안 쌓인 상태에서 FT/AET 가 되면 ft 1번만 보냄
+    if new_status in ("FT", "AET") and not events:
+        events.append(("ft", {}))
 
     # ==========================
     # 5) Goal (증가만 감지)
@@ -401,6 +409,7 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         )
 
     return events
+
 
 
 
