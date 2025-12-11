@@ -239,6 +239,39 @@ def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
         "extra": int(row["extra"] or 0),
     }
 
+def load_last_redcard_minute(match_id: int) -> Dict[str, int] | None:
+    """
+    마지막 레드카드 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
+    - match_events 에서 type='Card'
+      AND detail IN ('Red Card', 'Second Yellow Card') 인 것만 대상으로,
+      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    """
+    row = fetch_one(
+        """
+        SELECT
+            minute,
+            COALESCE(extra, 0) AS extra
+        FROM match_events
+        WHERE fixture_id = %s
+          AND type = 'Card'
+          AND detail IN ('Red Card', 'Second Yellow Card')
+        ORDER BY minute DESC NULLS LAST,
+                 extra DESC NULLS LAST,
+                 id DESC
+        LIMIT 1
+        """,
+        (match_id,),
+    )
+
+    if not row or row["minute"] is None:
+        return None
+
+    return {
+        "minute": int(row["minute"]),
+        "extra": int(row["extra"] or 0),
+    }
+
+
 
 def apply_monotonic_state(
     last: MatchState | None,
@@ -433,49 +466,49 @@ def build_message(
 
     # Kickoff
     if event_type == "kickoff":
-        title = "Kickoff"
+        title = "▶ Kickoff"
         body = f"{home_name} vs {away_name}"
         return (title, body)
 
     # Half-time
     if event_type == "ht":
-        title = "— Half-time —"
+        title = "⏸ Half-time"
         body = score_line
         return (title, body)
 
     # Second half start
     if event_type == "2h_start":
-        title = "— Second Half —"
+        title = "▶ Second Half"
         body = score_line
         return (title, body)
 
     # Full-time
     if event_type == "ft":
-        title = "— Full-time —"
+        title = "⏱ Full-time"
         body = score_line
         return (title, body)
 
     # Extra time start
     if event_type == "et_start":
-        title = "— Extra Time —"
+        title = "▶ Extra Time"
         body = score_line
         return (title, body)
 
     # Extra time end
     if event_type == "et_end":
-        title = "— Extra Time End —"
+        title = "⏱ Extra Time End"
         body = score_line
         return (title, body)
 
     # Penalty shoot-out start
     if event_type == "pen_start":
-        title = "— Penalties —"
+        title = "🥅 Penalties"
         body = score_line
         return (title, body)
 
     # Penalty shoot-out end
     if event_type == "pen_end":
-        title = "— Penalties End —"
+        title = "⏱ Penalties End"
         body = score_line
         return (title, body)
 
@@ -501,7 +534,7 @@ def build_message(
         # 타이틀 포맷: "Liverpool Goal! ⚽ 67'"
         if scorer_team in (home_name, away_name):
             if goal_minute_str:
-                title = f"{scorer_team} Goal! ⚽ {goal_minute_str}"
+                title = f"⚽ {goal_minute_str} {scorer_team} Goal!"
             else:
                 title = f"{scorer_team} Goal! ⚽"
         else:
@@ -527,13 +560,25 @@ def build_message(
         else:
             red_team = "Red Card"
 
+        # 득점처럼 레드카드 시간 문자열 사용
+        red_minute_str = extra.get("red_minute_str")
+
+        # 🔥 최종 포맷 예시:
+        # 🟥 78' Liverpool Red Card!
         if red_team in (home_name, away_name):
-            title = f"{red_team} Red Card! 🟥"
+            if red_minute_str:
+                title = f"🟥 {red_minute_str} {red_team} Red Card!"
+            else:
+                title = f"🟥 {red_team} Red Card!"
         else:
-            title = "Red Card! 🟥"
+            if red_minute_str:
+                title = f"🟥 {red_minute_str} Red Card!"
+            else:
+                title = "🟥 Red Card!"
 
         body = score_line
         return (title, body)
+
 
     # Fallback
     title = "Match update"
@@ -789,6 +834,23 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     goal_minute_str = f"{minute}'"
 
                 extra["goal_minute_str"] = goal_minute_str
+
+        # redcard 이벤트라면, 마지막 레드카드 시간(분+추가시간)을 extra 에 추가
+        if event_type == "redcard":
+            red_time = load_last_redcard_minute(match_id)
+            if red_time:
+                minute = red_time.get("minute", 0)
+                extra_min = red_time.get("extra", 0) or 0
+
+                if extra_min:
+                    # 예: 45+2'
+                    red_minute_str = f"{minute}+{extra_min}'"
+                else:
+                    # 예: 78'
+                    red_minute_str = f"{minute}'"
+
+                extra["red_minute_str"] = red_minute_str
+
 
         tokens = get_tokens_for_event(match_id, event_type)
         if not tokens:
