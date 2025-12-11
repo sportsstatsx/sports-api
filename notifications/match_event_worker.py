@@ -533,15 +533,16 @@ def build_message(
 
         # 타이틀 포맷: "Liverpool Goal! ⚽ 67'"
         if scorer_team in (home_name, away_name):
+            # 항상 이모지 먼저
             if goal_minute_str:
                 title = f"⚽ {goal_minute_str} {scorer_team} Goal!"
             else:
-                title = f"{scorer_team} Goal! ⚽"
+                title = f"⚽ {scorer_team} Goal!"
         else:
             if goal_minute_str:
-                title = f"Goal! ⚽ {goal_minute_str}"
+                title = f"⚽ {goal_minute_str} Goal!"
             else:
-                title = "Goal! ⚽"
+                title = "⚽ Goal!"
 
         body = score_line
         return (title, body)
