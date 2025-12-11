@@ -99,10 +99,8 @@ def enrich_overall_discipline_setpieces(
         WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
-          AND (
-                lower(m.status_group) IN ('finished','ft','fulltime')
-             OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-          )
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
+
         GROUP BY m.fixture_id, m.home_id, m.away_id, m.date_utc
         ORDER BY m.date_utc DESC
     """
@@ -230,10 +228,8 @@ def enrich_overall_discipline_setpieces(
         WHERE m.league_id IN ({placeholders_ev})
           AND m.season    = %s
           AND (%s = m.home_id OR %s = m.away_id)
-          AND (
-                lower(m.status_group) IN ('finished','ft','fulltime')
-             OR (m.home_ft IS NOT NULL AND m.away_ft IS NOT NULL)
-          )
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
+
           AND lower(e.type) IN ('card','red card')
           AND (
                 lower(e.detail) LIKE '%%red%%'
