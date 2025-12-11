@@ -156,7 +156,7 @@ def privacy_en():
     # EN main: ./static/privacy.html
     return send_from_directory(STATIC_DIR, "privacy.html")
 
-@app.route("/privacy/ko")
+@app.route("/privacy")
 def privacy_ko():
     # KO: ./static/privacy_ko.html
     return send_from_directory(STATIC_DIR, "privacy_ko.html")
@@ -166,7 +166,7 @@ def terms_en():
     # EN main: ./static/terms.html
     return send_from_directory(STATIC_DIR, "terms.html")
 
-@app.route("/terms/ko")
+@app.route("/terms")
 def terms_ko():
     # KO: ./static/terms_ko.html
     return send_from_directory(STATIC_DIR, "terms_ko.html")
@@ -317,6 +317,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
