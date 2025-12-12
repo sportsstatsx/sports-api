@@ -120,6 +120,19 @@ def upsert_league_season(league_id: int, s: Dict[str, Any]) -> None:
     execute(sql, (league_id, s.get("season"), bool(s.get("current", False)), s.get("start"), s.get("end")))
 
 def upsert_team(team: Dict[str, Any], country_id: Optional[int]) -> None:
+    tid = team.get("id")
+    if tid is None:
+        log.warning("[team skip] team_id is None team=%s", json_dumps(team))
+        return
+    try:
+        tid_i = int(tid)
+    except Exception:
+        log.warning("[team skip] invalid team_id=%s team=%s", tid, json_dumps(team))
+        return
+    if tid_i <= 0:
+        log.warning("[team skip] invalid team_id=%s team=%s", tid_i, json_dumps(team))
+        return
+
     sql = """
     INSERT INTO hockey_teams (id, name, logo, country_id)
     VALUES (%s, %s, %s, %s)
@@ -128,7 +141,8 @@ def upsert_team(team: Dict[str, Any], country_id: Optional[int]) -> None:
       logo = EXCLUDED.logo,
       country_id = EXCLUDED.country_id;
     """
-    execute(sql, (team.get("id"), team.get("name"), team.get("logo"), country_id))
+    execute(sql, (tid_i, team.get("name"), team.get("logo"), country_id))
+
 
 def upsert_game(row: Dict[str, Any]) -> Optional[int]:
     """
@@ -279,9 +293,25 @@ def upsert_standings(league_id: int, season: int, standings_resp: Dict[str, Any]
         """
 
         tid = team.get("id")
-        if tid:
-            # standings에서도 팀이 뜨니까 team upsert(국가 없을 수 있으니 country_id=None)
-            upsert_team(team, None)
+
+        # --- [PATCH START] FK 방어: team_id가 0/None/비정상이면 스탠딩 스킵 ---
+        if tid is None:
+            log.warning("[standings skip] league=%s season=%s team_id is None row=%s", league_id, season, json_dumps(r))
+            continue
+
+        try:
+            tid_i = int(tid)
+        except Exception:
+            log.warning("[standings skip] league=%s season=%s invalid team_id=%s row=%s", league_id, season, tid, json_dumps(r))
+            continue
+
+        if tid_i <= 0:
+            log.warning("[standings skip] league=%s season=%s invalid team_id=%s row=%s", league_id, season, tid_i, json_dumps(r))
+            continue
+
+        # standings에서도 팀이 뜨니까 team upsert(국가 없을 수 있으니 country_id=None)
+        upsert_team(team, None)
+        # --- [PATCH END] ---
 
         execute(
             sql,
@@ -290,7 +320,7 @@ def upsert_standings(league_id: int, season: int, standings_resp: Dict[str, Any]
                 season,
                 stage,
                 group_name,
-                tid,
+                tid_i,
                 r.get("position"),
                 games.get("played"),
 
@@ -569,7 +599,9 @@ def main():
             log.info("3) standings upserted league=%s season=%s rows=%d", lid, season, cnt)
         except requests.HTTPError as e:
             log.warning("3) standings 없음/에러 league=%s season=%s (%s)", lid, season, str(e))
+
         time.sleep(args.sleep)
+
 
         # 4) events (모든 game_id 대상으로)
         if not args.skip_events:
