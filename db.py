@@ -93,3 +93,10 @@ def execute(query: str, params: ParamsType = None) -> None:
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params or ())
+
+def close_pool():
+    try:
+        pool.close()
+    except Exception:
+        pass
+
