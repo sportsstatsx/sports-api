@@ -9,15 +9,12 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from db import execute, fetch_all, fetch_one
+from db import execute, fetch_one
 
 log = logging.getLogger("hockey_backfill")
 logging.basicConfig(level=logging.INFO)
 
 
-# ─────────────────────────────────────────
-# API Client (API-Sports Hockey)
-# ─────────────────────────────────────────
 class HockeyApi:
     BASE_URL = "https://v1.hockey.api-sports.io"
 
@@ -35,7 +32,6 @@ class HockeyApi:
         return r.json()
 
     def league_by_id(self, league_id: int) -> Dict[str, Any]:
-        # ✅ /leagues 전체를 훑지 말고, 필요한 리그만 id로 조회 (None/형태이상 방지)
         return self._get("/leagues", {"id": league_id})
 
     def games(self, league_id: int, season: int) -> Dict[str, Any]:
@@ -48,9 +44,6 @@ class HockeyApi:
         return self._get("/standings", {"league": league_id, "season": season})
 
 
-# ─────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────
 def safe_int(v) -> Optional[int]:
     try:
         if v is None or v == "":
@@ -76,9 +69,6 @@ def safe_float(v) -> Optional[float]:
         return None
 
 
-# ─────────────────────────────────────────
-# Upserts (001_init_hockey.sql 기준)
-# ─────────────────────────────────────────
 def upsert_country(country: Dict[str, Any]) -> None:
     if not isinstance(country, dict):
         return
@@ -200,8 +190,8 @@ def upsert_game(item: Dict[str, Any], league_id: int, season: int) -> Optional[i
         upsert_team(away)
 
     status_obj = g.get("status") if isinstance(g.get("status"), dict) else {}
-    status = safe_text(status_obj.get("short")) if isinstance(status_obj, dict) else None
-    status_long = safe_text(status_obj.get("long")) if isinstance(status_obj, dict) else None
+    status = safe_text(status_obj.get("short"))
+    status_long = safe_text(status_obj.get("long"))
 
     execute(
         """
@@ -231,8 +221,8 @@ def upsert_game(item: Dict[str, Any], league_id: int, season: int) -> Optional[i
             gid,
             league_id,
             season,
-            safe_text(league_obj.get("stage")) if isinstance(league_obj, dict) else None,
-            safe_text(league_obj.get("group")) if isinstance(league_obj, dict) else None,
+            safe_text(league_obj.get("stage")),
+            safe_text(league_obj.get("group")),
             safe_int(home.get("id")) if isinstance(home, dict) else None,
             safe_int(away.get("id")) if isinstance(away, dict) else None,
             g.get("date"),
@@ -266,7 +256,6 @@ def upsert_event(game_id: int, ev: Dict[str, Any], order: int) -> None:
     players = [safe_text(x) for x in players if safe_text(x)]
     assists = [safe_text(x) for x in assists if safe_text(x)]
 
-    # ✅ prod-safe: 유니크 인덱스(uq_hockey_game_events_nodup) 기반 upsert
     execute(
         """
         INSERT INTO hockey_game_events (
@@ -386,9 +375,6 @@ def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]) -> No
             )
 
 
-# ─────────────────────────────────────────
-# main
-# ─────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True, type=int)
@@ -406,20 +392,28 @@ def main():
     season = args.season
     league_ids = [int(x.strip()) for x in args.league_id.split(",") if x.strip()]
 
-    # 1) league meta upsert (필요한 리그만)
+    # 1) league meta upsert (✅ 응답 형태 A/B 모두 지원)
     for lid in league_ids:
         meta = api.league_by_id(lid)
         resp = meta.get("response") if isinstance(meta, dict) else None
-        if not isinstance(resp, list) or not resp:
-            log.warning("league meta empty: league_id=%s", lid)
+        if not isinstance(resp, list) or not resp or not isinstance(resp[0], dict):
+            log.warning("league meta empty/invalid: league_id=%s meta=%s", lid, meta)
             continue
 
-        item = resp[0] if isinstance(resp[0], dict) else {}
-        league_obj = item.get("league") if isinstance(item.get("league"), dict) else None
-        country_obj = item.get("country") if isinstance(item.get("country"), dict) else None
-        seasons_obj = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+        item = resp[0]
 
-        if not league_obj:
+        # 형태 A: item["league"]가 dict
+        if isinstance(item.get("league"), dict):
+            league_obj = item.get("league")
+            country_obj = item.get("country") if isinstance(item.get("country"), dict) else None
+            seasons_obj = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+        else:
+            # 형태 B: item 자체가 league 객체
+            league_obj = item
+            country_obj = item.get("country") if isinstance(item.get("country"), dict) else None
+            seasons_obj = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+
+        if not isinstance(league_obj, dict) or safe_int(league_obj.get("id")) is None:
             log.warning("league object missing: league_id=%s item=%s", lid, item)
             continue
 
@@ -428,12 +422,18 @@ def main():
             if isinstance(s, dict):
                 upsert_league_season(lid, s)
 
+        # ✅ sanity check: FK 터지지 않게 실제로 리그가 들어갔는지 확인 로그
+        chk = fetch_one("SELECT id FROM hockey_leagues WHERE id=%s", (lid,))
+        if not chk:
+            log.error("❌ league upsert failed unexpectedly: league_id=%s", lid)
+            raise SystemExit(2)
+
     # 2) games -> events -> standings
     for lid in league_ids:
         games_payload = api.games(lid, season)
         resp = games_payload.get("response") if isinstance(games_payload, dict) else None
         if not isinstance(resp, list):
-            log.warning("games response invalid: league_id=%s season=%s", lid, season)
+            log.warning("games response invalid: league_id=%s season=%s payload=%s", lid, season, games_payload)
             continue
 
         game_ids: List[int] = []
