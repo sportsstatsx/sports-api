@@ -576,40 +576,30 @@ def main():
     # 2) games + teams
     for lid in league_ids:
         log.info("2) games + teams upsert 시작 league=%s season=%s", lid, season)
-        page = 1
+
         total_games = 0
         game_ids: List[int] = []
 
         # leagues(country) id를 teams에 넣고 싶으면,
         # /games의 league.country가 없는 경우가 많아서 여기서는 None으로 둠.
         # teams.country_id가 꼭 필요하면 /teams endpoint 추가로 돌려야 함(원하면 해줄게).
-                while True:
+        while True:
             g = api.games(league_id=lid, season=season)
 
             # --- [PATCH START] /games 응답 진단 로그 ---
             errs = g.get("errors")
             if errs:
-                log.warning("[games errors] league=%s season=%s page=%s errors=%s full=%s", lid, season, page, errs, json_dumps(g))
+                log.warning("[games errors] league=%s season=%s errors=%s full=%s", lid, season, errs, json_dumps(g))
                 break
 
             resp = g.get("response") or []
             results = g.get("results")
 
-            # ✅ [ADD] page=1부터 비어버리면 반드시 로그 남김 (지금 너 상황이 이 케이스일 확률 높음)
-            if (not resp) and page == 1:
-                log.warning("[games page1 empty] league=%s season=%s results=%s full=%s", lid, season, results, json_dumps(g))
-                break
-
-            if (not resp) and results not in (None, 0):
-                # results가 있는데 resp가 비는 이상 케이스
-                log.warning("[games empty response] league=%s season=%s page=%s results=%s full=%s", lid, season, page, results, json_dumps(g))
-                break
-
+            # ✅ page 개념이 없으니 page=1 로그도 제거/단순화
             if not resp:
-                # 완전 빈 경우(보통 끝 페이지)
+                log.warning("[games empty] league=%s season=%s results=%s full=%s", lid, season, results, json_dumps(g))
                 break
             # --- [PATCH END] ---
-
 
             for row in resp:
                 teams = row.get("teams") or {}
@@ -627,10 +617,13 @@ def main():
                 total_games += 1
 
             time.sleep(args.sleep)
-
             break
 
-        log.info("league=%s season=%s games upserted=%d (unique game_ids=%d)", lid, season, total_games, len(set(game_ids)))
+        log.info(
+            "league=%s season=%s games upserted=%d (unique game_ids=%d)",
+            lid, season, total_games, len(set(game_ids))
+        )
+
 
         # 3) standings
         try:
