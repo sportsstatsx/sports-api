@@ -7,11 +7,27 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import atexit
+import db as dbmod
 
 from db import execute, fetch_all  # 너 프로젝트의 db 헬퍼
 
 log = logging.getLogger("hockey_backfill")
 logging.basicConfig(level=logging.INFO)
+
+
+# =========================
+# [ADD ✅ 정확한 위치] 프로세스 종료 시 psycopg pool 정리 훅
+# - 위치: logging 설정 바로 아래 (클래스/함수 정의 시작 전)
+# =========================
+def _close_db_pool():
+    try:
+        if hasattr(dbmod, "pool") and dbmod.pool:
+            dbmod.pool.close()
+    except Exception:
+        pass
+
+atexit.register(_close_db_pool)
 
 
 # =========================
@@ -510,9 +526,15 @@ def main():
     ap.add_argument("--skip-odds", action="store_true", help="odds 스킵(기본은 포함)")
     args = ap.parse_args()
 
-    api_key = os.environ.get("APISPORTS_KEY") or os.environ.get("API_SPORTS_KEY")
+    api_key = (
+        os.environ.get("APISPORTS_KEY")
+        or os.environ.get("API_SPORTS_KEY")
+        or os.environ.get("APIFOOTBALL_KEY")     # Render에 이미 있는 키명 fallback
+        or os.environ.get("API_KEY")             # 혹시 공용 키명으로 쓰는 경우 대비
+    )
     if not api_key:
-        raise SystemExit("APISPORTS_KEY 환경변수 필요")
+        raise SystemExit("APISPORTS_KEY (또는 APIFOOTBALL_KEY) 환경변수 필요")
+
 
     season = int(str(args.season).strip())
     league_ids = [int(x.strip()) for x in str(args.league_id).split(",") if x.strip()]
@@ -561,9 +583,31 @@ def main():
         # teams.country_id가 꼭 필요하면 /teams endpoint 추가로 돌려야 함(원하면 해줄게).
         while True:
             g = api.games(league_id=lid, season=season, page=page)
-            resp = g.get("response") or []
-            if not resp:
+
+            # --- [PATCH START] /games 응답 진단 로그 ---
+            errs = g.get("errors")
+            if errs:
+                log.warning("[games errors] league=%s season=%s page=%s errors=%s full=%s", lid, season, page, errs, json_dumps(g))
                 break
+
+            resp = g.get("response") or []
+            results = g.get("results")
+
+            # ✅ [ADD] page=1부터 비어버리면 반드시 로그 남김 (지금 너 상황이 이 케이스일 확률 높음)
+            if (not resp) and page == 1:
+                log.warning("[games page1 empty] league=%s season=%s results=%s full=%s", lid, season, results, json_dumps(g))
+                break
+
+            if (not resp) and results not in (None, 0):
+                # results가 있는데 resp가 비는 이상 케이스
+                log.warning("[games empty response] league=%s season=%s page=%s results=%s full=%s", lid, season, page, results, json_dumps(g))
+                break
+
+            if not resp:
+                # 완전 빈 경우(보통 끝 페이지)
+                break
+            # --- [PATCH END] ---
+
 
             for row in resp:
                 teams = row.get("teams") or {}
