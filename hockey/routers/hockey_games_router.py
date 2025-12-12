@@ -1,4 +1,4 @@
-# hockey/routers/hockey_home_router.py
+# hockey/routers/hockey_games_router.py
 from typing import Optional, List, Any
 
 from flask import Blueprint, request, jsonify
@@ -6,25 +6,23 @@ from flask import Blueprint, request, jsonify
 from hockey.hockey_db import hockey_fetch_all
 
 
-# /api/hockey 로 시작
-hockey_home_bp = Blueprint("hockey_home", __name__, url_prefix="/api/hockey")
+hockey_games_bp = Blueprint("hockey_games", __name__, url_prefix="/api/hockey")
 
 
-@hockey_home_bp.route("/games")
+@hockey_games_bp.route("/games")
 def route_hockey_games():
     """
-    하키 DB 연결/수집 상태 확인용 (임시/디버그 성격)
+    하키 경기 목록 (DB 연결/수집 상태 확인 + 추후 앱 매치리스트 기반)
 
     Query:
       - season: int (선택)
       - league_id: int (선택)
-      - limit: int (선택, 기본 50)
+      - limit: int (선택, 기본 50, 최대 500)
     """
     season: Optional[int] = request.args.get("season", type=int)
     league_id: Optional[int] = request.args.get("league_id", type=int)
     limit: int = request.args.get("limit", type=int) or 50
 
-    # 안전장치
     if limit < 1:
         limit = 1
     if limit > 500:
@@ -45,7 +43,6 @@ def route_hockey_games():
     if where:
         where_sql = "WHERE " + " AND ".join(where)
 
-    # ⚠️ 스키마를 100% 확신 못 하니까 일단 SELECT * 로 연결 확인부터
     sql = f"""
         SELECT *
         FROM hockey_games
