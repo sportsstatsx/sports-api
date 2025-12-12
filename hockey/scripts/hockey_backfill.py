@@ -15,9 +15,9 @@ log = logging.getLogger("hockey_backfill")
 logging.basicConfig(level=logging.INFO)
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 # API Client (API-Sports Hockey)
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 class HockeyApi:
     BASE_URL = "https://v1.hockey.api-sports.io"
 
@@ -29,32 +29,31 @@ class HockeyApi:
             f"{self.BASE_URL}{path}",
             headers={"x-apisports-key": self.api_key},
             params=params,
-            timeout=40,
+            timeout=45,
         )
         r.raise_for_status()
         return r.json()
 
     def league_by_id(self, league_id: int) -> Dict[str, Any]:
-        # /leagues 는 응답 형태가 들쭉날쭉할 수 있어서, 필요한 리그만 id로 조회
+        # ✅ /leagues 전체를 훑지 말고, 필요한 리그만 id로 조회 (None/형태이상 방지)
         return self._get("/leagues", {"id": league_id})
 
     def games(self, league_id: int, season: int) -> Dict[str, Any]:
         return self._get("/games", {"league": league_id, "season": season})
 
     def game_events(self, game_id: int) -> Dict[str, Any]:
-        # 공식 엔드포인트
         return self._get("/games/events", {"game": game_id})
 
     def standings(self, league_id: int, season: int) -> Dict[str, Any]:
         return self._get("/standings", {"league": league_id, "season": season})
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 def safe_int(v) -> Optional[int]:
     try:
-        if v is None:
+        if v is None or v == "":
             return None
         return int(v)
     except Exception:
@@ -68,7 +67,7 @@ def safe_text(v) -> Optional[str]:
     return s or None
 
 
-def safe_num(v) -> Optional[float]:
+def safe_float(v) -> Optional[float]:
     try:
         if v is None or v == "":
             return None
@@ -77,10 +76,10 @@ def safe_num(v) -> Optional[float]:
         return None
 
 
-# ──────────────────────────────────────────────────────────────
-# Upserts (schema: 001_init_hockey.sql 기준)
-# ──────────────────────────────────────────────────────────────
-def upsert_country(country: Dict[str, Any]):
+# ─────────────────────────────────────────
+# Upserts (001_init_hockey.sql 기준)
+# ─────────────────────────────────────────
+def upsert_country(country: Dict[str, Any]) -> None:
     if not isinstance(country, dict):
         return
     cid = safe_int(country.get("id"))
@@ -91,7 +90,7 @@ def upsert_country(country: Dict[str, Any]):
     execute(
         """
         INSERT INTO hockey_countries (id, name, code, flag)
-        VALUES (%s,%s,%s,%s)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           code = EXCLUDED.code,
@@ -101,7 +100,7 @@ def upsert_country(country: Dict[str, Any]):
     )
 
 
-def upsert_league(league: Dict[str, Any], country: Optional[Dict[str, Any]]):
+def upsert_league(league: Dict[str, Any], country: Optional[Dict[str, Any]]) -> None:
     if not isinstance(league, dict):
         return
     lid = safe_int(league.get("id"))
@@ -110,16 +109,15 @@ def upsert_league(league: Dict[str, Any], country: Optional[Dict[str, Any]]):
     if lid is None or not name or not ltype:
         return
 
+    country_id = None
     if isinstance(country, dict):
         upsert_country(country)
         country_id = safe_int(country.get("id"))
-    else:
-        country_id = None
 
     execute(
         """
         INSERT INTO hockey_leagues (id, name, type, logo, country_id)
-        VALUES (%s,%s,%s,%s,%s)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           type = EXCLUDED.type,
@@ -130,34 +128,27 @@ def upsert_league(league: Dict[str, Any], country: Optional[Dict[str, Any]]):
     )
 
 
-def upsert_league_season(league_id: int, season_obj: Dict[str, Any]):
-    if not isinstance(season_obj, dict):
+def upsert_league_season(league_id: int, s: Dict[str, Any]) -> None:
+    if not isinstance(s, dict):
         return
-    season = safe_int(season_obj.get("season"))
+    season = safe_int(s.get("season"))
     if season is None:
         return
 
     execute(
         """
-        INSERT INTO hockey_league_seasons
-          (league_id, season, current, start_date, end_date)
-        VALUES (%s,%s,%s,%s,%s)
+        INSERT INTO hockey_league_seasons (league_id, season, current, start_date, end_date)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (league_id, season) DO UPDATE SET
           current = EXCLUDED.current,
           start_date = EXCLUDED.start_date,
           end_date = EXCLUDED.end_date
         """,
-        (
-            league_id,
-            season,
-            bool(season_obj.get("current")),
-            season_obj.get("start"),
-            season_obj.get("end"),
-        ),
+        (league_id, season, bool(s.get("current", False)), s.get("start"), s.get("end")),
     )
 
 
-def upsert_team(team: Dict[str, Any]):
+def upsert_team(team: Dict[str, Any]) -> None:
     if not isinstance(team, dict):
         return
     tid = safe_int(team.get("id"))
@@ -165,16 +156,16 @@ def upsert_team(team: Dict[str, Any]):
     if tid is None or not name:
         return
 
-    country = team.get("country")
     country_id = None
-    if isinstance(country, dict):
-        upsert_country(country)
-        country_id = safe_int(country.get("id"))
+    c = team.get("country")
+    if isinstance(c, dict):
+        upsert_country(c)
+        country_id = safe_int(c.get("id"))
 
     execute(
         """
         INSERT INTO hockey_teams (id, name, logo, country_id)
-        VALUES (%s,%s,%s,%s)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           logo = EXCLUDED.logo,
@@ -184,11 +175,11 @@ def upsert_team(team: Dict[str, Any]):
     )
 
 
-def upsert_game(game_item: Dict[str, Any], league_id: int, season: int) -> Optional[int]:
-    if not isinstance(game_item, dict):
+def upsert_game(item: Dict[str, Any], league_id: int, season: int) -> Optional[int]:
+    if not isinstance(item, dict):
         return None
 
-    g = game_item.get("game") or {}
+    g = item.get("game") or {}
     if not isinstance(g, dict):
         return None
 
@@ -196,20 +187,20 @@ def upsert_game(game_item: Dict[str, Any], league_id: int, season: int) -> Optio
     if gid is None:
         return None
 
-    league_obj = game_item.get("league") or {}
-    teams_obj = game_item.get("teams") or {}
-    scores_obj = game_item.get("scores") or {}
+    league_obj = item.get("league") if isinstance(item.get("league"), dict) else {}
+    teams_obj = item.get("teams") if isinstance(item.get("teams"), dict) else {}
+    scores_obj = item.get("scores") if isinstance(item.get("scores"), dict) else {}
 
-    # teams upsert
-    home = (teams_obj.get("home") or {}) if isinstance(teams_obj, dict) else {}
-    away = (teams_obj.get("away") or {}) if isinstance(teams_obj, dict) else {}
-    if isinstance(home, dict) and home.get("id"):
+    home = teams_obj.get("home") if isinstance(teams_obj.get("home"), dict) else {}
+    away = teams_obj.get("away") if isinstance(teams_obj.get("away"), dict) else {}
+
+    if home.get("id"):
         upsert_team(home)
-    if isinstance(away, dict) and away.get("id"):
+    if away.get("id"):
         upsert_team(away)
 
-    status_obj = g.get("status") or {}
-    status = safe_text(status_obj.get("short")) if isinstance(status_obj, dict) else safe_text(status_obj)
+    status_obj = g.get("status") if isinstance(g.get("status"), dict) else {}
+    status = safe_text(status_obj.get("short")) if isinstance(status_obj, dict) else None
     status_long = safe_text(status_obj.get("long")) if isinstance(status_obj, dict) else None
 
     execute(
@@ -248,28 +239,26 @@ def upsert_game(game_item: Dict[str, Any], league_id: int, season: int) -> Optio
             status,
             status_long,
             safe_text(g.get("timezone")),
-            json.dumps(scores_obj or {}),
-            json.dumps(game_item or {}),
+            json.dumps(scores_obj),
+            json.dumps(item),
         ),
     )
-
     return gid
 
 
-def insert_game_event_if_absent(game_id: int, ev: Dict[str, Any], order: int):
+def upsert_event(game_id: int, ev: Dict[str, Any], order: int) -> None:
     if not isinstance(ev, dict):
         return
 
     period = safe_text(ev.get("period")) or "UNK"
     minute = safe_int(ev.get("minute"))
-    team = ev.get("team") or {}
+    team = ev.get("team") if isinstance(ev.get("team"), dict) else {}
     team_id = safe_int(team.get("id")) if isinstance(team, dict) else None
     etype = safe_text(ev.get("type")) or "unknown"
     comment = safe_text(ev.get("comment"))
 
-    players = ev.get("players") or []
-    assists = ev.get("assists") or []
-    # TEXT[]로 들어가야 하므로, 문자열만 남김
+    players = ev.get("players")
+    assists = ev.get("assists")
     if not isinstance(players, list):
         players = []
     if not isinstance(assists, list):
@@ -277,8 +266,7 @@ def insert_game_event_if_absent(game_id: int, ev: Dict[str, Any], order: int):
     players = [safe_text(x) for x in players if safe_text(x)]
     assists = [safe_text(x) for x in assists if safe_text(x)]
 
-    # 스키마에 유니크 제약이 없어서 ON CONFLICT 업서트 불가.
-    # 대신 "같은 game_id + period + minute + team_id + type + event_order" 조합이 없을 때만 insert.
+    # ✅ prod-safe: 유니크 인덱스(uq_hockey_game_events_nodup) 기반 upsert
     execute(
         """
         INSERT INTO hockey_game_events (
@@ -286,37 +274,28 @@ def insert_game_event_if_absent(game_id: int, ev: Dict[str, Any], order: int):
           type, comment, players, assists,
           event_order, raw_json
         )
-        SELECT
-          %s, %s, %s, %s,
-          %s, %s, %s, %s,
-          %s, %s::jsonb
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM hockey_game_events
-          WHERE game_id = %s
-            AND period = %s
-            AND minute IS NOT DISTINCT FROM %s
-            AND team_id IS NOT DISTINCT FROM %s
-            AND type = %s
-            AND event_order = %s
-        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+        ON CONFLICT (game_id, period, minute, team_id, type, event_order)
+        DO UPDATE SET
+          comment = EXCLUDED.comment,
+          players = EXCLUDED.players,
+          assists = EXCLUDED.assists,
+          raw_json = EXCLUDED.raw_json
+        WHERE hockey_game_events.raw_json IS DISTINCT FROM EXCLUDED.raw_json
         """,
         (
             game_id, period, minute, team_id,
             etype, comment, players, assists,
             order, json.dumps(ev),
-
-            game_id, period, minute, team_id, etype, order
         ),
     )
 
 
-def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]):
+def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]) -> None:
     resp = payload.get("response") if isinstance(payload, dict) else None
     if not isinstance(resp, list):
         return
 
-    # API-Sports standings는 보통 "list of lists" 구조
     for block in resp:
         if not isinstance(block, list):
             continue
@@ -324,16 +303,17 @@ def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]):
             if not isinstance(row, dict):
                 continue
 
-            team = row.get("team") or {}
-            if isinstance(team, dict) and team.get("id"):
+            team = row.get("team") if isinstance(row.get("team"), dict) else {}
+            if team.get("id"):
                 upsert_team(team)
 
-            group = row.get("group") or {}
-            win = row.get("win") or {}
-            win_ot = row.get("win_overtime") or {}
-            lose = row.get("lose") or {}
-            lose_ot = row.get("lose_overtime") or {}
-            goals = row.get("goals") or {}
+            group = row.get("group") if isinstance(row.get("group"), dict) else {}
+            win = row.get("win") if isinstance(row.get("win"), dict) else {}
+            win_ot = row.get("win_overtime") if isinstance(row.get("win_overtime"), dict) else {}
+            lose = row.get("lose") if isinstance(row.get("lose"), dict) else {}
+            lose_ot = row.get("lose_overtime") if isinstance(row.get("lose_overtime"), dict) else {}
+            goals = row.get("goals") if isinstance(row.get("goals"), dict) else {}
+            games = row.get("games") if isinstance(row.get("games"), dict) else {}
 
             execute(
                 """
@@ -344,9 +324,7 @@ def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]):
                   win_total, win_pct, win_ot_total, win_ot_pct,
                   lose_total, lose_pct, lose_ot_total, lose_ot_pct,
                   goals_for, goals_against,
-                  points,
-                  form, description,
-                  raw_json
+                  points, form, description, raw_json
                 )
                 VALUES (
                   %s,%s,%s,%s,
@@ -355,9 +333,7 @@ def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]):
                   %s,%s,%s,%s,
                   %s,%s,%s,%s,
                   %s,%s,
-                  %s,
-                  %s,%s,
-                  %s::jsonb
+                  %s,%s,%s,%s::jsonb
                 )
                 ON CONFLICT (league_id, season, stage, group_name, team_id)
                 DO UPDATE SET
@@ -387,34 +363,32 @@ def upsert_standings(league_id: int, season: int, payload: Dict[str, Any]):
                     safe_int(team.get("id")) if isinstance(team, dict) else None,
                     safe_int(row.get("position")),
 
-                    safe_int((row.get("games") or {}).get("played")) if isinstance(row.get("games"), dict) else None,
+                    safe_int(games.get("played")) if isinstance(games, dict) else None,
 
                     safe_int(win.get("total")) if isinstance(win, dict) else None,
-                    safe_num(win.get("percentage")) if isinstance(win, dict) else None,
+                    safe_float(win.get("percentage")) if isinstance(win, dict) else None,
                     safe_int(win_ot.get("total")) if isinstance(win_ot, dict) else None,
-                    safe_num(win_ot.get("percentage")) if isinstance(win_ot, dict) else None,
+                    safe_float(win_ot.get("percentage")) if isinstance(win_ot, dict) else None,
 
                     safe_int(lose.get("total")) if isinstance(lose, dict) else None,
-                    safe_num(lose.get("percentage")) if isinstance(lose, dict) else None,
+                    safe_float(lose.get("percentage")) if isinstance(lose, dict) else None,
                     safe_int(lose_ot.get("total")) if isinstance(lose_ot, dict) else None,
-                    safe_num(lose_ot.get("percentage")) if isinstance(lose_ot, dict) else None,
+                    safe_float(lose_ot.get("percentage")) if isinstance(lose_ot, dict) else None,
 
                     safe_int(goals.get("for")) if isinstance(goals, dict) else None,
                     safe_int(goals.get("against")) if isinstance(goals, dict) else None,
 
                     safe_int(row.get("points")),
-
                     safe_text(row.get("form")),
                     safe_text(row.get("description")),
-
                     json.dumps(row),
                 ),
             )
 
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 # main
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", required=True, type=int)
@@ -432,38 +406,39 @@ def main():
     season = args.season
     league_ids = [int(x.strip()) for x in args.league_id.split(",") if x.strip()]
 
-    # 리그/시즌 메타는 필요한 리그만 id로 조회해서 안정적으로 upsert
+    # 1) league meta upsert (필요한 리그만)
     for lid in league_ids:
         meta = api.league_by_id(lid)
-        items = meta.get("response") if isinstance(meta, dict) else None
-        if not isinstance(items, list) or not items:
-            log.warning("league meta empty for league_id=%s", lid)
+        resp = meta.get("response") if isinstance(meta, dict) else None
+        if not isinstance(resp, list) or not resp:
+            log.warning("league meta empty: league_id=%s", lid)
             continue
 
-        # 보통 첫 원소에 league/country/seasons가 들어있음
-        item0 = items[0] if isinstance(items[0], dict) else {}
-        league_obj = item0.get("league")
-        country_obj = item0.get("country")
-        seasons_obj = item0.get("seasons") or []
+        item = resp[0] if isinstance(resp[0], dict) else {}
+        league_obj = item.get("league") if isinstance(item.get("league"), dict) else None
+        country_obj = item.get("country") if isinstance(item.get("country"), dict) else None
+        seasons_obj = item.get("seasons") if isinstance(item.get("seasons"), list) else []
 
-        if isinstance(league_obj, dict):
-            upsert_league(league_obj, country_obj if isinstance(country_obj, dict) else None)
-            for s in seasons_obj:
-                upsert_league_season(lid, s if isinstance(s, dict) else {})
-        else:
-            log.warning("league object missing for league_id=%s", lid)
+        if not league_obj:
+            log.warning("league object missing: league_id=%s item=%s", lid, item)
+            continue
 
-    # games -> events -> standings
+        upsert_league(league_obj, country_obj)
+        for s in seasons_obj:
+            if isinstance(s, dict):
+                upsert_league_season(lid, s)
+
+    # 2) games -> events -> standings
     for lid in league_ids:
         games_payload = api.games(lid, season)
         resp = games_payload.get("response") if isinstance(games_payload, dict) else None
         if not isinstance(resp, list):
-            log.warning("games response invalid for league_id=%s season=%s", lid, season)
+            log.warning("games response invalid: league_id=%s season=%s", lid, season)
             continue
 
         game_ids: List[int] = []
         for item in resp:
-            gid = upsert_game(item, lid, season)
+            gid = upsert_game(item if isinstance(item, dict) else {}, lid, season)
             if gid:
                 game_ids.append(gid)
 
@@ -471,16 +446,13 @@ def main():
 
         if not args.skip_events:
             for gid in game_ids:
-                # 미래/NS 스킵 옵션
                 if args.skip_future_events:
                     row = fetch_one("SELECT status, game_date FROM hockey_games WHERE id=%s", (gid,))
                     if row:
                         st = row.get("status")
                         gd = row.get("game_date")
-                        # status NS/TBD면 이벤트 호출 불필요
                         if st in ("NS", "TBD"):
                             continue
-                        # 날짜가 미래면 스킵
                         if gd is not None:
                             chk = fetch_one("SELECT (%s::timestamptz > NOW()) AS is_future", (gd,))
                             if chk and chk.get("is_future"):
@@ -488,9 +460,9 @@ def main():
 
                 ev_payload = api.game_events(gid)
                 ev_list = ev_payload.get("response") if isinstance(ev_payload, dict) else None
-                if isinstance(ev_list, list) and ev_list:
+                if isinstance(ev_list, list):
                     for idx, ev in enumerate(ev_list):
-                        insert_game_event_if_absent(gid, ev if isinstance(ev, dict) else {}, idx)
+                        upsert_event(gid, ev if isinstance(ev, dict) else {}, idx)
 
                 time.sleep(args.sleep)
 
