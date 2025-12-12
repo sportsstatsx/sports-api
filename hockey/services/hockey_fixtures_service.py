@@ -47,7 +47,7 @@ def hockey_get_fixtures_by_utc_range(
             l.id AS league_id2,
             l.name AS league_name,
             l.logo AS league_logo,
-            l.country AS league_country,
+            c.name AS league_country,
 
             th.id AS home_id,
             th.name AS home_name,
@@ -71,6 +71,7 @@ def hockey_get_fixtures_by_utc_range(
         JOIN hockey_teams th ON th.id = g.home_team_id
         JOIN hockey_teams ta ON ta.id = g.away_team_id
         JOIN hockey_leagues l ON l.id = g.league_id
+        LEFT JOIN hockey_countries c ON c.id = l.country_id
         WHERE {where_sql}
         ORDER BY g.game_date ASC
     """
