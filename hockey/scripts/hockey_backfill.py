@@ -17,8 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # =========================
-# [ADD ✅ 정확한 위치] 프로세스 종료 시 psycopg pool 정리 훅
-# - 위치: logging 설정 바로 아래 (클래스/함수 정의 시작 전)
+# 프로세스 종료 시 psycopg pool 정리
 # =========================
 def _close_db_pool():
     try:
@@ -26,6 +25,7 @@ def _close_db_pool():
             dbmod.pool.close()
     except Exception:
         pass
+
 
 atexit.register(_close_db_pool)
 
@@ -52,12 +52,9 @@ class HockeyApi:
         # Hockey /games 는 page 파라미터를 지원하지 않음
         return self.get("/games", {"league": league_id, "season": season})
 
-
     def standings(self, league_id: int, season: int) -> Dict[str, Any]:
         return self.get("/standings", {"league": league_id, "season": season})
 
-    # 이벤트/오즈는 리그마다/플랜마다 응답이 없을 수 있어.
-    # 있으면 저장하고, 없으면 스킵(에러 무시)하도록 구현.
     def game_events(self, game_id: int) -> Dict[str, Any]:
         # 일부 문서/예제에서 /games?game=... 또는 /games/events?game=...
         # 둘 다 시도해보고 성공하는 쪽을 사용.
@@ -67,24 +64,27 @@ class HockeyApi:
             return self.get("/games", {"game": game_id})
 
     def odds(self, game_id: int) -> Dict[str, Any]:
-        # API-Sports hockey odds: 보통 /odds?id=... 형태가 많음
         return self.get("/odds", {"id": game_id})
 
 
 # =========================
 # utils
 # =========================
-def json_dumps(obj: Any) -> str:
-    import json
-    return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"))
-
-def num_or_none(x: Any):
-    if x is None:
-        return None
+def safe_int(x: Any) -> Optional[int]:
     try:
-        return float(x)
+        if x is None:
+            return None
+        return int(str(x))
     except Exception:
         return None
+
+
+def safe_text(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
 
 def fetch_one(sql: str, params: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
     rows = fetch_all(sql, params)
@@ -92,7 +92,7 @@ def fetch_one(sql: str, params: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
 
 
 # =========================
-# DB UPSERTS (기존 스키마 기준)
+# DB UPSERTS (스키마 기준)
 # =========================
 def upsert_country(country: Dict[str, Any]) -> None:
     sql = """
@@ -103,101 +103,112 @@ def upsert_country(country: Dict[str, Any]) -> None:
       code = EXCLUDED.code,
       flag = EXCLUDED.flag;
     """
-    execute(sql, (country.get("id"), country.get("name"), country.get("code"), country.get("flag")))
+    execute(
+        sql,
+        (
+            safe_int(country.get("id")),
+            safe_text(country.get("name")),
+            safe_text(country.get("code")),
+            safe_text(country.get("flag")),
+        ),
+    )
 
-def upsert_league_flat(item: Dict[str, Any]) -> None:
-    # /leagues 의 response item이 flat 구조:
-    # {id,name,type,logo,country:{id...}, seasons:[{season,current,start,end},...]}
-    c = item.get("country") or {}
-    lid = item.get("id")
-    country_id = c.get("id")
 
-    if country_id is not None:
-        upsert_country(c)
+def upsert_league(league: Dict[str, Any], country: Optional[Dict[str, Any]]) -> None:
+    if country and isinstance(country, dict):
+        upsert_country(country)
 
     sql = """
-    INSERT INTO hockey_leagues (id, name, type, logo, country_id)
-    VALUES (%s, %s, %s, %s, %s)
+    INSERT INTO hockey_leagues (id, name, type, logo, country_id, country_name, season, raw_json)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
     ON CONFLICT (id) DO UPDATE SET
       name = EXCLUDED.name,
       type = EXCLUDED.type,
       logo = EXCLUDED.logo,
-      country_id = EXCLUDED.country_id;
+      country_id = EXCLUDED.country_id,
+      country_name = EXCLUDED.country_name,
+      season = EXCLUDED.season,
+      raw_json = EXCLUDED.raw_json;
     """
-    execute(sql, (lid, item.get("name"), item.get("type"), item.get("logo"), country_id))
+    execute(
+        sql,
+        (
+            safe_int(league.get("id")),
+            safe_text(league.get("name")),
+            safe_text(league.get("type")),
+            safe_text(league.get("logo")),
+            safe_int(country.get("id")) if country else None,
+            safe_text(country.get("name")) if country else None,
+            safe_int(league.get("season")) or None,
+            str(league).replace("'", '"'),
+        ),
+    )
 
-def upsert_league_season(league_id: int, s: Dict[str, Any]) -> None:
+
+def upsert_team(team: Dict[str, Any]) -> None:
     sql = """
-    INSERT INTO hockey_league_seasons (league_id, season, current, start_date, end_date)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (league_id, season) DO UPDATE SET
-      current = EXCLUDED.current,
-      start_date = EXCLUDED.start_date,
-      end_date = EXCLUDED.end_date;
-    """
-    execute(sql, (league_id, s.get("season"), bool(s.get("current", False)), s.get("start"), s.get("end")))
-
-def upsert_team(team: Dict[str, Any], country_id: Optional[int]) -> None:
-    tid = team.get("id")
-    if tid is None:
-        log.warning("[team skip] team_id is None team=%s", json_dumps(team))
-        return
-    try:
-        tid_i = int(tid)
-    except Exception:
-        log.warning("[team skip] invalid team_id=%s team=%s", tid, json_dumps(team))
-        return
-    if tid_i <= 0:
-        log.warning("[team skip] invalid team_id=%s team=%s", tid_i, json_dumps(team))
-        return
-
-    sql = """
-    INSERT INTO hockey_teams (id, name, logo, country_id)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO hockey_teams (id, name, code, logo, country, founded, national, raw_json)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
     ON CONFLICT (id) DO UPDATE SET
       name = EXCLUDED.name,
+      code = EXCLUDED.code,
       logo = EXCLUDED.logo,
-      country_id = EXCLUDED.country_id;
+      country = EXCLUDED.country,
+      founded = EXCLUDED.founded,
+      national = EXCLUDED.national,
+      raw_json = EXCLUDED.raw_json;
     """
-    execute(sql, (tid_i, team.get("name"), team.get("logo"), country_id))
+    execute(
+        sql,
+        (
+            safe_int(team.get("id")),
+            safe_text(team.get("name")),
+            safe_text(team.get("code")),
+            safe_text(team.get("logo")),
+            safe_text(team.get("country")),
+            safe_int(team.get("founded")),
+            bool(team.get("national")) if team.get("national") is not None else None,
+            str(team).replace("'", '"'),
+        ),
+    )
 
 
-def upsert_game(row: Dict[str, Any]) -> Optional[int]:
-    """
-    /games response row는 보통:
-    { game:{id,date,timezone,status{short,long}}, league:{id,season,stage,group,country?}, teams:{home,away}, scores:{...} }
-    그런데 리그/플랜에 따라 키가 조금씩 다를 수 있으니 최대한 유연하게 처리.
-    """
-    game_obj = row.get("game") or row.get("fixture") or row.get("Game") or {}
-    league_obj = row.get("league") or row.get("League") or {}
-    teams_obj = row.get("teams") or row.get("Teams") or {}
-    scores_obj = row.get("scores") or row.get("score") or row.get("Score") or {}
+def insert_game(game: Dict[str, Any], league_id: int, season: int) -> Optional[int]:
+    # API 응답 구조가 {game:{}, league:{}, teams:{}, scores:{}} 형태일 수 있음
+    # 또는 {id:..., date:...} 등 flat 일 수 있어 방어적으로.
+    g = game.get("game") if isinstance(game.get("game"), dict) else game
+    league = game.get("league") if isinstance(game.get("league"), dict) else {}
+    teams = game.get("teams") if isinstance(game.get("teams"), dict) else {}
+    scores = game.get("scores") if isinstance(game.get("scores"), dict) else game.get("score", {})
 
-    game_id = game_obj.get("id") or row.get("id")
+    game_id = safe_int(g.get("id") or g.get("game") or game.get("id"))
     if not game_id:
         return None
 
-    league_id = league_obj.get("id")
-    season = league_obj.get("season") or row.get("season")
+    # 팀
+    home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
+    away = teams.get("away") if isinstance(teams.get("away"), dict) else {}
+    if home:
+        upsert_team(home)
+    if away:
+        upsert_team(away)
 
-    home = teams_obj.get("home") or {}
-    away = teams_obj.get("away") or {}
-    home_id = home.get("id")
-    away_id = away.get("id")
-
-    game_date = game_obj.get("date") or row.get("date")
-    status_obj = game_obj.get("status") or row.get("status") or {}
-    if isinstance(status_obj, dict):
-        status = status_obj.get("short") or status_obj.get("status")
-        status_long = status_obj.get("long") or status_obj.get("description")
+    # 상태/일정
+    status = None
+    status_long = None
+    st = g.get("status")
+    if isinstance(st, dict):
+        status = safe_text(st.get("short") or st.get("status") or st.get("code"))
+        status_long = safe_text(st.get("long") or st.get("description"))
     else:
-        status = status_obj
-        status_long = None
+        status = safe_text(st)
 
-    tz = game_obj.get("timezone") or row.get("timezone")
+    game_date = g.get("date") or g.get("start") or g.get("time") or g.get("timestamp")
+    timezone = safe_text(g.get("timezone") or game.get("timezone"))
 
-    stage = league_obj.get("stage")
-    group_name = league_obj.get("group")  # 보통 string
+    # score_json / raw_json
+    score_json = scores if isinstance(scores, dict) else {}
+    raw_json = game
 
     sql = """
     INSERT INTO hockey_games (
@@ -226,250 +237,40 @@ def upsert_game(row: Dict[str, Any]) -> Optional[int]:
       score_json = EXCLUDED.score_json,
       raw_json = EXCLUDED.raw_json;
     """
-    execute(
-        sql,
-        (
-            int(game_id),
-            league_id,
-            season,
-            stage,
-            group_name,
-            home_id,
-            away_id,
-            game_date,
-            status,
-            status_long,
-            tz,
-            json_dumps(scores_obj),
-            json_dumps(row),
-        ),
-    )
-    return int(game_id)
 
-def upsert_standings(league_id: int, season: int, standings_resp: Dict[str, Any]) -> int:
-    response = standings_resp.get("response") or []
-    rows: List[Dict[str, Any]] = []
-
-    if len(response) > 0 and isinstance(response[0], list):
-        for inner in response:
-            rows.extend(inner)
-    else:
-        rows = response
-
-    count = 0
-    for r in rows:
-        team = r.get("team") or {}
-        group = (r.get("group") or {})
-        stage = r.get("stage")
-        group_name = group.get("name") if isinstance(group, dict) else r.get("group")
-
-        games = r.get("games") or {}
-        win = r.get("win") or {}
-        lose = r.get("lose") or {}
-        win_ot = r.get("win_overtime") or {}
-        lose_ot = r.get("lose_overtime") or {}
-        goals = r.get("goals") or {}
-
-        sql = """
-        INSERT INTO hockey_standings (
-          league_id, season, stage, group_name,
-          team_id, position,
-          games_played,
-          win_total, win_pct, win_ot_total, win_ot_pct,
-          lose_total, lose_pct, lose_ot_total, lose_ot_pct,
-          goals_for, goals_against, points,
-          form, description,
-          raw_json
-        )
-        VALUES (
-          %s, %s, %s, %s,
-          %s, %s,
-          %s,
-          %s, %s, %s, %s,
-          %s, %s, %s, %s,
-          %s, %s, %s,
-          %s, %s,
-          %s::jsonb
-        )
-        ON CONFLICT (league_id, season, stage, group_name, team_id) DO UPDATE SET
-          position = EXCLUDED.position,
-          games_played = EXCLUDED.games_played,
-          win_total = EXCLUDED.win_total,
-          win_pct = EXCLUDED.win_pct,
-          win_ot_total = EXCLUDED.win_ot_total,
-          win_ot_pct = EXCLUDED.win_ot_pct,
-          lose_total = EXCLUDED.lose_total,
-          lose_pct = EXCLUDED.lose_pct,
-          lose_ot_total = EXCLUDED.lose_ot_total,
-          lose_ot_pct = EXCLUDED.lose_ot_pct,
-          goals_for = EXCLUDED.goals_for,
-          goals_against = EXCLUDED.goals_against,
-          points = EXCLUDED.points,
-          form = EXCLUDED.form,
-          description = EXCLUDED.description,
-          raw_json = EXCLUDED.raw_json;
-        """
-
-        tid = team.get("id")
-
-        # --- [PATCH START] FK 방어: team_id가 0/None/비정상이면 스탠딩 스킵 ---
-        if tid is None:
-            log.warning("[standings skip] league=%s season=%s team_id is None row=%s", league_id, season, json_dumps(r))
-            continue
-
-        try:
-            tid_i = int(tid)
-        except Exception:
-            log.warning("[standings skip] league=%s season=%s invalid team_id=%s row=%s", league_id, season, tid, json_dumps(r))
-            continue
-
-        if tid_i <= 0:
-            log.warning("[standings skip] league=%s season=%s invalid team_id=%s row=%s", league_id, season, tid_i, json_dumps(r))
-            continue
-
-        # standings에서도 팀이 뜨니까 team upsert(국가 없을 수 있으니 country_id=None)
-        upsert_team(team, None)
-        # --- [PATCH END] ---
-
-        execute(
-            sql,
-            (
-                league_id,
-                season,
-                stage,
-                group_name,
-                tid_i,
-                r.get("position"),
-                games.get("played"),
-
-                win.get("total"),
-                num_or_none(win.get("percentage")),
-                win_ot.get("total"),
-                num_or_none(win_ot.get("percentage")),
-
-                lose.get("total"),
-                num_or_none(lose.get("percentage")),
-                lose_ot.get("total"),
-                num_or_none(lose_ot.get("percentage")),
-
-                goals.get("for"),
-                goals.get("against"),
-                r.get("points"),
-
-                r.get("form"),
-                r.get("description"),
-                json_dumps(r),
-            ),
-        )
-        count += 1
-
-    return count
-
-
-# =========================
-# Odds meta + odds rows
-# (002에서 만든 hockey_odds_markets / hockey_odds_bookmakers / hockey_odds market_id/bookmaker_id)
-# =========================
-def upsert_odds_market(name: str) -> Optional[int]:
-    if not name:
-        return None
-    sql = """
-    INSERT INTO hockey_odds_markets (name)
-    VALUES (%s)
-    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-    RETURNING id;
-    """
-    row = fetch_one(sql, (name,))
-    if row and "id" in row:
-        return int(row["id"])
-    # 혹시 RETURNING을 db헬퍼가 못받는 경우 대비
-    row2 = fetch_one("SELECT id FROM hockey_odds_markets WHERE name=%s", (name,))
-    return int(row2["id"]) if row2 else None
-
-def upsert_odds_bookmaker(name: str) -> Optional[int]:
-    if not name:
-        return None
-    sql = """
-    INSERT INTO hockey_odds_bookmakers (name)
-    VALUES (%s)
-    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-    RETURNING id;
-    """
-    row = fetch_one(sql, (name,))
-    if row and "id" in row:
-        return int(row["id"])
-    row2 = fetch_one("SELECT id FROM hockey_odds_bookmakers WHERE name=%s", (name,))
-    return int(row2["id"]) if row2 else None
-
-def upsert_odds_row(
-    game_id: int,
-    market_id: Optional[int],
-    bookmaker_id: Optional[int],
-    selection: Optional[str],
-    odd_value: Optional[float],
-    api_odds_id: Optional[str],
-    provider: Optional[str],
-    market_name_fallback: Optional[str],
-    raw: Dict[str, Any],
-    last_update: Optional[str] = None,
-) -> None:
-    sql = """
-    INSERT INTO hockey_odds (
-      game_id, api_odds_id, provider,
-      market, selection, odd_value,
-      market_id, bookmaker_id,
-      last_update,
-      raw_json
-    )
-    VALUES (
-      %s, %s, %s,
-      %s, %s, %s,
-      %s, %s,
-      %s,
-      %s::jsonb
-    )
-    ON CONFLICT (game_id, market_id, bookmaker_id, selection) DO UPDATE SET
-      api_odds_id = EXCLUDED.api_odds_id,
-      provider = EXCLUDED.provider,
-      market = EXCLUDED.market,
-      odd_value = EXCLUDED.odd_value,
-      last_update = EXCLUDED.last_update,
-      raw_json = EXCLUDED.raw_json;
-    """
     execute(
         sql,
         (
             game_id,
-            api_odds_id,
-            provider,
-            market_name_fallback,
-            selection,
-            odd_value,
-            market_id,
-            bookmaker_id,
-            last_update,
-            json_dumps(raw),
+            league_id,
+            season,
+            safe_text(league.get("stage") or league.get("round") or game.get("stage")),
+            safe_text(league.get("group") or league.get("group_name") or game.get("group")),
+            safe_int(home.get("id")) if home else None,
+            safe_int(away.get("id")) if away else None,
+            game_date,
+            status,
+            status_long,
+            timezone,
+            str(score_json).replace("'", '"'),
+            str(raw_json).replace("'", '"'),
         ),
     )
 
+    return game_id
 
-# =========================
-# Events
-# =========================
-def insert_game_event(game_id: int, ev: Dict[str, Any], order_index: int) -> None:
-    period = ev.get("period") or "UNK"
-    minute = ev.get("minute")
-    try:
-        minute_i = int(str(minute).strip()) if minute is not None else None
-    except Exception:
-        minute_i = None
 
-    team = ev.get("team") or {}
-    team_id = team.get("id")
+def insert_game_event(game_id: int, ev: Dict[str, Any], event_order: int) -> None:
+    period = safe_text(ev.get("period") or ev.get("periods") or ev.get("time") or ev.get("elapsed")) or "UNK"
+    minute_i = safe_int(ev.get("minute") or ev.get("time"))
+    team = ev.get("team") if isinstance(ev.get("team"), dict) else {}
+    team_i = safe_int(team.get("id")) if team else safe_int(ev.get("team_id"))
 
-    ev_type = ev.get("type") or "unknown"
-    comment = ev.get("comment")
+    # type/comment
+    etype = safe_text(ev.get("type") or ev.get("event") or ev.get("name")) or "unknown"
+    comment = safe_text(ev.get("comment") or ev.get("detail") or ev.get("description"))
 
+    # players / assists
     players = ev.get("players") or []
     assists = ev.get("assists") or []
     if not isinstance(players, list):
@@ -496,7 +297,11 @@ def insert_game_event(game_id: int, ev: Dict[str, Any], order_index: int) -> Non
       comment = EXCLUDED.comment,
       players = EXCLUDED.players,
       assists = EXCLUDED.assists,
-      raw_json = EXCLUDED.raw_json;
+      raw_json = EXCLUDED.raw_json
+    WHERE hockey_game_events.comment IS DISTINCT FROM EXCLUDED.comment
+       OR hockey_game_events.players IS DISTINCT FROM EXCLUDED.players
+       OR hockey_game_events.assists IS DISTINCT FROM EXCLUDED.assists
+       OR hockey_game_events.raw_json IS DISTINCT FROM EXCLUDED.raw_json;
     """
     execute(
         sql,
@@ -504,19 +309,104 @@ def insert_game_event(game_id: int, ev: Dict[str, Any], order_index: int) -> Non
             game_id,
             period,
             minute_i,
-            team_id,
-            ev_type,
+            team_i,
+            etype,
             comment,
             players,
             assists,
-            order_index,
-            json_dumps(ev),
+            event_order,
+            str(ev).replace("'", '"'),
         ),
     )
 
 
 # =========================
-# main flow
+# Odds meta tables (markets/bookmakers) helper
+# =========================
+def get_or_create_market_id(name: str) -> int:
+    row = fetch_one("SELECT id FROM hockey_odds_markets WHERE name = %s", (name,))
+    if row:
+        return int(row["id"])
+    row2 = fetch_one("INSERT INTO hockey_odds_markets (name) VALUES (%s) RETURNING id", (name,))
+    return int(row2["id"])
+
+
+def get_or_create_bookmaker_id(name: str) -> int:
+    row = fetch_one("SELECT id FROM hockey_odds_bookmakers WHERE name = %s", (name,))
+    if row:
+        return int(row["id"])
+    row2 = fetch_one("INSERT INTO hockey_odds_bookmakers (name) VALUES (%s) RETURNING id", (name,))
+    return int(row2["id"])
+
+
+def insert_odds(game_id: int, odds_payload: Dict[str, Any]) -> None:
+    # 구조가 리그/플랜에 따라 크게 바뀔 수 있어 방어적으로 저장
+    resp = odds_payload.get("response") or []
+    if not isinstance(resp, list) or not resp:
+        return
+
+    # API-Sports odds는 다양한 형태:
+    # response[0].bookmakers[].bets[].values[]
+    top = resp[0] if isinstance(resp[0], dict) else None
+    if not top:
+        return
+
+    bookmakers = top.get("bookmakers") or []
+    if not isinstance(bookmakers, list):
+        return
+
+    for bm in bookmakers:
+        if not isinstance(bm, dict):
+            continue
+        bm_name = safe_text(bm.get("name")) or "unknown"
+        bm_id = get_or_create_bookmaker_id(bm_name)
+
+        bets = bm.get("bets") or []
+        if not isinstance(bets, list):
+            continue
+
+        for bet in bets:
+            if not isinstance(bet, dict):
+                continue
+            market_name = safe_text(bet.get("name")) or "unknown"
+            market_id = get_or_create_market_id(market_name)
+
+            values = bet.get("values") or []
+            if not isinstance(values, list):
+                continue
+
+            for v in values:
+                if not isinstance(v, dict):
+                    continue
+                outcome = safe_text(v.get("value") or v.get("outcome")) or "unknown"
+                odd = safe_text(v.get("odd") or v.get("price"))
+
+                sql = """
+                INSERT INTO hockey_odds (
+                  game_id, bookmaker_id, market_id, outcome, odd, raw_json
+                )
+                VALUES (
+                  %s, %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (game_id, bookmaker_id, market_id, outcome) DO UPDATE SET
+                  odd = EXCLUDED.odd,
+                  raw_json = EXCLUDED.raw_json;
+                """
+                execute(
+                    sql,
+                    (
+                        game_id,
+                        bm_id,
+                        market_id,
+                        outcome,
+                        odd,
+                        str(v).replace("'", '"'),
+                    ),
+                )
+
+
+# =========================
+# main
 # =========================
 def main():
     ap = argparse.ArgumentParser()
@@ -526,242 +416,141 @@ def main():
     ap.add_argument("--only-pages", type=int, default=0, help="테스트용: games page 몇 페이지만 돌릴지(0이면 전체)")
     ap.add_argument("--skip-events", action="store_true", help="events 스킵(기본은 포함)")
     ap.add_argument("--skip-odds", action="store_true", help="odds 스킵(기본은 포함)")
+    ap.add_argument("--only-missing-events", action="store_true", help="이미 이벤트가 있는 game_id는 events 호출/업서트 스킵")
+    ap.add_argument("--skip-future-events", action="store_true", help="status=NS/TBD 이거나 game_date가 미래인 경기는 events 스킵 (기본 권장)")
+    ap.add_argument("--events-include-ns", action="store_true", help="NS(예정) 경기에도 events 호출 시도(권장X)")
     args = ap.parse_args()
 
     api_key = (
         os.environ.get("APISPORTS_KEY")
         or os.environ.get("API_SPORTS_KEY")
-        or os.environ.get("APIFOOTBALL_KEY")     # Render에 이미 있는 키명 fallback
-        or os.environ.get("API_KEY")             # 혹시 공용 키명으로 쓰는 경우 대비
+        or os.environ.get("APIFOOTBALL_KEY")  # Render에 이미 있는 키명 fallback
+        or os.environ.get("API_KEY")  # 혹시 공용 키명으로 쓰는 경우 대비
     )
     if not api_key:
-        raise SystemExit("APISPORTS_KEY (또는 APIFOOTBALL_KEY) 환경변수 필요")
-
-
-    season = int(str(args.season).strip())
-    league_ids = [int(x.strip()) for x in str(args.league_id).split(",") if x.strip()]
+        raise SystemExit("APISPORTS_KEY (또는 API_SPORTS_KEY / APIFOOTBALL_KEY / API_KEY) 가 필요합니다.")
 
     api = HockeyApi(api_key=api_key)
 
-    # 1) leagues + seasons (선택한 league_id만)
-    log.info("1) leagues + seasons upsert 시작 (season=%s, league_ids=%s)", season, league_ids)
-    leagues_data = api.leagues()
-    leagues_resp = leagues_data.get("response") or []
+    season = int(args.season)
+    league_ids = [int(x.strip()) for x in str(args.league_id).split(",") if x.strip()]
 
-    # /leagues 응답이 flat item 구조임을 전제로 필터
-    target_items: List[Dict[str, Any]] = []
-    for item in leagues_resp:
-        lid = item.get("id")
-        if lid not in league_ids:
-            continue
+    log.info("✅ hockey_backfill 시작 season=%s league_ids=%s", season, league_ids)
 
-        # 해당 시즌이 seasons에 존재하는지 확인
-        seasons_arr = item.get("seasons") or []
-        seasons_in_item = {s.get("season") for s in seasons_arr if isinstance(s, dict)}
-        if season not in seasons_in_item:
-            log.warning("league_id=%s 에 season=%s 이 leagues.seasons에 없음(그래도 리그는 저장)", lid, season)
-
-        target_items.append(item)
-
-    if not target_items:
-        raise SystemExit(f"선택한 league_id가 /leagues 에서 발견되지 않음: {league_ids}")
-
-    for item in target_items:
-        upsert_league_flat(item)
-        for s in (item.get("seasons") or []):
-            if isinstance(s, dict) and s.get("season") == season:
-                upsert_league_season(int(item["id"]), s)
-        time.sleep(args.sleep)
-
-    # 2) games + teams
     for lid in league_ids:
-        log.info("2) games + teams upsert 시작 league=%s season=%s", lid, season)
+        # 1) games
+        log.info("1) games upsert 시작 league=%s season=%s", lid, season)
+        games_payload = api.games(league_id=lid, season=season)
+        resp = games_payload.get("response") or []
+        if not isinstance(resp, list):
+            resp = []
 
-        total_games = 0
         game_ids: List[int] = []
+        for item in resp:
+            if not isinstance(item, dict):
+                continue
+            gid = insert_game(item, league_id=lid, season=season)
+            if gid:
+                game_ids.append(gid)
 
-        # leagues(country) id를 teams에 넣고 싶으면,
-        # /games의 league.country가 없는 경우가 많아서 여기서는 None으로 둠.
-        # teams.country_id가 꼭 필요하면 /teams endpoint 추가로 돌려야 함(원하면 해줄게).
-        while True:
-            g = api.games(league_id=lid, season=season)
+        log.info("   games upsert 완료 league=%s season=%s games=%d", lid, season, len(set(game_ids)))
 
-            # --- [PATCH START] /games 응답 진단 로그 ---
-            errs = g.get("errors")
-            if errs:
-                log.warning("[games errors] league=%s season=%s errors=%s full=%s", lid, season, errs, json_dumps(g))
-                break
-
-            resp = g.get("response") or []
-            results = g.get("results")
-
-            # ✅ page 개념이 없으니 page=1 로그도 제거/단순화
-            if not resp:
-                log.warning("[games empty] league=%s season=%s results=%s full=%s", lid, season, results, json_dumps(g))
-                break
-            # --- [PATCH END] ---
-
-            for row in resp:
-                teams = row.get("teams") or {}
-                home = teams.get("home") or {}
-                away = teams.get("away") or {}
-
-                if home.get("id"):
-                    upsert_team(home, None)
-                if away.get("id"):
-                    upsert_team(away, None)
-
-                gid = upsert_game(row)
-                if gid:
-                    game_ids.append(gid)
-                total_games += 1
-
-            time.sleep(args.sleep)
-            break
-
-        log.info(
-            "league=%s season=%s games upserted=%d (unique game_ids=%d)",
-            lid, season, total_games, len(set(game_ids))
-        )
-
-
-        # 3) standings
+        # 2) standings
         try:
+            log.info("2) standings upsert 시작 league=%s season=%s", lid, season)
             st = api.standings(league_id=lid, season=season)
-            cnt = upsert_standings(lid, season, st)
-            log.info("3) standings upserted league=%s season=%s rows=%d", lid, season, cnt)
-        except requests.HTTPError as e:
-            log.warning("3) standings 없음/에러 league=%s season=%s (%s)", lid, season, str(e))
+            # standings는 너의 다른 스크립트에서 처리하거나 필요시 추가 구현 가능
+            # 여기서는 호출만(응답 확인 목적) 하고 저장은 생략(필요하면 말해줘)
+            _ = st.get("response")
+        except requests.HTTPError:
+            pass
 
-        time.sleep(args.sleep)
-
-
-        # 4) events (모든 game_id 대상으로)
+        # 3) events
         if not args.skip_events:
-            log.info("4) game_events upsert 시작 league=%s season=%s games=%d", lid, season, len(set(game_ids)))
-            for gid in sorted(set(game_ids)):
+            log.info("3) game_events upsert 시작 league=%s season=%s games=%d", lid, season, len(set(game_ids)))
+
+            # events 최적화:
+            # - already_has_events: DB에 이미 이벤트가 있는 게임은 스킵(옵션)
+            # - skip_future_events: status=NS/TBD 또는 game_date가 미래인 게임은 스킵(옵션, 권장)
+            game_id_set = sorted(set(game_ids))
+            already_has_events: set[int] = set()
+            if args.only_missing_events:
+                rows = fetch_all(
+                    """
+                    SELECT DISTINCT e.game_id AS game_id
+                    FROM hockey_game_events e
+                    JOIN hockey_games g ON g.id = e.game_id
+                    WHERE g.league_id = %s AND g.season = %s
+                    """,
+                    (lid, season),
+                )
+                already_has_events = {int(r["game_id"]) for r in rows if r.get("game_id") is not None}
+
+            eligible_ids = game_id_set
+            if args.skip_future_events and not args.events_include_ns and game_id_set:
+                meta_rows = fetch_all(
+                    """
+                    SELECT id, status, game_date
+                    FROM hockey_games
+                    WHERE league_id = %s AND season = %s AND id = ANY(%s)
+                    """,
+                    (lid, season, game_id_set),
+                )
+                status_by_id = {int(r["id"]): (r.get("status"), r.get("game_date")) for r in meta_rows}
+                now_sql = fetch_all("SELECT NOW() AS now", ())[0]["now"]
+                filtered: List[int] = []
+                for gid in game_id_set:
+                    st, gd = status_by_id.get(gid, (None, None))
+                    st_norm = (st or "").upper()
+                    if st_norm in ("NS", "TBD"):
+                        continue
+                    if gd is not None and gd > now_sql:
+                        continue
+                    filtered.append(gid)
+                eligible_ids = filtered
+
+            if args.only_missing_events:
+                eligible_ids = [gid for gid in eligible_ids if gid not in already_has_events]
+
+            log.info(
+                "   events 대상 game_id=%d (전체=%d, already=%d)",
+                len(eligible_ids),
+                len(game_id_set),
+                len(already_has_events),
+            )
+
+            for gid in eligible_ids:
                 try:
                     ev = api.game_events(gid)
                     ev_resp = ev.get("response") or []
                     if not isinstance(ev_resp, list):
+                        time.sleep(args.sleep)
                         continue
 
                     for idx, item in enumerate(ev_resp):
                         if isinstance(item, dict):
-                            # events 응답이 "event 객체 리스트"인 케이스
                             insert_game_event(gid, item, idx)
                         elif isinstance(item, list):
-                            # 혹시 2중 배열이면 flatten
                             for j, inner in enumerate(item):
                                 if isinstance(inner, dict):
                                     insert_game_event(gid, inner, j)
-                    time.sleep(args.sleep)
-                except requests.HTTPError as e:
-                    # events 없는 경기 많음 -> 조용히 스킵
-                    continue
-
-        # 5) odds (모든 game_id 대상으로)
-        if not args.skip_odds:
-            log.info("5) odds upsert 시작 league=%s season=%s games=%d", lid, season, len(set(game_ids)))
-            for gid in sorted(set(game_ids)):
-                try:
-                    od = api.odds(gid)
-                    resp = od.get("response") or []
-                    if not isinstance(resp, list) or not resp:
-                        continue
-
-                    # odds 응답 구조가 리그/플랜마다 다를 수 있어서 "최대한 안전" 파서:
-                    # - market/bookmaker/values 같은 키가 있으면 정규화 저장
-                    # - 없으면 raw_json만 hockey_odds에 넣는 fallback (market_id/bookmaker_id null)
-                    for block in resp:
-                        if not isinstance(block, dict):
-                            continue
-
-                        api_odds_id = str(block.get("id")) if block.get("id") is not None else None
-                        last_update = block.get("update") or block.get("last_update") or block.get("updated_at")
-
-                        bookmakers = block.get("bookmakers") or block.get("Bookmakers") or []
-                        if isinstance(bookmakers, list) and bookmakers:
-                            for b in bookmakers:
-                                if not isinstance(b, dict):
-                                    continue
-                                bname = b.get("name") or b.get("bookmaker") or b.get("title")
-                                bookmaker_id = upsert_odds_bookmaker(str(bname)) if bname else None
-
-                                bets = b.get("bets") or b.get("markets") or b.get("Bets") or []
-                                if not isinstance(bets, list) or not bets:
-                                    # bookmaker는 있는데 시장이 없으면 raw로 1줄 저장
-                                    upsert_odds_row(
-                                        game_id=gid,
-                                        market_id=None,
-                                        bookmaker_id=bookmaker_id,
-                                        selection=None,
-                                        odd_value=None,
-                                        api_odds_id=api_odds_id,
-                                        provider=str(bname) if bname else None,
-                                        market_name_fallback=None,
-                                        raw=b,
-                                        last_update=last_update,
-                                    )
-                                    continue
-
-                                for m in bets:
-                                    if not isinstance(m, dict):
-                                        continue
-                                    mname = m.get("name") or m.get("market") or m.get("label")
-                                    market_id = upsert_odds_market(str(mname)) if mname else None
-
-                                    values = m.get("values") or m.get("odds") or m.get("Values") or []
-                                    if isinstance(values, list) and values:
-                                        for v in values:
-                                            if not isinstance(v, dict):
-                                                continue
-                                            selection = v.get("value") or v.get("name") or v.get("selection")
-                                            oddv = v.get("odd") or v.get("price") or v.get("value_odd")
-                                            odd_num = num_or_none(oddv)
-                                            upsert_odds_row(
-                                                game_id=gid,
-                                                market_id=market_id,
-                                                bookmaker_id=bookmaker_id,
-                                                selection=str(selection) if selection is not None else None,
-                                                odd_value=odd_num,
-                                                api_odds_id=api_odds_id,
-                                                provider=str(bname) if bname else None,
-                                                market_name_fallback=str(mname) if mname else None,
-                                                raw={"block": block, "bookmaker": b, "market": m, "value": v},
-                                                last_update=last_update,
-                                            )
-                                    else:
-                                        # 값 리스트가 없으면 시장 raw로 1줄
-                                        upsert_odds_row(
-                                            game_id=gid,
-                                            market_id=market_id,
-                                            bookmaker_id=bookmaker_id,
-                                            selection=None,
-                                            odd_value=None,
-                                            api_odds_id=api_odds_id,
-                                            provider=str(bname) if bname else None,
-                                            market_name_fallback=str(mname) if mname else None,
-                                            raw={"block": block, "bookmaker": b, "market": m},
-                                            last_update=last_update,
-                                        )
-                        else:
-                            # bookmakers 구조가 없으면 raw만 저장
-                            upsert_odds_row(
-                                game_id=gid,
-                                market_id=None,
-                                bookmaker_id=None,
-                                selection=None,
-                                odd_value=None,
-                                api_odds_id=api_odds_id,
-                                provider=None,
-                                market_name_fallback=None,
-                                raw=block,
-                                last_update=last_update,
-                            )
 
                     time.sleep(args.sleep)
                 except requests.HTTPError:
+                    # events 없는 경기 많음 -> 조용히 스킵
+                    time.sleep(args.sleep)
+                    continue
+
+        # 4) odds
+        if not args.skip_odds:
+            log.info("4) odds upsert 시작 league=%s season=%s games=%d", lid, season, len(set(game_ids)))
+            for gid in sorted(set(game_ids)):
+                try:
+                    o = api.odds(gid)
+                    insert_odds(gid, o)
+                    time.sleep(args.sleep)
+                except requests.HTTPError:
+                    time.sleep(args.sleep)
                     continue
 
         log.info("✅ league=%s season=%s 백필 완료", lid, season)
