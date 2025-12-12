@@ -48,8 +48,10 @@ class HockeyApi:
     def leagues(self) -> Dict[str, Any]:
         return self.get("/leagues")
 
-    def games(self, league_id: int, season: int, page: int = 1) -> Dict[str, Any]:
-        return self.get("/games", {"league": league_id, "season": season, "page": page})
+    def games(self, league_id: int, season: int) -> Dict[str, Any]:
+        # Hockey /games 는 page 파라미터를 지원하지 않음
+        return self.get("/games", {"league": league_id, "season": season})
+
 
     def standings(self, league_id: int, season: int) -> Dict[str, Any]:
         return self.get("/standings", {"league": league_id, "season": season})
@@ -581,8 +583,8 @@ def main():
         # leagues(country) id를 teams에 넣고 싶으면,
         # /games의 league.country가 없는 경우가 많아서 여기서는 None으로 둠.
         # teams.country_id가 꼭 필요하면 /teams endpoint 추가로 돌려야 함(원하면 해줄게).
-        while True:
-            g = api.games(league_id=lid, season=season, page=page)
+                while True:
+            g = api.games(league_id=lid, season=season)
 
             # --- [PATCH START] /games 응답 진단 로그 ---
             errs = g.get("errors")
@@ -626,13 +628,7 @@ def main():
 
             time.sleep(args.sleep)
 
-            paging = g.get("paging") or {}
-            total_pages = paging.get("total")
-            if args.only_pages and page >= args.only_pages:
-                break
-            if total_pages and page >= int(total_pages):
-                break
-            page += 1
+            break
 
         log.info("league=%s season=%s games upserted=%d (unique game_ids=%d)", lid, season, total_games, len(set(game_ids)))
 
