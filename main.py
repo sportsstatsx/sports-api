@@ -62,7 +62,6 @@ app.register_blueprint(hockey_games_bp)
 app.register_blueprint(hockey_fixtures_bp)
 app.register_blueprint(hockey_matchdetail_bp)
 app.register_blueprint(hockey_standings_bp)
-app.register_blueprint(hockey_standings_bp, url_prefix="/api/hockey")
 
 
 # ─────────────────────────────────────────
@@ -328,6 +327,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
