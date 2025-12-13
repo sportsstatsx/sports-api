@@ -1,4 +1,3 @@
-# hockey/services/hockey_matchdetail_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -81,21 +80,20 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
             home_score = _safe_int(s.get("home"))
             away_score = _safe_int(s.get("away"))
 
-        # date_utc를 ISO8601(Z)로 고정
+    # ✅ date_utc를 ISO8601(Z)로 고정
     dt = g.get("date_utc")
     if dt is not None:
         try:
             dt_iso = (
                 dt.astimezone(timezone.utc)
-                  .replace(microsecond=0)
-                  .isoformat()
-                  .replace("+00:00", "Z")
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
             )
         except Exception:
             dt_iso = str(dt)
     else:
         dt_iso = None
-
 
     game_obj: Dict[str, Any] = {
         "game_id": g["game_id"],
