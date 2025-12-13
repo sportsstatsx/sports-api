@@ -1,4 +1,3 @@
-# hockey/routers/hockey_games_router.py
 from typing import Optional, List, Any
 
 from flask import Blueprint, request, jsonify
@@ -12,7 +11,8 @@ hockey_games_bp = Blueprint("hockey_games", __name__, url_prefix="/api/hockey")
 @hockey_games_bp.route("/games")
 def route_hockey_games():
     """
-    하키 경기 목록 (DB 연결/수집 상태 확인 + 추후 앱 매치리스트 기반)
+    하키 경기 목록 (DB 연결/수집 상태 확인용 - 경량)
+    - SELECT * 제거 (raw_json/score_json 등 대형 컬럼으로 응답 비대해지는 것 방지)
 
     Query:
       - season: int (선택)
@@ -43,8 +43,20 @@ def route_hockey_games():
     if where:
         where_sql = "WHERE " + " AND ".join(where)
 
+    # ✅ 디버그/확인용으로 필요한 최소 컬럼만 반환
     sql = f"""
-        SELECT *
+        SELECT
+            id,
+            league_id,
+            season,
+            stage,
+            group_name,
+            game_date,
+            status,
+            status_long,
+            home_team_id,
+            away_team_id,
+            timezone
         FROM hockey_games
         {where_sql}
         ORDER BY id DESC
