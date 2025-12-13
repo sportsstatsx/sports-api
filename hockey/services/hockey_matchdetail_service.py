@@ -1,7 +1,8 @@
+# hockey/services/hockey_matchdetail_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
 
@@ -15,12 +16,173 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
+def _norm_period(p: Any) -> str:
+    if p is None:
+        return ""
+    s = str(p).strip().upper()
+    return s
+
+
+def _is_goal_event(ev_type: Any) -> bool:
+    if ev_type is None:
+        return False
+    return str(ev_type).strip().lower() == "goal"
+
+
+def _calc_period_scores(
+    *,
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+    home_final: Optional[int],
+    away_final: Optional[int],
+    status: Optional[str],
+    events: List[Dict[str, Any]],
+) -> Dict[str, Optional[Dict[str, int]]]:
+    """
+    서버에서 period별 득점 스코어를 계산해서 내려준다 (A방식)
+    - 기본은 P1/P2/P3 는 항상 내려줌 (0 포함)
+    - OT/SO 는 '해당될 때만' 내려줌
+      - 연장만 갔으면 OT만
+      - 승부샷까지 갔으면 OT + SO
+    - 소스:
+      1) events에 period 정보가 있고 goal 이벤트가 있으면 우선 집계
+      2) OT/SO goal 이벤트가 없을 때는 final - (P1~P3, OT) 차이로 보정
+         - AP(After Penalties)인 경우: OT를 events에서 못찾으면 OT는 0으로 두고,
+           남는 1점을 SO로 배정 (하키 최종 스코어는 SO 승자 +1로 표시되는 케이스 고려)
+    """
+
+    # 팀 id 없으면 안정적으로 None 반환
+    if home_team_id is None or away_team_id is None:
+        return {"p1": None, "p2": None, "p3": None, "ot": None, "so": None}
+
+    # 상태 판단
+    st = (status or "").strip().upper()
+
+    # 넌 지금 status_long에 "After Penalties"가 내려오는 케이스를 확인했지(AP). (대화 로그 기준)
+    # 일반적으로:
+    # - AP: 승부샷(SO)까지 감 => OT + SO 표시
+    # - AOT: OT에서 끝남 => OT만 표시
+    # - FT: 정규 종료 => OT/SO 없음
+    # 리그/공급자에 따라 코드값이 다를 수 있어서 폭넓게 잡음.
+    AP_STATUSES = {"AP", "PEN", "SO", "AFTER PENALTIES", "AFTERPENALTIES"}
+    OT_STATUSES = {"AOT", "OT", "AFTER OVER TIME", "AFTER OVERTIME", "AFTEROVERTIME"}
+
+    show_ot = st in AP_STATUSES or st in OT_STATUSES
+    show_so = st in AP_STATUSES  # 승부샷까지 갔을 때만
+
+    # period별 집계(우선 events 기반)
+    p1_home = p1_away = 0
+    p2_home = p2_away = 0
+    p3_home = p3_away = 0
+    ot_home = ot_away = 0
+    so_home = so_away = 0
+
+    for e in events:
+        if not _is_goal_event(e.get("type")):
+            continue
+
+        period = _norm_period(e.get("period"))
+        team = e.get("team") or {}
+        team_id = team.get("id")
+
+        if team_id not in (home_team_id, away_team_id):
+            continue
+
+        is_home = team_id == home_team_id
+
+        if period == "P1":
+            if is_home:
+                p1_home += 1
+            else:
+                p1_away += 1
+        elif period == "P2":
+            if is_home:
+                p2_home += 1
+            else:
+                p2_away += 1
+        elif period == "P3":
+            if is_home:
+                p3_home += 1
+            else:
+                p3_away += 1
+        elif period in ("OT", "P4") or period.startswith("OT"):
+            if is_home:
+                ot_home += 1
+            else:
+                ot_away += 1
+        elif period in ("SO", "PEN") or period.startswith("SO"):
+            if is_home:
+                so_home += 1
+            else:
+                so_away += 1
+
+    # 정규합
+    reg_home = p1_home + p2_home + p3_home
+    reg_away = p1_away + p2_away + p3_away
+
+    # final 점수가 없으면, events 집계까지만 신뢰
+    if home_final is None or away_final is None:
+        periods: Dict[str, Optional[Dict[str, int]]] = {
+            "p1": {"home": p1_home, "away": p1_away},
+            "p2": {"home": p2_home, "away": p2_away},
+            "p3": {"home": p3_home, "away": p3_away},
+            "ot": None,
+            "so": None,
+        }
+        if show_ot:
+            periods["ot"] = {"home": ot_home, "away": ot_away}
+        if show_so:
+            periods["so"] = {"home": so_home, "away": so_away}
+        return periods
+
+    # OT 계산 보정
+    # - AP(승부샷): OT goal 이벤트가 없으면 OT는 0으로 두는 게 안전
+    # - AOT(연장 종료): OT = final - reg (events OT가 없을 때)
+    if show_ot:
+        if ot_home == 0 and ot_away == 0:
+            if st in OT_STATUSES:
+                # 연장 종료: final에서 정규를 뺀 값이 OT 득점
+                ot_home = max(0, home_final - reg_home)
+                ot_away = max(0, away_final - reg_away)
+            else:
+                # 승부샷(AP)인데 OT 득점 이벤트가 없으면 OT는 0으로 둔다.
+                ot_home = 0
+                ot_away = 0
+
+    # SO 계산 보정
+    if show_so:
+        # events 기반 SO가 없으면 final - (reg + ot)로 남는 점수를 SO로 처리
+        if so_home == 0 and so_away == 0:
+            so_home = max(0, home_final - (reg_home + (ot_home if show_ot else 0)))
+            so_away = max(0, away_final - (reg_away + (ot_away if show_ot else 0)))
+
+            # 일반적으로 SO는 승자만 +1 이라서 (1,0) 혹은 (0,1) 형태가 기대됨.
+            # 다만 데이터가 깨진 경우 대비해서 음수는 이미 0 처리.
+
+    periods_out: Dict[str, Optional[Dict[str, int]]] = {
+        "p1": {"home": p1_home, "away": p1_away},
+        "p2": {"home": p2_home, "away": p2_away},
+        "p3": {"home": p3_home, "away": p3_away},
+        "ot": None,
+        "so": None,
+    }
+
+    if show_ot:
+        periods_out["ot"] = {"home": ot_home, "away": ot_away}
+
+    if show_so:
+        periods_out["so"] = {"home": so_home, "away": so_away}
+
+    return periods_out
+
+
 def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
     """
     하키 경기 상세 (정식)
     - hockey_games + teams + leagues + countries JOIN
     - score_json을 공식 점수로 사용
     - events는 hockey_game_events 기반
+    - periods(P1/P2/P3/OT/SO)는 서버에서 계산해서 내려줌 (A방식)
     """
 
     # -------------------------
@@ -122,7 +284,7 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
             "logo": g.get("away_logo"),
             "score": away_score,
         },
-        # 앞으로 period별 점수/OT/SO를 넣을 수 있도록 자리만 고정
+        # periods는 아래에서 계산해서 채운다
         "periods": {
             "p1": None,
             "p2": None,
@@ -182,12 +344,27 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
             }
         )
 
+    # -------------------------
+    # 3) PERIOD SCORES (A 방식)
+    # -------------------------
+    game_obj["periods"] = _calc_period_scores(
+        home_team_id=game_obj["home"]["id"],
+        away_team_id=game_obj["away"]["id"],
+        home_final=home_score,
+        away_final=away_score,
+        status=game_obj.get("status"),
+        events=events,
+    )
+
     return {
         "ok": True,
         "game": game_obj,
         "events": events,
         "meta": {
             "source": "db",
-            "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "generated_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     }
