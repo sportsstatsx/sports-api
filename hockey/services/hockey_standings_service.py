@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
 
@@ -16,13 +16,17 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
-def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
+def hockey_get_standings(
+    league_id: int,
+    season: int,
+    stage: Optional[str] = None,
+    group_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     하키 스탠딩 (정식 고정)
-    - hockey_standings 스키마 기준(너가 올린 컬럼명 그대로 사용)
-    - group: stage + group_name 단위로 묶어서 내려줌
-    - rank는 position 사용
-    - stats는 향후 변경 최소화: form/description도 고정 포함
+    - hockey_standings 정규화 컬럼을 신뢰 (raw_json 파싱 ❌)
+    - 그룹 단위: (stage, group_name)로 분리해서 groups 배열로 반환
+    - 필터 지원: stage, group_name
     """
 
     # league 메타
@@ -43,8 +47,20 @@ def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
     if not league:
         raise ValueError("LEAGUE_NOT_FOUND")
 
+    where = ["s.league_id = %s", "s.season = %s"]
+    params: List[Any] = [league_id, season]
+
+    if stage:
+        where.append("s.stage = %s")
+        params.append(stage)
+    if group_name:
+        where.append("s.group_name = %s")
+        params.append(group_name)
+
+    where_sql = " AND ".join(where)
+
     rows = hockey_fetch_all(
-        """
+        f"""
         SELECT
             s.league_id,
             s.season,
@@ -62,24 +78,23 @@ def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
             s.points,
             s.form,
             s.description,
-
             t.name AS team_name,
             t.logo AS team_logo
         FROM hockey_standings s
         JOIN hockey_teams t ON t.id = s.team_id
-        WHERE s.league_id = %s
-          AND s.season = %s
+        WHERE {where_sql}
         ORDER BY s.stage ASC, s.group_name ASC, s.position ASC
         """,
-        (league_id, season),
+        tuple(params),
     )
 
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    # key: (stage, group_name)
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 
     for r in rows:
-        stage = r.get("stage") or "Overall"
-        group_name = r.get("group_name") or "Overall"
-        group_key = f"{stage} / {group_name}"
+        st = r.get("stage") or "Overall"
+        gn = r.get("group_name") or "Overall"
+        key = (st, gn)
 
         gp = _safe_int(r.get("games_played"))
         w = _safe_int(r.get("win_total"))
@@ -94,7 +109,7 @@ def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
         if gf is not None and ga is not None:
             diff = gf - ga
 
-        grouped.setdefault(group_key, []).append(
+        grouped.setdefault(key, []).append(
             {
                 "rank": _safe_int(r.get("position")),
                 "team": {
@@ -106,26 +121,31 @@ def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
                     "played": gp,
                     "wins": w,
                     "losses": l,
-                    # 하키 특성상 OT를 “승/패” 둘 다 분리해서 고정
                     "ot_wins": ot_w,
                     "ot_losses": ot_l,
                     "points": pts,
                     "gf": gf,
                     "ga": ga,
                     "diff": diff,
-                    # 향후 UI에서 바로 쓰게 정식 포함 (없으면 null)
                     "form": r.get("form"),
                     "description": r.get("description"),
                 },
             }
         )
 
-    # 그룹 출력(정렬)
-    groups_out = []
-    for key, items in grouped.items():
-        # 이미 ORDER BY position이라 그대로여도 되지만, 방어적으로 rank ASC
+    groups_out: List[Dict[str, Any]] = []
+    for (st, gn), items in grouped.items():
         items_sorted = sorted(items, key=lambda x: (x["rank"] is None, x["rank"] or 10**9))
-        groups_out.append({"name": key, "rows": items_sorted})
+        groups_out.append(
+            {
+                "stage": st,
+                "group_name": gn,
+                "rows": items_sorted,
+            }
+        )
+
+    # groups 정렬: stage -> group_name
+    groups_out.sort(key=lambda g: (g["stage"], g["group_name"]))
 
     return {
         "ok": True,
@@ -136,9 +156,17 @@ def hockey_get_standings(league_id: int, season: int) -> Dict[str, Any]:
             "country": league.get("country"),
         },
         "season": season,
+        # 요청 필터를 meta로 남겨두면 디버깅/운영에 좋음(포맷 고정)
         "groups": groups_out,
         "meta": {
             "source": "db",
-            "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "filters": {
+                "stage": stage,
+                "group_name": group_name,
+            },
+            "generated_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
         },
     }
