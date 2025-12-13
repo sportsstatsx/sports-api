@@ -1,4 +1,3 @@
-# hockey/services/hockey_fixtures_service.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -80,12 +79,27 @@ def hockey_get_fixtures_by_utc_range(
 
     fixtures: List[Dict[str, Any]] = []
     for r in rows:
+        # ✅ date_utc를 ISO8601(Z) 문자열로 고정 (matchdetail과 동일)
+        dt = r.get("date_utc")
+        if dt is not None:
+            try:
+                dt_iso = (
+                    dt.astimezone(timezone.utc)
+                      .replace(microsecond=0)
+                      .isoformat()
+                      .replace("+00:00", "Z")
+                )
+            except Exception:
+                dt_iso = str(dt)
+        else:
+            dt_iso = None
+
         fixtures.append(
             {
                 "game_id": r["game_id"],
                 "league_id": r["league_id"],
                 "season": r["season"],
-                "date_utc": r["date_utc"],
+                "date_utc": dt_iso,
                 "status": r["status"],
                 "status_long": r["status_long"],
                 "league": {
