@@ -143,9 +143,35 @@ def hockey_get_standings(
                 "rows": items_sorted,
             }
         )
+    # ─────────────────────────────────────────
+    # 정식 정렬 규칙: stage 우선순위 고정
+    #   1) Regular Season
+    #   2) Playoffs/Postseason/Finals
+    #   3) Pre-season/Exhibition
+    #   4) 기타 stage는 맨 뒤(알파벳)
+    # group_name은 동일 stage 내 알파벳 정렬(안정)
+    # ─────────────────────────────────────────
 
-    # groups 정렬: stage -> group_name
-    groups_out.sort(key=lambda g: (g["stage"], g["group_name"]))
+    def _stage_rank(s: str) -> tuple[int, str]:
+        s0 = (s or "").strip().lower()
+
+        # 가장 중요한 정규시즌이 항상 위로
+        if "regular" in s0:
+            return (1, s0)
+
+        # 플레이오프/포스트시즌
+        if "playoff" in s0 or "post" in s0 or "final" in s0:
+            return (2, s0)
+
+        # 프리시즌/전시경기
+        if "pre" in s0 or "exhibition" in s0:
+            return (3, s0)
+
+        # 그 외는 맨 뒤
+        return (9, s0)
+
+    groups_out.sort(key=lambda g: (_stage_rank(g["stage"])[0], _stage_rank(g["stage"])[1], g["group_name"]))
+
 
     return {
         "ok": True,
