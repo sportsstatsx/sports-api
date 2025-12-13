@@ -16,6 +16,52 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
+# ─────────────────────────────────────────
+# 정식 정렬 규칙(고정)
+# 1) stage 우선순위: Regular -> Playoffs/Post -> Pre -> 기타(알파벳)
+# 2) group 우선순위(동일 stage): Division(기본) -> Conference -> Overall -> 기타
+#    (NHL 기본 정렬 포함: Atlantic/Metropolitan/Central/Pacific, Eastern/Western)
+# ─────────────────────────────────────────
+def _stage_rank(stage: str) -> tuple[int, str]:
+    s0 = (stage or "").strip().lower()
+
+    if "regular" in s0:
+        return (1, s0)
+    if "playoff" in s0 or "post" in s0 or "final" in s0:
+        return (2, s0)
+    if "pre" in s0 or "exhibition" in s0:
+        return (3, s0)
+    return (9, s0)
+
+
+def _group_rank(group_name: str) -> tuple[int, str]:
+    g0 = (group_name or "").strip().lower()
+
+    # 기본: 디비전 먼저
+    if "division" in g0:
+        # NHL 디비전 정식 순서 고정
+        order = {
+            "atlantic division": 1,
+            "metropolitan division": 2,
+            "central division": 3,
+            "pacific division": 4,
+        }
+        return (1, str(order.get(g0, 99)).zfill(2) + "_" + g0)
+
+    if "conference" in g0:
+        order = {
+            "eastern conference": 1,
+            "western conference": 2,
+        }
+        return (2, str(order.get(g0, 99)).zfill(2) + "_" + g0)
+
+    # 전체/통합 느낌(리그마다 다르니 최소 규칙만)
+    if g0 in ("overall", "all", "total") or "overall" in g0:
+        return (3, g0)
+
+    return (9, g0)
+
+
 def hockey_get_standings(
     league_id: int,
     season: int,
@@ -23,9 +69,9 @@ def hockey_get_standings(
     group_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    하키 스탠딩 (정식 고정)
+    하키 스탠딩 (정식 고정: stage -> groups -> rows)
     - hockey_standings 정규화 컬럼을 신뢰 (raw_json 파싱 ❌)
-    - 그룹 단위: (stage, group_name)로 분리해서 groups 배열로 반환
+    - 반환 구조: stages=[{stage, groups:[{group_name, rows:[...]}]}]
     - 필터 지원: stage, group_name
     """
 
@@ -88,13 +134,12 @@ def hockey_get_standings(
         tuple(params),
     )
 
-    # key: (stage, group_name)
-    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    # stages_map[stage][group_name] = [rows...]
+    stages_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
     for r in rows:
-        st = r.get("stage") or "Overall"
-        gn = r.get("group_name") or "Overall"
-        key = (st, gn)
+        st = (r.get("stage") or "Overall").strip()
+        gn = (r.get("group_name") or "Overall").strip()
 
         gp = _safe_int(r.get("games_played"))
         w = _safe_int(r.get("win_total"))
@@ -109,69 +154,56 @@ def hockey_get_standings(
         if gf is not None and ga is not None:
             diff = gf - ga
 
-        grouped.setdefault(key, []).append(
-            {
-                "rank": _safe_int(r.get("position")),
-                "team": {
-                    "id": _safe_int(r.get("team_id")),
-                    "name": r.get("team_name"),
-                    "logo": r.get("team_logo"),
-                },
-                "stats": {
-                    "played": gp,
-                    "wins": w,
-                    "losses": l,
-                    "ot_wins": ot_w,
-                    "ot_losses": ot_l,
-                    "points": pts,
-                    "gf": gf,
-                    "ga": ga,
-                    "diff": diff,
-                    "form": r.get("form"),
-                    "description": r.get("description"),
-                },
-            }
-        )
+        row_obj = {
+            "rank": _safe_int(r.get("position")),
+            "team": {
+                "id": _safe_int(r.get("team_id")),
+                "name": r.get("team_name"),
+                "logo": r.get("team_logo"),
+            },
+            "stats": {
+                "played": gp,
+                "wins": w,
+                "losses": l,
+                "ot_wins": ot_w,
+                "ot_losses": ot_l,
+                "points": pts,
+                "gf": gf,
+                "ga": ga,
+                "diff": diff,
+                "form": r.get("form"),
+                "description": r.get("description"),
+            },
+        }
 
-    groups_out: List[Dict[str, Any]] = []
-    for (st, gn), items in grouped.items():
-        items_sorted = sorted(items, key=lambda x: (x["rank"] is None, x["rank"] or 10**9))
-        groups_out.append(
+        stages_map.setdefault(st, {}).setdefault(gn, []).append(row_obj)
+
+    # 정렬 & 출력
+    stages_out: List[Dict[str, Any]] = []
+
+    for st, groups in stages_map.items():
+        groups_out: List[Dict[str, Any]] = []
+        for gn, items in groups.items():
+            items_sorted = sorted(items, key=lambda x: (x["rank"] is None, x["rank"] or 10**9))
+            groups_out.append(
+                {
+                    "group_name": gn,
+                    "rows": items_sorted,
+                }
+            )
+
+        # group 정식 정렬(기본=Division 우선)
+        groups_out.sort(key=lambda g: _group_rank(g["group_name"]))
+
+        stages_out.append(
             {
                 "stage": st,
-                "group_name": gn,
-                "rows": items_sorted,
+                "groups": groups_out,
             }
         )
-    # ─────────────────────────────────────────
-    # 정식 정렬 규칙: stage 우선순위 고정
-    #   1) Regular Season
-    #   2) Playoffs/Postseason/Finals
-    #   3) Pre-season/Exhibition
-    #   4) 기타 stage는 맨 뒤(알파벳)
-    # group_name은 동일 stage 내 알파벳 정렬(안정)
-    # ─────────────────────────────────────────
 
-    def _stage_rank(s: str) -> tuple[int, str]:
-        s0 = (s or "").strip().lower()
-
-        # 가장 중요한 정규시즌이 항상 위로
-        if "regular" in s0:
-            return (1, s0)
-
-        # 플레이오프/포스트시즌
-        if "playoff" in s0 or "post" in s0 or "final" in s0:
-            return (2, s0)
-
-        # 프리시즌/전시경기
-        if "pre" in s0 or "exhibition" in s0:
-            return (3, s0)
-
-        # 그 외는 맨 뒤
-        return (9, s0)
-
-    groups_out.sort(key=lambda g: (_stage_rank(g["stage"])[0], _stage_rank(g["stage"])[1], g["group_name"]))
-
+    # stage 정식 정렬
+    stages_out.sort(key=lambda s: _stage_rank(s["stage"]))
 
     return {
         "ok": True,
@@ -182,8 +214,7 @@ def hockey_get_standings(
             "country": league.get("country"),
         },
         "season": season,
-        # 요청 필터를 meta로 남겨두면 디버깅/운영에 좋음(포맷 고정)
-        "groups": groups_out,
+        "stages": stages_out,
         "meta": {
             "source": "db",
             "filters": {
