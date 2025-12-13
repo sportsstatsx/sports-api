@@ -21,7 +21,7 @@ def hockey_get_fixtures_by_utc_range(
     """
 
     params: List[Any] = [utc_start, utc_end]
-    where_clauses: List[str] = ["(g.game_date::timestamptz BETWEEN %s AND %s)"]
+    where_clauses: List[str] = ["(g.game_date::timestamptz >= %s AND g.game_date::timestamptz < %s)"]
 
     if league_ids:
         placeholders = ", ".join(["%s"] * len(league_ids))
