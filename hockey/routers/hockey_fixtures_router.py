@@ -64,11 +64,11 @@ def hockey_list_fixtures():
     utc_start = local_start.astimezone(timezone.utc)
     utc_end = local_next_day_start.astimezone(timezone.utc)
 
-    rows = hockey_get_fixtures_by_utc_range(
+    games = hockey_get_fixtures_by_utc_range(
         utc_start=utc_start,
         utc_end=utc_end,
         league_ids=league_ids,
         league_id=league_id,
     )
 
-    return jsonify({"ok": True, "rows": rows})
+    return jsonify({"ok": True, "games": games})
