@@ -1,4 +1,3 @@
-# hockey/routers/hockey_fixtures_router.py
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
