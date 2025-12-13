@@ -13,11 +13,22 @@ def standings():
     league_id = request.args.get("league_id", type=int)
     season = request.args.get("season", type=int)
 
+    # 선택 필터 (정식 지원)
+    stage = request.args.get("stage", type=str)
+    group_name = request.args.get("group_name", type=str)
+
     if not league_id or not season:
         return jsonify({"ok": False, "error": "league_id and season are required"}), 400
 
     try:
-        return jsonify(hockey_get_standings(league_id=league_id, season=season))
+        return jsonify(
+            hockey_get_standings(
+                league_id=league_id,
+                season=season,
+                stage=stage,
+                group_name=group_name,
+            )
+        )
     except ValueError as e:
         if str(e) == "LEAGUE_NOT_FOUND":
             return jsonify({"ok": False, "error": "LEAGUE_NOT_FOUND"}), 404
