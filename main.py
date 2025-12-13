@@ -36,6 +36,7 @@ from routers.vip_routes import vip_bp
 from hockey.routers.hockey_games_router import hockey_games_bp
 from hockey.routers.hockey_fixtures_router import hockey_fixtures_bp
 from hockey.routers.hockey_matchdetail_router import hockey_matchdetail_bp
+from hockey.routers.hockey_standings_router import hockey_standings_bp
 
 
 
@@ -60,6 +61,7 @@ app.register_blueprint(vip_bp)
 app.register_blueprint(hockey_games_bp)
 app.register_blueprint(hockey_fixtures_bp)
 app.register_blueprint(hockey_matchdetail_bp)
+app.register_blueprint(hockey_standings_bp)
 
 
 # ─────────────────────────────────────────
@@ -325,6 +327,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
