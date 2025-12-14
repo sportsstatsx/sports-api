@@ -356,15 +356,143 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
         events=events,
     )
 
+    # -------------------------
+    # 3) H2H (Head-to-Head)
+    # -------------------------
+    # ✅ 종료경기만 사용: FT / AOT / AP
+    finished_statuses = ("FT", "AOT", "AP")
+
+    home_id = g.get("home_id")
+    away_id = g.get("away_id")
+
+    h2h_rows: List[Dict[str, Any]] = []
+
+    # 팀 ID가 없으면 h2h는 빈 배열 유지
+    if home_id and away_id:
+        h2h_sql = """
+            SELECT
+                gg.id AS game_id,
+                gg.league_id,
+                gg.season,
+                gg.stage,
+                gg.group_name,
+                gg.game_date AS date_utc,
+                gg.status,
+                gg.status_long,
+                gg.timezone AS game_timezone,
+                gg.score_json,
+
+                l.id AS league_id2,
+                l.name AS league_name,
+                l.logo AS league_logo,
+                c.name AS league_country,
+
+                th.id AS home_id,
+                th.name AS home_name,
+                th.logo AS home_logo,
+
+                ta.id AS away_id,
+                ta.name AS away_name,
+                ta.logo AS away_logo
+            FROM hockey_games gg
+            JOIN hockey_leagues l ON l.id = gg.league_id
+            LEFT JOIN hockey_countries c ON c.id = l.country_id
+            LEFT JOIN hockey_teams th ON th.id = gg.home_team_id
+            LEFT JOIN hockey_teams ta ON ta.id = gg.away_team_id
+            WHERE
+                gg.id <> %s
+                AND (
+                    (gg.home_team_id = %s AND gg.away_team_id = %s)
+                    OR
+                    (gg.home_team_id = %s AND gg.away_team_id = %s)
+                )
+                AND gg.status = ANY(%s)
+            ORDER BY gg.game_date DESC
+            LIMIT 20
+        """
+
+        h2h_game_rows = hockey_fetch_all(
+            h2h_sql,
+            (
+                game_id,
+                home_id, away_id,
+                away_id, home_id,
+                list(finished_statuses),
+            ),
+        )
+
+        for rr in h2h_game_rows:
+            # score_json에서 home/away 점수 안전 추출 (현재 game header와 동일 규칙)
+            sj = rr.get("score_json") or {}
+            hs = None
+            aws = None
+            if isinstance(sj, dict):
+                if "home" in sj or "away" in sj:
+                    hs = _safe_int(sj.get("home"))
+                    aws = _safe_int(sj.get("away"))
+                elif "scores" in sj and isinstance(sj.get("scores"), dict):
+                    ss = sj.get("scores") or {}
+                    hs = _safe_int(ss.get("home"))
+                    aws = _safe_int(ss.get("away"))
+
+            # date_utc ISO8601(Z) 고정
+            dtt = rr.get("date_utc")
+            if dtt is not None:
+                try:
+                    dt_iso2 = (
+                        dtt.astimezone(timezone.utc)
+                        .replace(microsecond=0)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                except Exception:
+                    dt_iso2 = str(dtt)
+            else:
+                dt_iso2 = None
+
+            h2h_rows.append(
+                {
+                    # ✅ 앱 쪽에서 “경기 선택 → 해당 경기 matchdetail 이동”에 쓰는 키
+                    "game_id": rr["game_id"],
+                    "league_id": rr["league_id"],
+                    "season": rr["season"],
+                    "stage": rr.get("stage"),
+                    "group_name": rr.get("group_name"),
+                    "date_utc": dt_iso2,
+                    "status": rr.get("status"),
+                    "status_long": rr.get("status_long"),
+                    "timezone": rr.get("game_timezone") or "UTC",
+                    "league": {
+                        "id": rr["league_id2"],
+                        "name": rr["league_name"],
+                        "logo": rr["league_logo"],
+                        "country": rr["league_country"],
+                    },
+                    "home": {
+                        "id": rr.get("home_id"),
+                        "name": rr.get("home_name"),
+                        "logo": rr.get("home_logo"),
+                        "score": hs,
+                    },
+                    "away": {
+                        "id": rr.get("away_id"),
+                        "name": rr.get("away_name"),
+                        "logo": rr.get("away_logo"),
+                        "score": aws,
+                    },
+                }
+            )
+
     return {
         "ok": True,
         "game": game_obj,
         "events": events,
+        "h2h": {
+            "rows": h2h_rows
+        },
         "meta": {
             "source": "db",
-            "generated_at": datetime.now(timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         },
     }
+
