@@ -11,7 +11,6 @@ hockey_insights_bp = Blueprint("hockey_insights", __name__, url_prefix="/api/hoc
 
 @hockey_insights_bp.route("/games/<int:game_id>/insights", methods=["GET"])
 def hockey_game_insights(game_id: int):
-    # 선택: 샘플 사이즈 (기본 200)
     sample_size = request.args.get("sample_size", type=int) or 200
     if sample_size < 20:
         sample_size = 20
