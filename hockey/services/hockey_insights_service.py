@@ -2,12 +2,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from hockey.hockey_db import hockey_fetch_all
+from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
 
 
-FINISHED_STATUSES = ("FT", "AOT", "AP")  # matchdetail 서비스와 동일 :contentReference[oaicite:1]{index=1}
+FINISHED_STATUSES = ("FT", "AOT", "AP")  # 종료 경기만
+
+
+def _iso_utc_now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _safe_int(v: Any) -> Optional[int]:
@@ -19,42 +29,134 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
-def _pct(n: int, d: int) -> float:
+def _safe_div(n: int, d: int) -> Optional[float]:
     if d <= 0:
-        return 0.0
-    return round((n * 100.0) / d, 1)
+        return None
+    return float(n) / float(d)
 
 
-def _period_rank(p: Any) -> int:
-    s = (str(p).strip().upper() if p is not None else "")
-    if s == "P1":
+def _norm_period(p: Any) -> str:
+    s = (p or "").strip().upper()
+    if s in ("P1", "1", "1ST", "1ST PERIOD", "1STPERIOD"):
+        return "P1"
+    if s in ("P2", "2", "2ND", "2ND PERIOD", "2NDPERIOD"):
+        return "P2"
+    if s in ("P3", "3", "3RD", "3RD PERIOD", "3RDPERIOD"):
+        return "P3"
+    if s.startswith("OT") or s in ("OT", "P4"):
+        return "OT"
+    return s or "UNK"
+
+
+def _period_index(p: str) -> int:
+    if p == "P1":
+        return 0
+    if p == "P2":
         return 1
-    if s == "P2":
+    if p == "P3":
         return 2
-    if s == "P3":
+    if p == "OT":
         return 3
-    if s == "OT":
-        return 4
     return 9
 
 
-@dataclass
-class GameSlice:
-    game_id: int
-    is_home: bool
-    opponent_id: Optional[int]
+def _event_sort_key(ev: Dict[str, Any]) -> Tuple[int, int, int]:
+    # minute이 NULL일 수도 있으니 안전 처리
+    p = _norm_period(ev.get("period"))
+    m = ev.get("minute")
+    mi = _safe_int(m)
+    if mi is None:
+        mi = 10**9
+    order = _safe_int(ev.get("event_order")) or 0
+    return (_period_index(p), mi, order)
 
 
-def _load_last_n_games_for_team(
+def _score_after_regulation(goal_events: List[Dict[str, Any]], team_id: int) -> Tuple[int, int]:
+    # team_for, team_against (P1~P3만)
+    gf = 0
+    ga = 0
+    for ev in goal_events:
+        p = _norm_period(ev.get("period"))
+        if p not in ("P1", "P2", "P3"):
+            continue
+        tid = _safe_int(ev.get("team_id"))
+        if tid is None:
+            continue
+        if tid == team_id:
+            gf += 1
+        else:
+            ga += 1
+    return gf, ga
+
+
+def _score_at_checkpoint(
+    goal_events: List[Dict[str, Any]],
     team_id: int,
-    last_n: int,
-) -> List[GameSlice]:
+    checkpoint: Tuple[str, int],
+) -> Tuple[int, int]:
     """
-    팀 최근 N경기(상대 무관)
-    Totals: 최근 N 전체
-    Home: 그 중 team이 home인 경기만
-    Away: 그 중 team이 away인 경기만
+    checkpoint = (period, minute_start)
+    예) ("P3", 17) -> P3 17:00 시작 시점 스코어 (P3 minute < 17 까지만 반영)
     """
+    cp_period, cp_min = checkpoint
+    gf = 0
+    ga = 0
+
+    for ev in goal_events:
+        p = _norm_period(ev.get("period"))
+        tid = _safe_int(ev.get("team_id"))
+        mi = _safe_int(ev.get("minute"))
+        if tid is None or mi is None:
+            continue
+
+        if p in ("P1", "P2"):
+            if tid == team_id:
+                gf += 1
+            else:
+                ga += 1
+            continue
+
+        if p == cp_period:
+            if mi < cp_min:
+                if tid == team_id:
+                    gf += 1
+                else:
+                    ga += 1
+
+    return gf, ga
+
+
+def _first_goal_of_game(goal_events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    reg = [ev for ev in goal_events if _norm_period(ev.get("period")) in ("P1", "P2", "P3")]
+    if not reg:
+        return None
+    reg.sort(key=_event_sort_key)
+    return reg[0]
+
+
+def _first_goal_after_checkpoint(
+    goal_events: List[Dict[str, Any]],
+    checkpoint_periods: Tuple[str, ...],
+) -> Optional[Dict[str, Any]]:
+    cand = []
+    for ev in goal_events:
+        p = _norm_period(ev.get("period"))
+        if p in checkpoint_periods:
+            cand.append(ev)
+    if not cand:
+        return None
+    cand.sort(key=_event_sort_key)
+    return cand[0]
+
+
+@dataclass
+class _Bucket:
+    games: List[int]
+    # game_id -> (is_home_for_selected, opponent_team_id)
+    home_flags: Dict[int, bool]
+
+
+def _load_recent_games(team_id: int, last_n: int) -> _Bucket:
     sql = """
         SELECT
             g.id AS game_id,
@@ -62,32 +164,26 @@ def _load_last_n_games_for_team(
             g.away_team_id
         FROM hockey_games g
         WHERE
-            (g.home_team_id = %s OR g.away_team_id = %s)
-            AND g.status = ANY(%s)
-        ORDER BY g.game_date DESC
+            g.status = ANY(%s)
+            AND (g.home_team_id = %s OR g.away_team_id = %s)
+        ORDER BY g.game_date DESC NULLS LAST, g.id DESC
         LIMIT %s
     """
-    rows = hockey_fetch_all(sql, (team_id, team_id, list(FINISHED_STATUSES), last_n))
+    rows = hockey_fetch_all(sql, (list(FINISHED_STATUSES), team_id, team_id, last_n))
 
-    out: List[GameSlice] = []
+    games: List[int] = []
+    home_flags: Dict[int, bool] = {}
     for r in rows:
         gid = _safe_int(r.get("game_id"))
-        hid = _safe_int(r.get("home_team_id"))
-        aid = _safe_int(r.get("away_team_id"))
         if gid is None:
             continue
+        games.append(gid)
+        home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
 
-        is_home = (hid == team_id)
-        opp = aid if is_home else hid
-        out.append(GameSlice(game_id=gid, is_home=is_home, opponent_id=opp))
-    return out
+    return _Bucket(games=games, home_flags=home_flags)
 
 
-def _load_goal_events_for_games(game_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    game_id -> goal events list
-    필요한 최소 필드만 로딩 (period, minute, team_id)
-    """
+def _load_goal_events(game_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
     if not game_ids:
         return {}
 
@@ -98,626 +194,566 @@ def _load_goal_events_for_games(game_ids: List[int]) -> Dict[int, List[Dict[str,
             e.period,
             e.minute,
             e.team_id,
-            e.type,
-            e.comment
+            e.event_order
         FROM hockey_game_events e
         WHERE
-            e.game_id IN ({placeholders})
-            AND e.type = 'goal'
+            e.type = 'goal'
+            AND e.game_id IN ({placeholders})
         ORDER BY e.game_id ASC, e.period ASC, e.minute ASC NULLS LAST, e.event_order ASC
     """
     rows = hockey_fetch_all(sql, tuple(game_ids))
 
-    mp: Dict[int, List[Dict[str, Any]]] = {}
+    out: Dict[int, List[Dict[str, Any]]] = {}
     for r in rows:
         gid = _safe_int(r.get("game_id"))
         if gid is None:
             continue
-        mp.setdefault(gid, []).append(
-            {
-                "period": (r.get("period") or "").strip().upper(),
-                "minute": _safe_int(r.get("minute")),
-                "team_id": _safe_int(r.get("team_id")),
-                "comment": r.get("comment"),
-            }
-        )
-    return mp
+        out.setdefault(gid, []).append(r)
+    return out
 
 
-def _regulation_score_from_events(
-    *,
-    team_id: int,
-    events: List[Dict[str, Any]],
-) -> Tuple[int, int]:
-    """
-    정규시간(P1~P3) 기준 득점/실점
-    """
-    gf = 0
-    ga = 0
-    for e in events:
-        p = (e.get("period") or "").strip().upper()
-        if p not in ("P1", "P2", "P3"):
-            continue
-        tid = _safe_int(e.get("team_id"))
-        if tid is None:
-            continue
-        if tid == team_id:
-            gf += 1
-        else:
-            ga += 1
-    return gf, ga
-
-
-def _score_until(
-    *,
-    team_id: int,
-    events: List[Dict[str, Any]],
-    up_to_period: str,
-    up_to_minute_lt: Optional[int],
-) -> Tuple[int, int]:
-    """
-    특정 시점 '이전'까지(P1~P3만) 스코어 계산.
-    - up_to_period = "P3"
-    - up_to_minute_lt = 17 이면 P3 minute < 17 까지 포함
-    """
-    gf = 0
-    ga = 0
-    for e in events:
-        p = (e.get("period") or "").strip().upper()
-        if p not in ("P1", "P2", "P3"):
-            continue
-
-        if _period_rank(p) < _period_rank(up_to_period):
-            pass
-        elif p == up_to_period:
-            m = _safe_int(e.get("minute"))
-            if up_to_minute_lt is not None:
-                if m is None:
-                    continue
-                if m >= up_to_minute_lt:
-                    continue
-        else:
-            continue
-
-        tid = _safe_int(e.get("team_id"))
-        if tid is None:
-            continue
-        if tid == team_id:
-            gf += 1
-        else:
-            ga += 1
-    return gf, ga
-
-
-def _count_goals_in_window(
-    *,
-    team_id: int,
-    events: List[Dict[str, Any]],
-    period: str,
-    minute_ge: int,
-) -> Tuple[int, int]:
-    """
-    특정 구간(예: P3 minute>=17)에서 득점/실점 카운트
-    """
-    gf = 0
-    ga = 0
-    p0 = period.strip().upper()
-    for e in events:
-        p = (e.get("period") or "").strip().upper()
-        if p != p0:
-            continue
-        m = _safe_int(e.get("minute"))
-        if m is None:
-            continue
-        if m < minute_ge:
-            continue
-
-        tid = _safe_int(e.get("team_id"))
-        if tid is None:
-            continue
-        if tid == team_id:
-            gf += 1
-        else:
-            ga += 1
-    return gf, ga
-
-
-def _first_goal_in_period(
-    *,
-    team_id: int,
-    events: List[Dict[str, Any]],
-    period: str,
-) -> Optional[str]:
-    """
-    해당 period에서 '첫 골'이 누구였는지:
-    - return "for" (team이 넣음)
-    - return "against" (상대가 넣음)
-    - return None (그 period에 골 없음)
-    """
-    p0 = period.strip().upper()
-    candidates: List[Tuple[int, int, str]] = []
-    for e in events:
-        p = (e.get("period") or "").strip().upper()
-        if p != p0:
-            continue
-        m = _safe_int(e.get("minute"))
-        if m is None:
-            continue
-        tid = _safe_int(e.get("team_id"))
-        if tid is None:
-            continue
-        who = "for" if tid == team_id else "against"
-        candidates.append((m, 0, who))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    return candidates[0][2]
-
-
-def _goal_timing_distribution_2min(
-    *,
-    team_id: int,
-    events: List[Dict[str, Any]],
-    period: str,
-) -> Dict[str, Any]:
-    """
-    2분 단위(0-1, 2-3, ..., 18-19) 득점 분포
-    - team이 넣은 골만 집계
-    """
-    p0 = period.strip().upper()
-    bins = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17), (18, 19)]
-    counts = [0] * len(bins)
-
-    for e in events:
-        p = (e.get("period") or "").strip().upper()
-        if p != p0:
-            continue
-        tid = _safe_int(e.get("team_id"))
-        if tid != team_id:
-            continue
-        m = _safe_int(e.get("minute"))
-        if m is None:
-            continue
-        if m < 0 or m > 19:
-            continue
-
-        idx = m // 2
-        if idx < 0:
-            continue
-        if idx >= len(counts):
-            idx = len(counts) - 1
-        counts[idx] += 1
-
-    total = sum(counts)
-    out_bins: List[Dict[str, Any]] = []
-    for i, (a, b) in enumerate(bins):
-        c = counts[i]
-        out_bins.append(
-            {
-                "start_min": a,
-                "end_min": b,
-                "label": f"{a:02d}-{b:02d}",
-                "count": c,
-                "pct": _pct(c, total),
-            }
-        )
-
+def _triple(values_by_bucket: Dict[str, Optional[float]]) -> Dict[str, Any]:
     return {
-        "period": p0,
-        "total_goals": total,
-        "bins": out_bins,
+        "totals": values_by_bucket.get("totals"),
+        "home": values_by_bucket.get("home"),
+        "away": values_by_bucket.get("away"),
     }
 
 
-def _compute_subset_insights(
-    *,
-    team_id: int,
-    game_ids: List[int],
-    events_by_game: Dict[int, List[Dict[str, Any]]],
-    last_minutes: int,
-) -> Dict[str, Any]:
-    """
-    subset(=totals/home/away)용 계산 결과
-    """
-    # last 3 minutes 기본: minute>=17
-    last_start_minute = 20 - last_minutes  # 20분 period 기준
-    if last_start_minute < 0:
-        last_start_minute = 0
-
-    # ---------
-    # (1) Last 3 Minutes · 1–2 Goal Margin
-    # ---------
-    # 분모(상태별 게임수)
-    den_lead1 = den_lead2 = den_trail1 = den_trail2 = den_tied = 0
-    # score at least 1 in last window
-    num_lead1_score = num_lead2_score = num_trail1_score = num_trail2_score = num_tied_score = 0
-    num_lead1_conc = num_lead2_conc = num_trail1_conc = num_trail2_conc = num_tied_conc = 0
-
-    # ---------
-    # (2) 3rd Period Start Score Impact (Regular Time)
-    # ---------
-    den_p3_lead = den_p3_tied = den_p3_trail = 0
-    num_p3_lead_w = num_p3_lead_d = num_p3_lead_l = 0
-    num_p3_tied_w = num_p3_tied_d = num_p3_tied_l = 0
-    num_p3_trail_w = num_p3_trail_d = num_p3_trail_l = 0
-
-    # ---------
-    # (3) First Goal Impact (Regular Time)
-    # ---------
-    den_1p_first_for = den_1p_first_against = 0
-    num_1p_first_for_w = num_1p_first_for_d = num_1p_first_for_l = 0
-    num_1p_first_ag_w = num_1p_first_ag_d = num_1p_first_ag_l = 0
-
-    den_2p_00_first_for = den_2p_00_first_against = 0
-    num_2p_00_first_for_w = num_2p_00_first_for_d = num_2p_00_first_for_l = 0
-    num_2p_00_first_ag_w = num_2p_00_first_ag_d = num_2p_00_first_ag_l = 0
-
-    den_3p_00_first_for = den_3p_00_first_against = 0
-    num_3p_00_first_for_w = num_3p_00_first_for_d = num_3p_00_first_for_l = 0
-    num_3p_00_first_ag_w = num_3p_00_first_ag_d = num_3p_00_first_ag_l = 0
-
-    # ---------
-    # (4) Goal Timing Distribution (2-Minute Intervals) - P1/P2/P3
-    # ---------
-    # subset 전체 이벤트를 period별로 합산할 때, "분포는 팀 득점만"이므로
-    # game별 계산 후 단순 합산(카운트)하고 pct는 다시 계산
-    agg_counts = {
-        "P1": [0] * 10,
-        "P2": [0] * 10,
-        "P3": [0] * 10,
-    }
-
-    def _apply_outcome_counts(prefix: str, outcome: str):
-        # helper: outcome in ("W","D","L")
-        pass
-
-    for gid in game_ids:
-        evs = events_by_game.get(gid, [])
-
-        # regulation outcome
-        reg_gf, reg_ga = _regulation_score_from_events(team_id=team_id, events=evs)
-        if reg_gf > reg_ga:
-            outcome = "W"
-        elif reg_gf == reg_ga:
-            outcome = "D"
-        else:
-            outcome = "L"
-
-        # ---- (1) last window state at P3 minute < last_start_minute (즉, 17 이전)
-        gf_before, ga_before = _score_until(
-            team_id=team_id,
-            events=evs,
-            up_to_period="P3",
-            up_to_minute_lt=last_start_minute,
-        )
-        margin = gf_before - ga_before
-
-        gf_last, ga_last = _count_goals_in_window(
-            team_id=team_id,
-            events=evs,
-            period="P3",
-            minute_ge=last_start_minute,
-        )
-        scored_in_last = gf_last >= 1
-        conceded_in_last = ga_last >= 1
-
-        if margin == 1:
-            den_lead1 += 1
-            if scored_in_last:
-                num_lead1_score += 1
-            if conceded_in_last:
-                num_lead1_conc += 1
-        elif margin == 2:
-            den_lead2 += 1
-            if scored_in_last:
-                num_lead2_score += 1
-            if conceded_in_last:
-                num_lead2_conc += 1
-        elif margin == -1:
-            den_trail1 += 1
-            if scored_in_last:
-                num_trail1_score += 1
-            if conceded_in_last:
-                num_trail1_conc += 1
-        elif margin == -2:
-            den_trail2 += 1
-            if scored_in_last:
-                num_trail2_score += 1
-            if conceded_in_last:
-                num_trail2_conc += 1
-        elif margin == 0:
-            den_tied += 1
-            if scored_in_last:
-                num_tied_score += 1
-            if conceded_in_last:
-                num_tied_conc += 1
-
-        # ---- (2) score at start of P3 (after P2)
-        gf_p2, ga_p2 = _score_until(team_id=team_id, events=evs, up_to_period="P3", up_to_minute_lt=0)
-        # 위 함수는 P3 minute<0 이므로 사실상 P1+P2만 카운트됨
-        margin_p3_start = gf_p2 - ga_p2
-
-        if margin_p3_start > 0:
-            den_p3_lead += 1
-            if outcome == "W":
-                num_p3_lead_w += 1
-            elif outcome == "D":
-                num_p3_lead_d += 1
-            else:
-                num_p3_lead_l += 1
-        elif margin_p3_start == 0:
-            den_p3_tied += 1
-            if outcome == "W":
-                num_p3_tied_w += 1
-            elif outcome == "D":
-                num_p3_tied_d += 1
-            else:
-                num_p3_tied_l += 1
-        else:
-            den_p3_trail += 1
-            if outcome == "W":
-                num_p3_trail_w += 1
-            elif outcome == "D":
-                num_p3_trail_d += 1
-            else:
-                num_p3_trail_l += 1
-
-        # ---- (3) first goal impact
-        # 1P first goal for/against
-        who_1p = _first_goal_in_period(team_id=team_id, events=evs, period="P1")
-        if who_1p == "for":
-            den_1p_first_for += 1
-            if outcome == "W":
-                num_1p_first_for_w += 1
-            elif outcome == "D":
-                num_1p_first_for_d += 1
-            else:
-                num_1p_first_for_l += 1
-        elif who_1p == "against":
-            den_1p_first_against += 1
-            if outcome == "W":
-                num_1p_first_ag_w += 1
-            elif outcome == "D":
-                num_1p_first_ag_d += 1
-            else:
-                num_1p_first_ag_l += 1
-
-        # 2P start 0-0
-        gf_after_p1, ga_after_p1 = _score_until(team_id=team_id, events=evs, up_to_period="P2", up_to_minute_lt=0)
-        if gf_after_p1 == 0 and ga_after_p1 == 0:
-            who_2p = _first_goal_in_period(team_id=team_id, events=evs, period="P2")
-            if who_2p == "for":
-                den_2p_00_first_for += 1
-                if outcome == "W":
-                    num_2p_00_first_for_w += 1
-                elif outcome == "D":
-                    num_2p_00_first_for_d += 1
-                else:
-                    num_2p_00_first_for_l += 1
-            elif who_2p == "against":
-                den_2p_00_first_against += 1
-                if outcome == "W":
-                    num_2p_00_first_ag_w += 1
-                elif outcome == "D":
-                    num_2p_00_first_ag_d += 1
-                else:
-                    num_2p_00_first_ag_l += 1
-
-        # 3P start 0-0
-        gf_after_p2, ga_after_p2 = _score_until(team_id=team_id, events=evs, up_to_period="P3", up_to_minute_lt=0)
-        if gf_after_p2 == 0 and ga_after_p2 == 0:
-            who_3p = _first_goal_in_period(team_id=team_id, events=evs, period="P3")
-            if who_3p == "for":
-                den_3p_00_first_for += 1
-                if outcome == "W":
-                    num_3p_00_first_for_w += 1
-                elif outcome == "D":
-                    num_3p_00_first_for_d += 1
-                else:
-                    num_3p_00_first_for_l += 1
-            elif who_3p == "against":
-                den_3p_00_first_against += 1
-                if outcome == "W":
-                    num_3p_00_first_ag_w += 1
-                elif outcome == "D":
-                    num_3p_00_first_ag_d += 1
-                else:
-                    num_3p_00_first_ag_l += 1
-
-        # ---- (4) goal timing distribution 2-min bins (team goals only)
-        for e in evs:
-            p = (e.get("period") or "").strip().upper()
-            if p not in ("P1", "P2", "P3"):
-                continue
-            tid = _safe_int(e.get("team_id"))
-            if tid != team_id:
-                continue
-            m = _safe_int(e.get("minute"))
-            if m is None or m < 0 or m > 19:
-                continue
-            idx = m // 2
-            if idx < 0:
-                continue
-            if idx >= 10:
-                idx = 9
-            agg_counts[p][idx] += 1
-
-    # build timing response
-    def _build_timing(period: str) -> Dict[str, Any]:
-        bins = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17), (18, 19)]
-        counts = agg_counts[period]
-        total = sum(counts)
-        out_bins: List[Dict[str, Any]] = []
-        for i, (a, b) in enumerate(bins):
-            c = counts[i]
-            out_bins.append(
-                {
-                    "start_min": a,
-                    "end_min": b,
-                    "label": f"{a:02d}-{b:02d}",
-                    "count": c,
-                    "pct": _pct(c, total),
-                }
-            )
-        return {"period": period, "total_goals": total, "bins": out_bins}
-
+def _build_section(title: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
-        "sample_size": len(game_ids),
-
-        "last_minutes": last_minutes,
-        "last_3_minutes_1_2_goal_margin": {
-            "leading_by_1_goal": {
-                "den": den_lead1,
-                "score_prob_pct": _pct(num_lead1_score, den_lead1),
-                "concede_prob_pct": _pct(num_lead1_conc, den_lead1),
-            },
-            "leading_by_2_goals": {
-                "den": den_lead2,
-                "score_prob_pct": _pct(num_lead2_score, den_lead2),
-                "concede_prob_pct": _pct(num_lead2_conc, den_lead2),
-            },
-            "trailing_by_1_goal": {
-                "den": den_trail1,
-                "score_prob_pct": _pct(num_trail1_score, den_trail1),
-                "concede_prob_pct": _pct(num_trail1_conc, den_trail1),
-            },
-            "trailing_by_2_goals": {
-                "den": den_trail2,
-                "score_prob_pct": _pct(num_trail2_score, den_trail2),
-                "concede_prob_pct": _pct(num_trail2_conc, den_trail2),
-            },
-            "tied_game": {
-                "den": den_tied,
-                "score_prob_pct": _pct(num_tied_score, den_tied),
-                "concede_prob_pct": _pct(num_tied_conc, den_tied),
-            },
-        },
-
-        "third_period_start_score_impact_regular_time": {
-            "leading_at_3p_start": {
-                "den": den_p3_lead,
-                "win_prob_pct": _pct(num_p3_lead_w, den_p3_lead),
-                "draw_prob_pct": _pct(num_p3_lead_d, den_p3_lead),
-                "loss_prob_pct": _pct(num_p3_lead_l, den_p3_lead),
-            },
-            "tied_at_3p_start": {
-                "den": den_p3_tied,
-                "win_prob_pct": _pct(num_p3_tied_w, den_p3_tied),
-                "draw_prob_pct": _pct(num_p3_tied_d, den_p3_tied),
-                "loss_prob_pct": _pct(num_p3_tied_l, den_p3_tied),
-            },
-            "trailing_at_3p_start": {
-                "den": den_p3_trail,
-                "win_prob_pct": _pct(num_p3_trail_w, den_p3_trail),
-                "draw_prob_pct": _pct(num_p3_trail_d, den_p3_trail),
-                "loss_prob_pct": _pct(num_p3_trail_l, den_p3_trail),
-            },
-        },
-
-        "first_goal_impact_regular_time": {
-            "p1_first_goal_for": {
-                "den": den_1p_first_for,
-                "win_prob_pct": _pct(num_1p_first_for_w, den_1p_first_for),
-                "draw_prob_pct": _pct(num_1p_first_for_d, den_1p_first_for),
-                "loss_prob_pct": _pct(num_1p_first_for_l, den_1p_first_for),
-            },
-            "p1_first_goal_conceded": {
-                "den": den_1p_first_against,
-                "win_prob_pct": _pct(num_1p_first_ag_w, den_1p_first_against),
-                "draw_prob_pct": _pct(num_1p_first_ag_d, den_1p_first_against),
-                "loss_prob_pct": _pct(num_1p_first_ag_l, den_1p_first_against),
-            },
-
-            "p2_start_0_0_first_goal_for": {
-                "den": den_2p_00_first_for,
-                "win_prob_pct": _pct(num_2p_00_first_for_w, den_2p_00_first_for),
-                "draw_prob_pct": _pct(num_2p_00_first_for_d, den_2p_00_first_for),
-                "loss_prob_pct": _pct(num_2p_00_first_for_l, den_2p_00_first_for),
-            },
-            "p2_start_0_0_first_goal_conceded": {
-                "den": den_2p_00_first_against,
-                "win_prob_pct": _pct(num_2p_00_first_ag_w, den_2p_00_first_against),
-                "draw_prob_pct": _pct(num_2p_00_first_ag_d, den_2p_00_first_against),
-                "loss_prob_pct": _pct(num_2p_00_first_ag_l, den_2p_00_first_against),
-            },
-
-            "p3_start_0_0_first_goal_for": {
-                "den": den_3p_00_first_for,
-                "win_prob_pct": _pct(num_3p_00_first_for_w, den_3p_00_first_for),
-                "draw_prob_pct": _pct(num_3p_00_first_for_d, den_3p_00_first_for),
-                "loss_prob_pct": _pct(num_3p_00_first_for_l, den_3p_00_first_for),
-            },
-            "p3_start_0_0_first_goal_conceded": {
-                "den": den_3p_00_first_against,
-                "win_prob_pct": _pct(num_3p_00_first_ag_w, den_3p_00_first_against),
-                "draw_prob_pct": _pct(num_3p_00_first_ag_d, den_3p_00_first_against),
-                "loss_prob_pct": _pct(num_3p_00_first_ag_l, den_3p_00_first_against),
-            },
-        },
-
-        "goal_timing_distribution_2min_intervals": {
-            "p1": _build_timing("P1"),
-            "p2": _build_timing("P2"),
-            "p3": _build_timing("P3"),
-        },
+        "title": title,
+        "columns": ["Totals", "Home", "Away"],
+        "rows": rows,
     }
 
 
-def hockey_get_team_insights(
-    *,
-    team_id: int,
-    last_n: int,
+def hockey_get_game_insights(
+    game_id: int,
+    team_id: Optional[int] = None,
+    last_n: int = 10,
     last_minutes: int = 3,
 ) -> Dict[str, Any]:
-    """
-    팀 기반 insights (Totals/Home/Away)
-    - last_n: 팀 최근 N경기(상대 무관)
-    - last_minutes: 기본 3 (minute>=17)
-    """
-    if team_id <= 0:
-        raise ValueError("team_id is required")
-    if last_n <= 0:
+    # 0) game 존재 확인 + 기본 team_id 결정
+    g = hockey_fetch_one(
+        """
+        SELECT id, league_id, season, home_team_id, away_team_id
+        FROM hockey_games
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (game_id,),
+    )
+    if not g:
+        raise ValueError("GAME_NOT_FOUND")
+
+    default_team_id = _safe_int(g.get("home_team_id"))
+    sel_team_id = _safe_int(team_id) or default_team_id
+    if sel_team_id is None:
+        # 팀이 NULL이면 인사이트 계산 불가
+        return {"ok": True, "game_id": game_id, "sections": [], "meta": {"reason": "TEAM_ID_MISSING"}}
+
+    if last_n < 1:
         last_n = 1
     if last_n > 50:
-        last_n = 50
-    if last_minutes <= 0:
-        last_minutes = 3
-    if last_minutes > 20:
-        last_minutes = 20
+        last_n = 50  # 서버 보호
 
-    slices = _load_last_n_games_for_team(team_id=team_id, last_n=last_n)
-    game_ids_all = [s.game_id for s in slices]
-    events_by_game = _load_goal_events_for_games(game_ids_all)
+    if last_minutes < 1:
+        last_minutes = 1
+    if last_minutes > 10:
+        last_minutes = 10
 
-    # split
-    game_ids_home = [s.game_id for s in slices if s.is_home]
-    game_ids_away = [s.game_id for s in slices if not s.is_home]
+    # 너 확정 룰: 20분 기준 (P3 minute >= 17이면 last 3min)
+    threshold_minute = 20 - last_minutes  # 기본 17
 
-    totals = _compute_subset_insights(
-        team_id=team_id,
-        game_ids=game_ids_all,
-        events_by_game=events_by_game,
-        last_minutes=last_minutes,
+    bucket = _load_recent_games(sel_team_id, last_n)
+    game_ids = bucket.games
+
+    goal_by_game = _load_goal_events(game_ids)
+
+    # bucket별 game_ids
+    totals_ids = list(game_ids)
+    home_ids = [gid for gid in game_ids if bucket.home_flags.get(gid) is True]
+    away_ids = [gid for gid in game_ids if bucket.home_flags.get(gid) is False]
+
+    def iter_bucket(name: str) -> List[int]:
+        if name == "totals":
+            return totals_ids
+        if name == "home":
+            return home_ids
+        return away_ids
+
+    # 공통: 결과(정규시간) 구하기
+    def reg_result_for_game(gid: int) -> Optional[str]:
+        evs = goal_by_game.get(gid, [])
+        gf, ga = _score_after_regulation(evs, sel_team_id)
+        if gf > ga:
+            return "W"
+        if gf < ga:
+            return "L"
+        return "D"
+
+    # ─────────────────────────────────────────
+    # A) Last 3 Minutes · 1–2 Goal Margin
+    # ─────────────────────────────────────────
+    def last_minutes_probs(state: str) -> Dict[str, Optional[float]]:
+        """
+        state:
+          LEAD1/LEAD2/TRAIL1/TRAIL2/TIED
+        return: {totals/home/away: prob}
+        prob = (#games where condition met AND (scored OR conceded))/ #games where condition met
+        """
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num_score = 0
+            num_concede = 0
+
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                # 체크포인트: P3 17:00 (last 3min 시작) 시점 스코어
+                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", threshold_minute))
+                diff0 = gf0 - ga0
+
+                ok = False
+                if state == "LEAD1" and diff0 == 1:
+                    ok = True
+                elif state == "LEAD2" and diff0 == 2:
+                    ok = True
+                elif state == "TRAIL1" and diff0 == -1:
+                    ok = True
+                elif state == "TRAIL2" and diff0 == -2:
+                    ok = True
+                elif state == "TIED" and diff0 == 0:
+                    ok = True
+
+                if not ok:
+                    continue
+
+                denom += 1
+
+                # last minutes window: P3 minute >= threshold_minute
+                scored = False
+                conceded = False
+                for ev in evs:
+                    if _norm_period(ev.get("period")) != "P3":
+                        continue
+                    mi = _safe_int(ev.get("minute"))
+                    if mi is None or mi < threshold_minute:
+                        continue
+                    tid = _safe_int(ev.get("team_id"))
+                    if tid is None:
+                        continue
+                    if tid == sel_team_id:
+                        scored = True
+                    else:
+                        conceded = True
+
+                if scored:
+                    num_score += 1
+                if conceded:
+                    num_concede += 1
+
+            # 이 함수는 “Score/Concede”를 나눠서 쓰려고,
+            # 여기선 임시로 dict에 담지 않고 호출부에서 분리 계산할 것.
+            # (아래에서 별도 함수로 쓴다)
+            out[b] = None
+        return out
+
+    def last_minutes_score_prob(state: str) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", threshold_minute))
+                diff0 = gf0 - ga0
+
+                ok = False
+                if state == "LEAD1" and diff0 == 1:
+                    ok = True
+                elif state == "LEAD2" and diff0 == 2:
+                    ok = True
+                elif state == "TRAIL1" and diff0 == -1:
+                    ok = True
+                elif state == "TRAIL2" and diff0 == -2:
+                    ok = True
+                elif state == "TIED" and diff0 == 0:
+                    ok = True
+                if not ok:
+                    continue
+
+                denom += 1
+                scored = False
+                for ev in evs:
+                    if _norm_period(ev.get("period")) != "P3":
+                        continue
+                    mi = _safe_int(ev.get("minute"))
+                    if mi is None or mi < threshold_minute:
+                        continue
+                    tid = _safe_int(ev.get("team_id"))
+                    if tid == sel_team_id:
+                        scored = True
+                        break
+                if scored:
+                    num += 1
+            out[b] = _safe_div(num, denom)
+        return out
+
+    def last_minutes_concede_prob(state: str) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", threshold_minute))
+                diff0 = gf0 - ga0
+
+                ok = False
+                if state == "LEAD1" and diff0 == 1:
+                    ok = True
+                elif state == "LEAD2" and diff0 == 2:
+                    ok = True
+                elif state == "TRAIL1" and diff0 == -1:
+                    ok = True
+                elif state == "TRAIL2" and diff0 == -2:
+                    ok = True
+                elif state == "TIED" and diff0 == 0:
+                    ok = True
+                if not ok:
+                    continue
+
+                denom += 1
+                conceded = False
+                for ev in evs:
+                    if _norm_period(ev.get("period")) != "P3":
+                        continue
+                    mi = _safe_int(ev.get("minute"))
+                    if mi is None or mi < threshold_minute:
+                        continue
+                    tid = _safe_int(ev.get("team_id"))
+                    if tid is None:
+                        continue
+                    if tid != sel_team_id:
+                        conceded = True
+                        break
+                if conceded:
+                    num += 1
+            out[b] = _safe_div(num, denom)
+        return out
+
+    sec_last = _build_section(
+        "Last 3 Minutes · 1–2 Goal Margin",
+        rows=[
+            {
+                "label": "Leading by 1 Goal – Score Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_score_prob("LEAD1")),
+            },
+            {
+                "label": "Leading by 1 Goal – Concede Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_concede_prob("LEAD1")),
+            },
+            {
+                "label": "Leading by 2 Goals – Score Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_score_prob("LEAD2")),
+            },
+            {
+                "label": "Leading by 2 Goals – Concede Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_concede_prob("LEAD2")),
+            },
+            {
+                "label": "Trailing by 1 Goal – Score Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_score_prob("TRAIL1")),
+            },
+            {
+                "label": "Trailing by 1 Goal – Concede Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_concede_prob("TRAIL1")),
+            },
+            {
+                "label": "Trailing by 2 Goals – Score Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_score_prob("TRAIL2")),
+            },
+            {
+                "label": "Trailing by 2 Goals – Concede Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_concede_prob("TRAIL2")),
+            },
+            {
+                "label": "Tied Game – Score Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_score_prob("TIED")),
+            },
+            {
+                "label": "Tied Game – Concede Probability (Last 3 Minutes)",
+                "values": _triple(last_minutes_concede_prob("TIED")),
+            },
+        ],
     )
-    home = _compute_subset_insights(
-        team_id=team_id,
-        game_ids=game_ids_home,
-        events_by_game=events_by_game,
-        last_minutes=last_minutes,
+
+    # ─────────────────────────────────────────
+    # B) 3rd Period Start Score Impact (Regular Time)
+    # ─────────────────────────────────────────
+    def p3_start_state_prob(state: str, outcome: str) -> Dict[str, Optional[float]]:
+        """
+        state: LEAD/TIED/TRAIL at start of P3 (after P2)
+        outcome: W/D/L at end of regulation
+        """
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                # P3 시작 = P1,P2까지만 반영
+                # checkpoint를 ("P3", 0) 로 보면 P1,P2는 다 포함되고 P3 minute<0 없음
+                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
+                diff0 = gf0 - ga0
+
+                ok = False
+                if state == "LEAD" and diff0 > 0:
+                    ok = True
+                elif state == "TIED" and diff0 == 0:
+                    ok = True
+                elif state == "TRAIL" and diff0 < 0:
+                    ok = True
+                if not ok:
+                    continue
+
+                denom += 1
+                res = reg_result_for_game(gid)
+                if res == outcome:
+                    num += 1
+            out[b] = _safe_div(num, denom)
+        return out
+
+    sec_p3 = _build_section(
+        "3rd Period Start Score Impact (Regular Time)",
+        rows=[
+            {"label": "Leading at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("LEAD", "W"))},
+            {"label": "Leading at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("LEAD", "D"))},
+            {"label": "Leading at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("LEAD", "L"))},
+            {"label": "Tied at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("TIED", "W"))},
+            {"label": "Tied at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("TIED", "D"))},
+            {"label": "Tied at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("TIED", "L"))},
+            {"label": "Trailing at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("TRAIL", "W"))},
+            {"label": "Trailing at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("TRAIL", "D"))},
+            {"label": "Trailing at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("TRAIL", "L"))},
+        ],
     )
-    away = _compute_subset_insights(
-        team_id=team_id,
-        game_ids=game_ids_away,
-        events_by_game=events_by_game,
-        last_minutes=last_minutes,
+
+    # ─────────────────────────────────────────
+    # C) First Goal Impact (Regular Time)
+    # ─────────────────────────────────────────
+    def first_goal_condition_prob(cond: str, outcome: str) -> Dict[str, Optional[float]]:
+        """
+        cond:
+          - P1_FIRST_FOR / P1_FIRST_AGAINST
+          - P2_00_FIRST_FOR / P2_00_FIRST_AGAINST (P1 0-0)
+          - P3_00_FIRST_FOR / P3_00_FIRST_AGAINST (P1+P2 0-0)
+        """
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                # 결과
+                res = reg_result_for_game(gid)
+                if res is None:
+                    continue
+
+                ok = False
+
+                if cond in ("P1_FIRST_FOR", "P1_FIRST_AGAINST"):
+                    fg = _first_goal_of_game(evs)
+                    if not fg:
+                        continue
+                    if _norm_period(fg.get("period")) != "P1":
+                        continue
+                    tid = _safe_int(fg.get("team_id"))
+                    if tid is None:
+                        continue
+                    if cond == "P1_FIRST_FOR" and tid == sel_team_id:
+                        ok = True
+                    if cond == "P1_FIRST_AGAINST" and tid != sel_team_id:
+                        ok = True
+
+                elif cond in ("P2_00_FIRST_FOR", "P2_00_FIRST_AGAINST"):
+                    # P1 0-0
+                    gf1 = 0
+                    ga1 = 0
+                    for ev in evs:
+                        if _norm_period(ev.get("period")) != "P1":
+                            continue
+                        tid = _safe_int(ev.get("team_id"))
+                        if tid is None:
+                            continue
+                        if tid == sel_team_id:
+                            gf1 += 1
+                        else:
+                            ga1 += 1
+                    if (gf1 + ga1) != 0:
+                        continue
+
+                    fg2 = _first_goal_after_checkpoint(evs, ("P2", "P3"))
+                    if not fg2:
+                        continue
+                    tid = _safe_int(fg2.get("team_id"))
+                    if tid is None:
+                        continue
+                    if cond == "P2_00_FIRST_FOR" and tid == sel_team_id:
+                        ok = True
+                    if cond == "P2_00_FIRST_AGAINST" and tid != sel_team_id:
+                        ok = True
+
+                elif cond in ("P3_00_FIRST_FOR", "P3_00_FIRST_AGAINST"):
+                    # P1+P2 0-0
+                    gf12, ga12 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
+                    if (gf12 + ga12) != 0:
+                        continue
+
+                    fg3 = _first_goal_after_checkpoint(evs, ("P3",))
+                    if not fg3:
+                        continue
+                    tid = _safe_int(fg3.get("team_id"))
+                    if tid is None:
+                        continue
+                    if cond == "P3_00_FIRST_FOR" and tid == sel_team_id:
+                        ok = True
+                    if cond == "P3_00_FIRST_AGAINST" and tid != sel_team_id:
+                        ok = True
+
+                if not ok:
+                    continue
+
+                denom += 1
+                if res == outcome:
+                    num += 1
+
+            out[b] = _safe_div(num, denom)
+        return out
+
+    sec_fg = _build_section(
+        "First Goal Impact (Regular Time)",
+        rows=[
+            {"label": "1P First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "W"))},
+            {"label": "1P First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "D"))},
+            {"label": "1P First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "L"))},
+
+            {"label": "1P Conceded First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "W"))},
+            {"label": "1P Conceded First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "D"))},
+            {"label": "1P Conceded First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "L"))},
+
+            {"label": "2P Start 0–0 → First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "W"))},
+            {"label": "2P Start 0–0 → First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "D"))},
+            {"label": "2P Start 0–0 → First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "L"))},
+
+            {"label": "2P Start 0–0 → First Goal Conceded → Win Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "W"))},
+            {"label": "2P Start 0–0 → First Goal Conceded → Draw Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "D"))},
+            {"label": "2P Start 0–0 → First Goal Conceded → Loss Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "L"))},
+
+            {"label": "3P Start 0–0 → First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "W"))},
+            {"label": "3P Start 0–0 → First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "D"))},
+            {"label": "3P Start 0–0 → First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "L"))},
+
+            {"label": "3P Start 0–0 → First Goal Conceded → Win Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "W"))},
+            {"label": "3P Start 0–0 → First Goal Conceded → Draw Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "D"))},
+            {"label": "3P Start 0–0 → First Goal Conceded → Loss Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "L"))},
+        ],
     )
+
+    # ─────────────────────────────────────────
+    # D) Goal Timing Distribution (2-Minute Intervals)
+    #    - 앱에서 게이지바 그릴 수 있게 “분포(합=1)”로 내려줌
+    # ─────────────────────────────────────────
+    def goal_timing_distribution(period: str) -> Dict[str, List[Optional[float]]]:
+        """
+        return {totals:[10], home:[10], away:[10]}
+        각 버킷은 해당 period에서 나온 '선택팀 득점'을 2분 구간으로 나눈 비율
+        """
+        out: Dict[str, List[Optional[float]]] = {}
+
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+
+            counts = [0] * 10  # 0-2,2-4,...,18-20
+            total_goals = 0
+
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                for ev in evs:
+                    if _norm_period(ev.get("period")) != period:
+                        continue
+                    tid = _safe_int(ev.get("team_id"))
+                    mi = _safe_int(ev.get("minute"))
+                    if tid != sel_team_id or mi is None:
+                        continue
+                    # minute 0~19 가정 (너가 확인한 raw_json minute="00")
+                    idx = mi // 2
+                    if 0 <= idx <= 9:
+                        counts[idx] += 1
+                        total_goals += 1
+
+            if total_goals <= 0:
+                out[b] = [None] * 10
+            else:
+                out[b] = [c / total_goals for c in counts]
+
+        return out
+
+    def _interval_label(i: int) -> str:
+        start = i * 2
+        end = start + 2
+        return f"{start:02d}–{end:02d}"
+
+    def _dist_rows(period: str, title_prefix: str) -> List[Dict[str, Any]]:
+        dist = goal_timing_distribution(period)
+        rows: List[Dict[str, Any]] = []
+        for i in range(10):
+            rows.append(
+                {
+                    "label": f"{title_prefix} { _interval_label(i) }",
+                    "values": {
+                        "totals": dist["totals"][i],
+                        "home": dist["home"][i],
+                        "away": dist["away"][i],
+                    },
+                }
+            )
+        return rows
+
+    sec_goal_time = _build_section(
+        "Goal Timing Distribution",
+        rows=(
+            _dist_rows("P1", "1st Period (2-min)") +
+            _dist_rows("P2", "2nd Period (2-min)") +
+            _dist_rows("P3", "3rd Period (2-min)")
+        ),
+    )
+
+    sections = [sec_last, sec_p3, sec_fg, sec_goal_time]
 
     return {
         "ok": True,
-        "team_id": team_id,
+        "game_id": game_id,
+        "team_id": sel_team_id,
         "last_n": last_n,
-        "last_minutes": last_minutes,
-        "totals": totals,
-        "home": home,
-        "away": away,
+        "sections": sections,
+        "meta": {
+            "source": "db",
+            "finished_statuses": list(FINISHED_STATUSES),
+            "last_minutes": last_minutes,
+            "threshold_minute": threshold_minute,
+            "generated_at": _iso_utc_now(),
+            "sample_sizes": {
+                "totals": len(totals_ids),
+                "home": len(home_ids),
+                "away": len(away_ids),
+            },
+        },
     }
