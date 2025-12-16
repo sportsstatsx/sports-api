@@ -54,7 +54,8 @@ def hockey_register_device():
     fcm_token = str(body.get("fcm_token", "")).strip()
     platform = str(body.get("platform", "")).strip() or None
     timezone = str(body.get("timezone", "")).strip() or None
-    locale = str(body.get("locale", "")).strip() or None
+    language = str(body.get("language", "")).strip() or None
+
 
     if not device_id:
         return jsonify({"ok": False, "error": "device_id is required"}), 400
@@ -64,17 +65,17 @@ def hockey_register_device():
     # upsert
     hockey_execute(
         """
-        INSERT INTO hockey_user_devices (device_id, fcm_token, platform, timezone, locale)
+        INSERT INTO hockey_user_devices (device_id, fcm_token, platform, timezone, language)
         VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (device_id)
         DO UPDATE SET
           fcm_token = EXCLUDED.fcm_token,
           platform = EXCLUDED.platform,
           timezone = EXCLUDED.timezone,
-          locale = EXCLUDED.locale,
+          language = EXCLUDED.language,
           updated_at = now()
         """,
-        (device_id, fcm_token, platform, timezone, locale),
+        (device_id, fcm_token, platform, timezone, language),
     )
 
     return jsonify({"ok": True, "device_id": device_id})
