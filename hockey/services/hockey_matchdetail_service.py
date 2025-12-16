@@ -47,6 +47,108 @@ def _is_meaningful_goal_event(e: Dict[str, Any]) -> bool:
     # comment/players/assists 중 하나라도 있으면 "진짜 goal"로 취급
     return bool(detail) or len(players_clean) > 0 or len(assists_clean) > 0
 
+def _goal_quality(e: Dict[str, Any]) -> int:
+    """
+    goal 이벤트 "신뢰도" 점수
+    - 디테일/선수/어시스트가 있을수록 점수↑
+    - 취소/오류로 남는 goal일수록 점수↓
+    """
+    detail = str(e.get("detail") or "").strip()
+    players = e.get("players") or []
+    assists = e.get("assists") or []
+
+    if not isinstance(players, list):
+        players = []
+    if not isinstance(assists, list):
+        assists = []
+
+    players_clean = [str(x).strip() for x in players if str(x).strip()]
+    assists_clean = [str(x).strip() for x in assists if str(x).strip()]
+
+    score = 0
+    if detail:
+        score += 2
+    if len(players_clean) > 0:
+        score += 2
+    if len(assists_clean) > 0:
+        score += 1
+    return score
+
+
+def _filter_goals_to_match_final(
+    *,
+    events: List[Dict[str, Any]],
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+    home_final: Optional[int],
+    away_final: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    취소골/정정골이 DB에 남는 케이스 방어:
+    - (이미 빈 goal은 위에서 걸러지고 있지만) goal 수가 공식 점수보다 많으면
+      '품질 낮은 goal'부터 제거해서 공식 점수에 맞춘다.
+    """
+    if home_team_id is None or away_team_id is None:
+        return events
+    if home_final is None or away_final is None:
+        return events
+
+    home_goals: List[Dict[str, Any]] = []
+    away_goals: List[Dict[str, Any]] = []
+
+    for e in events:
+        if not _is_goal_event(e.get("type")):
+            continue
+        if not _is_meaningful_goal_event(e):
+            continue
+        tid = (e.get("team") or {}).get("id")
+        if tid == home_team_id:
+            home_goals.append(e)
+        elif tid == away_team_id:
+            away_goals.append(e)
+
+    def keep_top(goals: List[Dict[str, Any]], final: int) -> set:
+        if final < 0:
+            final = 0
+        if len(goals) <= final:
+            return {g.get("id") for g in goals}
+
+        def sort_key(g: Dict[str, Any]):
+            q = _goal_quality(g)
+            period = str(g.get("period") or "")
+            minute = g.get("minute")
+            try:
+                minute_i = int(minute) if minute is not None else 9999
+            except Exception:
+                minute_i = 9999
+            order = g.get("order")
+            try:
+                order_i = int(order) if order is not None else 9999
+            except Exception:
+                order_i = 9999
+            return (-q, period, minute_i, order_i)
+
+        goals_sorted = sorted(goals, key=sort_key)
+        keep = goals_sorted[:final]
+        return {g.get("id") for g in keep}
+
+    home_keep_ids = keep_top(home_goals, int(home_final))
+    away_keep_ids = keep_top(away_goals, int(away_final))
+
+    # keep에 없는 goal은 제거
+    out: List[Dict[str, Any]] = []
+    for e in events:
+        if _is_goal_event(e.get("type")) and _is_meaningful_goal_event(e):
+            tid = (e.get("team") or {}).get("id")
+            if tid == home_team_id and e.get("id") not in home_keep_ids:
+                continue
+            if tid == away_team_id and e.get("id") not in away_keep_ids:
+                continue
+        out.append(e)
+
+    return out
+
+
 
 
 def _calc_period_scores(
@@ -382,6 +484,17 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
                 "assists": assists,
             }
         )
+
+        # ✅ 취소/정정으로 DB에 goal이 남는 케이스 방어:
+    # 공식 점수(score_json)에 맞춰 goal 이벤트 수를 제한
+    events = _filter_goals_to_match_final(
+        events=events,
+        home_team_id=game_obj["home"]["id"],
+        away_team_id=game_obj["away"]["id"],
+        home_final=home_score,
+        away_final=away_score,
+    )
+
 
 
     # -------------------------
