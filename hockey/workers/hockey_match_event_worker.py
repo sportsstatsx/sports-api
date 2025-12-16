@@ -204,9 +204,19 @@ DDL = [
 
 
 def ensure_tables() -> None:
+    # 1) base tables / indexes
     for stmt in DDL:
         execute(stmt)
-    log.info("ensure_tables: OK")
+
+    # 2) migrations: 기존 테이블이 이미 있어도 컬럼을 보강
+    # subscriptions 옵션 컬럼들 (라우터가 사용)
+    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;")
+    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_start BOOLEAN NOT NULL DEFAULT TRUE;")
+    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_end BOOLEAN NOT NULL DEFAULT TRUE;")
+    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
+
+    log.info("ensure_tables: OK (with migrations)")
+
 
 
 # ─────────────────────────────────────────
