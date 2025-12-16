@@ -213,6 +213,9 @@ def ensure_tables() -> None:
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;")
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_start BOOLEAN NOT NULL DEFAULT TRUE;")
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_end BOOLEAN NOT NULL DEFAULT TRUE;")
+    # ✅ 피리어드 전환 알림(1P 종료, 2P 시작, 2P 종료, 3P 시작)
+    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_periods BOOLEAN NOT NULL DEFAULT TRUE;")
+
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
 
     log.info("ensure_tables: OK (with migrations)")
@@ -336,6 +339,10 @@ class SubRow:
     device_id: str
     fcm_token: str
     game_id: int
+    notify_score: bool
+    notify_game_start: bool
+    notify_game_end: bool
+    notify_periods: bool
 
 
 def fetch_subscriptions_for_games(game_ids: List[int]) -> List[SubRow]:
@@ -346,7 +353,11 @@ def fetch_subscriptions_for_games(game_ids: List[int]) -> List[SubRow]:
         SELECT
             s.device_id,
             d.fcm_token,
-            s.game_id
+            s.game_id,
+            COALESCE(s.notify_score, TRUE) AS notify_score,
+            COALESCE(s.notify_game_start, TRUE) AS notify_game_start,
+            COALESCE(s.notify_game_end, TRUE) AS notify_game_end,
+            COALESCE(s.notify_periods, TRUE) AS notify_periods
         FROM hockey_game_notification_subscriptions s
         JOIN hockey_user_devices d
           ON d.device_id = s.device_id
@@ -363,6 +374,10 @@ def fetch_subscriptions_for_games(game_ids: List[int]) -> List[SubRow]:
                 device_id=str(r["device_id"]),
                 fcm_token=str(r["fcm_token"]),
                 game_id=int(r["game_id"]),
+                notify_score=bool(r["notify_score"]),
+                notify_game_start=bool(r["notify_game_start"]),
+                notify_game_end=bool(r["notify_game_end"]),
+                notify_periods=bool(r["notify_periods"]),
             )
         )
     return out
@@ -523,6 +538,50 @@ def format_event_body(game_row: Dict[str, Any], ev: Dict[str, Any], home: int, a
             core = f"{core} ({comment})"
         return f"{prefix} {core}".strip()
 
+def _arr_len(x: Any) -> int:
+    if x is None:
+        return 0
+    if isinstance(x, (list, tuple, set)):
+        return len(x)
+    return 0
+
+
+def is_empty_notification_event(ev: Dict[str, Any]) -> bool:
+    """
+    API-Sports/수집 과정에서 가끔 players/assists/comment가 전부 비어있는 '껍데기' 이벤트가 먼저 들어오고,
+    잠시 뒤 같은 시점의 정상 이벤트가 들어오는 케이스가 있음.
+    -> 이 껍데기는 알림에서 스킵 (단, last_event_id는 계속 전진)
+    """
+    etype = str(ev.get("type") or "").strip().lower()
+    if etype not in ("goal", "penalty"):
+        return False
+
+    comment = str(ev.get("comment") or "").strip()
+    players = ev.get("players")
+    assists = ev.get("assists")
+
+    # players/assists가 배열이 아니어도 방어적으로 처리
+    has_players = _arr_len(players) > 0
+    has_assists = _arr_len(assists) > 0
+
+    if (not comment) and (not has_players) and (not has_assists):
+        return True
+    return False
+
+
+def event_dedupe_key(ev: Dict[str, Any]) -> str:
+    """
+    같은 tick 안에서 중복 전송 방지용 키.
+    (DB id는 다를 수 있어서 period/minute/type/team_id/detail 조합으로 방어)
+    """
+    period = str(ev.get("period") or "").strip()
+    minute = str(ev.get("minute") or "").strip()
+    team_id = str(ev.get("team_id") or "").strip()
+    etype = str(ev.get("type") or "").strip().lower()
+    comment = str(ev.get("comment") or "").strip().lower()
+    return f"{etype}|{period}|{minute}|{team_id}|{comment}"
+
+
 
 def run_once() -> None:
     now_utc = datetime.now(timezone.utc)
@@ -562,7 +621,56 @@ def run_once() -> None:
         last_home = _to_int(st.get("last_home_score"), 0)
         last_away = _to_int(st.get("last_away_score"), 0)
 
-        # 이벤트 증분
+        # ─────────────────────────────
+        # (A) 상태 전환 알림: 경기 시작/피리어드 전환/경기 종료
+        # ─────────────────────────────
+        last_status_norm = str(last_status or "").strip().upper()
+        status_norm = str(status or "").strip().upper()
+
+        def _send_status_notif(ntype: str, body: str) -> None:
+            nonlocal sent
+            ok = send_push(
+                token=sub.fcm_token,
+                title=title,
+                body=body,
+                data={
+                    "sport": "hockey",
+                    "game_id": str(sub.game_id),
+                    "type": ntype,
+                    "status": status,
+                },
+            )
+            if ok:
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
+        # ✅ 경기 시작: (이전이 1P가 아니었고) 현재가 1P로 들어온 순간
+        if sub.notify_game_start and (status_norm == "1P") and (last_status_norm != "1P"):
+            _send_status_notif("game_start", "Game Started")
+
+        # ✅ 1P 종료: 1P -> BT
+        if sub.notify_periods and (last_status_norm == "1P") and (status_norm == "BT"):
+            _send_status_notif("period_end_1", "End of 1st Period")
+
+        # ✅ 2P 시작: BT -> 2P
+        if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "2P"):
+            _send_status_notif("period_start_2", "Start of 2nd Period")
+
+        # ✅ 2P 종료: 2P -> BT
+        if sub.notify_periods and (last_status_norm == "2P") and (status_norm == "BT"):
+            _send_status_notif("period_end_2", "End of 2nd Period")
+
+        # ✅ 3P 시작: BT -> 3P
+        if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "3P"):
+            _send_status_notif("period_start_3", "Start of 3rd Period")
+
+        # ✅ 경기 종료: Final status로 들어온 순간
+        if sub.notify_game_end and is_final_status(status) and (not is_final_status(str(last_status or ""))):
+            _send_status_notif("final", f"Final  |  {home}-{away}")
+
+        # ─────────────────────────────
+        # (B) 이벤트 알림: 빈 이벤트 스킵 + tick 내 디듀프 + 옵션 적용
+        # ─────────────────────────────
         new_events = fetch_new_events(sub.game_id, last_event_id)
 
         # 너무 많으면 스팸 방지: 최신 N개만
@@ -570,14 +678,32 @@ def run_once() -> None:
             new_events = new_events[-MAX_EVENTS_PER_GAME_PER_TICK :]
 
         max_seen_event_id = last_event_id
+        sent_keys: set[str] = set()
+
         for ev in new_events:
             ev_id = _to_int(ev.get("id"), 0)
             if ev_id > max_seen_event_id:
                 max_seen_event_id = ev_id
 
             etype = str(ev.get("type") or "").strip().lower()
+
             # 기본: goal/penalty만 알림
             if etype not in ("goal", "penalty"):
+                continue
+
+            # ✅ 빈(껍데기) 이벤트는 알림 스킵
+            if is_empty_notification_event(ev):
+                continue
+
+            # ✅ 같은 tick 내 중복 방지
+            k = event_dedupe_key(ev)
+            if k in sent_keys:
+                continue
+            sent_keys.add(k)
+
+            # ✅ 옵션: score 알림 off면 goal/penalty 자체를 막고 싶다면 여기서 컷
+            # (원하면 penalty는 허용/goal만 차단 등으로 세분화 가능)
+            if (not sub.notify_score) and (etype in ("goal", "penalty")):
                 continue
 
             body = format_event_body(g, ev, home, away)
@@ -596,23 +722,6 @@ def run_once() -> None:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        # 종료 알림(상태 전환 감지)
-        if is_final_status(status) and not is_final_status(str(last_status or "")):
-            body = f"Final  |  {home}-{away}"
-            ok = send_push(
-                token=sub.fcm_token,
-                title=title,
-                body=body,
-                data={
-                    "sport": "hockey",
-                    "game_id": str(sub.game_id),
-                    "type": "final",
-                    "status": status,
-                },
-            )
-            if ok:
-                sent += 1
-                time.sleep(SEND_SLEEP_SEC)
 
         # 점수 변화만으로도 알림 주고 싶다면(옵션) 아래를 활성화 가능
         # if (home, away) != (last_home, last_away) and not new_events:
