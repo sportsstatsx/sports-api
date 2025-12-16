@@ -94,14 +94,29 @@ def hockey_get_fixtures_by_utc_range(
         else:
             dt_iso = None
 
+                # ✅ 종료 정규화:
+        # API-Sports가 "AOT(After Over Time)" / "AP(After Penalties)"로 멈춰있어도
+        # 우리 앱 UX에서는 "종료"로 취급해야 함.
+        raw_status = (r.get("status") or "").strip().upper()
+        raw_status_long = (r.get("status_long") or "").strip()
+
+        norm_status = raw_status
+        norm_status_long = raw_status_long
+
+        if raw_status in ("AOT", "AP"):
+            norm_status = "FT"
+            # status_long은 굳이 바꿀 필요 없지만, 앱에서 "진행중"처럼 보이는 원인이면 Finished로 통일
+            if not norm_status_long or norm_status_long in ("After Over Time", "After Penalties"):
+                norm_status_long = "Finished"
+
         fixtures.append(
             {
                 "game_id": r["game_id"],
                 "league_id": r["league_id"],
                 "season": r["season"],
                 "date_utc": dt_iso,
-                "status": r["status"],
-                "status_long": r["status_long"],
+                "status": norm_status,
+                "status_long": norm_status_long,
                 "league": {
                     "id": r["league_id2"],
                     "name": r["league_name"],
@@ -122,5 +137,6 @@ def hockey_get_fixtures_by_utc_range(
                 },
             }
         )
+
 
     return fixtures
