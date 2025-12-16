@@ -15,6 +15,7 @@ def hockey_game_insights(game_id: int):
         team_id = request.args.get("team_id", type=int)
         last_n = request.args.get("last_n", type=int) or 10
         last_minutes = request.args.get("last_minutes", type=int) or 3
+        season = request.args.get("season", type=int)  # ✅ 추가
 
         return jsonify(
             hockey_get_game_insights(
@@ -22,8 +23,10 @@ def hockey_game_insights(game_id: int):
                 team_id=team_id,
                 last_n=last_n,
                 last_minutes=last_minutes,
+                season=season,  # ✅ 추가
             )
         )
+
 
     except ValueError as e:
         if str(e) == "GAME_NOT_FOUND":
