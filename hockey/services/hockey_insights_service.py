@@ -156,7 +156,7 @@ class _Bucket:
     home_flags: Dict[int, bool]
 
 
-def _load_recent_games(team_id: int, last_n: int) -> _Bucket:
+def _load_recent_games(team_id: int, last_n: int, league_id: Optional[int] = None) -> _Bucket:
     sql = """
         SELECT
             g.id AS game_id,
@@ -166,10 +166,20 @@ def _load_recent_games(team_id: int, last_n: int) -> _Bucket:
         WHERE
             g.status = ANY(%s)
             AND (g.home_team_id = %s OR g.away_team_id = %s)
+    """
+    params: List[Any] = [list(FINISHED_STATUSES), team_id, team_id]
+
+    if league_id is not None:
+        sql += " AND g.league_id = %s\n"
+        params.append(league_id)
+
+    sql += """
         ORDER BY g.game_date DESC NULLS LAST, g.id DESC
         LIMIT %s
     """
-    rows = hockey_fetch_all(sql, (list(FINISHED_STATUSES), team_id, team_id, last_n))
+    params.append(last_n)
+
+    rows = hockey_fetch_all(sql, tuple(params))
 
     games: List[int] = []
     home_flags: Dict[int, bool] = {}
@@ -181,6 +191,59 @@ def _load_recent_games(team_id: int, last_n: int) -> _Bucket:
         home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
 
     return _Bucket(games=games, home_flags=home_flags)
+
+def _load_available_seasons_for_league(league_id: int, limit: int = 2) -> List[int]:
+    sql = """
+        SELECT DISTINCT g.season
+        FROM hockey_games g
+        WHERE
+            g.league_id = %s
+            AND g.status = ANY(%s)
+            AND g.season IS NOT NULL
+        ORDER BY g.season DESC
+        LIMIT %s
+    """
+    rows = hockey_fetch_all(sql, (league_id, list(FINISHED_STATUSES), limit))
+    seasons: List[int] = []
+    for r in rows:
+        y = _safe_int(r.get("season"))
+        if y is not None:
+            seasons.append(y)
+    return seasons
+
+
+def _load_games_for_season(team_id: int, league_id: int, season: int) -> _Bucket:
+    sql = """
+        SELECT
+            g.id AS game_id,
+            g.home_team_id,
+            g.away_team_id
+        FROM hockey_games g
+        WHERE
+            g.status = ANY(%s)
+            AND g.league_id = %s
+            AND g.season = %s
+            AND (g.home_team_id = %s OR g.away_team_id = %s)
+        ORDER BY g.game_date DESC NULLS LAST, g.id DESC
+        LIMIT 5000
+    """
+    rows = hockey_fetch_all(
+        sql,
+        (list(FINISHED_STATUSES), league_id, season, team_id, team_id),
+    )
+
+    games: List[int] = []
+    home_flags: Dict[int, bool] = {}
+    for r in rows:
+        gid = _safe_int(r.get("game_id"))
+        if gid is None:
+            continue
+        games.append(gid)
+        home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
+
+    return _Bucket(games=games, home_flags=home_flags)
+
+
 
 
 def _load_goal_events(game_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
@@ -268,7 +331,9 @@ def hockey_get_game_insights(
     team_id: Optional[int] = None,
     last_n: int = 10,
     last_minutes: int = 3,
+    season: Optional[int] = None,  # ✅ 추가
 ) -> Dict[str, Any]:
+
     # 0) game 존재 확인 + 기본 team_id 결정
     g = hockey_fetch_one(
         """
@@ -301,8 +366,24 @@ def hockey_get_game_insights(
     # 너 확정 룰: 20분 기준 (P3 minute >= 17이면 last 3min)
     threshold_minute = 20 - last_minutes  # 기본 17
 
-    bucket = _load_recent_games(sel_team_id, last_n)
+    league_id = _safe_int(g.get("league_id"))
+    if league_id is None:
+        # league_id 없으면 기존 동작(최악의 경우라도 동작은 하게)
+        bucket = _load_recent_games(sel_team_id, last_n)
+        available_seasons: List[int] = []
+        mode = "last_n"
+    else:
+        available_seasons = _load_available_seasons_for_league(league_id, limit=2)
+
+        if season is not None:
+            mode = "season"
+            bucket = _load_games_for_season(sel_team_id, league_id, season)
+        else:
+            mode = "last_n"
+            bucket = _load_recent_games(sel_team_id, last_n, league_id=league_id)
+
     game_ids = bucket.games
+
 
     goal_by_game = _load_goal_events(game_ids)
     all_events_by_game = _load_all_events(game_ids)
@@ -1242,6 +1323,9 @@ def hockey_get_game_insights(
             "last_minutes": last_minutes,
             "threshold_minute": threshold_minute,
             "generated_at": _iso_utc_now(),
+            "mode": mode,  # ✅ "last_n" or "season"
+            "selected_season": season,  # ✅ 선택한 시즌(없으면 null)
+            "available_seasons": available_seasons,  # ✅ DB에서 최신 2개 자동
             "sample_sizes": {
                 "totals": len(totals_ids),
                 "home": len(home_ids),
