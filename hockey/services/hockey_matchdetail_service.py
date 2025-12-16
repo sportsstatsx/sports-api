@@ -28,6 +28,26 @@ def _is_goal_event(ev_type: Any) -> bool:
         return False
     return str(ev_type).strip().lower() == "goal"
 
+def _is_meaningful_goal_event(e: Dict[str, Any]) -> bool:
+    if not _is_goal_event(e.get("type")):
+        return False
+
+    detail = str(e.get("detail") or "").strip()
+    players = e.get("players") or []
+    assists = e.get("assists") or []
+
+    if not isinstance(players, list):
+        players = []
+    if not isinstance(assists, list):
+        assists = []
+
+    players_clean = [str(x).strip() for x in players if str(x).strip()]
+    assists_clean = [str(x).strip() for x in assists if str(x).strip()]
+
+    # comment/players/assists 중 하나라도 있으면 "진짜 goal"로 취급
+    return bool(detail) or len(players_clean) > 0 or len(assists_clean) > 0
+
+
 
 def _calc_period_scores(
     *,
@@ -78,7 +98,7 @@ def _calc_period_scores(
     so_home = so_away = 0
 
     for e in events:
-        if not _is_goal_event(e.get("type")):
+        if not _is_meaningful_goal_event(e):
             continue
 
         period = _norm_period(e.get("period"))
@@ -322,8 +342,27 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
     events: List[Dict[str, Any]] = []
 
     for r in ev_rows:
+        etype = str(r.get("type") or "").strip().lower()
+
         players = r.get("players") or []
         assists = r.get("assists") or []
+        detail = str(r.get("comment") or "").strip()
+
+        # ✅ "빈 goal" (comment/players/assists 모두 없음) 은 타임라인에서 제외
+        if etype == "goal":
+            if not isinstance(players, list):
+                players = []
+            if not isinstance(assists, list):
+                assists = []
+
+            players_clean = [str(x).strip() for x in players if str(x).strip()]
+            assists_clean = [str(x).strip() for x in assists if str(x).strip()]
+
+            if (not detail) and (len(players_clean) == 0) and (len(assists_clean) == 0):
+                continue
+
+            players = players_clean
+            assists = assists_clean
 
         events.append(
             {
@@ -343,6 +382,7 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
                 "assists": assists,
             }
         )
+
 
     # -------------------------
     # 3) PERIOD SCORES (A 방식)
