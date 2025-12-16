@@ -45,3 +45,19 @@ def hockey_fetch_one(sql: str, params: Optional[Sequence[Any]] = None) -> Option
         with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
             cur.execute(sql, params or ())
             return cur.fetchone()
+
+
+def hockey_execute(sql: str, params: Optional[Sequence[Any]] = None) -> None:
+    """
+    INSERT / UPDATE / DELETE
+    """
+    with _hockey_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+
+
+def hockey_close_pool() -> None:
+    try:
+        _hockey_pool.close()
+    except Exception:
+        pass
