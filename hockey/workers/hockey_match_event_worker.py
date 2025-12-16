@@ -97,14 +97,16 @@ LEAGUE_IDS = _parse_leagues(LEAGUES_RAW)
 # 하키 경기 상태(최종 종료로 간주)
 FINAL_STATUSES = {
     "FT",
-    "AOT",
+    "AOT",   # After Over Time (SO 없이 OT로 끝나는 케이스)
+    "AP",    # After Penalties (SO/승부치기 종료 케이스)
     "AET",
-    "PEN",  # 혹시
+    "PEN",   # 혹시
     "CANC",
     "PST",
     "ABD",
     "WO",
 }
+
 
 # 진행/라이브로 간주(명확히 들어오면 우선)
 LIVE_STATUSES_HINT = {
