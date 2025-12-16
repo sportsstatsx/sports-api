@@ -300,6 +300,27 @@ def is_liveish_status(status: Optional[str]) -> bool:
     # status_long 기반은 여기서 판단 안 함(없을 수도 있음)
     return False
 
+def normalize_status(status: Optional[str]) -> str:
+    """
+    API-Sports / DB 저장값이 리그/시점에 따라 "P3"처럼 들어오기도 해서
+    워커 내부 판단은 표준 키(1P/2P/3P/BT/OT/SO/FT...)로 통일한다.
+    """
+    s = (status or "").strip().upper()
+    if not s:
+        return ""
+
+    # API에서 P1/P2/P3 형태로 내려오는 케이스 대응
+    if s == "P1":
+        return "1P"
+    if s == "P2":
+        return "2P"
+    if s == "P3":
+        return "3P"
+
+    # 이미 표준이면 그대로
+    return s
+
+
 
 # ─────────────────────────────────────────
 # NOTIFICATION PAYLOAD
@@ -624,8 +645,8 @@ def run_once() -> None:
         # ─────────────────────────────
         # (A) 상태 전환 알림: 경기 시작/피리어드 전환/경기 종료
         # ─────────────────────────────
-        last_status_norm = str(last_status or "").strip().upper()
-        status_norm = str(status or "").strip().upper()
+        last_status_norm = normalize_status(last_status)
+        status_norm = normalize_status(status)
 
         def _send_status_notif(ntype: str, body: str) -> None:
             nonlocal sent
@@ -664,9 +685,27 @@ def run_once() -> None:
         if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "3P"):
             _send_status_notif("period_start_3", "Start of 3rd Period")
 
+        # ✅ OT 시작: 3P -> OT
+        if sub.notify_periods and (last_status_norm == "3P") and (status_norm == "OT"):
+            _send_status_notif("ot_start", "Start of OT")
+
+        # ✅ SO 시작: OT -> SO
+        if sub.notify_periods and (last_status_norm == "OT") and (status_norm == "SO"):
+            _send_status_notif("so_start", "Start of Shootout")
+
+        # ✅ OT 종료(연장 종료):
+        # - OT -> SO 로 넘어갈 때
+        # - 또는 OT -> Final 로 바로 끝날 때(리그/소스에 따라 SO 없이 끝날 수 있음)
+        if sub.notify_periods and (last_status_norm == "OT") and (status_norm in ("SO",)) :
+            _send_status_notif("ot_end", "End of OT")
+
+        if sub.notify_periods and (last_status_norm == "OT") and is_final_status(status_norm):
+            _send_status_notif("ot_end", "End of OT")
+
         # ✅ 경기 종료: Final status로 들어온 순간
-        if sub.notify_game_end and is_final_status(status) and (not is_final_status(str(last_status or ""))):
+        if sub.notify_game_end and is_final_status(status_norm) and (not is_final_status(last_status_norm)):
             _send_status_notif("final", f"Final  |  {home}-{away}")
+
 
         # ─────────────────────────────
         # (B) 이벤트 알림: 빈 이벤트 스킵 + tick 내 디듀프 + 옵션 적용
