@@ -687,14 +687,16 @@ def is_empty_notification_event(ev: Dict[str, Any]) -> bool:
 def event_dedupe_key(ev: Dict[str, Any]) -> str:
     """
     같은 tick 안에서 중복 전송 방지용 키.
-    (DB id는 다를 수 있어서 period/minute/type/team_id/detail 조합으로 방어)
+    - comment는 나중에 "PPG"처럼 업데이트되어 2번 들어올 수 있으니 키에서 제외
+    - 대신 event_order를 포함해서 "연속골(같은 분)"도 안전하게 구분
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
     team_id = str(ev.get("team_id") or "").strip()
     etype = str(ev.get("type") or "").strip().lower()
-    comment = str(ev.get("comment") or "").strip().lower()
-    return f"{etype}|{period}|{minute}|{team_id}|{comment}"
+    event_order = str(ev.get("event_order") or "").strip()
+    return f"{etype}|{period}|{minute}|{team_id}|{event_order}"
+
 
 
 
@@ -870,16 +872,31 @@ def run_once() -> None:
             tag = str(ev.get("comment") or "").strip()
 
             if etype == "goal":
+                # 알림용 스코어 보정:
+                # - goal 이벤트는 들어왔는데 hockey_games.score_json이 아직 업데이트 전이면
+                #   알림에서만 1점을 올려서 보여줌(타임라인과 일치)
+                notif_home, notif_away = home, away
+
+                if ev_team_id and home_team_id and ev_team_id == home_team_id:
+                    # 홈이 득점했는데 점수가 아직 그대로면 +1
+                    if notif_home <= last_home:
+                        notif_home = last_home + 1
+                elif ev_team_id and away_team_id and ev_team_id == away_team_id:
+                    # 원정이 득점했는데 점수가 아직 그대로면 +1
+                    if notif_away <= last_away:
+                        notif_away = last_away + 1
+
                 t, b = build_hockey_message(
                     "goal",
                     g,
-                    home,
-                    away,
+                    notif_home,
+                    notif_away,
                     period=period,
                     minute=minute,
                     team_name=team_name,
                     tag=tag,
                 )
+
 
             ok = send_push(
                 token=sub.fcm_token,
