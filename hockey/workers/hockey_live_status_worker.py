@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import time
 import json
+import zlib
 import logging
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple
@@ -141,8 +142,40 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
     return gid
 
 
+def _norm_text(x: Optional[str]) -> str:
+    return (x or "").strip().lower()
+
+
+def _stable_event_order(
+    period: str,
+    minute: Optional[int],
+    team_id: Optional[int],
+    etype: str,
+    comment: Optional[str],
+    players_arr: List[str],
+) -> int:
+    """
+    라이브 수집에서 '순서(idx)' 때문에 중복이 쌓이지 않도록,
+    이벤트의 의미 기반 fingerprint로 event_order를 생성한다.
+
+    - assists는 fingerprint에서 제외 (동일 골의 assists가 늦게 채워지는 케이스를 UPDATE로 흡수)
+    - 같은 분에 같은 타입 골이 2개라도 players/ comment가 다르면 다른 fingerprint → 둘 다 저장됨
+    """
+    sig = "|".join(
+        [
+            _norm_text(period),
+            str(minute if minute is not None else -1),
+            str(team_id if team_id is not None else -1),
+            _norm_text(etype),
+            _norm_text(comment),
+            ",".join([_norm_text(p) for p in (players_arr or [])]),
+        ]
+    )
+    return zlib.crc32(sig.encode("utf-8")) & 0x7FFFFFFF
+
+
 def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
-    for idx, ev in enumerate(ev_list):
+    for ev in ev_list:
         if not isinstance(ev, dict):
             continue
 
@@ -167,6 +200,8 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
         players_arr = [str(x).strip() for x in players if str(x).strip()]
         assists_arr = [str(x).strip() for x in assists if str(x).strip()]
 
+        event_order = _stable_event_order(period, minute, team_id, etype, comment, players_arr)
+
         hockey_execute(
             """
             INSERT INTO hockey_game_events (
@@ -177,9 +212,17 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
             ON CONFLICT (game_id, period, minute, team_id, type, event_order)
             DO UPDATE SET
-              comment = EXCLUDED.comment,
-              players = EXCLUDED.players,
-              assists = EXCLUDED.assists,
+              comment = COALESCE(EXCLUDED.comment, hockey_game_events.comment),
+              players = CASE
+                WHEN COALESCE(array_length(EXCLUDED.players, 1), 0) >= COALESCE(array_length(hockey_game_events.players, 1), 0)
+                THEN EXCLUDED.players
+                ELSE hockey_game_events.players
+              END,
+              assists = CASE
+                WHEN COALESCE(array_length(EXCLUDED.assists, 1), 0) >= COALESCE(array_length(hockey_game_events.assists, 1), 0)
+                THEN EXCLUDED.assists
+                ELSE hockey_game_events.assists
+              END,
               raw_json = EXCLUDED.raw_json
             """,
             (
@@ -191,10 +234,11 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
                 comment,
                 players_arr,
                 assists_arr,
-                idx,
+                event_order,
                 _jdump(ev),
             ),
         )
+
 
 
 def tick_once_for_date(league_id: int, season: int, target_date: dt.date) -> int:
