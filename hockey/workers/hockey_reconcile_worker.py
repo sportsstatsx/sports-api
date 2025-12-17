@@ -240,8 +240,12 @@ def upsert_game_from_api_item(item: Dict[str, Any]) -> Optional[int]:
     status = _safe_text(status_obj.get("short"))
     status_long = _safe_text(status_obj.get("long"))
 
+    # ✅ API-Sports: timer
+    live_timer = _safe_text(item.get("timer"))
+
     tz = _safe_text(item.get("timezone"))
     scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+
 
     # league_id/season은 NOT NULL이므로, DB에 있는 값으로 fallback
     if league_id is None or season is None:
