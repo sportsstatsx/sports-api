@@ -216,18 +216,82 @@ def ensure_tables() -> None:
 
     # 2) migrations: 기존 테이블이 이미 있어도 컬럼을 보강
     # subscriptions 옵션 컬럼들 (라우터가 사용)
-    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;")
-    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_start BOOLEAN NOT NULL DEFAULT TRUE;")
-    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_game_end BOOLEAN NOT NULL DEFAULT TRUE;")
+    execute(
+        "ALTER TABLE hockey_game_notification_subscriptions "
+        "ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;"
+    )
+    execute(
+        "ALTER TABLE hockey_game_notification_subscriptions "
+        "ADD COLUMN IF NOT EXISTS notify_game_start BOOLEAN NOT NULL DEFAULT TRUE;"
+    )
+    execute(
+        "ALTER TABLE hockey_game_notification_subscriptions "
+        "ADD COLUMN IF NOT EXISTS notify_game_end BOOLEAN NOT NULL DEFAULT TRUE;"
+    )
     # ✅ 피리어드 전환 알림(1P 종료, 2P 시작, 2P 종료, 3P 시작)
-    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_periods BOOLEAN NOT NULL DEFAULT TRUE;")
+    execute(
+        "ALTER TABLE hockey_game_notification_subscriptions "
+        "ADD COLUMN IF NOT EXISTS notify_periods BOOLEAN NOT NULL DEFAULT TRUE;"
+    )
+    execute(
+        "ALTER TABLE hockey_game_notification_subscriptions "
+        "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"
+    )
 
-    execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
-        # ✅ states: 리컨실 이후 중복알림 방지용 fingerprint 히스토리
-    execute("ALTER TABLE hockey_game_notification_states ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[];")
+    # ✅ states: 리컨실 이후 중복알림 방지용 fingerprint 히스토리
+    execute(
+        "ALTER TABLE hockey_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[];"
+    )
 
+    # 3) ✅ hockey_game_events: DB 레벨 “중복 insert 원천 차단”용 fingerprint 컬럼 + 유니크 인덱스
+    # - 핵심: event_order가 바뀌어도 같은 이벤트면 event_key가 동일 → (game_id, event_key)로 중복 차단
+    execute(
+        """
+        ALTER TABLE hockey_game_events
+        ADD COLUMN IF NOT EXISTS event_key TEXT
+        GENERATED ALWAYS AS (
+          lower(coalesce(type,'')) || '|' ||
+          coalesce(period,'') || '|' ||
+          coalesce(minute::text,'') || '|' ||
+          coalesce(team_id::text,'') || '|' ||
+          lower(coalesce(comment,'')) || '|' ||
+          lower(coalesce(array_to_string(players,','),'')) || '|' ||
+          lower(coalesce(array_to_string(assists,','),''))
+        ) STORED;
+        """
+    )
 
-    log.info("ensure_tables: OK (with migrations)")
+    # (선택이지만 강력추천) 최근 경기 범위에서 “완전 동일 이벤트” 중복이 이미 있다면 정리 후 인덱스 생성
+    execute(
+        """
+        WITH ranked AS (
+          SELECT
+            e.id,
+            row_number() OVER (
+              PARTITION BY e.game_id, e.event_key
+              ORDER BY e.id DESC
+            ) AS rn
+          FROM hockey_game_events e
+          JOIN hockey_games g ON g.id = e.game_id
+          WHERE g.game_date >= NOW() - interval '14 days'
+        )
+        DELETE FROM hockey_game_events e
+        USING ranked r
+        WHERE e.id = r.id
+          AND r.rn > 1;
+        """
+    )
+
+    execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
+        ON hockey_game_events (game_id, event_key);
+        """
+    )
+
+    log.info("ensure_tables: OK (with migrations + event dedupe key)")
+
 
 
 
