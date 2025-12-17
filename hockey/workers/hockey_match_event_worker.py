@@ -413,12 +413,12 @@ def build_hockey_message(
     time_prefix = " ".join([p for p in [period.strip(), mm] if p]).strip()
 
     if event_type == "goal":
-        # 예) 🥅 P2 07' Rangers PPG Goal!
+        # 예) 🏒 P2 07' Rangers PPG Goal!
         who = team_name.strip() or "Goal"
         tag_part = f" {tag.strip()}" if tag.strip() else ""
         if time_prefix:
-            return (f"🥅 {time_prefix} {who}{tag_part} Goal!", score_line)
-        return (f"🥅 {who}{tag_part} Goal!", score_line)
+            return (f"🏒 {time_prefix} {who}{tag_part} Goal!", score_line)
+        return (f"🏒 {who}{tag_part} Goal!", score_line)
 
     if event_type == "penalty":
         # 예) ⛔ P2 12' Rangers Penalty
