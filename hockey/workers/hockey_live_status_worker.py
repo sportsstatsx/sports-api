@@ -210,7 +210,7 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
               event_order, raw_json
             )
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-            ON CONFLICT (game_id, period, minute, team_id, type, event_order)
+            ON CONFLICT (game_id, event_key)
             DO UPDATE SET
               comment = COALESCE(EXCLUDED.comment, hockey_game_events.comment),
               players = CASE
