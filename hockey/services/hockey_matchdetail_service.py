@@ -7,13 +7,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
 
 
-def _safe_int(v: Any) -> Optional[int]:
+def _safe_text(v: Any) -> str:
+    if v is None:
+        return ""
     try:
-        if v is None:
-            return None
-        return int(v)
+        return str(v).strip()
     except Exception:
-        return None
+        return ""
+
 
 
 def _norm_period(p: Any) -> str:
