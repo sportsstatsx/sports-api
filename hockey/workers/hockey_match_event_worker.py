@@ -675,7 +675,7 @@ def is_empty_notification_event(ev: Dict[str, Any]) -> bool:
     -> 이 껍데기는 알림에서 스킵 (단, last_event_id는 계속 전진)
     """
     etype = str(ev.get("type") or "").strip().lower()
-    if etype not in ("goal", "penalty"):
+    if etype != "goal":
         return False
 
     comment = str(ev.get("comment") or "").strip()
@@ -839,7 +839,7 @@ def run_once() -> None:
             etype = str(ev.get("type") or "").strip().lower()
 
             # 기본: goal/penalty만 알림
-            if etype not in ("goal", "penalty"):
+            if etype != "goal":
                 continue
 
             # ✅ 빈(껍데기) 이벤트는 알림 스킵
@@ -887,17 +887,6 @@ def run_once() -> None:
                     minute=minute,
                     team_name=team_name,
                     tag=tag,
-                )
-            else:
-                # penalty
-                t, b = build_hockey_message(
-                    "penalty",
-                    g,
-                    home,
-                    away,
-                    period=period,
-                    minute=minute,
-                    team_name=team_name,
                 )
 
             ok = send_push(
