@@ -137,6 +137,43 @@ def hockey_subscribe_game():
         (device_id, game_id_int, notify_score, notify_game_start, notify_game_end),
     )
 
+        # ✅ 옵션 A: 구독(즐겨찾기) 시점 기준으로 "커서(last_event_id)"를 현재 끝으로 맞춰서
+    #    구독 이전 이벤트(이미 발생한 골/상태)를 밀린 알림처럼 보내지 않도록 한다.
+
+    # 현재까지 이벤트의 마지막 id (없으면 0)
+    last_ev = hockey_fetch_one(
+        "SELECT COALESCE(MAX(id), 0) AS max_id FROM hockey_game_events WHERE game_id=%s",
+        (game_id_int,),
+    )
+    max_event_id = int((last_ev or {}).get("max_id") or 0)
+
+    # 현재 게임 상태/스코어도 같이 스냅샷 (없어도 되지만 상태알림(game_start)까지 깔끔해짐)
+    cur = hockey_fetch_one(
+        "SELECT status, score_json FROM hockey_games WHERE id=%s",
+        (game_id_int,),
+    )
+    cur_status = (cur or {}).get("status", None)
+    score_json = (cur or {}).get("score_json", None)
+
+    # score_json은 포맷이 다양하니까, 여기서는 단순하게 0/0으로 두거나
+    # (원하면 워커의 parse_score 로직을 라우터로 옮겨서 동일 계산 가능)
+    # 일단 상태알림/이벤트 커서가 핵심이라 스코어는 0/0으로 둔다.
+    hockey_execute(
+        """
+        INSERT INTO hockey_game_notification_states
+          (device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (device_id, game_id) DO UPDATE SET
+          last_status = EXCLUDED.last_status,
+          last_home_score = EXCLUDED.last_home_score,
+          last_away_score = EXCLUDED.last_away_score,
+          last_event_id = EXCLUDED.last_event_id,
+          updated_at = now()
+        """,
+        (device_id, game_id_int, cur_status, 0, 0, max_event_id, []),
+    )
+
+
     return jsonify({"ok": True, "device_id": device_id, "game_id": game_id_int})
 
 
