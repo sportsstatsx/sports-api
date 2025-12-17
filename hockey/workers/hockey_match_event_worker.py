@@ -188,11 +188,15 @@ DDL = [
 
         last_event_id BIGINT NOT NULL DEFAULT 0,
 
+        -- ✅ 리컨실(DELETE/INSERT) 후에도 중복 알림을 막기 위한 "발송된 이벤트 fingerprint"
+        sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[],
+
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
         PRIMARY KEY (device_id, game_id)
     );
+
     """,
     """
     CREATE INDEX IF NOT EXISTS idx_hockey_subs_game_id
@@ -219,6 +223,9 @@ def ensure_tables() -> None:
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS notify_periods BOOLEAN NOT NULL DEFAULT TRUE;")
 
     execute("ALTER TABLE hockey_game_notification_subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
+        # ✅ states: 리컨실 이후 중복알림 방지용 fingerprint 히스토리
+    execute("ALTER TABLE hockey_game_notification_states ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[];")
+
 
     log.info("ensure_tables: OK (with migrations)")
 
@@ -531,23 +538,25 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
             last_status,
             last_home_score,
             last_away_score,
-            last_event_id
+            last_event_id,
+            sent_event_keys
         FROM hockey_game_notification_states
         WHERE device_id = %s AND game_id = %s
         """,
         (device_id, game_id),
     )
+
     if row:
         return row
     # 없으면 기본 state 생성(Upsert)
     execute(
         """
         INSERT INTO hockey_game_notification_states (
-            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id
-        ) VALUES (%s, %s, %s, %s, %s, %s)
+            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (device_id, game_id) DO NOTHING
         """,
-        (device_id, game_id, None, 0, 0, 0),
+        (device_id, game_id, None, 0, 0, 0, []),
     )
     return {
         "device_id": device_id,
@@ -556,7 +565,9 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
         "last_home_score": 0,
         "last_away_score": 0,
         "last_event_id": 0,
+        "sent_event_keys": [],
     }
+
 
 
 def save_state(
@@ -566,21 +577,25 @@ def save_state(
     last_home_score: int,
     last_away_score: int,
     last_event_id: int,
+    sent_event_keys: List[str],
 ) -> None:
+
     execute(
         """
         INSERT INTO hockey_game_notification_states (
-            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, now())
+            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, now())
         ON CONFLICT (device_id, game_id) DO UPDATE SET
             last_status = EXCLUDED.last_status,
             last_home_score = EXCLUDED.last_home_score,
             last_away_score = EXCLUDED.last_away_score,
             last_event_id = EXCLUDED.last_event_id,
+            sent_event_keys = EXCLUDED.sent_event_keys,
             updated_at = now()
         """,
-        (device_id, game_id, last_status, last_home_score, last_away_score, last_event_id),
+        (device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys),
     )
+
 
 
 def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
@@ -697,6 +712,26 @@ def event_dedupe_key(ev: Dict[str, Any]) -> str:
     event_order = str(ev.get("event_order") or "").strip()
     return f"{etype}|{period}|{minute}|{team_id}|{event_order}"
 
+def event_dedupe_key(ev: Dict[str, Any]) -> str:
+    """
+    같은 tick 안에서 중복 전송 방지용 키.
+    (DB id는 다를 수 있어서 period/minute/type/team_id/detail 조합으로 방어)
+    """
+    period = str(ev.get("period") or "").strip()
+    minute = str(ev.get("minute") or "").strip()
+    team_id = str(ev.get("team_id") or "").strip()
+    etype = str(ev.get("type") or "").strip().lower()
+    comment = str(ev.get("comment") or "").strip().lower()
+    return f"{etype}|{period}|{minute}|{team_id}|{comment}"
+
+    players = ev.get("players") or []
+    if not isinstance(players, list):
+        players = []
+    players_norm = ",".join([str(p).strip().lower() for p in players if str(p).strip()])
+
+    return f"{etype}|{period}|{minute}|{team_id}|{comment}|{players_norm}"
+
+
 
 
 
@@ -736,6 +771,12 @@ def run_once() -> None:
         last_status = st.get("last_status")
         last_home = _to_int(st.get("last_home_score"), 0)
         last_away = _to_int(st.get("last_away_score"), 0)
+
+        sent_hist = st.get("sent_event_keys") or []
+        if not isinstance(sent_hist, list):
+            sent_hist = []
+        sent_hist_set = set(str(x) for x in sent_hist if str(x))
+
 
         # ─────────────────────────────
         # (A) 상태 전환 알림: 경기 시작/피리어드 전환/경기 종료
@@ -846,6 +887,12 @@ def run_once() -> None:
                 continue
             sent_keys.add(k)
 
+            # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
+            pk = event_persist_key(ev)
+            if pk in sent_hist_set:
+                continue
+
+
             # ✅ 옵션: score 알림 off면 goal/penalty 자체를 막고 싶다면 여기서 컷
             # (원하면 penalty는 허용/goal만 차단 등으로 세분화 가능)
             if (not sub.notify_score) and (etype in ("goal", "penalty")):
@@ -924,6 +971,10 @@ def run_once() -> None:
         #         time.sleep(SEND_SLEEP_SEC)
 
         # state 저장
+        # 너무 커지는 것 방지: 최근 200개만 유지
+        if len(sent_hist) > 200:
+            sent_hist = sent_hist[-200:]
+
         save_state(
             device_id=sub.device_id,
             game_id=sub.game_id,
@@ -931,7 +982,9 @@ def run_once() -> None:
             last_home_score=home,
             last_away_score=away,
             last_event_id=max_seen_event_id,
+            sent_event_keys=sent_hist,
         )
+
 
     log.info("tick: sent=%d", sent)
 
