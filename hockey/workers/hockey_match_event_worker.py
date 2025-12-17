@@ -721,7 +721,8 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
             comment,
             players,
             assists,
-            event_order
+            event_order,
+            event_key
         FROM hockey_game_events
         WHERE game_id = %s
           AND id > %s
@@ -730,6 +731,7 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
         (game_id, last_event_id),
     )
     return rows
+
 
 
 def _arr_len(x: Any) -> int:
@@ -951,10 +953,12 @@ def run_once() -> None:
                 continue
 
             # ✅ 같은 tick 내 중복 방지
-            k = event_dedupe_key(ev)
+            # - event_order는 리컨실/정렬 변경 등으로 흔들릴 수 있어 stable 키로 통일
+            k = event_persist_key(ev)
             if k in sent_keys:
                 continue
             sent_keys.add(k)
+
 
             # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
             pk = event_persist_key(ev)
