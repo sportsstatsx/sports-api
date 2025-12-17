@@ -439,6 +439,19 @@ def load_candidate_game_ids() -> List[int]:
     )
     return [int(r["id"]) for r in rows if r.get("id") is not None]
 
+def reconcile_fetch_events_enabled() -> bool:
+    """
+    리컨실에서 events를 가져올지 여부.
+    기본은 OFF(0) → 호출량 최소화.
+    필요할 때만 env로 ON(1).
+
+    env:
+      HOCKEY_RECONCILE_FETCH_EVENTS=1  -> events fetch ON
+      (기본값 0)
+    """
+    return _int_env("HOCKEY_RECONCILE_FETCH_EVENTS", 0) == 1
+
+
 
 def should_refresh_events(status: str, game_date: Optional[dt.datetime]) -> bool:
     """
@@ -529,7 +542,9 @@ def main() -> None:
                 cur_status = (cur.get("status") if cur else None) or db_status
                 cur_date = cur.get("game_date") if cur else db_date
 
-                if should_refresh_events(cur_status, cur_date):
+                # events 리컨실은 기본 OFF (호출량 줄이기 목적)
+                # 필요할 때만 env HOCKEY_RECONCILE_FETCH_EVENTS=1 로 켜라.
+                if reconcile_fetch_events_enabled() and should_refresh_events(cur_status, cur_date):
                     try:
                         ev_list = _api_get_events(gid)
                         if ev_list:
@@ -537,6 +552,7 @@ def main() -> None:
                             updated_events += saved
                     except Exception as e:
                         log.warning("events reconcile failed: game_id=%s err=%s", gid, e)
+
 
             log.info(
                 "reconcile done: games_upserted=%s events_upserted=%s skipped=%s missing_api=%s",
