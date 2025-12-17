@@ -998,9 +998,7 @@ def run_once() -> None:
                 notif_home, notif_away = home, away
 
                 if ev_team_id and home_team_id and ev_team_id == home_team_id:
-                    # 홈이 득점했는데 점수가 아직 그대로면 +1
-                    if notif_home <= last_home:
-                        notif_home = last_home + 1
+
                 elif ev_team_id and away_team_id and ev_team_id == away_team_id:
                     # 원정이 득점했는데 점수가 아직 그대로면 +1
                     if notif_away <= last_away:
