@@ -633,33 +633,6 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
     return rows
 
 
-def format_event_body(game_row: Dict[str, Any], ev: Dict[str, Any], home: int, away: int) -> str:
-    etype = str(ev.get("type") or "").strip().lower()
-    period = str(ev.get("period") or "").strip()
-    minute = ev.get("minute")
-    mm = f"{minute}'" if minute is not None else ""
-    prefix = " ".join([p for p in [period, mm] if p]).strip()
-
-    # comment에 "PPG/SHG/ENG" 같은 정보가 있을 수 있음
-    comment = str(ev.get("comment") or "").strip()
-    if etype == "goal":
-        core = "GOAL"
-        if comment:
-            core = f"GOAL ({comment})"
-        score_part = f"{home}-{away}"
-        return f"{prefix} {core}  |  {score_part}".strip()
-    elif etype == "penalty":
-        core = "PENALTY"
-        if comment:
-            core = f"PENALTY ({comment})"
-        return f"{prefix} {core}".strip()
-    else:
-        # 기타 이벤트는 너무 스팸일 수 있어 기본은 짧게
-        core = etype.upper() if etype else "EVENT"
-        if comment:
-            core = f"{core} ({comment})"
-        return f"{prefix} {core}".strip()
-
 def _arr_len(x: Any) -> int:
     if x is None:
         return 0
