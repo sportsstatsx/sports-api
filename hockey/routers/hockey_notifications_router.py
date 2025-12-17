@@ -122,7 +122,8 @@ def hockey_subscribe_game():
     if not g:
         return jsonify({"ok": False, "error": "game_id not found in hockey_games"}), 404
 
-    hockey_execute(
+    # ✅ upsert + "이번 호출이 insert(처음 구독)인지" 여부를 반환
+    up = hockey_fetch_one(
         """
         INSERT INTO hockey_game_notification_subscriptions
           (device_id, game_id, notify_score, notify_game_start, notify_game_end)
@@ -133,9 +134,12 @@ def hockey_subscribe_game():
           notify_game_start = EXCLUDED.notify_game_start,
           notify_game_end = EXCLUDED.notify_game_end,
           updated_at = now()
+        RETURNING (xmax = 0) AS inserted
         """,
         (device_id, game_id_int, notify_score, notify_game_start, notify_game_end),
     )
+    inserted = bool((up or {}).get("inserted"))
+
 
         # ✅ 옵션 A: 구독(즐겨찾기) 시점 기준으로 "커서(last_event_id)"를 현재 끝으로 맞춰서
     #    구독 이전 이벤트(이미 발생한 골/상태)를 밀린 알림처럼 보내지 않도록 한다.
