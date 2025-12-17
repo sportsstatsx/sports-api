@@ -414,7 +414,9 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
         "group_name": g.get("group_name"),
         "date_utc": dt_iso,
         "status": g.get("status"),
-        "status_long": g.get("status_long"),
+        "status_long": status_long_out,
+        "clock": clock_text or None,
+        "timer": live_timer or None,
         "timezone": g.get("game_timezone") or "UTC",
         "home": {
             "id": g.get("home_id"),
