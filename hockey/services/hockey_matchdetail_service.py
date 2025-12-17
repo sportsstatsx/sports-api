@@ -350,6 +350,26 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
     if not g:
         raise ValueError("GAME_NOT_FOUND")
 
+    # ✅ LIVE일 때 status_long + timer 조합
+    status = _safe_text(g.get("status"))
+    status_long = _safe_text(g.get("status_long"))
+    live_timer = _safe_text(g.get("live_timer"))
+
+    clock_text = ""
+    if live_timer:
+        if ":" in live_timer:
+            clock_text = live_timer
+        else:
+            try:
+                clock_text = f"{int(live_timer):02d}:00"
+            except Exception:
+                clock_text = live_timer
+
+    status_long_out = status_long
+    if status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
+        status_long_out = f"{status_long} {clock_text}"
+
+
     score_json = g.get("score_json") or {}
 
     # score_json 구조가 다양한 경우를 대비해서 안전하게 추출
@@ -380,27 +400,6 @@ def hockey_get_game_detail(game_id: int) -> Dict[str, Any]:
             dt_iso = str(dt)
     else:
         dt_iso = None
-
-        # ✅ LIVE일 때 status_long에 timer 붙이기 (앱은 status_long을 timeText로 사용)
-    status = _safe_text(g.get("status"))
-    status_long = _safe_text(g.get("status_long"))
-    live_timer = _safe_text(g.get("live_timer"))
-
-    clock_text = ""
-    if live_timer:
-        # "18" -> "18:00", "18:34" -> 그대로
-        if ":" in live_timer:
-            clock_text = live_timer
-        else:
-            try:
-                clock_text = f"{int(live_timer):02d}:00"
-            except Exception:
-                clock_text = live_timer
-
-    status_long_out = status_long
-    if status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
-        status_long_out = f"{status_long} {clock_text}"
-
 
     game_obj: Dict[str, Any] = {
         "game_id": g["game_id"],
