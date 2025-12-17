@@ -114,26 +114,26 @@ def _utc_now() -> dt.datetime:
 
 def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     """
-    정석 구조:
-    - 시작 전(pre) ~ 종료 후(post) 윈도우에 들어오는 경기만 DB에서 뽑는다.
-    - 이 목록만 API 호출(/games?id, /games/events)한다.
+    정석 구조(개선):
+    - 시작 전(pre): now ~ now+pre_min
+    - 진행중(in-play): game_date가 now - inplay_max_min 이후이고, status가 '종료'가 아닌 경기
 
     env:
-      HOCKEY_LIVE_PRESTART_MIN (default 60)
-      HOCKEY_LIVE_POSTEND_MIN  (default 30)
-      HOCKEY_LIVE_BATCH_LIMIT  (default 120)
+      HOCKEY_LIVE_PRESTART_MIN     (default 60)
+      HOCKEY_LIVE_INPLAY_MAX_MIN   (default 240)  # 진행중으로 간주할 최대(시작 후) 분
+      HOCKEY_LIVE_BATCH_LIMIT      (default 120)
     """
     leagues = hockey_live_leagues()
     if not leagues:
         return []
 
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
-    post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
+    inplay_max_min = _int_env("HOCKEY_LIVE_INPLAY_MAX_MIN", 240)
     batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
 
     now = _utc_now()
-    start = now - dt.timedelta(minutes=post_min)
-    end = now + dt.timedelta(minutes=pre_min)
+    upcoming_end = now + dt.timedelta(minutes=pre_min)
+    inplay_start = now - dt.timedelta(minutes=inplay_max_min)
 
     rows = hockey_fetch_all(
         """
@@ -141,14 +141,25 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
           id, league_id, season, status, game_date
         FROM hockey_games
         WHERE league_id = ANY(%s)
-          AND game_date >= %s
-          AND game_date <= %s
+          AND (
+            -- (1) 시작 전(pre) 경기: now ~ now+pre
+            (game_date >= %s AND game_date <= %s)
+
+            OR
+
+            -- (2) 진행중(in-play) 경기: 시작시간이 최근 N분 이내 + 종료 아님
+            (game_date >= %s
+             AND COALESCE(status, '') NOT IN ('FT','AET','PEN','FIN','ENDED','END')
+             AND COALESCE(status, '') NOT IN ('NS','TBD')
+            )
+          )
         ORDER BY game_date ASC
         LIMIT %s
         """,
-        (leagues, start, end, batch_limit),
+        (leagues, now, upcoming_end, inplay_start, batch_limit),
     )
     return [dict(r) for r in rows]
+
 
 
 def _is_finished_status(s: str) -> bool:
