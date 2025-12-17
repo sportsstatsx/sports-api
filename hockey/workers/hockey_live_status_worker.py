@@ -226,6 +226,9 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
     status = _safe_text(status_obj.get("short"))
     status_long = _safe_text(status_obj.get("long"))
 
+    # ✅ API-Sports: timer (예: "18" 또는 "18:34")
+    live_timer = _safe_text(item.get("timer"))
+
     tz = _safe_text(item.get("timezone"))
     scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
 
@@ -235,10 +238,10 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
           id, league_id, season,
           stage, group_name,
           home_team_id, away_team_id,
-          game_date, status, status_long, timezone,
+          game_date, status, status_long, live_timer, timezone,
           score_json, raw_json
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
         ON CONFLICT (id) DO UPDATE SET
           league_id = EXCLUDED.league_id,
           season = EXCLUDED.season,
@@ -249,6 +252,7 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
           game_date = EXCLUDED.game_date,
           status = EXCLUDED.status,
           status_long = EXCLUDED.status_long,
+          live_timer = EXCLUDED.live_timer,
           timezone = EXCLUDED.timezone,
           score_json = EXCLUDED.score_json,
           raw_json = EXCLUDED.raw_json
@@ -264,11 +268,13 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
             game_date,
             status,
             status_long,
+            live_timer,
             tz,
             _jdump(scores),
             _jdump(item),
         ),
     )
+
 
     return gid
 
