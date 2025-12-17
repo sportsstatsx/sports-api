@@ -11,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from hockey.hockey_db import hockey_execute
-from hockey.workers.hockey_live_common import now_utc, hockey_live_leagues, interval_sec
+from hockey.hockey_db import hockey_execute, hockey_fetch_all, hockey_fetch_one
+from hockey.workers.hockey_live_common import now_utc, hockey_live_leagues
 
 log = logging.getLogger("hockey_live_status_worker")
 logging.basicConfig(level=logging.INFO)
@@ -87,6 +87,95 @@ def _safe_text(v: Any) -> Optional[str]:
 
 def _jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
+
+def _int_env(name: str, default: int) -> int:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _utc_now() -> dt.datetime:
+    return now_utc()
+
+
+def _load_live_window_game_rows() -> List[Dict[str, Any]]:
+    """
+    정석 구조:
+    - 시작 전(pre) ~ 종료 후(post) 윈도우에 들어오는 경기만 DB에서 뽑는다.
+    - 이 목록만 API 호출(/games?id, /games/events)한다.
+
+    env:
+      HOCKEY_LIVE_PRESTART_MIN (default 60)
+      HOCKEY_LIVE_POSTEND_MIN  (default 30)
+      HOCKEY_LIVE_BATCH_LIMIT  (default 120)
+    """
+    leagues = hockey_live_leagues()
+    if not leagues:
+        return []
+
+    pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
+    post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
+    batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
+
+    now = _utc_now()
+    start = now - dt.timedelta(minutes=post_min)
+    end = now + dt.timedelta(minutes=pre_min)
+
+    rows = hockey_fetch_all(
+        """
+        SELECT
+          id, league_id, season, status, game_date
+        FROM hockey_games
+        WHERE league_id = ANY(%s)
+          AND game_date >= %s
+          AND game_date <= %s
+        ORDER BY game_date ASC
+        LIMIT %s
+        """,
+        (leagues, start, end, batch_limit),
+    )
+    return [dict(r) for r in rows]
+
+
+def _is_finished_status(s: str) -> bool:
+    x = (s or "").upper().strip()
+    return x in {"FT", "AET", "PEN", "FIN", "ENDED", "END"}
+
+
+def _is_not_started_status(s: str) -> bool:
+    x = (s or "").upper().strip()
+    return x in {"NS", "TBD"}
+
+
+def _should_poll_events(db_status: str, game_date: Optional[dt.datetime]) -> bool:
+    """
+    events 폴링 조건:
+    - 윈도우 목록에 들어온 경기들만 여기까지 오고,
+    - status가 완전 종료면 스킵(단, 종료 직후 정정이 필요하면 윈도우 안이므로 /games?id 업데이트는 해도 됨)
+    """
+    if _is_finished_status(db_status):
+        return False
+    if _is_not_started_status(db_status):
+        # 시작 전이라도 윈도우 안이면 line-up/상태변경 가능성은 있지만,
+        # events는 보통 시작 후 의미가 크므로 기본은 스킵.
+        # 필요하면 여기 True로 바꾸면 됨.
+        return False
+    return True
+
 
 
 def _extract_team_ids(item: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
@@ -272,32 +361,69 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
 
 
 
-def tick_once_for_date(league_id: int, season: int, target_date: dt.date) -> int:
-    payload = _get("/games", {"league": league_id, "season": season, "date": target_date.isoformat()})
+def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
+    payload = _get("/games", {"id": game_id})
     resp = payload.get("response") if isinstance(payload, dict) else None
-    if not isinstance(resp, list) or not resp:
-        return 0
+    if isinstance(resp, list) and resp and isinstance(resp[0], dict):
+        return resp[0]
+    return None
 
-    updated = 0
-    for item in resp:
-        if not isinstance(item, dict):
-            continue
-        gid = upsert_game(item, league_id, season)
-        if not gid:
-            continue
-        updated += 1
 
-        # events 갱신
+def tick_once_windowed() -> Tuple[int, int, int]:
+    """
+    정석 구조 tick:
+    - DB에서 윈도우 내 경기만 로드
+    - 각 경기:
+        1) /games?id 로 최신 상태 스냅샷 반영(upsert)
+        2) (진행중일 때만) /games/events 호출 + upsert
+    returns: (games_upserted, events_upserted, candidates)
+    """
+    rows = _load_live_window_game_rows()
+    if not rows:
+        return (0, 0, 0)
+
+    games_upserted = 0
+    events_upserted = 0
+
+    for r in rows:
+        gid = int(r["id"])
+        league_id = int(r.get("league_id") or 0)
+        season = int(r.get("season") or 0)
+        db_status = (r.get("status") or "").strip()
+        db_date = r.get("game_date")
+
+        # 1) 게임 스냅샷 갱신
         try:
-            ev_payload = _get("/games/events", {"game": gid})
-            ev_resp = ev_payload.get("response") if isinstance(ev_payload, dict) else None
-            if isinstance(ev_resp, list):
-                ev_list = [x for x in ev_resp if isinstance(x, dict)]
-                upsert_events(gid, ev_list)
-        except Exception as e:
-            log.warning("events fetch failed: game=%s err=%s", gid, e)
+            api_item = _api_get_game_by_id(gid)
+            if isinstance(api_item, dict):
+                new_id = upsert_game(api_item, league_id, season)
+                if new_id:
+                    games_upserted += 1
 
-    return updated
+                    # upsert 이후 최신 status를 다시 읽어 events 판단
+                    cur = hockey_fetch_one("SELECT status, game_date FROM hockey_games WHERE id=%s", (gid,))
+                    if cur:
+                        db_status = (cur.get("status") or db_status).strip()
+                        db_date = cur.get("game_date") or db_date
+        except Exception as e:
+            log.warning("api games(id) fetch failed: game=%s err=%s", gid, e)
+            continue
+
+        # 2) events는 "진행중일 때만" 폴링
+        if _should_poll_events(db_status, db_date):
+            try:
+                ev_payload = _get("/games/events", {"game": gid})
+                ev_resp = ev_payload.get("response") if isinstance(ev_payload, dict) else None
+                if isinstance(ev_resp, list):
+                    ev_list = [x for x in ev_resp if isinstance(x, dict)]
+                    if ev_list:
+                        upsert_events(gid, ev_list)
+                        events_upserted += len(ev_list)
+            except Exception as e:
+                log.warning("events fetch failed: game=%s err=%s", gid, e)
+
+    return (games_upserted, events_upserted, len(rows))
+
 
 
 def main() -> None:
@@ -308,37 +434,36 @@ def main() -> None:
     ensure_event_key_migration()
     log.info("ensure_event_key_migration: OK")
 
-    season_env = (os.getenv("HOCKEY_SEASON") or "").strip()
-    if season_env:
-        try:
-            season = int(season_env)
-        except Exception:
-            raise RuntimeError("HOCKEY_SEASON must be int")
-    else:
-        # 비워두면 현재 연도 기준 (너가 시즌을 2025로 쓴다면 env로 지정 추천)
-        season = now_utc().year
+    # 정석 구조에서는 season을 굳이 고정할 필요가 없다.
+    # DB에서 window로 뽑힌 경기 row에 season이 이미 들어있기 때문.
+    # (HOCKEY_SEASON 환경변수도 더 이상 강제하지 않음)
 
-    sleep_sec = interval_sec(25.0)
-    log.info("🏒 hockey live worker start: leagues=%s season=%s interval=%.1fs", leagues, season, sleep_sec)
+    active_interval = _float_env("HOCKEY_LIVE_ACTIVE_INTERVAL_SEC", 15.0)  # 대상 경기 있을 때
+    idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0)     # 대상 경기 없을 때(3분)
+
+    pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
+    post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
+
+    log.info(
+        "🏒 hockey live worker(start windowed): leagues=%s pre=%sm post=%sm active=%.1fs idle=%.1fs",
+        leagues, pre_min, post_min, active_interval, idle_interval
+    )
 
     while True:
+        sleep_sec = idle_interval
         try:
-            now = now_utc()
-            dates = [
-                (now - dt.timedelta(days=1)).date(),
-                now.date(),
-                (now + dt.timedelta(days=1)).date(),
-            ]
-            total = 0
-            for lid in leagues:
-                for d in dates:
-                    total += tick_once_for_date(lid, season, d)
-
-            log.info("tick done. games_upserted=%s dates=%s", total, [x.isoformat() for x in dates])
+            games_upserted, events_upserted, candidates = tick_once_windowed()
+            log.info(
+                "tick done(windowed): candidates=%s games_upserted=%s events_upserted=%s",
+                candidates, games_upserted, events_upserted
+            )
+            sleep_sec = active_interval if candidates > 0 else idle_interval
         except Exception as e:
             log.exception("tick failed: %s", e)
+            sleep_sec = idle_interval
 
         time.sleep(sleep_sec)
+
 
 
 if __name__ == "__main__":
