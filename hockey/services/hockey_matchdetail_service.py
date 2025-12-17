@@ -16,6 +16,16 @@ def _safe_text(v: Any) -> str:
         return ""
 
 
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except Exception:
+        return None
+""
+
+
 
 def _norm_period(p: Any) -> str:
     if p is None:
