@@ -327,14 +327,109 @@ def normalize_status(status: Optional[str]) -> str:
 # ─────────────────────────────────────────
 # NOTIFICATION PAYLOAD
 # ─────────────────────────────────────────
-def build_title(game_row: Dict[str, Any]) -> str:
-    # 팀명이 없을 수 있으니 안전하게 구성
-    hid = game_row.get("home_team_id")
-    aid = game_row.get("away_team_id")
-    # teams 테이블 join으로 이미 이름을 가져오는 쿼리를 사용함
-    home_name = str(game_row.get("home_name") or f"Home({hid})")
-    away_name = str(game_row.get("away_name") or f"Away({aid})")
+def build_matchup(game_row: Dict[str, Any]) -> str:
+    home_name = str(game_row.get("home_name") or "Home")
+    away_name = str(game_row.get("away_name") or "Away")
     return f"{home_name} vs {away_name}"
+
+
+def build_score_line(game_row: Dict[str, Any], home: int, away: int) -> str:
+    """
+    축구 워커와 동일하게 en dash(–) 사용:
+    예) Rangers 2–1 Devils
+    """
+    home_name = str(game_row.get("home_name") or "Home")
+    away_name = str(game_row.get("away_name") or "Away")
+    return f"{home_name} {home}–{away} {away_name}"
+
+
+def _period_label_from_status(status_norm: str) -> str:
+    # status 기반 period 표시(상태 알림용)
+    if status_norm == "1P":
+        return "1st Period"
+    if status_norm == "2P":
+        return "2nd Period"
+    if status_norm == "3P":
+        return "3rd Period"
+    if status_norm == "OT":
+        return "Overtime"
+    if status_norm == "SO":
+        return "Shootout"
+    return ""
+
+
+def build_hockey_message(
+    event_type: str,
+    game_row: Dict[str, Any],
+    home: int,
+    away: int,
+    *,
+    status_norm: str = "",
+    period: str = "",
+    minute: Any = None,
+    team_name: str = "",
+    tag: str = "",
+) -> Tuple[str, str]:
+    """
+    축구 match_event_worker.py 스타일:
+    - title: 이벤트 중심 + 이모지
+    - body: score_line 또는 matchup
+    """
+    matchup = build_matchup(game_row)
+    score_line = build_score_line(game_row, home, away)
+
+    # 상태(피리어드/경기) 알림
+    if event_type == "game_start":
+        return ("▶ Game Started", matchup)
+
+    if event_type == "period_start":
+        label = _period_label_from_status(status_norm) or "Period"
+        return (f"▶ {label} Start", score_line)
+
+    if event_type == "period_end":
+        label = _period_label_from_status(status_norm) or "Period"
+        return (f"⏸ {label} End", score_line)
+
+    if event_type == "ot_start":
+        return ("▶ Overtime", score_line)
+
+    if event_type == "so_start":
+        return ("🥅 Shootout", score_line)
+
+    if event_type == "ot_end":
+        return ("⏱ End of OT", score_line)
+
+    if event_type == "final":
+        return ("⏱ Final", score_line)
+
+    # 이벤트(Goal / Penalty)
+    # 시간 prefix: "P2 07'"
+    mm = ""
+    try:
+        if minute is not None and str(minute).strip() != "":
+            mm = f"{int(minute)}'"
+    except Exception:
+        mm = ""
+    time_prefix = " ".join([p for p in [period.strip(), mm] if p]).strip()
+
+    if event_type == "goal":
+        # 예) 🥅 P2 07' Rangers PPG Goal!
+        who = team_name.strip() or "Goal"
+        tag_part = f" {tag.strip()}" if tag.strip() else ""
+        if time_prefix:
+            return (f"🥅 {time_prefix} {who}{tag_part} Goal!", score_line)
+        return (f"🥅 {who}{tag_part} Goal!", score_line)
+
+    if event_type == "penalty":
+        # 예) ⛔ P2 12' Rangers Penalty
+        who = team_name.strip()
+        who_part = f"{who} " if who else ""
+        if time_prefix:
+            return (f"⛔ {time_prefix} {who_part}Penalty", score_line)
+        return (f"⛔ {who_part}Penalty", score_line)
+
+    # fallback
+    return ("Match update", score_line)
 
 
 def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
@@ -352,6 +447,7 @@ def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] 
     except Exception as e:
         log.warning("FCM send failed: %s", e)
         return False
+
 
 
 # ─────────────────────────────────────────
@@ -492,11 +588,14 @@ def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
             g.status,
             g.status_long,
             g.score_json,
+            g.home_team_id,
+            g.away_team_id,
             ht.name AS home_name,
             at.name AS away_name
         FROM hockey_games g
         LEFT JOIN hockey_teams ht ON ht.id = g.home_team_id
         LEFT JOIN hockey_teams at ON at.id = g.away_team_id
+
         WHERE g.game_date IS NOT NULL
           AND g.game_date >= %s
           AND g.game_date <= %s
@@ -650,7 +749,7 @@ def run_once() -> None:
         last_status_norm = normalize_status(last_status)
         status_norm = normalize_status(status)
 
-        def _send_status_notif(ntype: str, body: str) -> None:
+        def _send_status_notif(ntype: str, title: str, body: str) -> None:
             nonlocal sent
             ok = send_push(
                 token=sub.fcm_token,
@@ -667,46 +766,57 @@ def run_once() -> None:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
+
         # ✅ 경기 시작: (이전이 1P가 아니었고) 현재가 1P로 들어온 순간
+        # ✅ Game start
         if sub.notify_game_start and (status_norm == "1P") and (last_status_norm != "1P"):
-            _send_status_notif("game_start", "Game Started")
+            t, b = build_hockey_message("game_start", g, home, away)
+            _send_status_notif("game_start", t, b)
 
-        # ✅ 1P 종료: 1P -> BT
+        # ✅ 1P end (1P -> BT)
         if sub.notify_periods and (last_status_norm == "1P") and (status_norm == "BT"):
-            _send_status_notif("period_end_1", "End of 1st Period")
+            t, b = build_hockey_message("period_end", g, home, away, status_norm="1P")
+            _send_status_notif("period_end_1", t, b)
 
-        # ✅ 2P 시작: BT -> 2P
+        # ✅ 2P start (BT -> 2P)
         if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "2P"):
-            _send_status_notif("period_start_2", "Start of 2nd Period")
+            t, b = build_hockey_message("period_start", g, home, away, status_norm="2P")
+            _send_status_notif("period_start_2", t, b)
 
-        # ✅ 2P 종료: 2P -> BT
+        # ✅ 2P end (2P -> BT)
         if sub.notify_periods and (last_status_norm == "2P") and (status_norm == "BT"):
-            _send_status_notif("period_end_2", "End of 2nd Period")
+            t, b = build_hockey_message("period_end", g, home, away, status_norm="2P")
+            _send_status_notif("period_end_2", t, b)
 
-        # ✅ 3P 시작: BT -> 3P
+        # ✅ 3P start (BT -> 3P)
         if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "3P"):
-            _send_status_notif("period_start_3", "Start of 3rd Period")
+            t, b = build_hockey_message("period_start", g, home, away, status_norm="3P")
+            _send_status_notif("period_start_3", t, b)
 
-        # ✅ OT 시작: 3P -> OT
+        # ✅ OT start (3P -> OT)
         if sub.notify_periods and (last_status_norm == "3P") and (status_norm == "OT"):
-            _send_status_notif("ot_start", "Start of OT")
+            t, b = build_hockey_message("ot_start", g, home, away)
+            _send_status_notif("ot_start", t, b)
 
-        # ✅ SO 시작: OT -> SO
+        # ✅ SO start (OT -> SO)
         if sub.notify_periods and (last_status_norm == "OT") and (status_norm == "SO"):
-            _send_status_notif("so_start", "Start of Shootout")
+            t, b = build_hockey_message("so_start", g, home, away)
+            _send_status_notif("so_start", t, b)
 
-        # ✅ OT 종료(연장 종료):
-        # - OT -> SO 로 넘어갈 때
-        # - 또는 OT -> Final 로 바로 끝날 때(리그/소스에 따라 SO 없이 끝날 수 있음)
-        if sub.notify_periods and (last_status_norm == "OT") and (status_norm in ("SO",)) :
-            _send_status_notif("ot_end", "End of OT")
+        # ✅ OT end
+        if sub.notify_periods and (last_status_norm == "OT") and (status_norm in ("SO",)):
+            t, b = build_hockey_message("ot_end", g, home, away)
+            _send_status_notif("ot_end", t, b)
 
         if sub.notify_periods and (last_status_norm == "OT") and is_final_status(status_norm):
-            _send_status_notif("ot_end", "End of OT")
+            t, b = build_hockey_message("ot_end", g, home, away)
+            _send_status_notif("ot_end", t, b)
 
-        # ✅ 경기 종료: Final status로 들어온 순간
+        # ✅ Final
         if sub.notify_game_end and is_final_status(status_norm) and (not is_final_status(last_status_norm)):
-            _send_status_notif("final", f"Final  |  {home}-{away}")
+            t, b = build_hockey_message("final", g, home, away)
+            _send_status_notif("final", t, b)
+
 
 
         # ─────────────────────────────
@@ -747,11 +857,53 @@ def run_once() -> None:
             if (not sub.notify_score) and (etype in ("goal", "penalty")):
                 continue
 
-            body = format_event_body(g, ev, home, away)
+            # 득점/패널티 팀명 판별(가능하면)
+            ev_team_id = _to_int(ev.get("team_id"), 0)
+            home_team_id = _to_int(g.get("home_team_id"), 0)
+            away_team_id = _to_int(g.get("away_team_id"), 0)
+
+            home_name = str(g.get("home_name") or "Home")
+            away_name = str(g.get("away_name") or "Away")
+
+            team_name = ""
+            if ev_team_id and home_team_id and ev_team_id == home_team_id:
+                team_name = home_name
+            elif ev_team_id and away_team_id and ev_team_id == away_team_id:
+                team_name = away_name
+
+            period = str(ev.get("period") or "").strip()
+            minute = ev.get("minute")
+
+            # comment에 PPG/SHG/ENG 등이 들어오는 경우 타이틀에 살짝 붙임
+            tag = str(ev.get("comment") or "").strip()
+
+            if etype == "goal":
+                t, b = build_hockey_message(
+                    "goal",
+                    g,
+                    home,
+                    away,
+                    period=period,
+                    minute=minute,
+                    team_name=team_name,
+                    tag=tag,
+                )
+            else:
+                # penalty
+                t, b = build_hockey_message(
+                    "penalty",
+                    g,
+                    home,
+                    away,
+                    period=period,
+                    minute=minute,
+                    team_name=team_name,
+                )
+
             ok = send_push(
                 token=sub.fcm_token,
-                title=title,
-                body=body,
+                title=t,
+                body=b,
                 data={
                     "sport": "hockey",
                     "game_id": str(sub.game_id),
@@ -762,6 +914,7 @@ def run_once() -> None:
             if ok:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
+
 
 
         # 점수 변화만으로도 알림 주고 싶다면(옵션) 아래를 활성화 가능
