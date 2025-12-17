@@ -231,8 +231,18 @@ def upsert_game_from_api_item(item: Dict[str, Any]) -> Optional[int]:
 
 
 def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> int:
-    saved = 0
-    for idx, ev in enumerate(ev_list):
+    """
+    Reconcile 목적:
+    - 최신 API 스냅샷 기준으로 이벤트를 "교체(replace)"해야 정정/취소가 반영된다.
+    - 기존 방식(UPSERT only)은 API에서 이벤트 정렬/내용이 바뀌면 과거 row가 남아서
+      타임라인/period score가 꼬일 수 있다.
+    """
+    if not ev_list:
+        return 0
+
+    # 1) 정규화된 이벤트 레코드 만들기
+    norm_rows: List[Tuple[str, Optional[int], Optional[int], str, Optional[str], List[str], List[str], Dict[str, Any]]] = []
+    for ev in ev_list:
         if not isinstance(ev, dict):
             continue
 
@@ -257,36 +267,61 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> int:
         players_arr = [str(x).strip() for x in players if str(x).strip()]
         assists_arr = [str(x).strip() for x in assists if str(x).strip()]
 
-        hockey_execute(
-            """
-            INSERT INTO hockey_game_events (
-              game_id, period, minute, team_id,
-              type, comment, players, assists,
-              event_order, raw_json
-            )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
-            ON CONFLICT (game_id, period, minute, team_id, type, event_order)
-            DO UPDATE SET
-              comment = EXCLUDED.comment,
-              players = EXCLUDED.players,
-              assists = EXCLUDED.assists,
-              raw_json = EXCLUDED.raw_json
-            """,
-            (
-                game_id,
-                period,
-                minute,
-                team_id,
-                etype,
-                comment,
-                players_arr,
-                assists_arr,
-                idx,
-                _jdump(ev),
+        norm_rows.append((period, minute, team_id, etype, comment, players_arr, assists_arr, ev))
+
+    if not norm_rows:
+        return 0
+
+    # 2) event_order를 "안정적으로" 재부여
+    #    - 같은 (period, minute, team_id, type) 안에서
+    #      (comment, players, assists, raw_json 문자열)로 정렬 → 0..N-1 부여
+    grouped: Dict[Tuple[str, Optional[int], Optional[int], str], List[Tuple[Optional[str], List[str], List[str], Dict[str, Any]]]] = {}
+    for period, minute, team_id, etype, comment, players_arr, assists_arr, raw in norm_rows:
+        k = (period, minute, team_id, etype)
+        grouped.setdefault(k, []).append((comment, players_arr, assists_arr, raw))
+
+    # 3) DB에서 해당 게임 이벤트를 "전부 삭제" 후 최신 스냅샷으로 재삽입
+    hockey_execute("DELETE FROM hockey_game_events WHERE game_id=%s", (game_id,))
+
+    saved = 0
+    for (period, minute, team_id, etype), items in grouped.items():
+        items_sorted = sorted(
+            items,
+            key=lambda x: (
+                (x[0] or ""),                # comment
+                ",".join(x[1] or []),        # players
+                ",".join(x[2] or []),        # assists
+                _jdump(x[3])                 # raw_json
             ),
         )
-        saved += 1
+
+        for event_order, (comment, players_arr, assists_arr, raw) in enumerate(items_sorted):
+            hockey_execute(
+                """
+                INSERT INTO hockey_game_events (
+                  game_id, period, minute, team_id,
+                  type, comment, players, assists,
+                  event_order, raw_json
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                """,
+                (
+                    game_id,
+                    period,
+                    minute,
+                    team_id,
+                    etype,
+                    comment,
+                    players_arr,
+                    assists_arr,
+                    event_order,
+                    _jdump(raw),
+                ),
+            )
+            saved += 1
+
     return saved
+
 
 
 # ----------------------------
