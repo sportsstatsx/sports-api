@@ -245,19 +245,12 @@ def ensure_tables() -> None:
     )
 
     # 3) ✅ hockey_game_events: DB 레벨 “중복 insert 원천 차단”용 fingerprint 컬럼 + 유니크 인덱스
-    # - Postgres generated column은 IMMUTABLE 요구 → 여기서는 "일반 컬럼"로 운용
+    # - 핵심: event_order가 바뀌어도 같은 이벤트면 event_key가 동일 → (game_id, event_key)로 중복 차단
     execute(
         """
         ALTER TABLE hockey_game_events
-        ADD COLUMN IF NOT EXISTS event_key TEXT;
-        """
-    )
-
-    # event_key 백필(비어있는 row만)
-    execute(
-        """
-        UPDATE hockey_game_events
-        SET event_key =
+        ADD COLUMN IF NOT EXISTS event_key TEXT
+        GENERATED ALWAYS AS (
           lower(coalesce(type,'')) || '|' ||
           coalesce(period,'') || '|' ||
           coalesce(minute::text,'') || '|' ||
@@ -265,11 +258,11 @@ def ensure_tables() -> None:
           lower(coalesce(comment,'')) || '|' ||
           lower(coalesce(array_to_string(players,','),'')) || '|' ||
           lower(coalesce(array_to_string(assists,','),''))
-        WHERE event_key IS NULL;
+        ) STORED;
         """
     )
 
-    # 최근 경기 중복 정리(이건 선택)
+    # (선택이지만 강력추천) 최근 경기 범위에서 “완전 동일 이벤트” 중복이 이미 있다면 정리 후 인덱스 생성
     execute(
         """
         WITH ranked AS (
@@ -290,18 +283,14 @@ def ensure_tables() -> None:
         """
     )
 
-    # 유니크 인덱스 생성: 기존 중복이 남아있으면 실패할 수 있음 → 워커는 죽지 않게 처리
-    try:
-        execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
-            ON hockey_game_events (game_id, event_key);
-            """
-        )
-    except Exception as e:
-        log.warning("event_key unique index create failed (duplicates remain). err=%s", e)
+    execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
+        ON hockey_game_events (game_id, event_key);
+        """
+    )
 
-
+    log.info("ensure_tables: OK (with migrations + event dedupe key)")
 
 
 
