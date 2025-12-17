@@ -17,6 +17,75 @@ logging.basicConfig(level=logging.INFO)
 
 BASE_URL = "https://v1.hockey.api-sports.io"
 
+def ensure_event_key_migration() -> None:
+    """
+    reconcile worker가 ON CONFLICT (game_id, event_key)로 upsert할 때
+    필요한 DB 요소(event_key 컬럼/유니크 인덱스/트리거)를 보장한다.
+    """
+    # 1) event_key 컬럼 보장 (이미 있으면 스킵)
+    hockey_execute(
+        """
+        ALTER TABLE hockey_game_events
+        ADD COLUMN IF NOT EXISTS event_key TEXT;
+        """
+    )
+
+    # 2) (game_id, event_key) 유니크 인덱스 보장
+    hockey_execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
+        ON hockey_game_events (game_id, event_key);
+        """
+    )
+
+    # 3) event_key 자동 계산 트리거 보장 (이미 있으면 교체)
+    hockey_execute(
+        """
+        CREATE OR REPLACE FUNCTION hockey_game_events_set_event_key()
+        RETURNS trigger AS $$
+        BEGIN
+          NEW.event_key :=
+            lower(coalesce(NEW.type,'')) || '|' ||
+            coalesce(NEW.period,'') || '|' ||
+            coalesce(NEW.minute::text,'') || '|' ||
+            coalesce(NEW.team_id::text,'') || '|' ||
+            lower(coalesce(NEW.comment,'')) || '|' ||
+            lower(coalesce(array_to_string(NEW.players,','),'')) || '|' ||
+            lower(coalesce(array_to_string(NEW.assists,','),''));
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+
+    hockey_execute(
+        """
+        DROP TRIGGER IF EXISTS trg_hockey_game_events_set_event_key ON hockey_game_events;
+
+        CREATE TRIGGER trg_hockey_game_events_set_event_key
+        BEFORE INSERT OR UPDATE ON hockey_game_events
+        FOR EACH ROW
+        EXECUTE FUNCTION hockey_game_events_set_event_key();
+        """
+    )
+
+    # 4) event_key 백필 (NULL/빈값만)
+    hockey_execute(
+        """
+        UPDATE hockey_game_events
+        SET event_key =
+          lower(coalesce(type,'')) || '|' ||
+          coalesce(period,'') || '|' ||
+          coalesce(minute::text,'') || '|' ||
+          coalesce(team_id::text,'') || '|' ||
+          lower(coalesce(comment,'')) || '|' ||
+          lower(coalesce(array_to_string(players,','),'')) || '|' ||
+          lower(coalesce(array_to_string(assists,','),''))
+        WHERE event_key IS NULL OR event_key = '';
+        """
+    )
+
+
 
 # ----------------------------
 # env helpers
@@ -408,7 +477,11 @@ def main() -> None:
         _live_leagues(),
     )
 
+    ensure_event_key_migration()
+    log.info("ensure_event_key_migration: OK")
+
     while True:
+
         try:
             ids = load_candidate_game_ids()
             if batch_limit > 0:
