@@ -42,6 +42,7 @@ def hockey_get_fixtures_by_utc_range(
             g.game_date AS date_utc,
             g.status,
             g.status_long,
+            g.live_timer,
 
             l.id AS league_id2,
             l.name AS league_name,
@@ -99,6 +100,7 @@ def hockey_get_fixtures_by_utc_range(
         # 우리 앱 UX에서는 "종료"로 취급해야 함.
         raw_status = (r.get("status") or "").strip().upper()
         raw_status_long = (r.get("status_long") or "").strip()
+        live_timer = (r.get("live_timer") or "").strip()
 
         norm_status = raw_status
         norm_status_long = raw_status_long
@@ -109,6 +111,21 @@ def hockey_get_fixtures_by_utc_range(
             if not norm_status_long or norm_status_long in ("After Over Time", "After Penalties"):
                 norm_status_long = "Finished"
 
+        # ✅ LIVE(진행중)면 status_long에 timer 붙이기
+        clock_text = ""
+        if live_timer:
+            if ":" in live_timer:
+                clock_text = live_timer
+            else:
+                try:
+                    clock_text = f"{int(live_timer):02d}:00"
+                except Exception:
+                    clock_text = live_timer
+
+        status_long_out = norm_status_long
+        if norm_status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
+            status_long_out = f"{norm_status_long} {clock_text}"
+
         fixtures.append(
             {
                 "game_id": r["game_id"],
@@ -116,7 +133,9 @@ def hockey_get_fixtures_by_utc_range(
                 "season": r["season"],
                 "date_utc": dt_iso,
                 "status": norm_status,
-                "status_long": norm_status_long,
+                "status_long": status_long_out,
+                "clock": clock_text or None,
+                "timer": live_timer or None,
                 "league": {
                     "id": r["league_id2"],
                     "name": r["league_name"],
