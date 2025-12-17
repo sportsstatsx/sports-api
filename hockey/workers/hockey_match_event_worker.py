@@ -782,14 +782,13 @@ def event_persist_key(ev: Dict[str, Any]) -> str:
     ✅ tick을 넘어(워커 재시작/리컨실 DELETE-INSERT 포함) 중복 알림을 막는 "의미 기반" 키.
     - DB id / event_order 변화에 영향을 받지 않도록 구성
     - assists는 늦게 채워지는 케이스가 있어서 기본적으로 제외(assists 업데이트로 재알림 방지)
+    - comment(예: power-play/shorthanded/empty-net)는 나중에 업데이트될 수 있어
+      ✅ comment 변화로 '같은 골'이 재알림되는 문제를 막기 위해 persist 키에서는 제외
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
     team_id = str(ev.get("team_id") or "").strip()
     etype = str(ev.get("type") or "").strip().lower()
-
-    # comment: Shorthanded / Power-play / Empty-net 등 (없을 수도 있음)
-    comment = str(ev.get("comment") or "").strip().lower()
 
     # players: 득점자(보통 1명). 배열이 아니면 방어
     players = ev.get("players") or []
@@ -797,7 +796,8 @@ def event_persist_key(ev: Dict[str, Any]) -> str:
         players = []
     players_norm = ",".join([str(p).strip().lower() for p in players if str(p).strip()])
 
-    return f"{etype}|{period}|{minute}|{team_id}|{comment}|{players_norm}"
+    return f"{etype}|{period}|{minute}|{team_id}|{players_norm}"
+
 
 
 
