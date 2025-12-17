@@ -246,51 +246,12 @@ def ensure_tables() -> None:
 
     # 3) ✅ hockey_game_events: DB 레벨 “중복 insert 원천 차단”용 fingerprint 컬럼 + 유니크 인덱스
     # - 핵심: event_order가 바뀌어도 같은 이벤트면 event_key가 동일 → (game_id, event_key)로 중복 차단
-    execute(
-        """
-        ALTER TABLE hockey_game_events
-        ADD COLUMN IF NOT EXISTS event_key TEXT
-        GENERATED ALWAYS AS (
-          lower(coalesce(type,'')) || '|' ||
-          coalesce(period,'') || '|' ||
-          coalesce(minute::text,'') || '|' ||
-          coalesce(team_id::text,'') || '|' ||
-          lower(coalesce(comment,'')) || '|' ||
-          lower(coalesce(array_to_string(players,','),'')) || '|' ||
-          lower(coalesce(array_to_string(assists,','),''))
-        ) STORED;
-        """
-    )
+    # ✅ event_key generated column은 Postgres에서 "generation expression is not immutable"로
+    # 환경에 따라 실패할 수 있어(실제로 지금 워커가 그 이유로 크래시).
+    # 또한 현재 중복 방지는 "event_order 규칙 통일 + 기존 UNIQUE 제약"으로 원천 차단할 것이므로
+    # 여기서 event_key/unique-index를 강제 생성하지 않는다.
+    log.info("ensure_tables: OK")
 
-    # (선택이지만 강력추천) 최근 경기 범위에서 “완전 동일 이벤트” 중복이 이미 있다면 정리 후 인덱스 생성
-    execute(
-        """
-        WITH ranked AS (
-          SELECT
-            e.id,
-            row_number() OVER (
-              PARTITION BY e.game_id, e.event_key
-              ORDER BY e.id DESC
-            ) AS rn
-          FROM hockey_game_events e
-          JOIN hockey_games g ON g.id = e.game_id
-          WHERE g.game_date >= NOW() - interval '14 days'
-        )
-        DELETE FROM hockey_game_events e
-        USING ranked r
-        WHERE e.id = r.id
-          AND r.rn > 1;
-        """
-    )
-
-    execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
-        ON hockey_game_events (game_id, event_key);
-        """
-    )
-
-    log.info("ensure_tables: OK (with migrations + event dedupe key)")
 
 
 
