@@ -731,7 +731,6 @@ def run_once() -> None:
         if not g:
             continue
 
-        title = build_title(g)
 
         # 현재 상태
         status = str(g.get("status") or "").strip()
@@ -838,7 +837,7 @@ def run_once() -> None:
 
             etype = str(ev.get("type") or "").strip().lower()
 
-            # 기본: goal/penalty만 알림
+            # 기본: goal만 알림 (penalty 알림은 비활성화)
             if etype != "goal":
                 continue
 
