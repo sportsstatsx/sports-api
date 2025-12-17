@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS hockey_games (
   game_date        TIMESTAMPTZ,                -- 경기 시작 시간
   status           TEXT,                       -- 예: "NS", "LIVE", "FT" 등
   status_long      TEXT,                       -- 더 긴 설명(있으면)
+  live_timer       TEXT,                       -- ✅ LIVE 진행 시간/타이머 (API-Sports: timer)
   timezone         TEXT,                       -- 저장해두면 앱 타임존 처리에 도움
 
   -- 스코어: period별 점수 등 변형이 많아서 JSONB 추천
