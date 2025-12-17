@@ -304,6 +304,18 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> int:
                   event_order, raw_json
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                ON CONFLICT (game_id, event_key)
+                DO UPDATE SET
+                  period = EXCLUDED.period,
+                  minute = EXCLUDED.minute,
+                  team_id = EXCLUDED.team_id,
+                  type = EXCLUDED.type,
+                  comment = EXCLUDED.comment,
+                  players = EXCLUDED.players,
+                  assists = EXCLUDED.assists,
+                  event_order = EXCLUDED.event_order,
+                  raw_json = EXCLUDED.raw_json
+
                 """,
                 (
                     game_id,
