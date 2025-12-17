@@ -703,7 +703,7 @@ def event_dedupe_key(ev: Dict[str, Any]) -> str:
     """
     같은 tick 안에서 중복 전송 방지용 키.
     - comment는 나중에 "PPG"처럼 업데이트되어 2번 들어올 수 있으니 키에서 제외
-    - 대신 event_order를 포함해서 "연속골(같은 분)"도 안전하게 구분
+    - 대신 event_order를 포함해서 "연속골(같은 분에 같은 팀 득점)"도 안전하게 구분
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
@@ -712,24 +712,29 @@ def event_dedupe_key(ev: Dict[str, Any]) -> str:
     event_order = str(ev.get("event_order") or "").strip()
     return f"{etype}|{period}|{minute}|{team_id}|{event_order}"
 
-def event_dedupe_key(ev: Dict[str, Any]) -> str:
+
+def event_persist_key(ev: Dict[str, Any]) -> str:
     """
-    같은 tick 안에서 중복 전송 방지용 키.
-    (DB id는 다를 수 있어서 period/minute/type/team_id/detail 조합으로 방어)
+    ✅ tick을 넘어(워커 재시작/리컨실 DELETE-INSERT 포함) 중복 알림을 막는 "의미 기반" 키.
+    - DB id / event_order 변화에 영향을 받지 않도록 구성
+    - assists는 늦게 채워지는 케이스가 있어서 기본적으로 제외(assists 업데이트로 재알림 방지)
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
     team_id = str(ev.get("team_id") or "").strip()
     etype = str(ev.get("type") or "").strip().lower()
-    comment = str(ev.get("comment") or "").strip().lower()
-    return f"{etype}|{period}|{minute}|{team_id}|{comment}"
 
+    # comment: Shorthanded / Power-play / Empty-net 등 (없을 수도 있음)
+    comment = str(ev.get("comment") or "").strip().lower()
+
+    # players: 득점자(보통 1명). 배열이 아니면 방어
     players = ev.get("players") or []
     if not isinstance(players, list):
         players = []
     players_norm = ",".join([str(p).strip().lower() for p in players if str(p).strip()])
 
     return f"{etype}|{period}|{minute}|{team_id}|{comment}|{players_norm}"
+
 
 
 
@@ -957,8 +962,13 @@ def run_once() -> None:
                 },
             )
             if ok:
+                # ✅ 리컨실(DELETE/INSERT)로 이벤트 id가 바뀌어도 같은 이벤트 재발송 방지
+                sent_hist_set.add(pk)
+                sent_hist.append(pk)
+
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
+
 
 
 
