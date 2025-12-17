@@ -75,4 +75,34 @@ def route_hockey_games():
     params.append(limit)
 
     rows = hockey_fetch_all(sql, tuple(params))
+    # ✅ live=1일 때: status_long에 live_timer를 붙여 "Live {Period} {MM:SS}"로 가공
+    if live == 1 and rows:
+        for r in rows:
+            status = (r.get("status") or "").strip().upper()
+            status_long = (r.get("status_long") or "").strip()
+            live_timer = r.get("live_timer")
+
+            live_timer_s = ""
+            if live_timer is None:
+                live_timer_s = ""
+            else:
+                live_timer_s = str(live_timer).strip()
+
+            clock_text = ""
+            if live_timer_s:
+                # "7" -> "07:00", "18:34" -> 그대로
+                if ":" in live_timer_s:
+                    clock_text = live_timer_s
+                else:
+                    try:
+                        clock_text = f"{int(live_timer_s):02d}:00"
+                    except Exception:
+                        clock_text = live_timer_s
+
+            if status in ("P1", "P2", "P3", "OT", "SO"):
+                if clock_text:
+                    r["status_long"] = f"Live {status_long} {clock_text}"
+                else:
+                    r["status_long"] = f"Live {status_long}"
+
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
