@@ -992,28 +992,19 @@ def run_once() -> None:
             tag = str(ev.get("comment") or "").strip()
 
             if etype == "goal":
-                # 알림용 스코어 보정:
-                # - goal 이벤트는 들어왔는데 hockey_games.score_json이 아직 업데이트 전이면
-                #   알림에서만 1점을 올려서 보여줌(타임라인과 일치)
-                notif_home, notif_away = home, away
-
-                if ev_team_id and home_team_id and ev_team_id == home_team_id:
-
-                elif ev_team_id and away_team_id and ev_team_id == away_team_id:
-                    # 원정이 득점했는데 점수가 아직 그대로면 +1
-                    if notif_away <= last_away:
-                        notif_away = last_away + 1
-
+                # ✅ 정석: 알림 점수도 DB(score_json) 기준만 사용해서
+                # 앱 타임라인/스코어와 100% 동일하게 만든다.
                 t, b = build_hockey_message(
                     "goal",
                     g,
-                    notif_home,
-                    notif_away,
+                    home,
+                    away,
                     period=period,
                     minute=minute,
                     team_name=team_name,
                     tag=tag,
                 )
+
 
 
             ok = send_push(
