@@ -19,6 +19,37 @@ logging.basicConfig(level=logging.INFO)
 
 BASE_URL = "https://v1.hockey.api-sports.io"
 
+def ensure_event_key_migration() -> None:
+    """
+    live worker가 먼저 뜨는 환경에서도 ON CONFLICT (game_id, event_key)가 안전하게 동작하도록
+    DB에 event_key 컬럼 + 유니크 인덱스를 보장한다.
+    """
+    # 1) event_key 생성 컬럼
+    hockey_execute(
+        """
+        ALTER TABLE hockey_game_events
+        ADD COLUMN IF NOT EXISTS event_key TEXT
+        GENERATED ALWAYS AS (
+          lower(coalesce(type,'')) || '|' ||
+          coalesce(period,'') || '|' ||
+          coalesce(minute::text,'') || '|' ||
+          coalesce(team_id::text,'') || '|' ||
+          lower(coalesce(comment,'')) || '|' ||
+          lower(coalesce(array_to_string(players,','),'')) || '|' ||
+          lower(coalesce(array_to_string(assists,','),''))
+        ) STORED;
+        """
+    )
+
+    # 2) 유니크 인덱스
+    hockey_execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
+        ON hockey_game_events (game_id, event_key);
+        """
+    )
+
+
 
 def _headers() -> Dict[str, str]:
     key = (os.getenv("APISPORTS_KEY") or os.getenv("API_SPORTS_KEY") or "").strip()
@@ -273,6 +304,9 @@ def main() -> None:
     leagues = hockey_live_leagues()
     if not leagues:
         raise RuntimeError("HOCKEY_LIVE_LEAGUES is empty. ex) 57,58")
+
+    ensure_event_key_migration()
+    log.info("ensure_event_key_migration: OK")
 
     season_env = (os.getenv("HOCKEY_SEASON") or "").strip()
     if season_env:
