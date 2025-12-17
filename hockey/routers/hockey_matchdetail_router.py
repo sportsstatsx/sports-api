@@ -10,6 +10,7 @@ hockey_matchdetail_bp = Blueprint("hockey_matchdetail", __name__, url_prefix="/a
 
 
 @hockey_matchdetail_bp.route("/games/<int:game_id>")
+@hockey_matchdetail_bp.route("/matchdetail/<int:game_id>")  # ✅ 구버전/앱 호환 alias
 def hockey_game_detail(game_id: int):
     try:
         return jsonify(hockey_get_game_detail(game_id))
