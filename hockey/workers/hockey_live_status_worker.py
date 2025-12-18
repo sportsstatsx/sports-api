@@ -108,8 +108,25 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _int_set_env(name: str) -> set[int]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            pass
+    return out
+
+
 def _utc_now() -> dt.datetime:
     return now_utc()
+
 
 
 def _load_live_window_game_rows() -> List[Dict[str, Any]]:
@@ -472,16 +489,19 @@ def main() -> None:
     # DB에서 window로 뽑힌 경기 row에 season이 이미 들어있기 때문.
     # (HOCKEY_SEASON 환경변수도 더 이상 강제하지 않음)
 
-    active_interval = _float_env("HOCKEY_LIVE_ACTIVE_INTERVAL_SEC", 15.0)  # 대상 경기 있을 때
-    idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0)     # 대상 경기 없을 때(3분)
+    fast_leagues = _int_set_env("HOCKEY_LIVE_FAST_LEAGUES")
+    fast_interval = _float_env("HOCKEY_LIVE_FAST_INTERVAL_SEC", 5.0)   # 1부(빠른 리그)
+    slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 15.0)  # 나머지(기본)
+    idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0) # 대상 경기 없을 때(3분)
 
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
 
     log.info(
-        "🏒 hockey live worker(start windowed): leagues=%s pre=%sm post=%sm active=%.1fs idle=%.1fs",
-        leagues, pre_min, post_min, active_interval, idle_interval
+        "🏒 hockey live worker(start windowed): leagues=%s pre=%sm post=%sm fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
+        leagues, pre_min, post_min, sorted(list(fast_leagues)), fast_interval, slow_interval, idle_interval
     )
+
 
     while True:
         sleep_sec = idle_interval
@@ -491,12 +511,27 @@ def main() -> None:
                 "tick done(windowed): candidates=%s games_upserted=%s events_upserted=%s",
                 candidates, games_upserted, events_upserted
             )
-            sleep_sec = active_interval if candidates > 0 else idle_interval
+
+            if candidates > 0:
+                # 이번 윈도우에 fast league 경기가 하나라도 있으면 fast_interval
+                has_fast = False
+                rows_check = _load_live_window_game_rows()
+                for rr in rows_check:
+                    lid = int(rr.get("league_id") or 0)
+                    if lid in fast_leagues:
+                        has_fast = True
+                        break
+
+                sleep_sec = fast_interval if has_fast else slow_interval
+            else:
+                sleep_sec = idle_interval
+
         except Exception as e:
             log.exception("tick failed: %s", e)
             sleep_sec = idle_interval
 
         time.sleep(sleep_sec)
+
 
 
 
