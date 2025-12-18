@@ -489,18 +489,32 @@ def main() -> None:
     # DB에서 window로 뽑힌 경기 row에 season이 이미 들어있기 때문.
     # (HOCKEY_SEASON 환경변수도 더 이상 강제하지 않음)
 
+    super_fast_leagues = _int_set_env("HOCKEY_LIVE_SUPER_FAST_LEAGUES")
+    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 2.0)  # super fast
+
     fast_leagues = _int_set_env("HOCKEY_LIVE_FAST_LEAGUES")
-    fast_interval = _float_env("HOCKEY_LIVE_FAST_INTERVAL_SEC", 5.0)   # 1부(빠른 리그)
-    slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 15.0)  # 나머지(기본)
-    idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0) # 대상 경기 없을 때(3분)
+    fast_interval = _float_env("HOCKEY_LIVE_FAST_INTERVAL_SEC", 5.0)   # fast
+
+    slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 15.0)  # slow(기본)
+    idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0) # 후보 없을 때
+
 
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
 
     log.info(
-        "🏒 hockey live worker(start windowed): leagues=%s pre=%sm post=%sm fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
-        leagues, pre_min, post_min, sorted(list(fast_leagues)), fast_interval, slow_interval, idle_interval
+        "🏒 hockey live worker(start windowed): leagues=%s pre=%sm post=%sm super_fast_leagues=%s super_fast=%.1fs fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
+        leagues,
+        pre_min,
+        post_min,
+        sorted(list(super_fast_leagues)),
+        super_fast_interval,
+        sorted(list(fast_leagues)),
+        fast_interval,
+        slow_interval,
+        idle_interval,
     )
+
 
 
     while True:
@@ -513,18 +527,30 @@ def main() -> None:
             )
 
             if candidates > 0:
-                # 이번 윈도우에 fast league 경기가 하나라도 있으면 fast_interval
+                # 우선순위: SUPER_FAST > FAST > SLOW
+                has_super_fast = False
                 has_fast = False
+
                 rows_check = _load_live_window_game_rows()
                 for rr in rows_check:
                     lid = int(rr.get("league_id") or 0)
-                    if lid in fast_leagues:
-                        has_fast = True
+
+                    if lid in super_fast_leagues:
+                        has_super_fast = True
                         break
 
-                sleep_sec = fast_interval if has_fast else slow_interval
+                    if lid in fast_leagues:
+                        has_fast = True
+
+                if has_super_fast:
+                    sleep_sec = super_fast_interval
+                elif has_fast:
+                    sleep_sec = fast_interval
+                else:
+                    sleep_sec = slow_interval
             else:
                 sleep_sec = idle_interval
+
 
         except Exception as e:
             log.exception("tick failed: %s", e)
