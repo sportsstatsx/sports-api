@@ -118,10 +118,17 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     - 시작 전(pre): now ~ now+pre_min
     - 진행중(in-play): game_date가 now - inplay_max_min 이후이고, status가 '종료'가 아닌 경기
 
+    ✅ 추가 보강(중요):
+    - 시작 직후 API status가 잠깐 NS/TBD로 남는 케이스가 있어
+      game_date가 now보다 과거가 되는 순간 pre에서 빠지고,
+      in-play에서 NS/TBD 제외로 빠지면 "영원히 후보에서 탈락"하는 구멍이 생긴다.
+      → 시작 후 ns_grace_min 동안은 NS/TBD도 in-play 후보로 포함한다.
+
     env:
-      HOCKEY_LIVE_PRESTART_MIN     (default 60)
-      HOCKEY_LIVE_INPLAY_MAX_MIN   (default 240)  # 진행중으로 간주할 최대(시작 후) 분
-      HOCKEY_LIVE_BATCH_LIMIT      (default 120)
+      HOCKEY_LIVE_PRESTART_MIN      (default 60)
+      HOCKEY_LIVE_INPLAY_MAX_MIN    (default 240)
+      HOCKEY_LIVE_NS_GRACE_MIN      (default 20)   # ✅ 시작 후 NS/TBD 유예
+      HOCKEY_LIVE_BATCH_LIMIT       (default 120)
     """
     leagues = hockey_live_leagues()
     if not leagues:
@@ -129,11 +136,13 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     inplay_max_min = _int_env("HOCKEY_LIVE_INPLAY_MAX_MIN", 240)
+    ns_grace_min = _int_env("HOCKEY_LIVE_NS_GRACE_MIN", 20)
     batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
 
     now = _utc_now()
     upcoming_end = now + dt.timedelta(minutes=pre_min)
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
+    ns_grace_start = now - dt.timedelta(minutes=ns_grace_min)
 
     rows = hockey_fetch_all(
         """
@@ -148,17 +157,25 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             OR
 
             -- (2) 진행중(in-play) 경기: 시작시간이 최근 N분 이내 + 종료 아님
-            (game_date >= %s
-             AND COALESCE(status, '') NOT IN ('FT','AET','PEN','FIN','ENDED','END')
-             AND COALESCE(status, '') NOT IN ('NS','TBD')
+            (
+              game_date >= %s
+              AND COALESCE(status, '') NOT IN ('FT','AET','PEN','FIN','ENDED','END')
+              AND (
+                -- ✅ 보통 진행중 상태
+                COALESCE(status, '') NOT IN ('NS','TBD')
+                OR
+                -- ✅ 시작 후 ns_grace_min 동안은 NS/TBD도 후보로 포함(시작 상태 전환을 놓치지 않기 위함)
+                (COALESCE(status, '') IN ('NS','TBD') AND game_date >= %s)
+              )
             )
           )
         ORDER BY game_date ASC
         LIMIT %s
         """,
-        (leagues, now, upcoming_end, inplay_start, batch_limit),
+        (leagues, now, upcoming_end, inplay_start, ns_grace_start, batch_limit),
     )
     return [dict(r) for r in rows]
+
 
 
 
