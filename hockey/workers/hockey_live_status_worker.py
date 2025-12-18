@@ -123,6 +123,26 @@ def _int_set_env(name: str) -> set[int]:
             pass
     return out
 
+def _league_interval_sec(
+    league_id: int,
+    *,
+    super_fast_leagues: set[int],
+    fast_leagues: set[int],
+    super_fast_interval: float,
+    fast_interval: float,
+    slow_interval: float,
+) -> float:
+    """
+    리그별 폴링 주기 결정 우선순위:
+    SUPER_FAST > FAST > SLOW(기본)
+    """
+    if league_id in super_fast_leagues:
+        return super_fast_interval
+    if league_id in fast_leagues:
+        return fast_interval
+    return slow_interval
+
+
 
 def _utc_now() -> dt.datetime:
     return now_utc()
@@ -420,16 +440,13 @@ def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def tick_once_windowed() -> Tuple[int, int, int]:
+def tick_once_windowed(rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
     """
-    정석 구조 tick:
-    - DB에서 윈도우 내 경기만 로드
-    - 각 경기:
-        1) /games?id 로 최신 상태 스냅샷 반영(upsert)
-        2) (진행중일 때만) /games/events 호출 + upsert
+    정석 구조 tick (리그별 스케줄링 지원 버전):
+    - rows는 이미 window에서 뽑힌 후보 목록
+    - 이 함수는 주어진 rows만 처리한다.
     returns: (games_upserted, events_upserted, candidates)
     """
-    rows = _load_live_window_game_rows()
     if not rows:
         return (0, 0, 0)
 
@@ -477,6 +494,7 @@ def tick_once_windowed() -> Tuple[int, int, int]:
 
 
 
+
 def main() -> None:
     leagues = hockey_live_leagues()
     if not leagues:
@@ -517,46 +535,98 @@ def main() -> None:
 
 
 
+    super_fast_leagues = _int_set_env("HOCKEY_LIVE_SUPER_FAST_LEAGUES")
+    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 2.0)
+
+    log.info(
+        "🏒 hockey live worker(interval tiers): super_fast_leagues=%s super_fast=%.1fs fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
+        sorted(list(super_fast_leagues)), super_fast_interval,
+        sorted(list(fast_leagues)), fast_interval,
+        slow_interval, idle_interval
+    )
+
+    # 리그별 다음 실행 시각(UTC timestamp)
+    next_run_by_league: Dict[int, float] = {}
+
     while True:
-        sleep_sec = idle_interval
         try:
-            games_upserted, events_upserted, candidates = tick_once_windowed()
+            # 1) 윈도우 후보 한 번만 로드
+            all_rows = _load_live_window_game_rows()
+
+            if not all_rows:
+                # 후보 없으면 idle
+                time.sleep(idle_interval)
+                continue
+
+            # 2) 리그별로 rows 그룹핑
+            rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
+            for r in all_rows:
+                lid = int(r.get("league_id") or 0)
+                if lid <= 0:
+                    continue
+                rows_by_league.setdefault(lid, []).append(r)
+
+            if not rows_by_league:
+                time.sleep(idle_interval)
+                continue
+
+            now_ts = time.time()
+
+            # 3) due 된 리그만 처리
+            total_games_upserted = 0
+            total_events_upserted = 0
+            total_candidates = 0
+            processed_leagues: List[int] = []
+
+            for lid, rows in rows_by_league.items():
+                interval = _league_interval_sec(
+                    lid,
+                    super_fast_leagues=super_fast_leagues,
+                    fast_leagues=fast_leagues,
+                    super_fast_interval=super_fast_interval,
+                    fast_interval=fast_interval,
+                    slow_interval=slow_interval,
+                )
+
+                nxt = next_run_by_league.get(lid, 0.0)
+                if now_ts < nxt:
+                    continue  # 아직 시간 안 됨
+
+                # due → 실행
+                g_up, e_up, cand = tick_once_windowed(rows)
+                total_games_upserted += g_up
+                total_events_upserted += e_up
+                total_candidates += cand
+                processed_leagues.append(lid)
+
+                # 다음 실행 시각 갱신
+                next_run_by_league[lid] = now_ts + max(1.0, float(interval))
+
             log.info(
-                "tick done(windowed): candidates=%s games_upserted=%s events_upserted=%s",
-                candidates, games_upserted, events_upserted
+                "tick done(per-league): leagues_processed=%s total_candidates=%s games_upserted=%s events_upserted=%s",
+                processed_leagues, total_candidates, total_games_upserted, total_events_upserted
             )
 
-            if candidates > 0:
-                # 우선순위: SUPER_FAST > FAST > SLOW
-                has_super_fast = False
-                has_fast = False
+            # 4) 다음 sleep 계산: "가장 가까운 next_run" 까지
+            # (너무 길게 자면 딜레이 생김 → 최소 0.2s, 최대 1.0s로 clamp)
+            soonest = None
+            for lid, tnext in next_run_by_league.items():
+                if lid in rows_by_league:  # 현재 윈도우에 존재하는 리그만 고려
+                    if soonest is None or tnext < soonest:
+                        soonest = tnext
 
-                rows_check = _load_live_window_game_rows()
-                for rr in rows_check:
-                    lid = int(rr.get("league_id") or 0)
-
-                    if lid in super_fast_leagues:
-                        has_super_fast = True
-                        break
-
-                    if lid in fast_leagues:
-                        has_fast = True
-
-                if has_super_fast:
-                    sleep_sec = super_fast_interval
-                elif has_fast:
-                    sleep_sec = fast_interval
-                else:
-                    sleep_sec = slow_interval
+            if soonest is None:
+                time.sleep(1.0)
             else:
-                sleep_sec = idle_interval
-
+                wait = max(0.0, soonest - time.time())
+                # 너무 미세하게 돌면 CPU 부담 → 0.2~1.0로 제한
+                wait = min(1.0, max(0.2, wait))
+                time.sleep(wait)
 
         except Exception as e:
             log.exception("tick failed: %s", e)
-            sleep_sec = idle_interval
+            time.sleep(idle_interval)
 
-        time.sleep(sleep_sec)
 
 
 
