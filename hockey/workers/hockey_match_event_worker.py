@@ -60,8 +60,16 @@ HOCKEY_DATABASE_URL = (
 if not HOCKEY_DATABASE_URL:
     raise RuntimeError("HOCKEY_DATABASE_URL is not set")
 
-# 워커 루프 주기 (초)
+# ─────────────────────────────────────────
+# LOOP INTERVAL (league-based optional)
+# ─────────────────────────────────────────
+# 기본(느린) 루프 주기 (초) - 기존 변수 유지
 INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_INTERVAL_SEC", 10)
+
+# ✅ 1부리그만 더 촘촘히 돌리고 싶을 때(옵션)
+FAST_LEAGUES_RAW = _env_str("HOCKEY_MATCH_WORKER_FAST_LEAGUES", "")
+FAST_INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_FAST_INTERVAL_SEC", 5)
+SLOW_INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_SLOW_INTERVAL_SEC", INTERVAL_SEC)
 
 # 대상 리그 (쉼표 구분). 비어있으면 전체(주의: DB 부하)
 LEAGUES_RAW = _env_str("HOCKEY_LIVE_LEAGUES", "")
@@ -75,6 +83,7 @@ MAX_EVENTS_PER_GAME_PER_TICK = _env_int("HOCKEY_MATCH_WORKER_MAX_EVENTS_PER_GAME
 
 # FCM 전송 rate 제한(너무 빠르면 부담)
 SEND_SLEEP_SEC = _env_float("HOCKEY_MATCH_WORKER_SEND_SLEEP_SEC", 0.02)
+
 
 
 def _parse_leagues(raw: str) -> List[int]:
@@ -93,6 +102,9 @@ def _parse_leagues(raw: str) -> List[int]:
 
 
 LEAGUE_IDS = _parse_leagues(LEAGUES_RAW)
+FAST_LEAGUE_IDS = _parse_leagues(FAST_LEAGUES_RAW)
+FAST_LEAGUE_SET = set(FAST_LEAGUE_IDS)
+
 
 # 하키 경기 상태(최종 종료로 간주)
 FINAL_STATUSES = {
@@ -806,20 +818,51 @@ def event_persist_key(ev: Dict[str, Any]) -> str:
 
 
 
-def run_once() -> None:
+def run_once() -> bool:
+    """
+    returns:
+      - True  => fast interval recommended (fast league has relevant candidates)
+      - False => slow interval recommended
+    """
     now_utc = datetime.now(timezone.utc)
     games = fetch_candidate_games(now_utc)
 
     if not games:
         log.info("tick: candidates=0")
-        return
+        return False
+
+    # ✅ 이번 tick에 FAST 리그 경기가 "진행중이거나 임박"이면 fast
+    # - 여기서는 단순/안전하게: game_date가 now 기준 ±6시간 안이고, league가 fast면 fast
+    now_ts = now_utc.timestamp()
+    has_fast_candidate = False
+    if FAST_LEAGUE_SET:
+        for g in games:
+            try:
+                lg = int(g.get("league_id") or 0)
+            except Exception:
+                lg = 0
+            if lg not in FAST_LEAGUE_SET:
+                continue
+
+            gd = g.get("game_date")
+            gd_ts = None
+            if isinstance(gd, datetime):
+                gd_ts = gd.timestamp()
+            # game_date가 없거나 파싱 실패면 보수적으로 fast로 보지 않음
+            if gd_ts is None:
+                continue
+
+            if (now_ts - 6 * 3600) <= gd_ts <= (now_ts + 6 * 3600):
+                has_fast_candidate = True
+                break
 
     game_ids = [int(g["id"]) for g in games]
     subs = fetch_subscriptions_for_games(game_ids)
 
     if not subs:
         log.info("tick: candidates=%d subs=0", len(games))
-        return
+        return has_fast_candidate
+
 
     # game_id -> game row
     game_map: Dict[int, Dict[str, Any]] = {int(g["id"]): g for g in games}
@@ -1055,23 +1098,39 @@ def run_once() -> None:
 
     log.info("tick: sent=%d", sent)
 
+    return has_fast_candidate
+
+
 
 def run_forever(interval_sec: int) -> None:
     ensure_tables()
     log.info(
-        "worker start: interval=%ss leagues=%s window=%sd/%sd batch=%d",
+        "worker start: interval=%ss leagues=%s window=%sd/%sd batch=%d fast_leagues=%s fast=%ss slow=%ss",
         interval_sec,
         LEAGUE_IDS if LEAGUE_IDS else "ALL",
         PAST_DAYS,
         FUTURE_DAYS,
         BATCH_LIMIT,
+        FAST_LEAGUE_IDS if FAST_LEAGUE_IDS else "NONE",
+        FAST_INTERVAL_SEC,
+        SLOW_INTERVAL_SEC,
     )
+
     while True:
+        use_fast = False
         try:
-            run_once()
+            use_fast = run_once()
         except Exception as e:
             log.exception("tick failed: %s", e)
-        time.sleep(max(1, interval_sec))
+
+        # ✅ fast leagues가 설정되어 있고, 이번 tick에 fast 후보가 있으면 fast interval
+        if FAST_LEAGUE_SET and use_fast:
+            sleep_sec = max(1, FAST_INTERVAL_SEC)
+        else:
+            sleep_sec = max(1, SLOW_INTERVAL_SEC)
+
+        time.sleep(sleep_sec)
+
 
 
 if __name__ == "__main__":
