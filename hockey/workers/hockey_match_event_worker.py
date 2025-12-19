@@ -890,6 +890,11 @@ def run_once() -> bool:
         last_home = _to_int(st.get("last_home_score"), 0)
         last_away = _to_int(st.get("last_away_score"), 0)
 
+        # ✅ 이 tick 안에서 “스코어가 실제로 늘어난 골”만 보내기 위한 작업 변수
+        work_last_home = last_home
+        work_last_away = last_away
+
+
         sent_hist = st.get("sent_event_keys") or []
         if not isinstance(sent_hist, list):
             sent_hist = []
@@ -1057,6 +1062,29 @@ def run_once() -> bool:
             tag = str(ev.get("comment") or "").strip()
 
             if etype == "goal":
+                # ✅ “스코어 증가를 동반하는 골”만 알림 전송
+                # - API에서 minute/표기 정정으로 같은 골이 다시 들어오는 경우(스코어 변화 없음) 알림을 막는다.
+                # - ev_team_id를 기준으로 홈/원정 어느 쪽 스코어가 늘어야 하는지 판정한다.
+                score_increased = False
+
+                if ev_team_id and home_team_id and ev_team_id == home_team_id:
+                    if home > work_last_home:
+                        score_increased = True
+                        work_last_home = home
+                elif ev_team_id and away_team_id and ev_team_id == away_team_id:
+                    if away > work_last_away:
+                        score_increased = True
+                        work_last_away = away
+                else:
+                    # 팀 판정이 안 되면 보수적으로 “총점 증가”일 때만 허용
+                    if (home + away) > (work_last_home + work_last_away):
+                        score_increased = True
+                        work_last_home = max(work_last_home, home)
+                        work_last_away = max(work_last_away, away)
+
+                if not score_increased:
+                    continue
+
                 # ✅ 정석: 알림 점수도 DB(score_json) 기준만 사용해서
                 # 앱 타임라인/스코어와 100% 동일하게 만든다.
                 t, b = build_hockey_message(
@@ -1069,6 +1097,7 @@ def run_once() -> bool:
                     team_name=team_name,
                     tag=tag,
                 )
+
 
 
 
