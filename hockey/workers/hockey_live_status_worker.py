@@ -366,6 +366,16 @@ def _stable_event_order(
 
 
 def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
+    """
+    API-Sports events는 고유 id가 없고 minute/assists 등이 라이브 중 정정될 수 있다.
+    따라서 '증분 누적'이 아니라 '스냅샷 동기화'가 정석이다.
+
+    - 이번 스냅샷에 존재하는 event_key 목록을 만든다.
+    - 스냅샷 이벤트를 upsert 한다.
+    - DB에 남아있는 goal/penalty 중, 이번 스냅샷에 없는 event_key는 HARD DELETE 한다.
+    """
+    snapshot_event_keys: List[str] = []
+
     for ev in ev_list:
         if not isinstance(ev, dict):
             continue
@@ -390,6 +400,28 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
 
         players_arr = [str(x).strip() for x in players if str(x).strip()]
         assists_arr = [str(x).strip() for x in assists if str(x).strip()]
+
+        # (DB 트리거 hockey_game_events_set_event_key() 와 동일한 규칙으로 event_key 계산)
+        # lower(type)||'|'||period||'|'||minute||'|'||team_id||'|'||lower(comment)||'|'||lower(players_csv)||'|'||lower(assists_csv)
+        event_key = (
+            (etype or "").strip().lower()
+            + "|"
+            + (period or "")
+            + "|"
+            + ("" if minute is None else str(minute))
+            + "|"
+            + ("" if team_id is None else str(team_id))
+            + "|"
+            + ((comment or "").strip().lower())
+            + "|"
+            + (",".join(players_arr).strip().lower())
+            + "|"
+            + (",".join(assists_arr).strip().lower())
+        )
+
+        # 스냅샷 기준은 goal/penalty만 (현재 API 응답도 이 2종 위주)
+        if etype in ("goal", "penalty"):
+            snapshot_event_keys.append(event_key)
 
         event_order = _stable_event_order(period, minute, team_id, etype, comment, players_arr)
 
@@ -429,6 +461,23 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
                 _jdump(ev),
             ),
         )
+
+    # ─────────────────────────────────────────
+    # 스냅샷 HARD DELETE 동기화 (근본 해결)
+    # - 이번 스냅샷에 없는 goal/penalty 이벤트는 DB에서 제거
+    # - 이렇게 해야 minute 정정/삭제된 "찌꺼기 이벤트"가 남지 않음
+    # ─────────────────────────────────────────
+    hockey_execute(
+        """
+        DELETE FROM hockey_game_events
+        WHERE game_id = %s
+          AND type IN ('goal','penalty')
+          AND (event_key IS NOT NULL AND event_key <> '')
+          AND NOT (event_key = ANY(%s))
+        """,
+        (game_id, snapshot_event_keys),
+    )
+
 
 
 
