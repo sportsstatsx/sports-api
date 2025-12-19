@@ -711,9 +711,13 @@ def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
           AND g.game_date >= %s
           AND g.game_date <= %s
           {league_clause}
-          AND COALESCE(UPPER(g.status), '') NOT IN ({",".join(["%s"] * len(FINAL_STATUSES))})
+          AND (
+            COALESCE(UPPER(g.status), '') NOT IN ({",".join(["%s"] * len(FINAL_STATUSES))})
+            OR g.updated_at >= NOW() - interval '6 hours'
+          )
         ORDER BY g.game_date DESC
         LIMIT {BATCH_LIMIT}
+
         """,
         tuple(params + list(FINAL_STATUSES)),
     )
