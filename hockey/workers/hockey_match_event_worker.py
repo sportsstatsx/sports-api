@@ -1099,6 +1099,13 @@ def run_once() -> bool:
         #         time.sleep(SEND_SLEEP_SEC)
 
         # state 저장
+        # ✅ (A) 경기 종료 시 sent_event_keys 통째로 초기화
+        # - 종료된 경기에서 알림 재발송은 더 이상 필요 없음
+        # - 과거 중복 알림 잔재(잘못된 goal 키 등)를 상태 테이블에 남기지 않기 위함
+        if is_final_status(status_norm):
+            sent_hist = []
+            sent_hist_set.clear()
+
         # 너무 커지는 것 방지: 최근 200개만 유지
         if len(sent_hist) > 200:
             sent_hist = sent_hist[-200:]
@@ -1112,6 +1119,7 @@ def run_once() -> bool:
             last_event_id=max_seen_event_id,
             sent_event_keys=sent_hist,
         )
+
 
 
     log.info("tick: sent=%d", sent)
