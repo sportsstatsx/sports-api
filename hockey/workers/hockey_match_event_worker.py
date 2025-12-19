@@ -899,7 +899,20 @@ def run_once() -> bool:
         status_norm = normalize_status(status)
 
         def _send_status_notif(ntype: str, title: str, body: str) -> None:
+            """
+            상태 전환 알림(1P end 포함)은 status 플랩/재진입으로 중복 발송이 쉽게 발생한다.
+            tick 내 디듀프가 아니라, hockey_game_notification_states.sent_event_keys에
+            영속적으로 기록해서 "device_id + game_id + ntype" 기준으로 1회만 발송되게 한다.
+            """
             nonlocal sent
+
+            # ✅ 영속 디듀프 키 (상태 전환 전용)
+            sk = f"status:{ntype}"
+
+            # ✅ 이미 보낸 상태 알림이면 스킵 (경기당 1회 보장)
+            if sk in sent_hist_set:
+                return
+
             ok = send_push(
                 token=sub.fcm_token,
                 title=title,
@@ -912,8 +925,13 @@ def run_once() -> bool:
                 },
             )
             if ok:
+                # ✅ 영속 디듀프 기록
+                sent_hist_set.add(sk)
+                sent_hist.append(sk)
+
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
+
 
 
         # ✅ 경기 시작: (이전이 1P가 아니었고) 현재가 1P로 들어온 순간
