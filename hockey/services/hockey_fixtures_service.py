@@ -57,15 +57,22 @@ def hockey_get_fixtures_by_utc_range(
             ta.name AS away_name,
             ta.logo AS away_logo,
 
-            CASE
-                WHEN g.raw_json IS NULL THEN NULL
-                ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'home'), '')::int
-            END AS home_score,
+            COALESCE(
+                NULLIF((g.score_json ->> 'home'), '')::int,
+                CASE
+                    WHEN g.raw_json IS NULL THEN NULL
+                    ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'home'), '')::int
+                END
+            ) AS home_score,
 
-            CASE
-                WHEN g.raw_json IS NULL THEN NULL
-                ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'away'), '')::int
-            END AS away_score
+            COALESCE(
+                NULLIF((g.score_json ->> 'away'), '')::int,
+                CASE
+                    WHEN g.raw_json IS NULL THEN NULL
+                    ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'away'), '')::int
+                END
+            ) AS away_score
+
 
         FROM hockey_games g
         JOIN hockey_teams th ON th.id = g.home_team_id
