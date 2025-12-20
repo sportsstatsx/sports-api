@@ -36,7 +36,7 @@ def build_hockey_standing_block(
         SELECT
             position,
             team_id,
-            team_name,
+            raw_json->'team'->>'name' AS team_name,
             games_played,
             win_total,
             lose_total,
@@ -51,6 +51,7 @@ def build_hockey_standing_block(
         """,
         {"league_id": league_id, "season": season},
     )
+
 
     return {
         "team": team_row,
