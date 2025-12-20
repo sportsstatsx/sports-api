@@ -155,17 +155,16 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     - 시작 전(pre): now ~ now+pre_min
     - 진행중(in-play): game_date가 now - inplay_max_min 이후이고, status가 '종료'가 아닌 경기
 
-    ✅ 중요한 수정:
-    - in-play 후보는 "이미 시작했거나 막 시작한 경기"만 포함해야 한다.
-    - 기존 코드는 game_date >= inplay_start 만 있어서
-      '미래 NS 경기'가 대량으로 in-play 후보에 포함되는 버그가 있었다.
-    - 해결: in-play 조건에 game_date <= now(+future_grace_min) 를 추가
+    ✅ 추가 보정(중요):
+    - start_called_at(=킥오프 감지)이 찍힌 경기는,
+      DB status가 NS/TBD로 남아있더라도 in-play 후보에서 절대 빠지지 않게 유지한다.
+      (API가 NS를 오래 주는 케이스에서 윈도우 탈락 → 영구 NS 고착 방지)
 
     env:
       HOCKEY_LIVE_PRESTART_MIN        (default 60)
       HOCKEY_LIVE_INPLAY_MAX_MIN      (default 240)
-      HOCKEY_LIVE_NS_GRACE_MIN        (default 20)   # 시작 직후 NS/TBD 유예
-      HOCKEY_LIVE_FUTURE_GRACE_MIN    (default 2)    # ✅ 시각 오차 대비: in-play 미래 허용 범위(분)
+      HOCKEY_LIVE_NS_GRACE_MIN        (default 20)
+      HOCKEY_LIVE_FUTURE_GRACE_MIN    (default 2)
       HOCKEY_LIVE_BATCH_LIMIT         (default 120)
     """
     leagues = hockey_live_leagues()
@@ -175,14 +174,13 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     inplay_max_min = _int_env("HOCKEY_LIVE_INPLAY_MAX_MIN", 240)
     ns_grace_min = _int_env("HOCKEY_LIVE_NS_GRACE_MIN", 20)
-    future_grace_min = _int_env("HOCKEY_LIVE_FUTURE_GRACE_MIN", 2)  # ✅ 추가
+    future_grace_min = _int_env("HOCKEY_LIVE_FUTURE_GRACE_MIN", 2)
     batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
 
     now = _utc_now()
     upcoming_end = now + dt.timedelta(minutes=pre_min)
 
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
-    # ✅ in-play은 "이미 시작" 위주여야 하므로 미래는 아주 조금만 허용
     inplay_end = now + dt.timedelta(minutes=future_grace_min)
 
     ns_grace_start = now - dt.timedelta(minutes=ns_grace_min)
@@ -190,33 +188,45 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
         """
         SELECT
-          id, league_id, season, status, game_date
-        FROM hockey_games
-        WHERE league_id = ANY(%s)
+          g.id, g.league_id, g.season, g.status, g.game_date
+        FROM hockey_games g
+        LEFT JOIN hockey_live_poll_state ps
+          ON ps.game_id = g.id
+        WHERE g.league_id = ANY(%s)
           AND (
             -- (1) 시작 전(pre) 경기: now ~ now+pre
-            (game_date >= %s AND game_date <= %s)
+            (g.game_date >= %s AND g.game_date <= %s)
 
             OR
 
             -- (2) 진행중(in-play) 경기: 최근 N분 이내에 "시작했거나 막 시작한" 경기 + 종료 아님
             (
-              game_date >= %s
-              AND game_date <= %s
-              AND COALESCE(status, '') NOT IN (
+              g.game_date >= %s
+              AND g.game_date <= %s
+              AND COALESCE(g.status, '') NOT IN (
                 'FT','AET','PEN','FIN','ENDED','END',
                 'ABD','AW','CANC','POST','WO'
               )
               AND (
                 -- ✅ 보통 진행중 상태 (NS/TBD 제외)
-                COALESCE(status, '') NOT IN ('NS','TBD')
+                COALESCE(g.status, '') NOT IN ('NS','TBD')
+
                 OR
-                -- ✅ 시작 직후 ns_grace_min 동안만 NS/TBD 허용 (단, 미래경기는 제외됨: game_date <= inplay_end)
-                (COALESCE(status, '') IN ('NS','TBD') AND game_date >= %s)
+
+                -- ✅ 시작 직후 ns_grace_min 동안만 NS/TBD 허용
+                (COALESCE(g.status, '') IN ('NS','TBD') AND g.game_date >= %s)
+
+                OR
+
+                -- ✅ 핵심: "킥오프 감지(start_called_at)"가 찍힌 경기는
+                --        NS/TBD로 남아도 윈도우에서 절대 탈락시키지 않는다.
+                (COALESCE(g.status, '') IN ('NS','TBD')
+                 AND ps.start_called_at IS NOT NULL
+                 AND ps.finished_at IS NULL)
               )
             )
           )
-        ORDER BY game_date ASC
+        ORDER BY g.game_date ASC
         LIMIT %s
         """,
         (
@@ -228,8 +238,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
         ),
     )
     return [dict(r) for r in rows]
-
-
 
 
 
