@@ -878,9 +878,20 @@ def tick_once_windowed(
 
         # ─────────────────────────────────────────
         # (E) 라이브 중 주기 호출 (게임별 next_live_poll_at 기준)
-        #   - events는 기존 정책(_should_poll_events) 그대로 유지
+        #
+        # ✅ 핵심 수정(데드락 방지):
+        # - start_called_at이 찍힌 이후에는 DB status가 NS/TBD로 남아있더라도
+        #   /games 스냅샷을 주기적으로 다시 호출해야 상태(BT/P1/P2/P3/...)로 전환된다.
+        #
+        # - 기존: if _should_poll_events(db_status, db_date):
+        #         → db_status가 NS/TBD면 영원히 False라서 (E) 자체가 못 타는 데드락 발생
+        #
+        # - 변경: "종료가 아니고, start_called_at이 존재(=킥오프 이후 감지됨)"면 (E) 진입 허용
+        #
+        # - events 폴링은 기존 정책(_should_poll_events) 그대로 유지:
+        #   즉, DB status가 아직 NS/TBD면 events는 스킵(불필요 호출 방지)
         # ─────────────────────────────────────────
-        if _should_poll_events(db_status, db_date):
+        if (start_called_at is not None) and (not _is_finished_status(db_status, db_date)):
             due = False
             if next_live_poll_at is None:
                 due = True
@@ -900,14 +911,14 @@ def tick_once_windowed(
                     slow_interval=slow_interval,
                 )
 
-                # 1) /games 스냅샷
+                # 1) /games 스냅샷 (status 전환을 위해 NS/TBD여도 반드시 수행)
                 try:
                     api_item = _api_get_game_by_id(gid)
                     if isinstance(api_item, dict):
                         upsert_game(api_item, league_id, season)
                         games_upserted += 1
 
-                        # upsert 이후 최신 status/game_date로 events 재판정
+                        # upsert 이후 최신 status/game_date 로 재판정
                         cur = hockey_fetch_one(
                             "SELECT status, game_date FROM hockey_games WHERE id=%s",
                             (gid,),
@@ -918,10 +929,13 @@ def tick_once_windowed(
                 except Exception as e:
                     log.warning("live-call games(id) fetch failed: game=%s err=%s", gid, e)
                     # games 실패해도 next_live_poll_at은 너무 촘촘히 다시 치지 않게 약하게 밀어줌
-                    _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=max(5.0, float(interval))))
+                    _poll_state_update(
+                        gid,
+                        next_live_poll_at=now + dt.timedelta(seconds=max(5.0, float(interval))),
+                    )
                     continue
 
-                # 2) /games/events (진행중일 때만)
+                # 2) /games/events (진행중일 때만)  ← 여기 조건은 그대로 유지
                 if _should_poll_events(db_status, db_date):
                     try:
                         ev_payload = _get("/games/events", {"game": gid})
@@ -935,7 +949,11 @@ def tick_once_windowed(
                         log.warning("events fetch failed: game=%s err=%s", gid, e)
 
                 # 다음 라이브 폴링 시각 저장
-                _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=float(interval)))
+                _poll_state_update(
+                    gid,
+                    next_live_poll_at=now + dt.timedelta(seconds=float(interval)),
+                )
+
 
     return (games_upserted, events_upserted, len(rows))
 
