@@ -18,7 +18,7 @@ def build_hockey_upcoming_block(
         FROM hockey_games
         WHERE league_id = %(league_id)s
           AND season = %(season)s
-          AND status NOT IN ('FT')
+          AND status = 'NS'
           AND (home_team_id = %(team_id)s OR away_team_id = %(team_id)s)
         ORDER BY game_date ASC
         LIMIT %(limit)s
