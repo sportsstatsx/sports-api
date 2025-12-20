@@ -756,6 +756,52 @@ def tick_once_windowed(
                 log.warning("post-call games(id) fetch failed: game=%s err=%s", gid, e)
             continue
 
+                # ─────────────────────────────────────────
+        # (D2) LIVE 판정 보정
+        #   - 킥오프 이후인데 API가 계속 NS/TBD를 주는 경우
+        #   - timer / score / events 중 하나라도 있으면 LIVE로 간주
+        # ─────────────────────────────────────────
+        if (
+            isinstance(db_date, dt.datetime)
+            and now >= db_date
+            and db_status in ("NS", "TBD")
+        ):
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    status_obj = api_item.get("status") or {}
+                    api_status = (status_obj.get("short") or "").strip()
+                    timer = api_item.get("timer")
+
+                    scores = api_item.get("scores") or {}
+                    home_score = (scores.get("home") or {}).get("total")
+                    away_score = (scores.get("away") or {}).get("total")
+
+                    has_score = (
+                        isinstance(home_score, int)
+                        and isinstance(away_score, int)
+                        and (home_score + away_score) > 0
+                    )
+
+                    has_timer = bool(timer)
+
+                    # LIVE 징후가 있으면 강제로 스냅샷 반영
+                    if has_timer or has_score or api_status not in ("NS", "TBD", ""):
+                        upsert_game(api_item, league_id, season)
+                        games_upserted += 1
+
+                        # 최신 상태 다시 로드
+                        cur = hockey_fetch_one(
+                            "SELECT status, game_date FROM hockey_games WHERE id=%s",
+                            (gid,),
+                        )
+                        if cur:
+                            db_status = (cur.get("status") or db_status).strip()
+                            db_date = cur.get("game_date") or db_date
+            except Exception as e:
+                log.warning("live-force check failed: game=%s err=%s", gid, e)
+
+
         # ─────────────────────────────────────────
         # (E) 라이브 중 주기 호출 (게임별 next_live_poll_at 기준)
         #   - events는 기존 정책(_should_poll_events) 그대로 유지
