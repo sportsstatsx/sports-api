@@ -155,17 +155,18 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     - 시작 전(pre): now ~ now+pre_min
     - 진행중(in-play): game_date가 now - inplay_max_min 이후이고, status가 '종료'가 아닌 경기
 
-    ✅ 추가 보강(중요):
-    - 시작 직후 API status가 잠깐 NS/TBD로 남는 케이스가 있어
-      game_date가 now보다 과거가 되는 순간 pre에서 빠지고,
-      in-play에서 NS/TBD 제외로 빠지면 "영원히 후보에서 탈락"하는 구멍이 생긴다.
-      → 시작 후 ns_grace_min 동안은 NS/TBD도 in-play 후보로 포함한다.
+    ✅ 중요한 수정:
+    - in-play 후보는 "이미 시작했거나 막 시작한 경기"만 포함해야 한다.
+    - 기존 코드는 game_date >= inplay_start 만 있어서
+      '미래 NS 경기'가 대량으로 in-play 후보에 포함되는 버그가 있었다.
+    - 해결: in-play 조건에 game_date <= now(+future_grace_min) 를 추가
 
     env:
-      HOCKEY_LIVE_PRESTART_MIN      (default 60)
-      HOCKEY_LIVE_INPLAY_MAX_MIN    (default 240)
-      HOCKEY_LIVE_NS_GRACE_MIN      (default 20)   # ✅ 시작 후 NS/TBD 유예
-      HOCKEY_LIVE_BATCH_LIMIT       (default 120)
+      HOCKEY_LIVE_PRESTART_MIN        (default 60)
+      HOCKEY_LIVE_INPLAY_MAX_MIN      (default 240)
+      HOCKEY_LIVE_NS_GRACE_MIN        (default 20)   # 시작 직후 NS/TBD 유예
+      HOCKEY_LIVE_FUTURE_GRACE_MIN    (default 2)    # ✅ 시각 오차 대비: in-play 미래 허용 범위(분)
+      HOCKEY_LIVE_BATCH_LIMIT         (default 120)
     """
     leagues = hockey_live_leagues()
     if not leagues:
@@ -174,11 +175,16 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     inplay_max_min = _int_env("HOCKEY_LIVE_INPLAY_MAX_MIN", 240)
     ns_grace_min = _int_env("HOCKEY_LIVE_NS_GRACE_MIN", 20)
+    future_grace_min = _int_env("HOCKEY_LIVE_FUTURE_GRACE_MIN", 2)  # ✅ 추가
     batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
 
     now = _utc_now()
     upcoming_end = now + dt.timedelta(minutes=pre_min)
+
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
+    # ✅ in-play은 "이미 시작" 위주여야 하므로 미래는 아주 조금만 허용
+    inplay_end = now + dt.timedelta(minutes=future_grace_min)
+
     ns_grace_start = now - dt.timedelta(minutes=ns_grace_min)
 
     rows = hockey_fetch_all(
@@ -193,28 +199,19 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
             OR
 
-            -- (2) 진행중(in-play) 경기: 시작시간이 최근 N분 이내 + 종료 아님
+            -- (2) 진행중(in-play) 경기: 최근 N분 이내에 "시작했거나 막 시작한" 경기 + 종료 아님
             (
               game_date >= %s
-              AND NOT (
-                -- (1) 명시적 종료/확정 상태
-                COALESCE(status, '') IN (
-                  'FT','AET','PEN','FIN','ENDED','END',
-                  'ABD','AW','CANC','POST','WO'
-                )
-                OR
-                -- (2) 시간 기반 종료: 6시간 지난 과거 경기인데 미시작/중단류 상태로 남아있는 경우
-                (
-                  game_date < now() - interval '6 hours'
-                  AND COALESCE(status, '') IN ('NS','TBD','SUSP','INT','DELAYED')
-                )
+              AND game_date <= %s
+              AND COALESCE(status, '') NOT IN (
+                'FT','AET','PEN','FIN','ENDED','END',
+                'ABD','AW','CANC','POST','WO'
               )
-
               AND (
-                -- ✅ 보통 진행중 상태
+                -- ✅ 보통 진행중 상태 (NS/TBD 제외)
                 COALESCE(status, '') NOT IN ('NS','TBD')
                 OR
-                -- ✅ 시작 후 ns_grace_min 동안은 NS/TBD도 후보로 포함(시작 상태 전환을 놓치지 않기 위함)
+                -- ✅ 시작 직후 ns_grace_min 동안만 NS/TBD 허용 (단, 미래경기는 제외됨: game_date <= inplay_end)
                 (COALESCE(status, '') IN ('NS','TBD') AND game_date >= %s)
               )
             )
@@ -222,9 +219,16 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
         ORDER BY game_date ASC
         LIMIT %s
         """,
-        (leagues, now, upcoming_end, inplay_start, ns_grace_start, batch_limit),
+        (
+            leagues,
+            now, upcoming_end,
+            inplay_start, inplay_end,
+            ns_grace_start,
+            batch_limit,
+        ),
     )
     return [dict(r) for r in rows]
+
 
 
 
