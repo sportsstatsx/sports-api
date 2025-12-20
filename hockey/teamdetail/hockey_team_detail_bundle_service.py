@@ -3,7 +3,6 @@
 from typing import Dict, Any
 
 from hockey.teamdetail.blocks.hockey_header_block import build_hockey_header_block
-from hockey.teamdetail.blocks.hockey_overall_block import build_hockey_overall_block
 from hockey.teamdetail.blocks.hockey_standing_block import build_hockey_standing_block
 from hockey.teamdetail.blocks.hockey_recent_results_block import build_hockey_recent_results_block
 from hockey.teamdetail.blocks.hockey_upcoming_block import build_hockey_upcoming_block
@@ -20,12 +19,6 @@ def build_hockey_team_detail_bundle(
     """
 
     header = build_hockey_header_block(
-        team_id=team_id,
-        league_id=league_id,
-        season=season,
-    )
-
-    overall = build_hockey_overall_block(
         team_id=team_id,
         league_id=league_id,
         season=season,
@@ -53,7 +46,6 @@ def build_hockey_team_detail_bundle(
 
     return {
         "header": header,
-        "overall": overall,
         "standings": standings,
         "recent_results": recent_results,
         "upcoming_fixtures": upcoming_fixtures,
