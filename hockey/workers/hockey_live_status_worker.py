@@ -196,10 +196,20 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             -- (2) 진행중(in-play) 경기: 시작시간이 최근 N분 이내 + 종료 아님
             (
               game_date >= %s
-              AND COALESCE(status, '') NOT IN (
-                'FT','AET','PEN','FIN','ENDED','END',
-                'ABD','AW','CANC','POST'
+              AND NOT (
+                -- (1) 명시적 종료/확정 상태
+                COALESCE(status, '') IN (
+                  'FT','AET','PEN','FIN','ENDED','END',
+                  'ABD','AW','CANC','POST','WO'
+                )
+                OR
+                -- (2) 시간 기반 종료: 6시간 지난 과거 경기인데 미시작/중단류 상태로 남아있는 경우
+                (
+                  game_date < now() - interval '6 hours'
+                  AND COALESCE(status, '') IN ('NS','TBD','SUSP','INT','DELAYED')
+                )
               )
+
               AND (
                 -- ✅ 보통 진행중 상태
                 COALESCE(status, '') NOT IN ('NS','TBD')
@@ -219,20 +229,36 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
 
 
-def _is_finished_status(s: str) -> bool:
+def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
+    """
+    ✅ 워커 관점 '종료' 판정(중요):
+    - 명시적 종료 상태는 즉시 종료로 본다.
+    - 과거 경기인데 NS/TBD/SUSP/INT/DELAYED 같은 상태로 남아있으면
+      라이브로 다시 바뀔 가능성이 사실상 없으므로 '종료'로 본다(시간 기반 종료).
+    """
     x = (s or "").upper().strip()
-    return x in {
-        "FT",      # Full Time
-        "AET",     # After Extra Time
-        "PEN",     # Penalties
-        "FIN",     # Finished
-        "END",
-        "ENDED",
-        "ABD",     # Abandoned
-        "AW",      # Awarded
-        "CANC",    # Cancelled
-        "POST",    # Postponed
-    }
+
+    # 1) 명시적 종료/확정 상태
+    if x in {
+        "FT", "AET", "PEN", "FIN", "END", "ENDED",
+        "ABD", "AW", "CANC", "POST", "WO",
+    }:
+        return True
+
+    # 2) 시간 기반 종료: 과거 경기인데 미시작/중단류 상태로 남아있는 경우
+    #    (여기서 6시간은 너가 쿼리에서 쓰던 기준과 동일하게 맞춤)
+    if isinstance(game_date, dt.datetime):
+        try:
+            age = _utc_now() - game_date
+            if age > dt.timedelta(hours=6):
+                if x in {"NS", "TBD", "SUSP", "INT", "DELAYED"}:
+                    return True
+        except Exception:
+            # game_date 비교 실패 시에는 보수적으로 False
+            pass
+
+    return False
+
 
 
 
@@ -244,17 +270,17 @@ def _is_not_started_status(s: str) -> bool:
 def _should_poll_events(db_status: str, game_date: Optional[dt.datetime]) -> bool:
     """
     events 폴링 조건:
-    - 윈도우 목록에 들어온 경기들만 여기까지 오고,
-    - status가 완전 종료면 스킵(단, 종료 직후 정정이 필요하면 윈도우 안이므로 /games?id 업데이트는 해도 됨)
+    - 윈도우 후보로 들어온 경기들만 여기까지 오고,
+    - '종료'로 판정되면 스킵
     """
-    if _is_finished_status(db_status):
+    if _is_finished_status(db_status, game_date):
         return False
     if _is_not_started_status(db_status):
         # 시작 전이라도 윈도우 안이면 line-up/상태변경 가능성은 있지만,
         # events는 보통 시작 후 의미가 크므로 기본은 스킵.
-        # 필요하면 여기 True로 바꾸면 됨.
         return False
     return True
+
 
 def _poll_state_get_or_create(game_id: int) -> Dict[str, Any]:
     row = hockey_fetch_one(
@@ -608,7 +634,7 @@ def tick_once_windowed(
             start_called_at is None
             and isinstance(db_date, dt.datetime)
             and now >= db_date
-            and not _is_finished_status(db_status)
+            and not _is_finished_status(db_status, db_date)
         ):
             try:
                 api_item = _api_get_game_by_id(gid)
@@ -631,7 +657,7 @@ def tick_once_windowed(
         # ─────────────────────────────────────────
         # (C) 종료 감지 1회
         # ─────────────────────────────────────────
-        if _is_finished_status(db_status) and end_called_at is None:
+        if _is_finished_status(db_status, db_date) and end_called_at is None:
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
