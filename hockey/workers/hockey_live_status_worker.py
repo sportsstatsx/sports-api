@@ -801,6 +801,80 @@ def tick_once_windowed(
             except Exception as e:
                 log.warning("live-force check failed: game=%s err=%s", gid, e)
 
+                # ─────────────────────────────────────────
+        # (D3) 킥오프 이후에도 NS/TBD로 남는 케이스 강제 LIVE 처리
+        #   - /games 가 NS를 계속 주는 경우가 있음(하키에서 실제로 발생)
+        #   - 이때 /games/events 에 이벤트가 1개라도 오면 "이미 진행중"으로 보고
+        #     DB status를 LIVE로 강제 전환해서 (E) 폴링을 태운다.
+        # ─────────────────────────────────────────
+        if (
+            isinstance(db_date, dt.datetime)
+            and now >= db_date
+            and db_status in ("NS", "TBD")
+            and not _is_finished_status(db_status, db_date)
+        ):
+            # next_live_poll_at 기준으로만 재시도(너무 자주 치지 않게)
+            due = False
+            if next_live_poll_at is None:
+                due = True
+            else:
+                try:
+                    due = now >= next_live_poll_at
+                except Exception:
+                    due = True
+
+            if due:
+                interval = _league_interval_sec(
+                    league_id,
+                    super_fast_leagues=super_fast_leagues,
+                    fast_leagues=fast_leagues,
+                    super_fast_interval=super_fast_interval,
+                    fast_interval=fast_interval,
+                    slow_interval=slow_interval,
+                )
+
+                # 1) events 먼저 확인 (NS라도 이벤트가 오면 진행중으로 간주)
+                ev_list: List[Dict[str, Any]] = []
+                try:
+                    ev_payload = _get("/games/events", {"game": gid})
+                    ev_resp = ev_payload.get("response") if isinstance(ev_payload, dict) else None
+                    if isinstance(ev_resp, list):
+                        ev_list = [x for x in ev_resp if isinstance(x, dict)]
+                except Exception as e:
+                    log.warning("ns-livecheck events fetch failed: game=%s err=%s", gid, e)
+
+                if ev_list:
+                    # events가 있으면 → LIVE로 강제 전환 + 이벤트 저장
+                    try:
+                        upsert_events(gid, ev_list)
+                        events_upserted += len(ev_list)
+                    except Exception as e:
+                        log.warning("ns-livecheck upsert_events failed: game=%s err=%s", gid, e)
+
+                    # ✅ status를 강제로 LIVE로 변경 (upsert_game으로는 NS로 다시 덮일 수 있음)
+                    hockey_execute(
+                        """
+                        UPDATE hockey_games
+                        SET status=%s,
+                            status_long=%s,
+                            updated_at=now()
+                        WHERE id=%s
+                        """,
+                        ("LIVE", "Live (forced by events)", gid),
+                    )
+                    db_status = "LIVE"  # 이 틱에서 바로 (E)로 진입 가능
+
+                # 2) 다음 폴링 예약 (NS든 LIVE든 다음 확인 시각은 필요)
+                _poll_state_update(
+                    gid,
+                    next_live_poll_at=now + dt.timedelta(seconds=float(interval)),
+                )
+
+                # 아직도 NS/TBD면 (E) 못 타니까 다음 게임으로
+                if db_status in ("NS", "TBD"):
+                    continue
+
+
 
         # ─────────────────────────────────────────
         # (E) 라이브 중 주기 호출 (게임별 next_live_poll_at 기준)
