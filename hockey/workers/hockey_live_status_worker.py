@@ -196,7 +196,10 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             -- (2) 진행중(in-play) 경기: 시작시간이 최근 N분 이내 + 종료 아님
             (
               game_date >= %s
-              AND COALESCE(status, '') NOT IN ('FT','AET','PEN','FIN','ENDED','END')
+              AND COALESCE(status, '') NOT IN (
+                'FT','AET','PEN','FIN','ENDED','END',
+                'ABD','AW','CANC','POST'
+              )
               AND (
                 -- ✅ 보통 진행중 상태
                 COALESCE(status, '') NOT IN ('NS','TBD')
@@ -218,7 +221,19 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
 def _is_finished_status(s: str) -> bool:
     x = (s or "").upper().strip()
-    return x in {"FT", "AET", "PEN", "FIN", "ENDED", "END"}
+    return x in {
+        "FT",      # Full Time
+        "AET",     # After Extra Time
+        "PEN",     # Penalties
+        "FIN",     # Finished
+        "END",
+        "ENDED",
+        "ABD",     # Abandoned
+        "AW",      # Awarded
+        "CANC",    # Cancelled
+        "POST",    # Postponed
+    }
+
 
 
 def _is_not_started_status(s: str) -> bool:
