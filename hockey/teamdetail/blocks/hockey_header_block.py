@@ -2,7 +2,7 @@
 
 from typing import Dict, Any
 
-from db import fetch_one
+from hockey.hockey_db import hockey_fetch_one as fetch_one
 
 
 def build_hockey_header_block(
