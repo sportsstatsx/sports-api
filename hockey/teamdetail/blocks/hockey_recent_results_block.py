@@ -1,7 +1,7 @@
 # hockey/teamdetail/blocks/hockey_recent_results_block.py
 
 from typing import List, Dict, Any
-from db import fetch_all
+from hockey.hockey_db import hockey_fetch_all as fetch_all
 
 
 def build_hockey_recent_results_block(
