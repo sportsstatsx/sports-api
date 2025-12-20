@@ -594,6 +594,7 @@ def tick_once_windowed(
     games_upserted = 0
     events_upserted = 0
     now = _utc_now()
+    ns_grace_min = _int_env("HOCKEY_LIVE_NS_GRACE_MIN", 20)
 
     for r in rows:
         gid = int(r["id"])
@@ -657,6 +658,70 @@ def tick_once_windowed(
                         db_date = cur.get("game_date") or db_date
             except Exception as e:
                 log.warning("start-call games(id) fetch failed: game=%s err=%s", gid, e)
+
+                # ─────────────────────────────────────────
+        # (B2) 킥오프 이후 NS/TBD 재확인(상태 전환 지연 흡수)
+        #   - start_called_at은 찍혔는데 status가 계속 NS/TBD이면,
+        #     ns_grace_min 동안 next_live_poll_at 기준으로 /games를 재호출한다.
+        #   - status가 LIVE로 바뀌면 같은 틱에서 (E) 라이브 주기 호출로 자연스럽게 넘어간다.
+        # ─────────────────────────────────────────
+        if (
+            isinstance(db_date, dt.datetime)
+            and start_called_at is not None
+            and db_status in ("NS", "TBD")
+            and now >= db_date
+            and now <= (db_date + dt.timedelta(minutes=ns_grace_min))
+            and not _is_finished_status(db_status, db_date)
+        ):
+            # due 판단: next_live_poll_at이 없으면 즉시, 있으면 그 시각 이후에만
+            due = False
+            if next_live_poll_at is None:
+                due = True
+            else:
+                try:
+                    due = now >= next_live_poll_at
+                except Exception:
+                    due = True
+
+            if due:
+                interval = _league_interval_sec(
+                    league_id,
+                    super_fast_leagues=super_fast_leagues,
+                    fast_leagues=fast_leagues,
+                    super_fast_interval=super_fast_interval,
+                    fast_interval=fast_interval,
+                    slow_interval=slow_interval,
+                )
+
+                try:
+                    # /games 스냅샷 재확인
+                    api_item = _api_get_game_by_id(gid)
+                    if isinstance(api_item, dict):
+                        upsert_game(api_item, league_id, season)
+                        games_upserted += 1
+
+                        # 최신 status/game_date로 재판정
+                        cur = hockey_fetch_one(
+                            "SELECT status, game_date FROM hockey_games WHERE id=%s",
+                            (gid,),
+                        )
+                        if cur:
+                            db_status = (cur.get("status") or db_status).strip()
+                            db_date = cur.get("game_date") or db_date
+
+                except Exception as e:
+                    log.warning("ns-grace games(id) recheck failed: game=%s err=%s", gid, e)
+
+                # 다음 재확인 시각 저장(여기서부터 폴링이 "살아남")
+                _poll_state_update(
+                    gid,
+                    next_live_poll_at=now + dt.timedelta(seconds=float(interval)),
+                )
+
+            # 아직도 NS/TBD면 (E)로 못 가니 여기서 다음 게임으로
+            if db_status in ("NS", "TBD"):
+                continue
+
 
         # ─────────────────────────────────────────
         # (C) 종료 감지 1회
