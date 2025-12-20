@@ -241,6 +241,37 @@ def _should_poll_events(db_status: str, game_date: Optional[dt.datetime]) -> boo
         return False
     return True
 
+def _poll_state_get_or_create(game_id: int) -> Dict[str, Any]:
+    row = hockey_fetch_one(
+        "SELECT * FROM hockey_live_poll_state WHERE game_id=%s",
+        (game_id,),
+    )
+    if row:
+        return dict(row)
+
+    hockey_execute(
+        "INSERT INTO hockey_live_poll_state (game_id) VALUES (%s) ON CONFLICT DO NOTHING",
+        (game_id,),
+    )
+    row2 = hockey_fetch_one(
+        "SELECT * FROM hockey_live_poll_state WHERE game_id=%s",
+        (game_id,),
+    )
+    return dict(row2) if row2 else {"game_id": game_id}
+
+
+def _poll_state_update(game_id: int, **cols: Any) -> None:
+    if not cols:
+        return
+    keys = list(cols.keys())
+    sets = ", ".join([f"{k}=%s" for k in keys])
+    values = [cols[k] for k in keys]
+    hockey_execute(
+        f"UPDATE hockey_live_poll_state SET {sets}, updated_at=now() WHERE game_id=%s",
+        tuple(values + [game_id]),
+    )
+
+
 
 
 def _extract_team_ids(item: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
@@ -489,11 +520,27 @@ def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def tick_once_windowed(rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+def tick_once_windowed(
+    rows: List[Dict[str, Any]],
+    *,
+    super_fast_leagues: set[int],
+    fast_leagues: set[int],
+    super_fast_interval: float,
+    fast_interval: float,
+    slow_interval: float,
+    pre_min: int,
+    post_min: int,
+) -> Tuple[int, int, int]:
     """
-    정석 구조 tick (리그별 스케줄링 지원 버전):
-    - rows는 이미 window에서 뽑힌 후보 목록
-    - 이 함수는 주어진 rows만 처리한다.
+    ✅ 게임별 1회 호출 규칙 + 라이브 중 주기 규칙을 DB 상태(hockey_live_poll_state)로 보장한다.
+
+    게임 1개 기준 호출 구조:
+      - 시작 1시간 전 1회 (pre_called_at)
+      - 시작 감지 1회 (start_called_at)
+      - 라이브 중 next_live_poll_at 도달 시만 주기 호출
+      - 종료 감지 1회 (end_called_at + finished_at)
+      - 종료 30분 후 1회 (post_called_at)
+
     returns: (games_upserted, events_upserted, candidates)
     """
     if not rows:
@@ -501,6 +548,7 @@ def tick_once_windowed(rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
 
     games_upserted = 0
     events_upserted = 0
+    now = _utc_now()
 
     for r in rows:
         gid = int(r["id"])
@@ -509,37 +557,158 @@ def tick_once_windowed(rows: List[Dict[str, Any]]) -> Tuple[int, int, int]:
         db_status = (r.get("status") or "").strip()
         db_date = r.get("game_date")
 
-        # 1) 게임 스냅샷 갱신
-        try:
-            api_item = _api_get_game_by_id(gid)
-            if isinstance(api_item, dict):
-                new_id = upsert_game(api_item, league_id, season)
-                if new_id:
-                    games_upserted += 1
+        # poll state 로드/생성
+        st = _poll_state_get_or_create(gid)
+        pre_called_at = st.get("pre_called_at")
+        start_called_at = st.get("start_called_at")
+        end_called_at = st.get("end_called_at")
+        post_called_at = st.get("post_called_at")
+        finished_at = st.get("finished_at")
+        next_live_poll_at = st.get("next_live_poll_at")
 
-                    # upsert 이후 최신 status를 다시 읽어 events 판단
-                    cur = hockey_fetch_one("SELECT status, game_date FROM hockey_games WHERE id=%s", (gid,))
+        # ─────────────────────────────────────────
+        # (A) 시작 1시간 전 1회
+        # ─────────────────────────────────────────
+        if (
+            pre_called_at is None
+            and isinstance(db_date, dt.datetime)
+            and (db_date - dt.timedelta(minutes=pre_min)) <= now < db_date
+        ):
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    upsert_game(api_item, league_id, season)
+                    games_upserted += 1
+                    _poll_state_update(gid, pre_called_at=now)
+            except Exception as e:
+                log.warning("pre-call games(id) fetch failed: game=%s err=%s", gid, e)
+            continue
+
+        # ─────────────────────────────────────────
+        # (B) 시작 시점 1회 (워커가 처음 '시작 이후'를 감지했을 때)
+        #   - 시작 직후 NS/TBD가 잠깐 남는 케이스가 있으니
+        #     now >= game_date면 1회 호출로 스냅샷 갱신해준다.
+        # ─────────────────────────────────────────
+        if (
+            start_called_at is None
+            and isinstance(db_date, dt.datetime)
+            and now >= db_date
+            and not _is_finished_status(db_status)
+        ):
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    upsert_game(api_item, league_id, season)
+                    games_upserted += 1
+                    _poll_state_update(gid, start_called_at=now)
+
+                    # 최신 status/game_date로 재판정(라이브 전환을 놓치지 않기 위함)
+                    cur = hockey_fetch_one(
+                        "SELECT status, game_date FROM hockey_games WHERE id=%s",
+                        (gid,),
+                    )
                     if cur:
                         db_status = (cur.get("status") or db_status).strip()
                         db_date = cur.get("game_date") or db_date
-        except Exception as e:
-            log.warning("api games(id) fetch failed: game=%s err=%s", gid, e)
+            except Exception as e:
+                log.warning("start-call games(id) fetch failed: game=%s err=%s", gid, e)
+
+        # ─────────────────────────────────────────
+        # (C) 종료 감지 1회
+        # ─────────────────────────────────────────
+        if _is_finished_status(db_status) and end_called_at is None:
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    upsert_game(api_item, league_id, season)
+                    games_upserted += 1
+                    _poll_state_update(gid, end_called_at=now, finished_at=now)
+            except Exception as e:
+                log.warning("end-call games(id) fetch failed: game=%s err=%s", gid, e)
             continue
 
-        # 2) events는 "진행중일 때만" 폴링
-        if _should_poll_events(db_status, db_date):
+        # ─────────────────────────────────────────
+        # (D) 종료 30분 후 1회
+        #   - finished_at이 없으면(이전 루프에서 종료를 아직 못 봤으면) 실행 안 함
+        # ─────────────────────────────────────────
+        if (
+            finished_at is not None
+            and post_called_at is None
+            and now >= (finished_at + dt.timedelta(minutes=post_min))
+        ):
             try:
-                ev_payload = _get("/games/events", {"game": gid})
-                ev_resp = ev_payload.get("response") if isinstance(ev_payload, dict) else None
-                if isinstance(ev_resp, list):
-                    ev_list = [x for x in ev_resp if isinstance(x, dict)]
-                    if ev_list:
-                        upsert_events(gid, ev_list)
-                        events_upserted += len(ev_list)
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    upsert_game(api_item, league_id, season)
+                    games_upserted += 1
+                    _poll_state_update(gid, post_called_at=now)
             except Exception as e:
-                log.warning("events fetch failed: game=%s err=%s", gid, e)
+                log.warning("post-call games(id) fetch failed: game=%s err=%s", gid, e)
+            continue
+
+        # ─────────────────────────────────────────
+        # (E) 라이브 중 주기 호출 (게임별 next_live_poll_at 기준)
+        #   - events는 기존 정책(_should_poll_events) 그대로 유지
+        # ─────────────────────────────────────────
+        if _should_poll_events(db_status, db_date):
+            due = False
+            if next_live_poll_at is None:
+                due = True
+            else:
+                try:
+                    due = now >= next_live_poll_at
+                except Exception:
+                    due = True
+
+            if due:
+                interval = _league_interval_sec(
+                    league_id,
+                    super_fast_leagues=super_fast_leagues,
+                    fast_leagues=fast_leagues,
+                    super_fast_interval=super_fast_interval,
+                    fast_interval=fast_interval,
+                    slow_interval=slow_interval,
+                )
+
+                # 1) /games 스냅샷
+                try:
+                    api_item = _api_get_game_by_id(gid)
+                    if isinstance(api_item, dict):
+                        upsert_game(api_item, league_id, season)
+                        games_upserted += 1
+
+                        # upsert 이후 최신 status/game_date로 events 재판정
+                        cur = hockey_fetch_one(
+                            "SELECT status, game_date FROM hockey_games WHERE id=%s",
+                            (gid,),
+                        )
+                        if cur:
+                            db_status = (cur.get("status") or db_status).strip()
+                            db_date = cur.get("game_date") or db_date
+                except Exception as e:
+                    log.warning("live-call games(id) fetch failed: game=%s err=%s", gid, e)
+                    # games 실패해도 next_live_poll_at은 너무 촘촘히 다시 치지 않게 약하게 밀어줌
+                    _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=max(5.0, float(interval))))
+                    continue
+
+                # 2) /games/events (진행중일 때만)
+                if _should_poll_events(db_status, db_date):
+                    try:
+                        ev_payload = _get("/games/events", {"game": gid})
+                        ev_resp = ev_payload.get("response") if isinstance(ev_payload, dict) else None
+                        if isinstance(ev_resp, list):
+                            ev_list = [x for x in ev_resp if isinstance(x, dict)]
+                            if ev_list:
+                                upsert_events(gid, ev_list)
+                                events_upserted += len(ev_list)
+                    except Exception as e:
+                        log.warning("events fetch failed: game=%s err=%s", gid, e)
+
+                # 다음 라이브 폴링 시각 저장
+                _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=float(interval)))
 
     return (games_upserted, events_upserted, len(rows))
+
 
 
 
@@ -642,7 +811,16 @@ def main() -> None:
                     continue  # 아직 시간 안 됨
 
                 # due → 실행
-                g_up, e_up, cand = tick_once_windowed(rows)
+                g_up, e_up, cand = tick_once_windowed(
+                    rows,
+                    super_fast_leagues=super_fast_leagues,
+                    fast_leagues=fast_leagues,
+                    super_fast_interval=super_fast_interval,
+                    fast_interval=fast_interval,
+                    slow_interval=slow_interval,
+                    pre_min=pre_min,
+                    post_min=post_min,
+                )
                 total_games_upserted += g_up
                 total_events_upserted += e_up
                 total_candidates += cand
