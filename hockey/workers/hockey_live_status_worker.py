@@ -764,10 +764,10 @@ def tick_once_windowed(
                 log.warning("post-call games(id) fetch failed: game=%s err=%s", gid, e)
             continue
 
-                # ─────────────────────────────────────────
+        # ─────────────────────────────────────────
         # (D2) LIVE 판정 보정
         #   - 킥오프 이후인데 API가 계속 NS/TBD를 주는 경우
-        #   - timer / score / events 중 하나라도 있으면 LIVE로 간주
+        #   - timer / score / status_short 중 하나라도 LIVE 징후면 LIVE로 간주
         # ─────────────────────────────────────────
         if (
             isinstance(db_date, dt.datetime)
@@ -777,20 +777,27 @@ def tick_once_windowed(
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
-                    status_obj = api_item.get("status") or {}
+                    status_obj = api_item.get("status") if isinstance(api_item.get("status"), dict) else {}
                     api_status = (status_obj.get("short") or "").strip()
                     timer = api_item.get("timer")
 
-                    scores = api_item.get("scores") or {}
-                    home_score = (scores.get("home") or {}).get("total")
-                    away_score = (scores.get("away") or {}).get("total")
+                    # ✅ hockey API-sports scores는 {home:int, away:int} 형태
+                    scores = api_item.get("scores")
+                    home_score = None
+                    away_score = None
+                    if isinstance(scores, dict):
+                        h = scores.get("home")
+                        a = scores.get("away")
+                        if isinstance(h, int):
+                            home_score = h
+                        if isinstance(a, int):
+                            away_score = a
 
                     has_score = (
                         isinstance(home_score, int)
                         and isinstance(away_score, int)
                         and (home_score + away_score) > 0
                     )
-
                     has_timer = bool(timer)
 
                     # LIVE 징후가 있으면 강제로 스냅샷 반영
@@ -808,6 +815,7 @@ def tick_once_windowed(
                             db_date = cur.get("game_date") or db_date
             except Exception as e:
                 log.warning("live-force check failed: game=%s err=%s", gid, e)
+
 
                 # ─────────────────────────────────────────
         # (D3) 킥오프 이후에도 NS/TBD로 남는 케이스 강제 LIVE 처리
