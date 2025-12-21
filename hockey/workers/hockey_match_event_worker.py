@@ -1034,9 +1034,15 @@ def run_once() -> bool:
 
 
             # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
-            pk = event_persist_key(ev)
+            # - DB의 의미 기반 fingerprint(event_key)을 우선 사용
+            # - 혹시 event_key가 비어있으면 기존 persist_key로 fallback
+            pk = str(ev.get("event_key") or "").strip()
+            if not pk:
+                pk = event_persist_key(ev)
+
             if pk in sent_hist_set:
                 continue
+
 
 
             # ✅ 옵션: score 알림 off면 goal/penalty 자체를 막고 싶다면 여기서 컷
@@ -1091,7 +1097,6 @@ def run_once() -> bool:
                     max_seen_event_id = prev_max_seen_event_id
                     break
 
-
                 # ✅ 정석: 알림 점수도 DB(score_json) 기준만 사용해서
                 # 앱 타임라인/스코어와 100% 동일하게 만든다.
                 t, b = build_hockey_message(
@@ -1105,27 +1110,25 @@ def run_once() -> bool:
                     tag=tag,
                 )
 
+                ok = send_push(
+                    token=sub.fcm_token,
+                    title=t,
+                    body=b,
+                    data={
+                        "sport": "hockey",
+                        "game_id": str(sub.game_id),
+                        "type": etype,
+                        "status": status,
+                    },
+                )
+                if ok:
+                    # ✅ 리컨실(DELETE/INSERT)로 이벤트 id가 바뀌어도 같은 이벤트 재발송 방지
+                    sent_hist_set.add(pk)
+                    sent_hist.append(pk)
 
+                    sent += 1
+                    time.sleep(SEND_SLEEP_SEC)
 
-
-            ok = send_push(
-                token=sub.fcm_token,
-                title=t,
-                body=b,
-                data={
-                    "sport": "hockey",
-                    "game_id": str(sub.game_id),
-                    "type": etype,
-                    "status": status,
-                },
-            )
-            if ok:
-                # ✅ 리컨실(DELETE/INSERT)로 이벤트 id가 바뀌어도 같은 이벤트 재발송 방지
-                sent_hist_set.add(pk)
-                sent_hist.append(pk)
-
-                sent += 1
-                time.sleep(SEND_SLEEP_SEC)
 
 
 
