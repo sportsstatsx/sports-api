@@ -274,6 +274,52 @@ def ensure_tables() -> None:
         """
     )
 
+        # ✅ 알림 디듀프 전용 키: comment/assists 변화에 흔들리지 않도록 제외
+    execute(
+        """
+        ALTER TABLE hockey_game_events
+        ADD COLUMN IF NOT EXISTS notif_key TEXT
+        GENERATED ALWAYS AS (
+          lower(coalesce(type,'')) || '|' ||
+          coalesce(period,'') || '|' ||
+          coalesce(minute::text,'') || '|' ||
+          coalesce(team_id::text,'') || '|' ||
+          lower(coalesce(array_to_string(players,','),'')) 
+        ) STORED;
+        """
+    )
+
+    # 최근 범위에서 notif_key 기준 완전 중복 제거(인덱스 생성 전 안전장치)
+    execute(
+        """
+        WITH ranked AS (
+          SELECT
+            e.id,
+            row_number() OVER (
+              PARTITION BY e.game_id, e.notif_key
+              ORDER BY e.id DESC
+            ) AS rn
+          FROM hockey_game_events e
+          JOIN hockey_games g ON g.id = e.game_id
+          WHERE g.game_date >= NOW() - interval '14 days'
+            AND e.notif_key IS NOT NULL
+            AND e.notif_key <> ''
+        )
+        DELETE FROM hockey_game_events e
+        USING ranked r
+        WHERE e.id = r.id
+          AND r.rn > 1;
+        """
+    )
+
+    execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_notif_key
+        ON hockey_game_events (game_id, notif_key);
+        """
+    )
+
+
     # (선택이지만 강력추천) 최근 경기 범위에서 “완전 동일 이벤트” 중복이 이미 있다면 정리 후 인덱스 생성
     execute(
         """
@@ -738,7 +784,8 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
             players,
             assists,
             event_order,
-            event_key
+            event_key,
+            notif_key
         FROM hockey_game_events
         WHERE game_id = %s
           AND id > %s
@@ -747,6 +794,7 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
         (game_id, last_event_id),
     )
     return rows
+
 
 
 
@@ -1034,14 +1082,15 @@ def run_once() -> bool:
 
 
             # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
-            # - DB의 의미 기반 fingerprint(event_key)을 우선 사용
-            # - 혹시 event_key가 비어있으면 기존 persist_key로 fallback
-            pk = str(ev.get("event_key") or "").strip()
+            # - notif_key: comment/assists 변화에 흔들리지 않는 "알림 전용 안정 키"
+            # - 혹시 notif_key가 비어있으면 persist_key로 fallback
+            pk = str(ev.get("notif_key") or "").strip()
             if not pk:
                 pk = event_persist_key(ev)
 
             if pk in sent_hist_set:
                 continue
+
 
 
 
