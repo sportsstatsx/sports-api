@@ -712,28 +712,6 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
 
 
 
-def _arr_len(x: Any) -> int:
-    if x is None:
-        return 0
-    if isinstance(x, (list, tuple, set)):
-        return len(x)
-    return 0
-
-
-def event_dedupe_key(ev: Dict[str, Any]) -> str:
-    """
-    같은 tick 안에서 중복 전송 방지용 키.
-    - comment는 나중에 "PPG"처럼 업데이트되어 2번 들어올 수 있으니 키에서 제외
-    - 대신 event_order를 포함해서 "연속골(같은 분에 같은 팀 득점)"도 안전하게 구분
-    """
-    period = str(ev.get("period") or "").strip()
-    minute = str(ev.get("minute") or "").strip()
-    team_id = str(ev.get("team_id") or "").strip()
-    etype = str(ev.get("type") or "").strip().lower()
-    event_order = str(ev.get("event_order") or "").strip()
-    return f"{etype}|{period}|{minute}|{team_id}|{event_order}"
-
-
 def event_persist_key(ev: Dict[str, Any]) -> str:
     """
     ✅ tick을 넘어(워커 재시작/리컨실 DELETE-INSERT 포함) 중복 알림을 막는 "의미 기반" 키.
