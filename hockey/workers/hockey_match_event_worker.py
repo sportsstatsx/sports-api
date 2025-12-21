@@ -1,4 +1,3 @@
-# hockey/workers/hockey_match_event_worker.py
 from __future__ import annotations
 
 import json
@@ -162,9 +161,9 @@ def execute(sql: str, params: Optional[Sequence[Any]] = None) -> None:
 
 def table_columns(table_name: str) -> set[str]:
     """
-    ⚠️ 중요한 안전장치:
-    - 알림 워커는 hockey_game_events 스키마에 절대 발목 잡히면 안 됨.
-    - 컬럼 존재 여부를 런타임에 확인하고, 존재하는 컬럼만 SELECT 하도록 한다.
+    ✅ 안전장치:
+    - 알림 워커가 hockey_game_events 스키마 변경에 발목 잡히면 안 됨.
+    - 컬럼 존재 여부를 런타임에 확인하고, 존재하는 컬럼만 SELECT 한다.
     """
     rows = fetch_all(
         """
@@ -239,7 +238,7 @@ def ensure_tables() -> None:
     for stmt in DDL:
         execute(stmt)
 
-    # subscriptions 옵션 컬럼들 (기존 파일과 동일)
+    # ✅ (2) 알림 종류 체크용 옵션 컬럼들 (기존 파일과 동일)
     execute(
         "ALTER TABLE hockey_game_notification_subscriptions "
         "ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;"
@@ -647,11 +646,7 @@ def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
 
 def _normalize_players(val: Any) -> List[str]:
     """
-    hockey_game_events.players/assists 타입이 리그/시점에 따라:
-    - text[]
-    - json/jsonb
-    - 문자열
-    등으로 흔들려도 안전하게 리스트[str]로 맞춘다.
+    hockey_game_events.players/assists 타입이 흔들려도 안전하게 리스트[str]로 변환
     """
     if val is None:
         return []
@@ -663,29 +658,20 @@ def _normalize_players(val: Any) -> List[str]:
         s = val.strip()
         if not s:
             return []
-        # json 문자열일 수 있으니 시도
         try:
             obj = json.loads(s)
             if isinstance(obj, list):
                 return [str(x) for x in obj if str(x).strip()]
         except Exception:
             pass
-        # 그냥 단일 문자열이면 1개로 취급
         return [s]
-    # jsonb 등은 psycopg가 dict/list로 주는 경우가 있음
-    try:
-        if isinstance(val, dict):
-            # 의미 없음
-            return []
-    except Exception:
-        pass
     return []
 
 
 def event_persist_key(ev: Dict[str, Any]) -> str:
     """
-    ✅ 스키마 의존 없는, 의미 기반 디듀프 키
-    - comment/assists 변경으로 같은 골이 재알림되는걸 막기 위해 기본적으로 제외
+    ✅ 스키마 의존 없는 의미 기반 디듀프 키
+    - comment/assists 변경으로 같은 골이 재알림되는 걸 막기 위해 기본 제외
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
@@ -706,12 +692,11 @@ def _hash_key(s: str) -> str:
 
 def fetch_new_events(game_id: int, last_event_id: int, events_cols: set[str]) -> List[Dict[str, Any]]:
     """
-    ⚠️ 절대 event_key/notif_key 같은 컬럼에 의존하지 않는다.
-    존재하는 컬럼만 SELECT 해서, 스키마가 바뀌어도 워커가 라이브수집을 깨지 않게.
+    ✅ 절대 event_key/notif_key 컬럼에 의존하지 않는다.
+    존재하는 컬럼만 SELECT해서, 스키마 변경이 있어도 워커가 DB를 계속 때리며 터지지 않게 한다.
     """
-    # 최소 컬럼
     cols = ["id", "period", "minute", "team_id", "type", "comment", "updated_at"]
-    # 있으면 가져오기
+
     if "players" in events_cols:
         cols.append("players")
     if "assists" in events_cols:
@@ -753,7 +738,7 @@ def run_once(events_cols: set[str]) -> bool:
         log.info("tick: candidates=0")
         return False
 
-    # ✅ 기존 로직 유지: now 기준 ±6시간 & fast league면 fast
+    # ✅ (4) 워커 동작 조건: 기존 로직 유지 (now 기준 ±6시간 & fast league면 fast)
     now_ts = now_utc.timestamp()
     has_fast_candidate = False
     if FAST_LEAGUE_SET:
@@ -895,15 +880,15 @@ def run_once(events_cols: set[str]) -> bool:
 
             etype = str(ev.get("type") or "").strip().lower()
 
-            # ✅ 3) goal만인지: goal 외는 전부 스킵 (기존과 동일 정책)
+            # ✅ (3) goal만인지: goal 외는 전부 스킵
             if etype != "goal":
                 continue
 
-            # ✅ 2) 알림 종류 체크: notify_score 꺼져 있으면 goal도 스킵
+            # ✅ (2) 알림 종류 체크: notify_score 꺼져 있으면 goal도 스킵
             if not sub.notify_score:
                 continue
 
-            # ✅ 스키마 의존 없는 키 (event_key/notif_key 사용 금지)
+            # ✅ 스키마 의존 없는 키
             nk = event_persist_key(ev)
             persist_key = _hash_key(f"{sub.game_id}:{nk}")
 
