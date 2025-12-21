@@ -1076,39 +1076,48 @@ def run_once() -> bool:
                 # - ev_team_id를 기준으로 홈/원정 어느 쪽 스코어가 늘어야 하는지 판정한다.
                 score_increased = False
 
+                # ✅ goal 이벤트 1건당 점수 +1 누적(연속골/score_json 점프 대응)
+                # - score_json이 한 번에 2–2로 점프해도, goal 이벤트가 2개면 2번 알림이 나가야 정상
+                # - 알림에 찍는 점수는 "이벤트 기반 누적 점수"를 사용 (앱 진행과 더 잘 맞음)
+                notif_home = work_last_home
+                notif_away = work_last_away
+
                 if ev_team_id and home_team_id and ev_team_id == home_team_id:
-                    if home > work_last_home:
-                        score_increased = True
-                        work_last_home = home
+                    notif_home = work_last_home + 1
+                    score_increased = True
                 elif ev_team_id and away_team_id and ev_team_id == away_team_id:
-                    if away > work_last_away:
-                        score_increased = True
-                        work_last_away = away
+                    notif_away = work_last_away + 1
+                    score_increased = True
                 else:
-                    # 팀 판정이 안 되면 보수적으로 “총점 증가”일 때만 허용
+                    # 팀 판정이 안 되면, score_json이 last보다 큰 경우에만 1골로 처리
                     if (home + away) > (work_last_home + work_last_away):
                         score_increased = True
-                        work_last_home = max(work_last_home, home)
-                        work_last_away = max(work_last_away, away)
+                        # 어느 쪽이 올랐는지 모르니 보수적으로 총점 +1만 반영(홈 우선 X)
+                        notif_home = work_last_home
+                        notif_away = work_last_away
+                    else:
+                        score_increased = False
 
                 if not score_increased:
-                    # score_json 갱신이 늦는 경우(이벤트는 들어왔지만 점수는 아직 이전 값)
-                    # 이 goal 이벤트를 다음 tick에서 다시 보기 위해 last_event_id 전진을 되돌린다.
+                    # score_json/팀판정이 아직 따라오지 않으면 다음 tick에서 재시도
                     max_seen_event_id = prev_max_seen_event_id
                     break
 
-                # ✅ 정석: 알림 점수도 DB(score_json) 기준만 사용해서
-                # 앱 타임라인/스코어와 100% 동일하게 만든다.
+                # work_last 갱신(누적)
+                work_last_home = notif_home
+                work_last_away = notif_away
+
                 t, b = build_hockey_message(
                     "goal",
                     g,
-                    home,
-                    away,
+                    notif_home,
+                    notif_away,
                     period=period,
                     minute=minute,
                     team_name=team_name,
                     tag=tag,
                 )
+
 
                 ok = send_push(
                     token=sub.fcm_token,
@@ -1145,9 +1154,12 @@ def run_once() -> bool:
         # ✅ (A) 경기 종료 시 sent_event_keys 통째로 초기화
         # - 종료된 경기에서 알림 재발송은 더 이상 필요 없음
         # - 과거 중복 알림 잔재(잘못된 goal 키 등)를 상태 테이블에 남기지 않기 위함
+        # ✅ Final에서도 sent_event_keys를 비우지 않는다.
+        # - 경기 종료 후에도 늦게 들어오는 이벤트/리컨실 재삽입이 있을 수 있는데,
+        #   여기서 히스토리를 비우면 "오전 경기 골이 오후에 다시 알림" 같은 재발송이 생긴다.
         if is_final_status(status_norm):
-            sent_hist = []
-            sent_hist_set.clear()
+            pass
+
 
         # 너무 커지는 것 방지: 최근 200개만 유지
         if len(sent_hist) > 200:
