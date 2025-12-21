@@ -256,167 +256,6 @@ def ensure_tables() -> None:
         "ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[];"
     )
 
-    # 3) ✅ hockey_game_events: DB 레벨 “중복 insert 원천 차단”용 fingerprint 컬럼 + 유니크 인덱스
-    # ❌ GENERATED ALWAYS AS (...) STORED 는 환경에 따라 "immutable" 에러가 날 수 있어서 사용하지 않는다.
-    # ✅ TEXT 컬럼 + 트리거로 event_key/notif_key 를 채운다.
-    execute("ALTER TABLE hockey_game_events ADD COLUMN IF NOT EXISTS event_key TEXT;")
-    execute("ALTER TABLE hockey_game_events ADD COLUMN IF NOT EXISTS notif_key TEXT;")
-
-    # ✅ 트리거 함수 (없으면 생성/교체)
-    execute(
-        """
-        CREATE OR REPLACE FUNCTION hockey_set_event_keys()
-        RETURNS trigger AS $$
-        DECLARE
-          players_txt text;
-          assists_txt text;
-        BEGIN
-          -- ✅ players/assists 타입이 text[] 이든 json/jsonb 이든 상관없이 안전하게 문자열화
-          -- - ::text로 캐스팅 후, { } [ ] " 같은 포맷 문자를 제거해서 fingerprint 안정화
-          players_txt := lower(coalesce(NEW.players::text, ''));
-          players_txt := regexp_replace(players_txt, '[\\{\\}\\[\\]\\" ]', '', 'g');
-
-          assists_txt := lower(coalesce(NEW.assists::text, ''));
-          assists_txt := regexp_replace(assists_txt, '[\\{\\}\\[\\]\\" ]', '', 'g');
-
-          NEW.event_key :=
-            lower(coalesce(NEW.type,'')) || '|' ||
-            coalesce(NEW.period,'') || '|' ||
-            coalesce(NEW.minute::text,'') || '|' ||
-            coalesce(NEW.team_id::text,'') || '|' ||
-            lower(coalesce(NEW.comment,'')) || '|' ||
-            coalesce(players_txt,'') || '|' ||
-            coalesce(assists_txt,'');
-
-          NEW.notif_key :=
-            lower(coalesce(NEW.type,'')) || '|' ||
-            coalesce(NEW.period,'') || '|' ||
-            coalesce(NEW.minute::text,'') || '|' ||
-            coalesce(NEW.team_id::text,'') || '|' ||
-            coalesce(players_txt,'');
-
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;
-        """
-    )
-
-
-    # ✅ 트리거 (없으면 생성)
-    execute(
-        """
-        DO $$
-        BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM pg_trigger WHERE tgname = 'trg_hockey_set_event_keys'
-          ) THEN
-            CREATE TRIGGER trg_hockey_set_event_keys
-            BEFORE INSERT OR UPDATE OF type, period, minute, team_id, comment, players, assists
-            ON hockey_game_events
-            FOR EACH ROW
-            EXECUTE FUNCTION hockey_set_event_keys();
-          END IF;
-        END $$;
-        """
-    )
-
-    # ✅ 기존 데이터 백필 (최근 14일)
-    execute(
-        """
-        UPDATE hockey_game_events e
-        SET
-          event_key =
-            lower(coalesce(e.type,'')) || '|' ||
-            coalesce(e.period,'') || '|' ||
-            coalesce(e.minute::text,'') || '|' ||
-            coalesce(e.team_id::text,'') || '|' ||
-            lower(coalesce(e.comment,'')) || '|' ||
-            regexp_replace(lower(coalesce(e.players::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g') || '|' ||
-            regexp_replace(lower(coalesce(e.assists::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g'),
-          notif_key =
-            lower(coalesce(e.type,'')) || '|' ||
-            coalesce(e.period,'') || '|' ||
-            coalesce(e.minute::text,'') || '|' ||
-            coalesce(e.team_id::text,'') || '|' ||
-            regexp_replace(lower(coalesce(e.players::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g')
-        FROM hockey_games g
-        WHERE g.id = e.game_id
-          AND g.game_date >= NOW() - interval '14 days'
-          AND (
-            e.event_key IS NULL OR e.event_key = ''
-            OR e.notif_key IS NULL OR e.notif_key = ''
-          );
-        """
-    )
-
-
-    # 최근 범위에서 notif_key 기준 완전 중복 제거(인덱스 생성 전 안전장치)
-    execute(
-        """
-        WITH ranked AS (
-          SELECT
-            e.id,
-            row_number() OVER (
-              PARTITION BY e.game_id, e.notif_key
-              ORDER BY e.id DESC
-            ) AS rn
-          FROM hockey_game_events e
-          JOIN hockey_games g ON g.id = e.game_id
-          WHERE g.game_date >= NOW() - interval '14 days'
-            AND e.notif_key IS NOT NULL
-            AND e.notif_key <> ''
-        )
-        DELETE FROM hockey_game_events e
-        USING ranked r
-        WHERE e.id = r.id
-          AND r.rn > 1;
-        """
-    )
-
-    # ✅ 유니크 인덱스 (NULL/빈값 제외)
-    execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_notif_key
-        ON hockey_game_events (game_id, notif_key)
-        WHERE notif_key IS NOT NULL AND notif_key <> '';
-        """
-    )
-
-    # (선택이지만 강력추천) 최근 경기 범위에서 “완전 동일 이벤트” 중복이 이미 있다면 정리
-    execute(
-        """
-        WITH ranked AS (
-          SELECT
-            e.id,
-            row_number() OVER (
-              PARTITION BY e.game_id, e.event_key
-              ORDER BY e.id DESC
-            ) AS rn
-          FROM hockey_game_events e
-          JOIN hockey_games g ON g.id = e.game_id
-          WHERE g.game_date >= NOW() - interval '14 days'
-            AND e.event_key IS NOT NULL
-            AND e.event_key <> ''
-        )
-        DELETE FROM hockey_game_events e
-        USING ranked r
-        WHERE e.id = r.id
-          AND r.rn > 1;
-        """
-    )
-
-    execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_hockey_game_events_game_event_key
-        ON hockey_game_events (game_id, event_key)
-        WHERE event_key IS NOT NULL AND event_key <> '';
-        """
-    )
-
-    log.info("ensure_tables: OK (with migrations + event dedupe key)")
-
-
-
 
 
 # ─────────────────────────────────────────
@@ -837,7 +676,9 @@ def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
 
 
 def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
-    # id가 bigint seq라서 id 기준 증분 처리
+    # ✅ 기본은 id 증분이지만,
+    # ✅ 일부 리그/상황에서 이벤트가 UPDATE(UPSERT)로만 들어올 수 있으므로
+    #    최근 updated_at 윈도우를 같이 포함해 “놓침”을 방지한다.
     rows = fetch_all(
         """
         SELECT
@@ -851,15 +692,20 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
             assists,
             event_order,
             event_key,
-            notif_key
+            notif_key,
+            updated_at
         FROM hockey_game_events
         WHERE game_id = %s
-          AND id > %s
+          AND (
+            id > %s
+            OR updated_at >= NOW() - interval '60 seconds'
+          )
         ORDER BY id ASC
         """,
         (game_id, last_event_id),
     )
     return rows
+
 
 
 
