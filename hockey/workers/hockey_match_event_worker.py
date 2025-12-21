@@ -6,9 +6,11 @@ import json
 import logging
 import os
 import time
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -698,7 +700,7 @@ def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
         WHERE game_id = %s
           AND (
             id > %s
-            OR updated_at >= NOW() - interval '60 seconds'
+            OR updated_at >= NOW() - interval '180 seconds'
           )
         ORDER BY id ASC
         """,
@@ -752,6 +754,16 @@ def event_persist_key(ev: Dict[str, Any]) -> str:
     players_norm = ",".join([str(p).strip().lower() for p in players if str(p).strip()])
 
     return f"{etype}|{period}|{minute}|{team_id}|{players_norm}"
+
+def _hash_key(s: str) -> str:
+    """
+    sent_event_keys(TEXT[]) row 비대 방지용.
+    - 사람이 읽을 필요 없는 디듀프 키이므로 sha1(hex)로 축약 저장한다.
+    - prefix를 붙여 키 타입 식별 가능하게 함.
+    """
+    raw = (s or "").encode("utf-8", errors="ignore")
+    return "h1:" + hashlib.sha1(raw).hexdigest()
+
 
 
 
@@ -965,8 +977,9 @@ def run_once() -> bool:
             if not nk:
                 nk = event_persist_key(ev)
 
-            # 경기 단위로 묶어서 키 고정
-            persist_key = f"{sub.game_id}:{nk}"
+            # 경기 단위로 묶어서 키 고정 (row 비대 방지: 해시로 저장)
+            persist_key_raw = f"{sub.game_id}:{nk}"
+            persist_key = _hash_key(persist_key_raw)
 
             # ✅ 같은 tick 내 중복 방지
             if persist_key in sent_keys:
