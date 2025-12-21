@@ -1008,11 +1008,14 @@ def run_once() -> bool:
         sent_keys: set[str] = set()
 
         for ev in new_events:
+            prev_max_seen_event_id = max_seen_event_id
+
             ev_id = _to_int(ev.get("id"), 0)
             if ev_id > max_seen_event_id:
                 max_seen_event_id = ev_id
 
             etype = str(ev.get("type") or "").strip().lower()
+
 
             # 기본: goal만 알림 (penalty 알림은 비활성화)
             if etype != "goal":
@@ -1083,7 +1086,11 @@ def run_once() -> bool:
                         work_last_away = max(work_last_away, away)
 
                 if not score_increased:
-                    continue
+                    # score_json 갱신이 늦는 경우(이벤트는 들어왔지만 점수는 아직 이전 값)
+                    # 이 goal 이벤트를 다음 tick에서 다시 보기 위해 last_event_id 전진을 되돌린다.
+                    max_seen_event_id = prev_max_seen_event_id
+                    break
+
 
                 # ✅ 정석: 알림 점수도 DB(score_json) 기준만 사용해서
                 # 앱 타임라인/스코어와 100% 동일하게 만든다.
