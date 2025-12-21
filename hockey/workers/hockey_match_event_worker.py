@@ -930,11 +930,33 @@ def run_once(events_cols: set[str]) -> bool:
             minute = ev.get("minute")
             tag = str(ev.get("comment") or "").strip()
 
-            # ✅ 정책 유지: 알림 점수는 score_json과 동일
-            notif_home = home
-            notif_away = away
-            work_last_home = home
-            work_last_away = away
+            # ✅ goal 이벤트가 score_json보다 먼저 들어오는 케이스 대응:
+            # - score_json이 아직 안 올라왔으면(=마지막으로 알고 있던 점수와 동일하면)
+            #   득점 팀 기준으로 +1 해서 "추정 점수"로 알림을 보낸다.
+            # - score_json이 이미 올라와 있으면 score_json을 그대로 사용한다.
+            #
+            # ⚠️ 이 보정은 "goal 이벤트가 있을 때만" 하고,
+            #    득점 팀을 모르면 보정하지 않는다(안전).
+            base_home = max(home, work_last_home)
+            base_away = max(away, work_last_away)
+
+            notif_home = base_home
+            notif_away = base_away
+
+            # score_json이 아직 반영 전이면(점수가 그대로면) → 득점 팀에만 +1
+            if (home, away) == (base_home, base_away):
+                if ev_team_id and home_team_id and ev_team_id == home_team_id:
+                    notif_home = base_home + 1
+                    notif_away = base_away
+                elif ev_team_id and away_team_id and ev_team_id == away_team_id:
+                    notif_home = base_home
+                    notif_away = base_away + 1
+                # 팀을 못 맞추면 보정 안 함(0–0 그대로일 수 있지만, 잘못된 +1을 막는 게 우선)
+
+            # state는 "우리가 알림에 사용한 점수"로 저장해서 다음 이벤트에서 꼬이지 않게
+            work_last_home = notif_home
+            work_last_away = notif_away
+
 
             t, b = build_hockey_message(
                 "goal",
