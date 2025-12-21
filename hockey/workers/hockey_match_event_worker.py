@@ -1071,37 +1071,25 @@ def run_once() -> bool:
             tag = str(ev.get("comment") or "").strip()
 
             if etype == "goal":
-                # ✅ “스코어 증가를 동반하는 골”만 알림 전송
-                # - API에서 minute/표기 정정으로 같은 골이 다시 들어오는 경우(스코어 변화 없음) 알림을 막는다.
-                # - ev_team_id를 기준으로 홈/원정 어느 쪽 스코어가 늘어야 하는지 판정한다.
-                score_increased = False
+                # ✅ goal 이벤트는 "무조건 1회" 알림을 보낸다.
+                # - score_json 선반영/후반영/팀판정 실패로 인해 0개가 되는 것을 방지
+                # - 알림 표기 점수:
+                #   1) 팀 판정 가능하면 이벤트 1건당 +1 누적(work_last 기준)
+                #   2) 팀 판정 불가면 DB score_json(home/away)을 그대로 사용
 
-                # ✅ goal 이벤트 1건당 점수 +1 누적(연속골/score_json 점프 대응)
-                # - score_json이 한 번에 2–2로 점프해도, goal 이벤트가 2개면 2번 알림이 나가야 정상
-                # - 알림에 찍는 점수는 "이벤트 기반 누적 점수"를 사용 (앱 진행과 더 잘 맞음)
                 notif_home = work_last_home
                 notif_away = work_last_away
 
                 if ev_team_id and home_team_id and ev_team_id == home_team_id:
                     notif_home = work_last_home + 1
-                    score_increased = True
+                    notif_away = work_last_away
                 elif ev_team_id and away_team_id and ev_team_id == away_team_id:
+                    notif_home = work_last_home
                     notif_away = work_last_away + 1
-                    score_increased = True
                 else:
-                    # 팀 판정이 안 되면, score_json이 last보다 큰 경우에만 1골로 처리
-                    if (home + away) > (work_last_home + work_last_away):
-                        score_increased = True
-                        # 어느 쪽이 올랐는지 모르니 보수적으로 총점 +1만 반영(홈 우선 X)
-                        notif_home = work_last_home
-                        notif_away = work_last_away
-                    else:
-                        score_increased = False
-
-                if not score_increased:
-                    # score_json/팀판정이 아직 따라오지 않으면 다음 tick에서 재시도
-                    max_seen_event_id = prev_max_seen_event_id
-                    break
+                    # 팀 판정이 안 되면 score_json 기준으로 표기 (0개 방지가 목적)
+                    notif_home = home
+                    notif_away = away
 
                 # work_last 갱신(누적)
                 work_last_home = notif_home
@@ -1118,7 +1106,6 @@ def run_once() -> bool:
                     tag=tag,
                 )
 
-
                 ok = send_push(
                     token=sub.fcm_token,
                     title=t,
@@ -1131,12 +1118,13 @@ def run_once() -> bool:
                     },
                 )
                 if ok:
-                    # ✅ 리컨실(DELETE/INSERT)로 이벤트 id가 바뀌어도 같은 이벤트 재발송 방지
+                    # ✅ 영속 디듀프 기록
                     sent_hist_set.add(pk)
                     sent_hist.append(pk)
 
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
+
 
 
 
@@ -1169,11 +1157,12 @@ def run_once() -> bool:
             device_id=sub.device_id,
             game_id=sub.game_id,
             last_status=status,
-            last_home_score=home,
-            last_away_score=away,
+            last_home_score=work_last_home,
+            last_away_score=work_last_away,
             last_event_id=max_seen_event_id,
             sent_event_keys=sent_hist,
         )
+
 
 
 
