@@ -942,50 +942,46 @@ def run_once() -> bool:
             new_events = new_events[-MAX_EVENTS_PER_GAME_PER_TICK :]
 
         max_seen_event_id = last_event_id
+
+        # ✅ 같은 tick 내 중복 방지 (notif_key 기준)
         sent_keys: set[str] = set()
 
         for ev in new_events:
-            prev_max_seen_event_id = max_seen_event_id
-
             ev_id = _to_int(ev.get("id"), 0)
             if ev_id > max_seen_event_id:
                 max_seen_event_id = ev_id
 
             etype = str(ev.get("type") or "").strip().lower()
 
-
             # 기본: goal만 알림 (penalty 알림은 비활성화)
             if etype != "goal":
                 continue
 
-            # ✅ goal은 INSERT 시점(빈껍데기 포함)에서만 보낸다
-            # - UPDATE로 채워지는 동일 골은 event_order로 디듀프됨
-            event_order = _to_int(ev.get("event_order"), -1)
-            if event_order < 0:
-                # event_order 없는 goal은 비정상 → 안전하게 스킵
-                continue
+            # ✅ 핵심: event_order는 0이 많이 나오므로 "디듀프 키로 쓰면 안 됨"
+            # ✅ DB에 이미 notif_key(유니크)가 있으니 이것을 영속/틱 디듀프 키로 사용한다.
+            nk = str(ev.get("notif_key") or "").strip()
 
-            goal_key = f"{sub.game_id}:{event_order}"
+            # notif_key가 비어있는 예외 케이스 대비 (안전장치)
+            if not nk:
+                nk = event_persist_key(ev)
+
+            # 경기 단위로 묶어서 키 고정
+            persist_key = f"{sub.game_id}:{nk}"
 
             # ✅ 같은 tick 내 중복 방지
-            if goal_key in sent_keys:
+            if persist_key in sent_keys:
                 continue
-            sent_keys.add(goal_key)
+            sent_keys.add(persist_key)
 
-            # ✅ 영속 디듀프 (state) - UPDATE 포함 어떤 경우에도 동일 골 1회만
-            if goal_key in sent_hist_set:
+            # ✅ 영속 디듀프 (state) - 리컨실(DELETE/INSERT) / UPDATE 어떤 경우에도 동일 골 1회만
+            if persist_key in sent_hist_set:
                 continue
-
-
-
-
 
             # ✅ 옵션: score 알림 off면 goal/penalty 자체를 막고 싶다면 여기서 컷
-            # (원하면 penalty는 허용/goal만 차단 등으로 세분화 가능)
             if (not sub.notify_score) and (etype in ("goal", "penalty")):
                 continue
 
-            # 득점/패널티 팀명 판별(가능하면)
+            # 득점 팀명 판별(가능하면)
             ev_team_id = _to_int(ev.get("team_id"), 0)
             home_team_id = _to_int(g.get("home_team_id"), 0)
             away_team_id = _to_int(g.get("away_team_id"), 0)
@@ -1005,47 +1001,44 @@ def run_once() -> bool:
             # comment에 PPG/SHG/ENG 등이 들어오는 경우 타이틀에 살짝 붙임
             tag = str(ev.get("comment") or "").strip()
 
-            if etype == "goal":
-                # ✅ 정책: 골 알림 점수는 "항상 앱/DB score_json"과 100% 동일해야 한다.
-                # - event 기준 +1 누적(work_last 가산)은 절대 사용하지 않는다.
-                # - score_json 반영이 늦으면 알림 점수도 늦을 수 있지만, "일치"가 최우선이다.
+            # ✅ 정책: 골 알림 점수는 "항상 앱/DB score_json"과 100% 동일
+            notif_home = home
+            notif_away = away
 
-                notif_home = home
-                notif_away = away
+            # work_last도 score_json과 동일하게 맞춰서 state 일관성 유지
+            work_last_home = home
+            work_last_away = away
 
-                # work_last도 score_json과 동일하게 맞춰서 state 일관성 유지
-                work_last_home = home
-                work_last_away = away
+            t, b = build_hockey_message(
+                "goal",
+                g,
+                notif_home,
+                notif_away,
+                period=period,
+                minute=minute,
+                team_name=team_name,
+                tag=tag,
+            )
 
-                t, b = build_hockey_message(
-                    "goal",
-                    g,
-                    notif_home,
-                    notif_away,
-                    period=period,
-                    minute=minute,
-                    team_name=team_name,
-                    tag=tag,
-                )
+            ok = send_push(
+                token=sub.fcm_token,
+                title=t,
+                body=b,
+                data={
+                    "sport": "hockey",
+                    "game_id": str(sub.game_id),
+                    "type": etype,
+                    "status": status,
+                },
+            )
+            if ok:
+                # ✅ 영속 디듀프 기록 (notif_key 기반)
+                sent_hist_set.add(persist_key)
+                sent_hist.append(persist_key)
 
-                ok = send_push(
-                    token=sub.fcm_token,
-                    title=t,
-                    body=b,
-                    data={
-                        "sport": "hockey",
-                        "game_id": str(sub.game_id),
-                        "type": etype,
-                        "status": status,
-                    },
-                )
-                if ok:
-                    # ✅ 영속 디듀프 기록
-                    sent_hist_set.add(goal_key)
-                    sent_hist.append(goal_key)
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
 
-                    sent += 1
-                    time.sleep(SEND_SLEEP_SEC)
 
 
 
