@@ -1135,16 +1135,25 @@ def run_once() -> bool:
             if etype != "goal":
                 continue
 
-            # ✅ 빈(껍데기) 이벤트는 알림 스킵
-            if is_empty_notification_event(ev):
-                continue
+           # ✅ goal은 INSERT 시점(빈껍데기 포함)에서만 보낸다
+           # - UPDATE로 채워지는 동일 골은 event_order로 디듀프됨
 
-            # ✅ 같은 tick 내 중복 방지
-            # - event_order는 리컨실/정렬 변경 등으로 흔들릴 수 있어 stable 키로 통일
-            k = event_persist_key(ev)
-            if k in sent_keys:
-                continue
-            sent_keys.add(k)
+           event_order = _to_int(ev.get("event_order"), -1)
+           if event_order < 0:
+               # event_order 없는 goal은 비정상 → 안전하게 스킵
+               continue
+
+           goal_key = f"{sub.game_id}:{event_order}"
+
+           # tick 내 중복 방지
+           if goal_key in sent_keys:
+               continue
+           sent_keys.add(goal_key)
+
+           # 영속 디듀프 (state)
+           if goal_key in sent_hist_set:
+               continue
+
 
 
             # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
@@ -1221,8 +1230,8 @@ def run_once() -> bool:
                 )
                 if ok:
                     # ✅ 영속 디듀프 기록
-                    sent_hist_set.add(pk)
-                    sent_hist.append(pk)
+                    sent_hist_set.add(goal_key)
+                    sent_hist.append(goal_key)
 
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
