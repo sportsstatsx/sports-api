@@ -1,16 +1,14 @@
 # hockey/workers/hockey_match_event_worker.py
-
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -23,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 # ─────────────────────────────────────────
-# ENV
+# ENV (기존 키 그대로 유지)
 # ─────────────────────────────────────────
 def _env_str(key: str, default: str = "") -> str:
     v = os.environ.get(key)
@@ -58,1025 +56,610 @@ HOCKEY_DATABASE_URL = (
     or os.environ.get("HOCKEY_DATABASE_URL".upper())
     or os.environ.get("hockey_database_url")
 )
-
 if not HOCKEY_DATABASE_URL:
     raise RuntimeError("HOCKEY_DATABASE_URL is not set")
 
-# ─────────────────────────────────────────
-# LOOP INTERVAL (league-based optional)
-# ─────────────────────────────────────────
-# 기본(느린) 루프 주기 (초) - 기존 변수 유지
 INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_INTERVAL_SEC", 10)
 
-# ✅ 1부리그만 더 촘촘히 돌리고 싶을 때(옵션)
 FAST_LEAGUES_RAW = _env_str("HOCKEY_MATCH_WORKER_FAST_LEAGUES", "")
 FAST_INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_FAST_INTERVAL_SEC", 5)
 SLOW_INTERVAL_SEC = _env_int("HOCKEY_MATCH_WORKER_SLOW_INTERVAL_SEC", INTERVAL_SEC)
 
-# 대상 리그 (쉼표 구분). 비어있으면 전체(주의: DB 부하)
 LEAGUES_RAW = _env_str("HOCKEY_LIVE_LEAGUES", "")
-# 후보 경기 선택 범위 (과거/미래 며칠)
 PAST_DAYS = _env_int("HOCKEY_MATCH_WORKER_PAST_DAYS", 1)
 FUTURE_DAYS = _env_int("HOCKEY_MATCH_WORKER_FUTURE_DAYS", 1)
-# 한 tick 에 처리할 최대 경기 수
 BATCH_LIMIT = _env_int("HOCKEY_MATCH_WORKER_BATCH_LIMIT", 200)
-# 이벤트 알림 최대 처리 개수(과도한 스팸 방지)
 MAX_EVENTS_PER_GAME_PER_TICK = _env_int("HOCKEY_MATCH_WORKER_MAX_EVENTS_PER_GAME_PER_TICK", 30)
 
-# FCM 전송 rate 제한(너무 빠르면 부담)
 SEND_SLEEP_SEC = _env_float("HOCKEY_MATCH_WORKER_SEND_SLEEP_SEC", 0.02)
 
+LOG_SAMPLE_RATE = _env_float("LOG_SAMPLE_RATE", 0.25)  # 있으면 활용, 없으면 기본
 
 
-def _parse_leagues(raw: str) -> List[int]:
-    if not raw.strip():
-        return []
+def _parse_int_list(raw: str) -> List[int]:
     out: List[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
+    for p in (raw or "").split(","):
+        s = p.strip()
+        if not s:
             continue
         try:
-            out.append(int(part))
+            out.append(int(s))
         except Exception:
             continue
     return out
 
 
-LEAGUE_IDS = _parse_leagues(LEAGUES_RAW)
-FAST_LEAGUE_IDS = _parse_leagues(FAST_LEAGUES_RAW)
+LEAGUE_IDS = _parse_int_list(LEAGUES_RAW)
+FAST_LEAGUE_IDS = _parse_int_list(FAST_LEAGUES_RAW)
 FAST_LEAGUE_SET = set(FAST_LEAGUE_IDS)
 
-
-# 하키 경기 상태(최종 종료로 간주)
-FINAL_STATUSES = {
-    "FT",
-    "AOT",   # After Over Time (SO 없이 OT로 끝나는 케이스)
-    "AP",    # After Penalties (SO/승부치기 종료 케이스)
-    "AET",
-    "PEN",   # 혹시
-    "CANC",
-    "PST",
-    "ABD",
-    "WO",
-}
-
-
-# 진행/라이브로 간주(명확히 들어오면 우선)
-LIVE_STATUSES_HINT = {
-    "LIVE",
-    "1P",
-    "2P",
-    "3P",
-    "OT",
-    "SO",
-    "P",   # pregame/paused 등 혼재 가능
-}
+# DB 상태상 status는 NS/P1/P2/BT/FT/AOT/AP/CANC/POST 등으로 옴
+FINAL_STATUSES = {"FT", "AOT", "AP", "CANC", "POST"}  # 필요 시 확장
 
 
 # ─────────────────────────────────────────
-# DB (하키 DB 전용)
+# DB Pool
 # ─────────────────────────────────────────
-pool = ConnectionPool(
-    conninfo=HOCKEY_DATABASE_URL,
-    kwargs={"autocommit": True},
-    max_size=10,
-)
+pool = ConnectionPool(conninfo=HOCKEY_DATABASE_URL, max_size=5, kwargs={"autocommit": True})
 
 
-def fetch_all(sql: str, params: Optional[Sequence[Any]] = None) -> List[Dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute(sql, params or ())
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+def _hash_key(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def fetch_one(sql: str, params: Optional[Sequence[Any]] = None) -> Optional[Dict[str, Any]]:
-    with pool.connection() as conn:
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute(sql, params or ())
-            row = cur.fetchone()
-            return dict(row) if row else None
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def execute(sql: str, params: Optional[Sequence[Any]] = None) -> None:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+def _status_norm(s: Optional[str]) -> str:
+    return (s or "").strip().upper()
 
 
-# ─────────────────────────────────────────
-# TABLES (하키 알림 전용) - 자동 생성
-# ─────────────────────────────────────────
-DDL = [
+def _score_from_json(score_json: Any) -> Tuple[int, int]:
     """
-    CREATE TABLE IF NOT EXISTS hockey_user_devices (
-        device_id TEXT PRIMARY KEY,
-        fcm_token TEXT NOT NULL,
-        platform TEXT,
-        app_version TEXT,
-        timezone TEXT,
-        language TEXT,
-        notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    """,
+    hockey_games.score_json 구조는 네 서버 포맷 그대로 쓴다.
+    여기서는 안전하게 여러 케이스를 허용하고, 없으면 0,0.
     """
-    CREATE TABLE IF NOT EXISTS hockey_game_notification_subscriptions (
-        device_id TEXT NOT NULL REFERENCES hockey_user_devices(device_id) ON DELETE CASCADE,
-        game_id   INTEGER NOT NULL REFERENCES hockey_games(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        PRIMARY KEY (device_id, game_id)
-    );
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS hockey_game_notification_states (
-        device_id TEXT NOT NULL REFERENCES hockey_user_devices(device_id) ON DELETE CASCADE,
-        game_id   INTEGER NOT NULL REFERENCES hockey_games(id) ON DELETE CASCADE,
-
-        last_status TEXT,
-        last_home_score INTEGER NOT NULL DEFAULT 0,
-        last_away_score INTEGER NOT NULL DEFAULT 0,
-
-        last_event_id BIGINT NOT NULL DEFAULT 0,
-
-        -- ✅ 리컨실(DELETE/INSERT) 후에도 중복 알림을 막기 위한 "발송된 이벤트 fingerprint"
-        sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[],
-
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-        PRIMARY KEY (device_id, game_id)
-    );
-
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_hockey_subs_game_id
-    ON hockey_game_notification_subscriptions (game_id);
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_hockey_states_game_id
-    ON hockey_game_notification_states (game_id);
-    """,
-]
-
-
-def ensure_tables() -> None:
-    # 1) base tables / indexes
-    for stmt in DDL:
-        execute(stmt)
-
-    # 2) migrations: 기존 테이블이 이미 있어도 컬럼을 보강
-    # subscriptions 옵션 컬럼들 (라우터가 사용)
-    execute(
-        "ALTER TABLE hockey_game_notification_subscriptions "
-        "ADD COLUMN IF NOT EXISTS notify_score BOOLEAN NOT NULL DEFAULT TRUE;"
-    )
-    execute(
-        "ALTER TABLE hockey_game_notification_subscriptions "
-        "ADD COLUMN IF NOT EXISTS notify_game_start BOOLEAN NOT NULL DEFAULT TRUE;"
-    )
-    execute(
-        "ALTER TABLE hockey_game_notification_subscriptions "
-        "ADD COLUMN IF NOT EXISTS notify_game_end BOOLEAN NOT NULL DEFAULT TRUE;"
-    )
-    # ✅ 피리어드 전환 알림(1P 종료, 2P 시작, 2P 종료, 3P 시작)
-    execute(
-        "ALTER TABLE hockey_game_notification_subscriptions "
-        "ADD COLUMN IF NOT EXISTS notify_periods BOOLEAN NOT NULL DEFAULT TRUE;"
-    )
-    execute(
-        "ALTER TABLE hockey_game_notification_subscriptions "
-        "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"
-    )
-
-    # ✅ states: 리컨실 이후 중복알림 방지용 fingerprint 히스토리
-    execute(
-        "ALTER TABLE hockey_game_notification_states "
-        "ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] NOT NULL DEFAULT '{}'::text[];"
-    )
-
-
-
-# ─────────────────────────────────────────
-# SCORE / STATUS PARSE
-# ─────────────────────────────────────────
-def _to_int(x: Any, default: int = 0) -> int:
     try:
-        if x is None:
-            return default
-        if isinstance(x, bool):
-            return default
-        if isinstance(x, (int, float)):
-            return int(x)
-        s = str(x).strip()
-        if not s:
-            return default
-        return int(float(s))
+        if isinstance(score_json, str):
+            score_json = json.loads(score_json)
     except Exception:
-        return default
+        score_json = {}
 
-
-def parse_score(score_json: Any) -> Tuple[int, int]:
-    """
-    hockey_games.score_json 포맷이 리그/소스마다 조금씩 다를 수 있어서
-    최대한 안전하게 home/away 합계를 뽑아냄.
-    """
-    if score_json is None:
+    if not isinstance(score_json, dict):
         return 0, 0
 
-    obj = score_json
-    if isinstance(obj, str):
-        try:
-            obj = json.loads(obj)
-        except Exception:
-            return 0, 0
+    # 1) {"home": 1, "away": 2}
+    if isinstance(score_json.get("home"), (int, float)) and isinstance(score_json.get("away"), (int, float)):
+        return int(score_json.get("home") or 0), int(score_json.get("away") or 0)
 
-    if not isinstance(obj, dict):
-        return 0, 0
+    # 2) {"total": {"home": 1, "away": 2}}
+    total = score_json.get("total")
+    if isinstance(total, dict):
+        h = total.get("home")
+        a = total.get("away")
+        if isinstance(h, (int, float)) and isinstance(a, (int, float)):
+            return int(h or 0), int(a or 0)
 
-    # 1) 가장 흔한 케이스: {"home": 2, "away": 1}
-    if "home" in obj and "away" in obj and isinstance(obj.get("home"), (int, float, str)) and isinstance(obj.get("away"), (int, float, str)):
-        return _to_int(obj.get("home")), _to_int(obj.get("away"))
-
-    # 2) {"total": {"home":2, "away":1}} or {"totals": {...}}
-    for k in ("total", "totals", "final", "score"):
-        v = obj.get(k)
-        if isinstance(v, dict) and "home" in v and "away" in v:
-            return _to_int(v.get("home")), _to_int(v.get("away"))
-
-    # 3) {"periods": {"P1":{"home":..,"away":..}, ...}, "total": ...} 없을 때 합산 시도
-    periods = obj.get("periods")
-    if isinstance(periods, dict):
-        h = 0
-        a = 0
-        any_found = False
-        for pv in periods.values():
-            if isinstance(pv, dict) and ("home" in pv or "away" in pv):
-                any_found = True
-                h += _to_int(pv.get("home"))
-                a += _to_int(pv.get("away"))
-        if any_found:
-            return h, a
+    # 3) {"scores": {"home": {"total": 1}, "away": {"total": 2}}}
+    scores = score_json.get("scores")
+    if isinstance(scores, dict):
+        home = scores.get("home") if isinstance(scores.get("home"), dict) else {}
+        away = scores.get("away") if isinstance(scores.get("away"), dict) else {}
+        h = home.get("total")
+        a = away.get("total")
+        if isinstance(h, (int, float)) and isinstance(a, (int, float)):
+            return int(h or 0), int(a or 0)
 
     return 0, 0
 
 
-def is_final_status(status: Optional[str]) -> bool:
-    s = (status or "").strip().upper()
-    return s in FINAL_STATUSES
-
-
-def is_liveish_status(status: Optional[str]) -> bool:
-    s = (status or "").strip().upper()
-    if not s:
-        return False
-    if s in LIVE_STATUSES_HINT:
-        return True
-    # status_long 기반은 여기서 판단 안 함(없을 수도 있음)
-    return False
-
-def normalize_status(status: Optional[str]) -> str:
+# ─────────────────────────────────────────
+# MIGRATIONS (sent table)
+# ─────────────────────────────────────────
+def ensure_tables() -> None:
+    ddl = """
+    CREATE TABLE IF NOT EXISTS hockey_notification_sent (
+      device_id text NOT NULL,
+      game_id integer NOT NULL,
+      dedupe_key text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (device_id, game_id, dedupe_key),
+      FOREIGN KEY (device_id) REFERENCES hockey_user_devices(device_id) ON DELETE CASCADE,
+      FOREIGN KEY (game_id) REFERENCES hockey_games(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_hockey_notification_sent_game
+      ON hockey_notification_sent (game_id);
+    CREATE INDEX IF NOT EXISTS idx_hockey_notification_sent_created_at
+      ON hockey_notification_sent (created_at);
     """
-    API-Sports / DB 저장값이 리그/시점에 따라 "P3"처럼 들어오기도 해서
-    워커 내부 판단은 표준 키(1P/2P/3P/BT/OT/SO/FT...)로 통일한다.
-    """
-    s = (status or "").strip().upper()
-    if not s:
-        return ""
-
-    # API에서 P1/P2/P3 형태로 내려오는 케이스 대응
-    if s == "P1":
-        return "1P"
-    if s == "P2":
-        return "2P"
-    if s == "P3":
-        return "3P"
-
-    # 이미 표준이면 그대로
-    return s
-
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(ddl)
 
 
 # ─────────────────────────────────────────
-# NOTIFICATION PAYLOAD
+# DB QUERIES (game 단위로 한번에)
 # ─────────────────────────────────────────
-def build_matchup(game_row: Dict[str, Any]) -> str:
-    home_name = str(game_row.get("home_name") or "Home")
-    away_name = str(game_row.get("away_name") or "Away")
-    return f"{home_name} vs {away_name}"
+def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
+    start = now_utc.timestamp() - (PAST_DAYS * 86400)
+    end = now_utc.timestamp() + (FUTURE_DAYS * 86400)
 
+    league_clause = ""
+    params: List[Any] = [
+        datetime.fromtimestamp(start, tz=timezone.utc),
+        datetime.fromtimestamp(end, tz=timezone.utc),
+    ]
+    if LEAGUE_IDS:
+        league_clause = "AND g.league_id = ANY(%s)"
+        params.append(LEAGUE_IDS)
 
-def build_score_line(game_row: Dict[str, Any], home: int, away: int) -> str:
+    final_placeholders = ",".join(["%s"] * len(FINAL_STATUSES))
+
+    sql = f"""
+    SELECT
+      g.id,
+      g.league_id,
+      g.season,
+      g.game_date,
+      g.status,
+      g.status_long,
+      g.score_json,
+      g.home_team_id,
+      g.away_team_id,
+      ht.name AS home_name,
+      at.name AS away_name,
+      g.updated_at
+    FROM hockey_games g
+    LEFT JOIN hockey_teams ht ON ht.id = g.home_team_id
+    LEFT JOIN hockey_teams at ON at.id = g.away_team_id
+    WHERE g.game_date IS NOT NULL
+      AND g.game_date >= %s
+      AND g.game_date <= %s
+      {league_clause}
+      AND (
+        COALESCE(UPPER(g.status), '') NOT IN ({final_placeholders})
+        OR g.updated_at >= NOW() - interval '6 hours'
+      )
+    ORDER BY g.game_date DESC
+    LIMIT {BATCH_LIMIT}
     """
-    축구 워커와 동일하게 en dash(–) 사용:
-    예) Rangers 2–1 Devils
-    """
-    home_name = str(game_row.get("home_name") or "Home")
-    away_name = str(game_row.get("away_name") or "Away")
-    return f"{home_name} {home}–{away} {away_name}"
+
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, tuple(params + list(FINAL_STATUSES)))
+            return list(cur.fetchall())
 
 
-def _period_label_from_status(status_norm: str) -> str:
-    # status 기반 period 표시(상태 알림용)
-    if status_norm == "1P":
-        return "1st Period"
-    if status_norm == "2P":
-        return "2nd Period"
-    if status_norm == "3P":
-        return "3rd Period"
-    if status_norm == "OT":
-        return "Overtime"
-    if status_norm == "SO":
-        return "Shootout"
-    return ""
-
-
-def build_hockey_message(
-    event_type: str,
-    game_row: Dict[str, Any],
-    home: int,
-    away: int,
-    *,
-    status_norm: str = "",
-    period: str = "",
-    minute: Any = None,
-    team_name: str = "",
-    tag: str = "",
-) -> Tuple[str, str]:
-    """
-    축구 match_event_worker.py 스타일:
-    - title: 이벤트 중심 + 이모지
-    - body: score_line 또는 matchup
-    """
-    matchup = build_matchup(game_row)
-    score_line = build_score_line(game_row, home, away)
-
-    # 상태(피리어드/경기) 알림
-    if event_type == "game_start":
-        return ("▶ Game Started", matchup)
-
-    if event_type == "period_start":
-        label = _period_label_from_status(status_norm) or "Period"
-        return (f"▶ {label} Start", score_line)
-
-    if event_type == "period_end":
-        label = _period_label_from_status(status_norm) or "Period"
-        return (f"⏸ {label} End", score_line)
-
-    if event_type == "ot_start":
-        return ("▶ Overtime", score_line)
-
-    if event_type == "so_start":
-        return ("🥅 Shootout", score_line)
-
-    if event_type == "ot_end":
-        return ("⏱ End of OT", score_line)
-
-    if event_type == "final":
-        return ("⏱ Final", score_line)
-
-    # 이벤트(Goal / Penalty)
-    # 시간 prefix: "P2 07'"
-    mm = ""
-    try:
-        if minute is not None and str(minute).strip() != "":
-            mm = f"{int(minute)}'"
-    except Exception:
-        mm = ""
-    time_prefix = " ".join([p for p in [period.strip(), mm] if p]).strip()
-
-    if event_type == "goal":
-        # Title: 항상 "... {Team} Goal!" (PPG/SHG/ENG는 Title에 붙이지 않음)
-        # Body : (있으면) 골 타입 한 줄 + score_line
-        who = team_name.strip() or "Goal"
-
-        tag_norm = (tag or "").strip().upper()
-
-        # 골 타입 표기(원하는 문구)
-        tag_line = ""
-        if tag_norm == "PPG":
-            tag_line = "Power-play Goal!"
-        elif tag_norm == "SHG":
-            tag_line = "Short-handed Goal!"
-        elif tag_norm == "ENG":
-            tag_line = "Empty-net Goal!"
-        else:
-            tag_line = ""
-
-        if time_prefix:
-            title = f"🏒 {time_prefix} {who} Goal!"
-        else:
-            title = f"🏒 {who} Goal!"
-
-        # body는 "골 타입(있으면)\n스코어라인" 구조
-        body = score_line if not tag_line else f"{tag_line}\n{score_line}"
-        return (title, body)
-
-
-    if event_type == "penalty":
-        # 예) ⛔ P2 12' Rangers Penalty
-        who = team_name.strip()
-        who_part = f"{who} " if who else ""
-        if time_prefix:
-            return (f"⛔ {time_prefix} {who_part}Penalty", score_line)
-        return (f"⛔ {who_part}Penalty", score_line)
-
-    # fallback
-    return ("Match update", score_line)
-
-
-def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
-    if not token:
-        return False
-    try:
-        fcm = FCMClient()
-        fcm.send_to_tokens(
-            tokens=[token],
-            title=title,
-            body=body,
-            data=data or {},
-        )
-        return True
-    except Exception as e:
-        log.warning("FCM send failed: %s", e)
-        return False
-
-
-
-# ─────────────────────────────────────────
-# CORE LOGIC
-# ─────────────────────────────────────────
 @dataclass
 class SubRow:
     device_id: str
-    fcm_token: str
     game_id: int
     notify_score: bool
     notify_game_start: bool
     notify_game_end: bool
     notify_periods: bool
+    fcm_token: str
+    notifications_enabled: bool
 
 
-def fetch_subscriptions_for_games(game_ids: List[int]) -> List[SubRow]:
-    if not game_ids:
-        return []
-    rows = fetch_all(
-        f"""
-        SELECT
-            s.device_id,
-            d.fcm_token,
-            s.game_id,
-            COALESCE(s.notify_score, TRUE) AS notify_score,
-            COALESCE(s.notify_game_start, TRUE) AS notify_game_start,
-            COALESCE(s.notify_game_end, TRUE) AS notify_game_end,
-            COALESCE(s.notify_periods, TRUE) AS notify_periods
-        FROM hockey_game_notification_subscriptions s
-        JOIN hockey_user_devices d
-          ON d.device_id = s.device_id
-        WHERE s.game_id = ANY(%s)
-          AND COALESCE(d.notifications_enabled, TRUE) = TRUE
-          AND COALESCE(d.fcm_token, '') <> ''
-        """,
-        (game_ids,),
-    )
+def fetch_subscriptions_for_game(game_id: int) -> List[SubRow]:
+    # notifications_enabled=false면 발송 X
+    sql = """
+    SELECT
+      s.device_id,
+      s.game_id,
+      s.notify_score,
+      s.notify_game_start,
+      s.notify_game_end,
+      s.notify_periods,
+      d.fcm_token,
+      d.notifications_enabled
+    FROM hockey_game_notification_subscriptions s
+    JOIN hockey_user_devices d ON d.device_id = s.device_id
+    WHERE s.game_id = %s
+      AND d.notifications_enabled = true
+      AND d.fcm_token IS NOT NULL
+      AND btrim(d.fcm_token) <> ''
+    """
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, (game_id,))
+            rows = cur.fetchall()
+
     out: List[SubRow] = []
     for r in rows:
         out.append(
             SubRow(
                 device_id=str(r["device_id"]),
-                fcm_token=str(r["fcm_token"]),
                 game_id=int(r["game_id"]),
                 notify_score=bool(r["notify_score"]),
                 notify_game_start=bool(r["notify_game_start"]),
                 notify_game_end=bool(r["notify_game_end"]),
                 notify_periods=bool(r["notify_periods"]),
+                fcm_token=str(r["fcm_token"]),
+                notifications_enabled=bool(r["notifications_enabled"]),
             )
         )
     return out
 
 
-def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
-    row = fetch_one(
-        """
-        SELECT
-            device_id,
-            game_id,
-            last_status,
-            last_home_score,
-            last_away_score,
-            last_event_id,
-            sent_event_keys
-        FROM hockey_game_notification_states
-        WHERE device_id = %s AND game_id = %s
-        """,
-        (device_id, game_id),
-    )
-
-    if row:
-        return row
-    # 없으면 기본 state 생성(Upsert)
-    execute(
-        """
-        INSERT INTO hockey_game_notification_states (
-            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (device_id, game_id) DO NOTHING
-        """,
-        (device_id, game_id, None, 0, 0, 0, []),
-    )
-    return {
-        "device_id": device_id,
-        "game_id": game_id,
-        "last_status": None,
-        "last_home_score": 0,
-        "last_away_score": 0,
-        "last_event_id": 0,
-        "sent_event_keys": [],
-    }
+@dataclass
+class StateRow:
+    device_id: str
+    game_id: int
+    last_status: str
+    last_home_score: int
+    last_away_score: int
+    last_event_id: int
 
 
+def fetch_states_for_game(game_id: int, device_ids: Sequence[str]) -> Dict[str, StateRow]:
+    if not device_ids:
+        return {}
 
-def save_state(
-    device_id: str,
-    game_id: int,
-    last_status: Optional[str],
-    last_home_score: int,
-    last_away_score: int,
-    last_event_id: int,
-    sent_event_keys: List[str],
-) -> None:
-
-    execute(
-        """
-        INSERT INTO hockey_game_notification_states (
-            device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, now())
-        ON CONFLICT (device_id, game_id) DO UPDATE SET
-            last_status = EXCLUDED.last_status,
-            last_home_score = EXCLUDED.last_home_score,
-            last_away_score = EXCLUDED.last_away_score,
-            last_event_id = EXCLUDED.last_event_id,
-            sent_event_keys = EXCLUDED.sent_event_keys,
-            updated_at = now()
-        """,
-        (device_id, game_id, last_status, last_home_score, last_away_score, last_event_id, sent_event_keys),
-    )
-
-
-
-def fetch_candidate_games(now_utc: datetime) -> List[Dict[str, Any]]:
-    # window 설정
-    start = now_utc.timestamp() - (PAST_DAYS * 86400)
-    end = now_utc.timestamp() + (FUTURE_DAYS * 86400)
-
-    # league 필터 동적
-    league_clause = ""
-    params: List[Any] = []
-    params.extend([datetime.fromtimestamp(start, tz=timezone.utc), datetime.fromtimestamp(end, tz=timezone.utc)])
-
-    if LEAGUE_IDS:
-        league_clause = "AND g.league_id = ANY(%s)"
-        params.append(LEAGUE_IDS)
-
-    # 최종상태 제외 + 최근 범위만
-    rows = fetch_all(
-        f"""
-        SELECT
-            g.id,
-            g.league_id,
-            g.season,
-            g.game_date,
-            g.status,
-            g.status_long,
-            g.score_json,
-            g.home_team_id,
-            g.away_team_id,
-            ht.name AS home_name,
-            at.name AS away_name
-        FROM hockey_games g
-        LEFT JOIN hockey_teams ht ON ht.id = g.home_team_id
-        LEFT JOIN hockey_teams at ON at.id = g.away_team_id
-
-        WHERE g.game_date IS NOT NULL
-          AND g.game_date >= %s
-          AND g.game_date <= %s
-          {league_clause}
-          AND (
-            COALESCE(UPPER(g.status), '') NOT IN ({",".join(["%s"] * len(FINAL_STATUSES))})
-            OR g.updated_at >= NOW() - interval '6 hours'
-          )
-        ORDER BY g.game_date DESC
-        LIMIT {BATCH_LIMIT}
-
-        """,
-        tuple(params + list(FINAL_STATUSES)),
-    )
-    return rows
-
-
-def fetch_new_events(game_id: int, last_event_id: int) -> List[Dict[str, Any]]:
-    # ✅ 기본은 id 증분이지만,
-    # ✅ 일부 리그/상황에서 이벤트가 UPDATE(UPSERT)로만 들어올 수 있으므로
-    #    최근 updated_at 윈도우를 같이 포함해 “놓침”을 방지한다.
-    rows = fetch_all(
-        """
-        SELECT
-            id,
-            period,
-            minute,
-            team_id,
-            type,
-            comment,
-            players,
-            assists,
-            event_order,
-            event_key,
-            notif_key,
-            updated_at
-        FROM hockey_game_events
-        WHERE game_id = %s
-          AND (
-            id > %s
-            OR updated_at >= NOW() - interval '180 seconds'
-          )
-        ORDER BY id ASC
-        """,
-        (game_id, last_event_id),
-    )
-    return rows
-
-
-
-
-
-def event_persist_key(ev: Dict[str, Any]) -> str:
+    sql = """
+    SELECT device_id, game_id, last_status, last_home_score, last_away_score, last_event_id
+    FROM hockey_game_notification_states
+    WHERE game_id = %s
+      AND device_id = ANY(%s)
     """
-    ✅ tick을 넘어(워커 재시작/리컨실 DELETE-INSERT 포함) 중복 알림을 막는 "의미 기반" 키.
-    - DB id / event_order 변화에 영향을 받지 않도록 구성
-    - assists는 늦게 채워지는 케이스가 있어서 기본적으로 제외(assists 업데이트로 재알림 방지)
-    - comment(예: power-play/shorthanded/empty-net)는 나중에 업데이트될 수 있어
-      ✅ comment 변화로 '같은 골'이 재알림되는 문제를 막기 위해 persist 키에서는 제외
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, (game_id, list(device_ids)))
+            rows = cur.fetchall()
+
+    out: Dict[str, StateRow] = {}
+    for r in rows:
+        out[str(r["device_id"])] = StateRow(
+            device_id=str(r["device_id"]),
+            game_id=int(r["game_id"]),
+            last_status=str(r.get("last_status") or ""),
+            last_home_score=int(r.get("last_home_score") or 0),
+            last_away_score=int(r.get("last_away_score") or 0),
+            last_event_id=int(r.get("last_event_id") or 0),
+        )
+    return out
+
+
+def upsert_state(row: StateRow) -> None:
+    sql = """
+    INSERT INTO hockey_game_notification_states
+      (device_id, game_id, last_status, last_home_score, last_away_score, last_event_id)
+    VALUES
+      (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (device_id, game_id)
+    DO UPDATE SET
+      last_status = EXCLUDED.last_status,
+      last_home_score = EXCLUDED.last_home_score,
+      last_away_score = EXCLUDED.last_away_score,
+      last_event_id = EXCLUDED.last_event_id,
+      updated_at = now()
     """
-    period = str(ev.get("period") or "").strip()
-    minute = str(ev.get("minute") or "").strip()
-    team_id = str(ev.get("team_id") or "").strip()
-    etype = str(ev.get("type") or "").strip().lower()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    row.device_id,
+                    row.game_id,
+                    row.last_status,
+                    row.last_home_score,
+                    row.last_away_score,
+                    row.last_event_id,
+                ),
+            )
 
-    # players: 득점자(보통 1명). 배열이 아니면 방어
-    players = ev.get("players") or []
-    if not isinstance(players, list):
-        players = []
-    players_norm = ",".join([str(p).strip().lower() for p in players if str(p).strip()])
 
-    return f"{etype}|{period}|{minute}|{team_id}|{players_norm}"
-
-def _hash_key(s: str) -> str:
+def fetch_events_for_game(game_id: int, min_last_event_id: int) -> List[Dict[str, Any]]:
+    # ✅ id 증분 + 최근 updated_at 윈도우(UPDATE/리컨실 방지)
+    sql = """
+    SELECT
+      id, period, minute, team_id, type, comment,
+      players, assists, event_order, event_key, notif_key, updated_at
+    FROM hockey_game_events
+    WHERE game_id = %s
+      AND (
+        id > %s
+        OR updated_at >= NOW() - interval '180 seconds'
+      )
+    ORDER BY id ASC
     """
-    sent_event_keys(TEXT[]) row 비대 방지용.
-    - 사람이 읽을 필요 없는 디듀프 키이므로 sha1(hex)로 축약 저장한다.
-    - prefix를 붙여 키 타입 식별 가능하게 함.
+    with pool.connection() as conn:
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, (game_id, min_last_event_id))
+            return list(cur.fetchall())
+
+
+# ─────────────────────────────────────────
+# DEDUPE (DB row 기반)
+# ─────────────────────────────────────────
+def claim_send_once(device_id: str, game_id: int, dedupe_key: str) -> bool:
     """
-    raw = (s or "").encode("utf-8", errors="ignore")
-    return "h1:" + hashlib.sha1(raw).hexdigest()
+    최초 1회만 True.
+    """
+    sql = """
+    INSERT INTO hockey_notification_sent (device_id, game_id, dedupe_key)
+    VALUES (%s, %s, %s)
+    ON CONFLICT DO NOTHING
+    RETURNING 1
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (device_id, game_id, dedupe_key))
+            got = cur.fetchone()
+            return got is not None
 
 
+def cleanup_sent_table(days: int = 14) -> None:
+    sql = "DELETE FROM hockey_notification_sent WHERE created_at < NOW() - (%s || ' days')::interval"
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (int(days),))
 
 
+# ─────────────────────────────────────────
+# NOTIFICATION MESSAGE (기존 호출 문구/형식은 여기서 유지)
+# ─────────────────────────────────────────
+def build_title_body(kind: str, g: Dict[str, Any], home_score: int, away_score: int, extra: str = "") -> Tuple[str, str]:
+    home_name = str(g.get("home_name") or "Home")
+    away_name = str(g.get("away_name") or "Away")
+    base = f"{home_name} {home_score}-{away_score} {away_name}"
+    if kind == "goal":
+        title = "GOAL"
+        body = base if not extra else f"{base} · {extra}"
+        return title, body
+    if kind == "game_start":
+        return "GAME START", base
+    if kind == "period_start":
+        return "PERIOD START", base if not extra else f"{base} · {extra}"
+    if kind == "period_end":
+        return "PERIOD END", base if not extra else f"{base} · {extra}"
+    if kind == "final":
+        return "FINAL", base
+    return "UPDATE", base if not extra else f"{base} · {extra}"
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _send_fcm(client: FCMClient, token: str, title: str, body: str, data: Dict[str, str]) -> None:
+    client.send_to_token(token=token, title=title, body=body, data=data)
+
+
+# ─────────────────────────────────────────
+# STATUS TRANSITIONS (P1/P2/P3/BT/OT/SO/FT/AOT/AP)
+# ─────────────────────────────────────────
+def is_final(status: str) -> bool:
+    return _status_norm(status) in FINAL_STATUSES
 
 
 def run_once() -> bool:
-    """
-    returns:
-      - True  => fast interval recommended (fast league has relevant candidates)
-      - False => slow interval recommended
-    """
-    now_utc = datetime.now(timezone.utc)
-    games = fetch_candidate_games(now_utc)
+    now = _now_utc()
 
-    if not games:
-        log.info("tick: candidates=0")
-        return False
+    # 가끔 청소(너무 자주 하면 부담이라 샘플링)
+    if LOG_SAMPLE_RATE > 0 and (hash(int(now.timestamp())) % 100) < int(LOG_SAMPLE_RATE * 100):
+        try:
+            cleanup_sent_table(days=14)
+        except Exception:
+            log.debug("cleanup failed", exc_info=True)
 
-    # ✅ 이번 tick에 FAST 리그 경기가 "진행중이거나 임박"이면 fast
-    # - 여기서는 단순/안전하게: game_date가 now 기준 ±6시간 안이고, league가 fast면 fast
-    now_ts = now_utc.timestamp()
+    games = fetch_candidate_games(now)
+
     has_fast_candidate = False
-    if FAST_LEAGUE_SET:
-        for g in games:
-            try:
-                lg = int(g.get("league_id") or 0)
-            except Exception:
-                lg = 0
-            if lg not in FAST_LEAGUE_SET:
-                continue
-
-            gd = g.get("game_date")
-            gd_ts = None
-            if isinstance(gd, datetime):
-                gd_ts = gd.timestamp()
-            # game_date가 없거나 파싱 실패면 보수적으로 fast로 보지 않음
-            if gd_ts is None:
-                continue
-
-            if (now_ts - 6 * 3600) <= gd_ts <= (now_ts + 6 * 3600):
-                has_fast_candidate = True
-                break
-
-    game_ids = [int(g["id"]) for g in games]
-    subs = fetch_subscriptions_for_games(game_ids)
-
-    if not subs:
-        log.info("tick: candidates=%d subs=0", len(games))
-        return has_fast_candidate
-
-
-    # game_id -> game row
-    game_map: Dict[int, Dict[str, Any]] = {int(g["id"]): g for g in games}
-
-    log.info("tick: candidates=%d subs=%d", len(games), len(subs))
-
     sent = 0
-    for sub in subs:
-        g = game_map.get(sub.game_id)
-        if not g:
+
+    fcm = FCMClient()  # 기존 구현 그대로 사용
+
+    for g in games:
+        game_id = int(g["id"])
+        league_id = int(g.get("league_id") or 0)
+        if league_id and league_id in FAST_LEAGUE_SET:
+            has_fast_candidate = True
+
+        subs = fetch_subscriptions_for_game(game_id)
+        if not subs:
             continue
 
+        device_ids = [s.device_id for s in subs]
+        states = fetch_states_for_game(game_id, device_ids)
 
-        # 현재 상태
-        status = str(g.get("status") or "").strip()
-        home, away = parse_score(g.get("score_json"))
+        # subs 중 최소 last_event_id를 기준으로 이벤트를 한 번만 읽는다
+        min_last_event_id = min([states.get(s.device_id).last_event_id if states.get(s.device_id) else 0 for s in subs] or [0])
+        events = fetch_events_for_game(game_id, min_last_event_id)
 
-        st = load_state(sub.device_id, sub.game_id)
-        last_event_id = _to_int(st.get("last_event_id"), 0)
-        last_status = st.get("last_status")
-        last_home = _to_int(st.get("last_home_score"), 0)
-        last_away = _to_int(st.get("last_away_score"), 0)
+        # 스팸 방지: 너무 많으면 뒤에서 N개만
+        if len(events) > MAX_EVENTS_PER_GAME_PER_TICK:
+            events = events[-MAX_EVENTS_PER_GAME_PER_TICK :]
 
-        # ✅ 이 tick 안에서 “스코어가 실제로 늘어난 골”만 보내기 위한 작업 변수
-        work_last_home = last_home
-        work_last_away = last_away
+        status_now = _status_norm(g.get("status"))
+        home_score_now, away_score_now = _score_from_json(g.get("score_json"))
 
-
-        sent_hist = st.get("sent_event_keys") or []
-        if not isinstance(sent_hist, list):
-            sent_hist = []
-        sent_hist_set = set(str(x) for x in sent_hist if str(x))
-
-
-        # ─────────────────────────────
-        # (A) 상태 전환 알림: 경기 시작/피리어드 전환/경기 종료
-        # ─────────────────────────────
-        last_status_norm = normalize_status(last_status)
-        status_norm = normalize_status(status)
-
-        def _send_status_notif(ntype: str, title: str, body: str) -> None:
-            """
-            상태 전환 알림(1P end 포함)은 status 플랩/재진입으로 중복 발송이 쉽게 발생한다.
-            tick 내 디듀프가 아니라, hockey_game_notification_states.sent_event_keys에
-            영속적으로 기록해서 "device_id + game_id + ntype" 기준으로 1회만 발송되게 한다.
-            """
-            nonlocal sent
-
-            # ✅ 영속 디듀프 키 (상태 전환 전용)
-            sk = f"status:{ntype}"
-
-            # ✅ 이미 보낸 상태 알림이면 스킵 (경기당 1회 보장)
-            if sk in sent_hist_set:
-                return
-
-            ok = send_push(
-                token=sub.fcm_token,
-                title=title,
-                body=body,
-                data={
-                    "sport": "hockey",
-                    "game_id": str(sub.game_id),
-                    "type": ntype,
-                    "status": status,
-                },
+        for sub in subs:
+            st = states.get(sub.device_id) or StateRow(
+                device_id=sub.device_id,
+                game_id=game_id,
+                last_status="",
+                last_home_score=0,
+                last_away_score=0,
+                last_event_id=0,
             )
-            if ok:
-                # ✅ 영속 디듀프 기록
-                sent_hist_set.add(sk)
-                sent_hist.append(sk)
 
+            last_status = _status_norm(st.last_status)
+
+            # ─────────────────────────────
+            # (A) 상태 알림 (전이 기반, DB dedupe)
+            # ─────────────────────────────
+
+            # GAME START: NS -> P1 (또는 NS -> P2 같은 비정상 시작도 방어)
+            if sub.notify_game_start and (last_status == "NS") and (status_now in ("P1", "P2", "P3", "BT", "OT", "SO")):
+                dk = _hash_key(f"{game_id}:status:game_start")
+                if claim_send_once(sub.device_id, game_id, dk):
+                    t, b = build_title_body("game_start", g, home_score_now, away_score_now)
+                    _send_fcm(
+                        fcm,
+                        sub.fcm_token,
+                        t,
+                        b,
+                        {"sport": "hockey", "game_id": str(game_id), "kind": "game_start"},
+                    )
+                    sent += 1
+                    if SEND_SLEEP_SEC > 0:
+                        time.sleep(SEND_SLEEP_SEC)
+
+            # PERIOD START/END: status_long 분포상 BT가 break time으로 들어옴
+            # - P1 -> BT : 1피리어드 종료
+            # - BT -> P2 : 2피리어드 시작
+            # - P2 -> BT : 2피리어드 종료
+            # - BT -> P3 : 3피리어드 시작
+            if sub.notify_periods:
+                transitions = [
+                    ("P1", "BT", "period_end", "P1"),
+                    ("BT", "P2", "period_start", "P2"),
+                    ("P2", "BT", "period_end", "P2"),
+                    ("BT", "P3", "period_start", "P3"),
+                ]
+                for a, b, kind, label in transitions:
+                    if last_status == a and status_now == b:
+                        dk = _hash_key(f"{game_id}:status:{kind}:{label}")
+                        if claim_send_once(sub.device_id, game_id, dk):
+                            t, body = build_title_body(kind, g, home_score_now, away_score_now, extra=label)
+                            _send_fcm(
+                                fcm,
+                                sub.fcm_token,
+                                t,
+                                body,
+                                {"sport": "hockey", "game_id": str(game_id), "kind": kind, "period": label},
+                            )
+                            sent += 1
+                            if SEND_SLEEP_SEC > 0:
+                                time.sleep(SEND_SLEEP_SEC)
+
+                # OT/SO는 리그마다 다름. DB status 분포에 AOT/AP가 “완료 상태”로 존재.
+                # 여기서는 "진행상태 -> OT/SO" 전이만 잡고, 최종은 final에서 처리.
+                if last_status in ("P3", "BT") and status_now == "OT":
+                    dk = _hash_key(f"{game_id}:status:ot_start")
+                    if claim_send_once(sub.device_id, game_id, dk):
+                        t, body = build_title_body("period_start", g, home_score_now, away_score_now, extra="OT")
+                        _send_fcm(
+                            fcm,
+                            sub.fcm_token,
+                            t,
+                            body,
+                            {"sport": "hockey", "game_id": str(game_id), "kind": "ot_start"},
+                        )
+                        sent += 1
+                        if SEND_SLEEP_SEC > 0:
+                            time.sleep(SEND_SLEEP_SEC)
+
+                if last_status == "OT" and status_now == "SO":
+                    dk = _hash_key(f"{game_id}:status:so_start")
+                    if claim_send_once(sub.device_id, game_id, dk):
+                        t, body = build_title_body("period_start", g, home_score_now, away_score_now, extra="SO")
+                        _send_fcm(
+                            fcm,
+                            sub.fcm_token,
+                            t,
+                            body,
+                            {"sport": "hockey", "game_id": str(game_id), "kind": "so_start"},
+                        )
+                        sent += 1
+                        if SEND_SLEEP_SEC > 0:
+                            time.sleep(SEND_SLEEP_SEC)
+
+            # FINAL
+            if sub.notify_game_end and is_final(status_now) and (not is_final(last_status)):
+                dk = _hash_key(f"{game_id}:status:final")
+                if claim_send_once(sub.device_id, game_id, dk):
+                    t, b = build_title_body("final", g, home_score_now, away_score_now)
+                    _send_fcm(
+                        fcm,
+                        sub.fcm_token,
+                        t,
+                        b,
+                        {"sport": "hockey", "game_id": str(game_id), "kind": "final"},
+                    )
+                    sent += 1
+                    if SEND_SLEEP_SEC > 0:
+                        time.sleep(SEND_SLEEP_SEC)
+
+            # ─────────────────────────────
+            # (B) 이벤트 알림: goal만 (기존 정책 유지)
+            # ─────────────────────────────
+            max_seen_event_id = st.last_event_id
+
+            for ev in events:
+                ev_id = _safe_int(ev.get("id"), 0)
+                if ev_id > max_seen_event_id:
+                    max_seen_event_id = ev_id
+
+                # 각 device별로는 "내 last_event_id 이후"만 기본 처리
+                # 단, updated_at 윈도우로 들어온 이벤트도 있을 수 있어 dedupe로 최종 방어
+                if ev_id <= st.last_event_id and (ev.get("updated_at") is None):
+                    continue
+
+                etype = str(ev.get("type") or "").strip().lower()
+                if etype != "goal":
+                    continue
+
+                if not sub.notify_score:
+                    continue
+
+                # ✅ dedupe는 event_key 기반으로 고정 (DB에서 항상 존재, game_id+event_key 유니크)
+                ek = str(ev.get("event_key") or "").strip()
+                if not ek:
+                    # 이론상 없어야 함. 그래도 안전하게 fallback.
+                    ek = f"fallback|{ev.get('period')}|{ev.get('minute')}|{ev.get('team_id')}|{ev.get('comment')}|{ev_id}"
+
+                dk = _hash_key(f"{game_id}:event:{ek}")
+                if not claim_send_once(sub.device_id, game_id, dk):
+                    continue
+
+                period = str(ev.get("period") or "").strip()
+                minute = ev.get("minute")
+                team_id = _safe_int(ev.get("team_id"), 0)
+
+                # 표시용 extra (너의 기존 문구가 따로 있으면 여기서 교체하면 됨)
+                extra = ""
+                if period:
+                    extra = f"{period}"
+                if minute is not None:
+                    extra = f"{extra} {minute}'".strip()
+
+                # 점수는 항상 hockey_games.score_json 기준(보정 없음)
+                t, b = build_title_body("goal", g, home_score_now, away_score_now, extra=extra)
+                _send_fcm(
+                    fcm,
+                    sub.fcm_token,
+                    t,
+                    b,
+                    {
+                        "sport": "hockey",
+                        "game_id": str(game_id),
+                        "kind": "goal",
+                        "period": period,
+                        "minute": str(minute) if minute is not None else "",
+                        "team_id": str(team_id) if team_id else "",
+                        "event_id": str(ev_id),
+                    },
+                )
                 sent += 1
-                time.sleep(SEND_SLEEP_SEC)
+                if SEND_SLEEP_SEC > 0:
+                    time.sleep(SEND_SLEEP_SEC)
 
+            # state 갱신 (sent_event_keys는 더 이상 사용 안 함)
+            st.last_status = status_now
+            st.last_home_score = home_score_now
+            st.last_away_score = away_score_now
+            st.last_event_id = max_seen_event_id
+            upsert_state(st)
 
-
-        # ✅ 경기 시작: (이전이 1P가 아니었고) 현재가 1P로 들어온 순간
-        # ✅ Game start
-        if sub.notify_game_start and (status_norm == "1P") and (last_status_norm != "1P"):
-            t, b = build_hockey_message("game_start", g, home, away)
-            _send_status_notif("game_start", t, b)
-
-        # ✅ 1P end (1P -> BT)
-        if sub.notify_periods and (last_status_norm == "1P") and (status_norm == "BT"):
-            t, b = build_hockey_message("period_end", g, home, away, status_norm="1P")
-            _send_status_notif("period_end_1", t, b)
-
-        # ✅ 2P start (BT -> 2P)
-        if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "2P"):
-            t, b = build_hockey_message("period_start", g, home, away, status_norm="2P")
-            _send_status_notif("period_start_2", t, b)
-
-        # ✅ 2P end (2P -> BT)
-        if sub.notify_periods and (last_status_norm == "2P") and (status_norm == "BT"):
-            t, b = build_hockey_message("period_end", g, home, away, status_norm="2P")
-            _send_status_notif("period_end_2", t, b)
-
-        # ✅ 3P start (BT -> 3P)
-        if sub.notify_periods and (last_status_norm == "BT") and (status_norm == "3P"):
-            t, b = build_hockey_message("period_start", g, home, away, status_norm="3P")
-            _send_status_notif("period_start_3", t, b)
-
-        # ✅ OT start (3P -> OT)
-        if sub.notify_periods and (last_status_norm == "3P") and (status_norm == "OT"):
-            t, b = build_hockey_message("ot_start", g, home, away)
-            _send_status_notif("ot_start", t, b)
-
-        # ✅ SO start (OT -> SO)
-        if sub.notify_periods and (last_status_norm == "OT") and (status_norm == "SO"):
-            t, b = build_hockey_message("so_start", g, home, away)
-            _send_status_notif("so_start", t, b)
-
-        # ✅ OT end
-        if sub.notify_periods and (last_status_norm == "OT") and (status_norm in ("SO",)):
-            t, b = build_hockey_message("ot_end", g, home, away)
-            _send_status_notif("ot_end", t, b)
-
-        if sub.notify_periods and (last_status_norm == "OT") and is_final_status(status_norm):
-            t, b = build_hockey_message("ot_end", g, home, away)
-            _send_status_notif("ot_end", t, b)
-
-        # ✅ Final
-        if sub.notify_game_end and is_final_status(status_norm) and (not is_final_status(last_status_norm)):
-            t, b = build_hockey_message("final", g, home, away)
-            _send_status_notif("final", t, b)
-
-
-
-        # ─────────────────────────────
-        # (B) 이벤트 알림: 빈 이벤트 스킵 + tick 내 디듀프 + 옵션 적용
-        # ─────────────────────────────
-        new_events = fetch_new_events(sub.game_id, last_event_id)
-
-        # 너무 많으면 스팸 방지: 최신 N개만
-        if len(new_events) > MAX_EVENTS_PER_GAME_PER_TICK:
-            new_events = new_events[-MAX_EVENTS_PER_GAME_PER_TICK :]
-
-        max_seen_event_id = last_event_id
-
-        # ✅ 같은 tick 내 중복 방지 (notif_key 기준)
-        sent_keys: set[str] = set()
-
-        for ev in new_events:
-            ev_id = _to_int(ev.get("id"), 0)
-            if ev_id > max_seen_event_id:
-                max_seen_event_id = ev_id
-
-            etype = str(ev.get("type") or "").strip().lower()
-
-            # 기본: goal만 알림 (penalty 알림은 비활성화)
-            if etype != "goal":
-                continue
-
-            # ✅ 핵심: event_order는 0이 많이 나오므로 "디듀프 키로 쓰면 안 됨"
-            # ✅ DB에 이미 notif_key(유니크)가 있으니 이것을 영속/틱 디듀프 키로 사용한다.
-            nk = str(ev.get("notif_key") or "").strip()
-
-            # notif_key가 비어있는 예외 케이스 대비 (안전장치)
-            if not nk:
-                nk = event_persist_key(ev)
-
-            # 경기 단위로 묶어서 키 고정 (row 비대 방지: 해시로 저장)
-            persist_key_raw = f"{sub.game_id}:{nk}"
-            persist_key = _hash_key(persist_key_raw)
-
-            # ✅ 같은 tick 내 중복 방지
-            if persist_key in sent_keys:
-                continue
-            sent_keys.add(persist_key)
-
-            # ✅ 영속 디듀프 (state) - 리컨실(DELETE/INSERT) / UPDATE 어떤 경우에도 동일 골 1회만
-            if persist_key in sent_hist_set:
-                continue
-
-            # ✅ 옵션: score 알림 off면 goal/penalty 자체를 막고 싶다면 여기서 컷
-            if (not sub.notify_score) and (etype in ("goal", "penalty")):
-                continue
-
-            # 득점 팀명 판별(가능하면)
-            ev_team_id = _to_int(ev.get("team_id"), 0)
-            home_team_id = _to_int(g.get("home_team_id"), 0)
-            away_team_id = _to_int(g.get("away_team_id"), 0)
-
-            home_name = str(g.get("home_name") or "Home")
-            away_name = str(g.get("away_name") or "Away")
-
-            team_name = ""
-            if ev_team_id and home_team_id and ev_team_id == home_team_id:
-                team_name = home_name
-            elif ev_team_id and away_team_id and ev_team_id == away_team_id:
-                team_name = away_name
-
-            period = str(ev.get("period") or "").strip()
-            minute = ev.get("minute")
-
-            # comment에 PPG/SHG/ENG 등이 들어오는 경우 타이틀에 살짝 붙임
-            tag = str(ev.get("comment") or "").strip()
-
-            # ✅ 정책: 골 알림 점수는 "항상 앱/DB score_json"과 100% 동일
-            notif_home = home
-            notif_away = away
-
-            # work_last도 score_json과 동일하게 맞춰서 state 일관성 유지
-            work_last_home = home
-            work_last_away = away
-
-            t, b = build_hockey_message(
-                "goal",
-                g,
-                notif_home,
-                notif_away,
-                period=period,
-                minute=minute,
-                team_name=team_name,
-                tag=tag,
-            )
-
-            ok = send_push(
-                token=sub.fcm_token,
-                title=t,
-                body=b,
-                data={
-                    "sport": "hockey",
-                    "game_id": str(sub.game_id),
-                    "type": etype,
-                    "status": status,
-                },
-            )
-            if ok:
-                # ✅ 영속 디듀프 기록 (notif_key 기반)
-                sent_hist_set.add(persist_key)
-                sent_hist.append(persist_key)
-
-                sent += 1
-                time.sleep(SEND_SLEEP_SEC)
-
-
-
-
-
-
-
-
-        # 점수 변화만으로도 알림 주고 싶다면(옵션) 아래를 활성화 가능
-        # if (home, away) != (last_home, last_away) and not new_events:
-        #     body = f"Score Update  |  {home}-{away}"
-        #     ok = send_push(sub.fcm_token, title, body, {"sport":"hockey","game_id":str(sub.game_id),"type":"score"})
-        #     if ok:
-        #         sent += 1
-        #         time.sleep(SEND_SLEEP_SEC)
-
-        # state 저장
-        # ✅ (A) 경기 종료 시 sent_event_keys 통째로 초기화
-        # - 종료된 경기에서 알림 재발송은 더 이상 필요 없음
-        # - 과거 중복 알림 잔재(잘못된 goal 키 등)를 상태 테이블에 남기지 않기 위함
-        # ✅ Final에서도 sent_event_keys를 비우지 않는다.
-        # - 경기 종료 후에도 늦게 들어오는 이벤트/리컨실 재삽입이 있을 수 있는데,
-        #   여기서 히스토리를 비우면 "오전 경기 골이 오후에 다시 알림" 같은 재발송이 생긴다.
-        if is_final_status(status_norm):
-            pass
-
-
-        # 너무 커지는 것 방지: 최근 200개만 유지
-        if len(sent_hist) > 200:
-            sent_hist = sent_hist[-200:]
-
-        save_state(
-            device_id=sub.device_id,
-            game_id=sub.game_id,
-            last_status=status,
-            last_home_score=work_last_home,
-            last_away_score=work_last_away,
-            last_event_id=max_seen_event_id,
-            sent_event_keys=sent_hist,
-        )
-
-
-
-
-    log.info("tick: sent=%d", sent)
-
+    log.info("tick: sent=%d games=%d", sent, len(games))
     return has_fast_candidate
-
 
 
 def run_forever(interval_sec: int) -> None:
@@ -1100,14 +683,12 @@ def run_forever(interval_sec: int) -> None:
         except Exception as e:
             log.exception("tick failed: %s", e)
 
-        # ✅ fast leagues가 설정되어 있고, 이번 tick에 fast 후보가 있으면 fast interval
         if FAST_LEAGUE_SET and use_fast:
             sleep_sec = max(1, FAST_INTERVAL_SEC)
         else:
             sleep_sec = max(1, SLOW_INTERVAL_SEC)
 
         time.sleep(sleep_sec)
-
 
 
 if __name__ == "__main__":
