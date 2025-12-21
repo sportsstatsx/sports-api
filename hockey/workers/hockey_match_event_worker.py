@@ -872,29 +872,6 @@ def _arr_len(x: Any) -> int:
     return 0
 
 
-def is_empty_notification_event(ev: Dict[str, Any]) -> bool:
-    """
-    API-Sports/수집 과정에서 가끔 players/assists/comment가 전부 비어있는 '껍데기' 이벤트가 먼저 들어오고,
-    잠시 뒤 같은 시점의 정상 이벤트가 들어오는 케이스가 있음.
-    -> 이 껍데기는 알림에서 스킵 (단, last_event_id는 계속 전진)
-    """
-    etype = str(ev.get("type") or "").strip().lower()
-    if etype != "goal":
-        return False
-
-    comment = str(ev.get("comment") or "").strip()
-    players = ev.get("players")
-    assists = ev.get("assists")
-
-    # players/assists가 배열이 아니어도 방어적으로 처리
-    has_players = _arr_len(players) > 0
-    has_assists = _arr_len(assists) > 0
-
-    if (not comment) and (not has_players) and (not has_assists):
-        return True
-    return False
-
-
 def event_dedupe_key(ev: Dict[str, Any]) -> str:
     """
     같은 tick 안에서 중복 전송 방지용 키.
@@ -1135,36 +1112,24 @@ def run_once() -> bool:
             if etype != "goal":
                 continue
 
-           # ✅ goal은 INSERT 시점(빈껍데기 포함)에서만 보낸다
-           # - UPDATE로 채워지는 동일 골은 event_order로 디듀프됨
-
-           event_order = _to_int(ev.get("event_order"), -1)
-           if event_order < 0:
-               # event_order 없는 goal은 비정상 → 안전하게 스킵
-               continue
-
-           goal_key = f"{sub.game_id}:{event_order}"
-
-           # tick 내 중복 방지
-           if goal_key in sent_keys:
-               continue
-           sent_keys.add(goal_key)
-
-           # 영속 디듀프 (state)
-           if goal_key in sent_hist_set:
-               continue
-
-
-
-            # ✅ tick을 넘어서는(리컨실/재삽입 포함) 중복 방지
-            # - notif_key: comment/assists 변화에 흔들리지 않는 "알림 전용 안정 키"
-            # - 혹시 notif_key가 비어있으면 persist_key로 fallback
-            pk = str(ev.get("notif_key") or "").strip()
-            if not pk:
-                pk = event_persist_key(ev)
-
-            if pk in sent_hist_set:
+            # ✅ goal은 INSERT 시점(빈껍데기 포함)에서만 보낸다
+            # - UPDATE로 채워지는 동일 골은 event_order로 디듀프됨
+            event_order = _to_int(ev.get("event_order"), -1)
+            if event_order < 0:
+                # event_order 없는 goal은 비정상 → 안전하게 스킵
                 continue
+
+            goal_key = f"{sub.game_id}:{event_order}"
+
+            # ✅ 같은 tick 내 중복 방지
+            if goal_key in sent_keys:
+                continue
+            sent_keys.add(goal_key)
+
+            # ✅ 영속 디듀프 (state) - UPDATE 포함 어떤 경우에도 동일 골 1회만
+            if goal_key in sent_hist_set:
+                continue
+
 
 
 
