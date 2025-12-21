@@ -267,28 +267,40 @@ def ensure_tables() -> None:
         """
         CREATE OR REPLACE FUNCTION hockey_set_event_keys()
         RETURNS trigger AS $$
+        DECLARE
+          players_txt text;
+          assists_txt text;
         BEGIN
+          -- ✅ players/assists 타입이 text[] 이든 json/jsonb 이든 상관없이 안전하게 문자열화
+          -- - ::text로 캐스팅 후, { } [ ] " 같은 포맷 문자를 제거해서 fingerprint 안정화
+          players_txt := lower(coalesce(NEW.players::text, ''));
+          players_txt := regexp_replace(players_txt, '[\\{\\}\\[\\]\\" ]', '', 'g');
+
+          assists_txt := lower(coalesce(NEW.assists::text, ''));
+          assists_txt := regexp_replace(assists_txt, '[\\{\\}\\[\\]\\" ]', '', 'g');
+
           NEW.event_key :=
             lower(coalesce(NEW.type,'')) || '|' ||
             coalesce(NEW.period,'') || '|' ||
             coalesce(NEW.minute::text,'') || '|' ||
             coalesce(NEW.team_id::text,'') || '|' ||
             lower(coalesce(NEW.comment,'')) || '|' ||
-            lower(coalesce(array_to_string(NEW.players,','),'')) || '|' ||
-            lower(coalesce(array_to_string(NEW.assists,','),''));
+            coalesce(players_txt,'') || '|' ||
+            coalesce(assists_txt,'');
 
           NEW.notif_key :=
             lower(coalesce(NEW.type,'')) || '|' ||
             coalesce(NEW.period,'') || '|' ||
             coalesce(NEW.minute::text,'') || '|' ||
             coalesce(NEW.team_id::text,'') || '|' ||
-            lower(coalesce(array_to_string(NEW.players,','),''));
+            coalesce(players_txt,'');
 
           RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;
         """
     )
+
 
     # ✅ 트리거 (없으면 생성)
     execute(
@@ -319,14 +331,14 @@ def ensure_tables() -> None:
             coalesce(e.minute::text,'') || '|' ||
             coalesce(e.team_id::text,'') || '|' ||
             lower(coalesce(e.comment,'')) || '|' ||
-            lower(coalesce(array_to_string(e.players,','),'')) || '|' ||
-            lower(coalesce(array_to_string(e.assists,','),'')),
+            regexp_replace(lower(coalesce(e.players::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g') || '|' ||
+            regexp_replace(lower(coalesce(e.assists::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g'),
           notif_key =
             lower(coalesce(e.type,'')) || '|' ||
             coalesce(e.period,'') || '|' ||
             coalesce(e.minute::text,'') || '|' ||
             coalesce(e.team_id::text,'') || '|' ||
-            lower(coalesce(array_to_string(e.players,','),''))
+            regexp_replace(lower(coalesce(e.players::text,'')), '[\\{\\}\\[\\]\\" ]', '', 'g')
         FROM hockey_games g
         WHERE g.id = e.game_id
           AND g.game_date >= NOW() - interval '14 days'
@@ -336,6 +348,7 @@ def ensure_tables() -> None:
           );
         """
     )
+
 
     # 최근 범위에서 notif_key 기준 완전 중복 제거(인덱스 생성 전 안전장치)
     execute(
