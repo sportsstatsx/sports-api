@@ -670,19 +670,31 @@ def _normalize_players(val: Any) -> List[str]:
 
 def event_persist_key(ev: Dict[str, Any]) -> str:
     """
-    ✅ 스키마 의존 없는 의미 기반 디듀프 키
-    - comment/assists 변경으로 같은 골이 재알림되는 걸 막기 위해 기본 제외
+    ✅ '빈 골 → 업데이트로 상세 채워짐' 케이스에서 중복 알림을 막기 위한 고정 키
+
+    핵심:
+    - players/assists/comment 같은 "나중에 채워지는 필드"는 디듀프 키에 넣지 않는다.
+    - 대신 같은 골을 대표할 수 있는 "안정적인 식별자"를 쓴다.
+      1) event_order 가 있으면 그걸 사용 (리그/데이터에서 순번 역할)
+      2) 없으면 DB row id 를 사용 (같은 row 업데이트면 id 동일)
+
+    결과:
+    - 같은 골이 UPDATE 되어도 key가 변하지 않아서 "두 번째 알림"은 스킵된다.
+    - 같은 분에 2골이 나와도 event_order/id가 달라서 스킵되지 않는다.
     """
     period = str(ev.get("period") or "").strip()
     minute = str(ev.get("minute") or "").strip()
     team_id = str(ev.get("team_id") or "").strip()
     etype = str(ev.get("type") or "").strip().lower()
 
-    players_norm = ",".join(
-        [p.strip().lower() for p in _normalize_players(ev.get("players")) if p.strip()]
-    )
+    # 안정 식별자 우선순위: event_order > id
+    order_val = ev.get("event_order")
+    order_key = str(order_val).strip() if order_val is not None else ""
+    if not order_key:
+        order_key = str(_to_int(ev.get("id"), 0))
 
-    return f"{etype}|{period}|{minute}|{team_id}|{players_norm}"
+    return f"{etype}|{period}|{minute}|{team_id}|{order_key}"
+
 
 
 def _hash_key(s: str) -> str:
