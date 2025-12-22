@@ -630,24 +630,17 @@ def run_once() -> bool:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        # final: LIVE-ish -> FT
-        if sub.notify_game_end and (status_norm == "FT") and (last_status_norm != "FT"):
-            t, b = build_hockey_message("final", g, home, away)
-            if send_push(
-                token=sub.fcm_token,
-                title=t,
-                body=b,
-                data={"sport": "hockey", "game_id": str(sub.game_id), "type": "final", "status": status_raw},
-            ):
-                sent += 1
-                time.sleep(SEND_SLEEP_SEC)
+        # ─────────────────────────────
+        # (B) SCORE / FINAL COMBINED (FSM)
+        # ─────────────────────────────
 
-        # ─────────────────────────────
-        # (B) SCORE DIFF (FSM)  ← 핵심
-        # ─────────────────────────────
-        # DB-score가 바뀐 경우에만 골 알림
-        if sub.notify_score and (home, away) != (last_home, last_away):
-            # 어느 팀이 득점했는지 diff로만 판단 (보정 없음)
+        score_changed = (home, away) != (last_home, last_away)
+        became_final = (status_norm == "FT") and (last_status_norm != "FT")
+        was_ot_or_so = last_status_norm in ("OT", "SO")
+
+        # 1) 골 알림
+        sent_goal = False
+        if sub.notify_score and score_changed:
             team_name = ""
             if home > last_home:
                 team_name = str(g.get("home_name") or "Home")
@@ -662,7 +655,21 @@ def run_once() -> bool:
                 data={"sport": "hockey", "game_id": str(sub.game_id), "type": "goal", "status": status_raw},
             ):
                 sent += 1
+                sent_goal = True
                 time.sleep(SEND_SLEEP_SEC)
+
+        # 2) Final 알림
+        if sub.notify_game_end and became_final:
+            t, b = build_hockey_message("final", g, home, away)
+            if send_push(
+                token=sub.fcm_token,
+                title=t,
+                body=b,
+                data={"sport": "hockey", "game_id": str(sub.game_id), "type": "final", "status": status_raw},
+            ):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
 
         # ─────────────────────────────
         # (C) STATE SAVE (DB truth)
