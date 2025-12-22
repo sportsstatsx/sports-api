@@ -471,13 +471,52 @@ def build_hockey_message(
 _fcm = FCMClient()
 
 
-def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
+def _call_fcm(func, token: str, title: str, body: str, data: Dict[str, str]) -> None:
+    """
+    FCMClient 구현마다 시그니처가 다를 수 있어서
+    (kwargs / positional) 둘 다 시도한다.
+    """
     try:
-        _fcm.send(token=token, title=title, body=body, data=data or {})
-        return True
-    except Exception as e:
-        log.warning("send_push failed: %s", e)
-        return False
+        func(token=token, title=title, body=body, data=data)
+        return
+    except TypeError:
+        pass
+
+    # positional fallback (가장 흔한 형태)
+    func(token, title, body, data)
+
+
+def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
+    payload = data or {}
+
+    # ⚠️ 네 프로젝트의 notifications/fcm_client.py 안에서 실제 메서드명이 무엇이든
+    # 아래 후보 중 하나로 잡히게 만든다.
+    candidates = [
+        "send",
+        "send_notification",
+        "send_to_token",
+        "send_message",
+        "push",
+        "notify",
+    ]
+
+    for name in candidates:
+        func = getattr(_fcm, name, None)
+        if callable(func):
+            try:
+                _call_fcm(func, token=token, title=title, body=body, data=payload)
+                return True
+            except Exception as e:
+                log.warning("send_push failed via %s: %s", name, e)
+                return False
+
+    # 어떤 후보도 없으면, 구현 메서드명을 로그로 보여주기
+    log.error(
+        "FCMClient has no known send method. Available attrs: %s",
+        [x for x in dir(_fcm) if "send" in x or "push" in x or "notif" in x or "notify" in x],
+    )
+    return False
+
 
 
 # ─────────────────────────────────────────
