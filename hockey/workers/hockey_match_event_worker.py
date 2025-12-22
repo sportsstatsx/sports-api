@@ -646,7 +646,12 @@ def run_once() -> bool:
 
         score_changed = (home, away) != (last_home, last_away)
         became_final = (status_norm == "FT") and (last_status_norm != "FT")
+
+        # 옵션A 핵심:
+        # OT/SO 구간에서 점수 변동이 발생하면 "승부 결정 득점"으로 간주하고
+        # Final 알림을 즉시 따라 보낸다.
         was_ot_or_so = last_status_norm in ("OT", "SO")
+        decided_in_ot_or_so = was_ot_or_so and score_changed
 
         # 1) 골 알림
         sent_goal = False
@@ -681,7 +686,11 @@ def run_once() -> bool:
                 time.sleep(SEND_SLEEP_SEC)
 
         # 2) Final 알림
-        if sub.notify_game_end and became_final:
+        # - 기존: FT로 바뀌는 순간(became_final)
+        # - 옵션A: OT/SO 상태에서 점수 변동(decided_in_ot_or_so)
+        # 중 하나라도 만족하면 Final 발송 (중복 발송 방지)
+        should_send_final = sub.notify_game_end and (became_final or decided_in_ot_or_so)
+        if should_send_final:
             t, b = build_hockey_message("final", g, home, away)
             if send_push(
                 token=sub.fcm_token,
@@ -691,6 +700,7 @@ def run_once() -> bool:
             ):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
+
 
 
         # ─────────────────────────────
