@@ -10,6 +10,7 @@ from hockey.hockey_db import hockey_fetch_one, hockey_fetch_all
 import psycopg
 from psycopg_pool import ConnectionPool
 import os
+import json
 
 
 # ─────────────────────────────────────────
@@ -141,23 +142,75 @@ def hockey_subscribe_game():
     
     inserted = bool((up or {}).get("inserted"))
 
-    # ✅ 옵션 A: "처음 구독(즐겨찾기)" 일 때만
-    #    구독 시점 기준으로 커서(last_event_id)를 현재 끝으로 맞춰서
-    #    구독 이전 이벤트(이미 발생한 골/상태)를 밀린 알림처럼 보내지 않도록 한다.
+    # ✅ FSM: "처음 구독(즐겨찾기)"이면 '지금 DB 상태'를 그대로 state로 저장한다.
+    #   - 이벤트 테이블(hockey_game_events) 절대 보지 않음
+    #   - last_event_id / sent_event_keys는 사용 안 하더라도 스키마 호환상 0/[]로 유지
     if inserted:
-        # 현재까지 이벤트의 마지막 id (없으면 0)
-        last_ev = hockey_fetch_one(
-            "SELECT COALESCE(MAX(id), 0) AS max_id FROM hockey_game_events WHERE game_id=%s",
-            (game_id_int,),
-        )
-        max_event_id = int((last_ev or {}).get("max_id") or 0)
-
-        # 현재 게임 상태 스냅샷 (상태 알림(game_start)까지 깔끔해짐)
         cur = hockey_fetch_one(
-            "SELECT status FROM hockey_games WHERE id=%s",
+            "SELECT status, score_json FROM hockey_games WHERE id=%s",
             (game_id_int,),
         )
         cur_status = (cur or {}).get("status", None)
+
+        score_json = (cur or {}).get("score_json")
+
+        # score_json 구조가 문자열/딕트 등 다양하므로 안전 파싱
+        def _to_int_local(x: Any, default: int = 0) -> int:
+            try:
+                if x is None:
+                    return default
+                if isinstance(x, bool):
+                    return default
+                if isinstance(x, (int, float)):
+                    return int(x)
+                s = str(x).strip()
+                if not s:
+                    return default
+                return int(float(s))
+            except Exception:
+                return default
+
+        def _parse_score_local(v: Any) -> tuple[int, int]:
+            if v is None:
+                return (0, 0)
+
+            obj = v
+            if isinstance(obj, str):
+                try:
+                    obj = json.loads(obj)
+                except Exception:
+                    return (0, 0)
+
+            if not isinstance(obj, dict):
+                return (0, 0)
+
+            # 1) {"home":2,"away":1}
+            if "home" in obj or "away" in obj:
+                return (_to_int_local(obj.get("home"), 0), _to_int_local(obj.get("away"), 0))
+
+            # 2) {"total":{"home":..,"away":..}} 등
+            for k in ("total", "totals", "final", "score", "scores"):
+                vv = obj.get(k)
+                if isinstance(vv, dict) and ("home" in vv or "away" in vv):
+                    return (_to_int_local(vv.get("home"), 0), _to_int_local(vv.get("away"), 0))
+
+            # 3) periods 합산
+            periods = obj.get("periods")
+            if isinstance(periods, dict):
+                h = 0
+                a = 0
+                any_found = False
+                for pv in periods.values():
+                    if isinstance(pv, dict) and ("home" in pv or "away" in pv):
+                        any_found = True
+                        h += _to_int_local(pv.get("home"), 0)
+                        a += _to_int_local(pv.get("away"), 0)
+                if any_found:
+                    return (h, a)
+
+            return (0, 0)
+
+        home_score, away_score = _parse_score_local(score_json)
 
         hockey_execute(
             """
@@ -171,8 +224,9 @@ def hockey_subscribe_game():
               last_event_id = EXCLUDED.last_event_id,
               updated_at = now()
             """,
-            (device_id, game_id_int, cur_status, 0, 0, max_event_id, []),
+            (device_id, game_id_int, cur_status, home_score, away_score, 0, []),
         )
+
 
 
 
