@@ -34,14 +34,14 @@ def build_hockey_team_detail_bundle(
         team_id=team_id,
         league_id=league_id,
         season=season,
-        limit=10,
+        limit=None,
     )
 
     upcoming_fixtures = build_hockey_upcoming_block(
         team_id=team_id,
         league_id=league_id,
         season=season,
-        limit=10,
+        limit=None,
     )
 
     return {
