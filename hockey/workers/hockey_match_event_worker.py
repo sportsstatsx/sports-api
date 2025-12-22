@@ -434,16 +434,26 @@ def build_hockey_message(
 
     if event_type == "goal":
         who = team_name or "Goal"
-        extra = ""
+
+        parts: List[str] = []
         if period:
-            extra += f" ({period})"
+            parts.append(period)
         if minute is not None and str(minute).strip():
-            extra += f" {minute}"
-        title = f"🏒 {who} Goal"
+            parts.append(str(minute).strip())
+
+        prefix = " ".join(parts)
+
+        if prefix:
+            title = f"🏒 {prefix} {who} Goal!"
+        else:
+            title = f"🏒 {who} Goal!"
+
         body = score_line
         if tag:
             body = f"{score_line}\n{tag}"
+
         return (title, body)
+
 
     if event_type == "game_start":
         return ("▶ Game Start", score_line)
@@ -647,7 +657,19 @@ def run_once() -> bool:
             elif away > last_away:
                 team_name = str(g.get("away_name") or "Away")
 
-            t, b = build_hockey_message("goal", g, home, away, team_name=team_name)
+            period = status_norm
+            minute = (g.get("status_long") or "").strip()
+
+            t, b = build_hockey_message(
+                "goal",
+                g,
+                home,
+                away,
+                team_name=team_name,
+                period=period,
+                minute=minute,
+            )
+
             if send_push(
                 token=sub.fcm_token,
                 title=t,
