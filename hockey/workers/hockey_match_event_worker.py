@@ -367,6 +367,42 @@ def save_state(
         ),
     )
 
+def fetch_last_goal_minute(game_id: int) -> Optional[str]:
+    """
+    가장 최근 goal 이벤트의 minute(분)만 조회
+    초단위 제거, 예: 11"
+    """
+    row = fetch_one(
+        """
+        SELECT minute
+        FROM hockey_game_events
+        WHERE game_id = %s
+          AND event_type = 'goal'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (game_id,),
+    )
+
+    if not row:
+        return None
+
+    m = row.get("minute")
+    if m is None:
+        return None
+
+    # 문자열 정리: 11, "11", "11:23" → 11"
+    s = str(m).strip()
+    if not s:
+        return None
+
+    # ":" 있으면 분만
+    if ":" in s:
+        s = s.split(":", 1)[0]
+
+    return f'{s}"'
+
+
 
 
 # ─────────────────────────────────────────
@@ -751,6 +787,8 @@ def run_once() -> bool:
             elif away > last_away:
                 team_name = g.get("away_name") or "Away"
 
+            goal_minute = fetch_last_goal_minute(sub.game_id)
+
             t, b = build_hockey_message(
                 "goal",
                 g,
@@ -758,7 +796,7 @@ def run_once() -> bool:
                 away,
                 team_name=team_name,
                 period=status_norm,
-                minute=g.get("status_long"),
+                minute=goal_minute,
             )
 
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
