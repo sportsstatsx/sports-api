@@ -731,7 +731,7 @@ def run_once() -> bool:
                 save_state(
                     device_id=sub.device_id,
                     game_id=sub.game_id,
-                    last_status=last_status,
+                    last_status=status_raw,
                     last_home_score=home,
                     last_away_score=away,
                     sent_event_keys=sent_keys,
