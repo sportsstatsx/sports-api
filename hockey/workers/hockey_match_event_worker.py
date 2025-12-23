@@ -370,15 +370,17 @@ def save_state(
 def fetch_last_goal_minute(game_id: int) -> Optional[str]:
     """
     가장 최근 goal 이벤트의 minute(분)만 조회
-    초단위 제거, 예: 11"
+    예: 11"
+    - hockey_game_events 스키마 기준: type, minute, created_at
     """
     row = fetch_one(
         """
         SELECT minute
         FROM hockey_game_events
         WHERE game_id = %s
-          AND event_type = 'goal'
-        ORDER BY created_at DESC
+          AND type = 'goal'
+          AND minute IS NOT NULL
+        ORDER BY created_at DESC, event_order DESC, id DESC
         LIMIT 1
         """,
         (game_id,),
@@ -391,17 +393,20 @@ def fetch_last_goal_minute(game_id: int) -> Optional[str]:
     if m is None:
         return None
 
-    # 문자열 정리: 11, "11", "11:23" → 11"
-    s = str(m).strip()
-    if not s:
-        return None
+    # minute은 smallint라서 그냥 int 변환만 하면 됨
+    try:
+        mi = int(m)
+    except Exception:
+        s = str(m).strip()
+        if not s:
+            return None
+        if ":" in s:
+            s = s.split(":", 1)[0].strip()
+        if not s:
+            return None
+        return f'{s}"'
 
-    # ":" 있으면 분만
-    if ":" in s:
-        s = s.split(":", 1)[0]
-
-    return f'{s}"'
-
+    return f'{mi}"'
 
 
 
