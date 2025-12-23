@@ -756,23 +756,7 @@ def run_once() -> bool:
         if not g:
             continue
 
-        status_raw = str(g.get("status") or "").strip()
-        status_norm = normalize_status(status_raw)
-        ui_home, ui_away = extract_ui_scores(
-            g.get("score_json"),
-            g.get("raw_json"),
-        )
-
-        # UI와 동일 규칙:
-        # - 둘 다 None → 점수 미확정 tick → last 값 유지
-        # - 한쪽만 None → last 값 유지
-        if ui_home is None and ui_away is None:
-            home, away = last_home, last_away
-        else:
-            home = ui_home if ui_home is not None else last_home
-            away = ui_away if ui_away is not None else last_away
-
-
+        # ✅ 먼저 state 로드해서 last_* 확보 (중요!)
         st = load_state(sub.device_id, sub.game_id)
         last_status = st.get("last_status")
         last_status_norm = normalize_status(last_status)
@@ -780,8 +764,25 @@ def run_once() -> bool:
         last_away = _to_int(st.get("last_away_score"), 0)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
+        status_raw = str(g.get("status") or "").strip()
+        status_norm = normalize_status(status_raw)
+
+        # ✅ UI와 동일 스코어 규칙
+        ui_home, ui_away = extract_ui_scores(
+            g.get("score_json"),
+            g.get("raw_json"),
+        )
+
+        # - 둘 다 None → 점수 미확정 tick → last 값 유지
+        # - 한쪽만 None → 그쪽만 last 유지
+        if ui_home is None and ui_away is None:
+            home, away = last_home, last_away
+        else:
+            home = ui_home if ui_home is not None else last_home
+            away = ui_away if ui_away is not None else last_away
+
         # ─────────────────────────
-        # (A) STATUS FSM (Period Start/End 복구)
+        # (A) STATUS FSM
         # ─────────────────────────
 
         # game_start: NS -> 1P
@@ -819,15 +820,13 @@ def run_once() -> bool:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        # 3P 종료 + OT/SO/Final 점프 대응 (BT 없이 점프하는 케이스)
+        # 3P 종료 + OT/SO/Final 점프 대응
         if sub.notify_periods and last_status_norm == "3P" and status_norm in ("OT", "SO", "FT", "AP", "AOT"):
-            # 3P end
             t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-            # OT/SO start
             if status_norm == "OT":
                 t2, b2 = build_hockey_message("ot_start", g, home, away)
                 if send_push(sub.fcm_token, t2, b2, {"sport": "hockey", "game_id": str(sub.game_id)}):
@@ -839,7 +838,7 @@ def run_once() -> bool:
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
 
-        # OT -> SO start (일부 리그에서 이런 전환 존재)
+        # OT -> SO start
         if sub.notify_periods and last_status_norm == "OT" and status_norm == "SO":
             t, b = build_hockey_message("so_start", g, home, away)
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
@@ -847,15 +846,17 @@ def run_once() -> bool:
                 time.sleep(SEND_SLEEP_SEC)
 
         # ─────────────────────────
-        # (B) SCORE / FINAL (옵션 A 유지)
+        # (B) SCORE / FINAL
         # ─────────────────────────
         score_changed = (home, away) != (last_home, last_away)
+        score_increased = (home > last_home) or (away > last_away)
+
         became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
         decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
 
-        # 골 중복 방지 (DB 기반)
+        # ✅ 골 알림은 "증가"일 때만
         goal_key = f"goal:{sub.game_id}:{home}:{away}"
-        if sub.notify_score and score_changed and goal_key not in sent_keys:
+        if sub.notify_score and score_increased and goal_key not in sent_keys:
             team_name = ""
             if home > last_home:
                 team_name = g.get("home_name") or "Home"
@@ -878,7 +879,6 @@ def run_once() -> bool:
                 sent += 1
                 sent_keys.append(goal_key)
 
-                # 🔒 즉시 state 저장(중복골 race 차단)
                 save_state(
                     device_id=sub.device_id,
                     game_id=sub.game_id,
@@ -912,6 +912,7 @@ def run_once() -> bool:
 
     log.info("tick: sent=%d", sent)
     return has_fast_candidate
+
 
 
 
