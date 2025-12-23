@@ -242,7 +242,14 @@ def parse_score(score_json: Any) -> Tuple[int, int]:
 
 
 FINAL_STATUSES = {
-    "FT", "AET", "PEN", "FINAL", "FINISHED",
+    # regulation / generic final
+    "FT", "FINAL", "FINISHED",
+    # overtime finished (API-Sports에서 종종 AOT로 옴)
+    "AOT",
+    # after penalties/shootout (API-Sports: AP)
+    "AP",
+    # keep legacy tokens (혹시 다른 소스에서 올 수 있음)
+    "AET", "PEN",
 }
 LIVE_STATUSES_HINT = {
     "P1", "P2", "P3", "OT", "SO", "LIVE",
@@ -252,6 +259,7 @@ LIVE_STATUSES_HINT = {
 def is_final_status(status: Optional[str]) -> bool:
     s = (status or "").strip().upper()
     return s in FINAL_STATUSES
+
 
 
 def is_liveish_status(status: Optional[str]) -> bool:
@@ -265,7 +273,8 @@ def normalize_status(status: Any) -> str:
     s = str(status or "").strip().upper()
     if not s:
         return ""
-    # API-Sports 스타일도 흡수: P1/P2/P3/OT/SO/NS/FT/BT 등
+    # API-Sports 스타일도 흡수
+    # P1/P2/P3/OT/SO/NS/FT/BT + AP(Af. Penalties) + AOT(After OT)
     if s in ("NS", "TBD"):
         return "NS"
     if s in ("P1", "1P"):
@@ -280,9 +289,17 @@ def normalize_status(status: Any) -> str:
         return "SO"
     if s in ("BT", "BREAK", "INTERMISSION"):
         return "BT"
+
+    # 종료 계열
+    if s in ("AP",):         # After Penalties (API-Sports)
+        return "AP"
+    if s in ("AOT",):        # After Over Time (API-Sports)
+        return "AOT"
     if s in ("FT", "FINAL", "FINISHED"):
         return "FT"
+
     return s
+
 
 
 # ─────────────────────────────────────────
@@ -412,6 +429,46 @@ def fetch_subscriptions_for_games(game_ids: Sequence[int]) -> List[Subscription]
         )
     return [x for x in out if x.device_id and x.fcm_token and x.game_id]
 
+def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
+    """
+    ✅ 구독 우선:
+    - 구독된 game_id를 먼저 확정하고,
+    - hockey_games를 조인해서 (점수/상태/팀명 포함) 한 번에 가져온다.
+    - game_date window로만 제한해서 "오래된 구독"은 매 tick마다 보지 않게 한다.
+    """
+    time_min = now_utc.timestamp() - (PAST_DAYS * 86400)
+    time_max = now_utc.timestamp() + (FUTURE_DAYS * 86400)
+
+    sql = """
+        SELECT
+          s.device_id,
+          d.fcm_token,
+          s.game_id,
+          s.notify_score,
+          s.notify_game_start,
+          s.notify_game_end,
+          s.notify_periods,
+
+          g.league_id,
+          g.game_date,
+          g.status,
+          g.status_long,
+          g.score_json,
+          g.home_team_id,
+          g.away_team_id,
+          th.name AS home_name,
+          ta.name AS away_name
+
+        FROM hockey_game_notification_subscriptions s
+        JOIN hockey_user_devices d ON d.device_id = s.device_id
+        JOIN hockey_games g ON g.id = s.game_id
+        LEFT JOIN hockey_teams th ON th.id = g.home_team_id
+        LEFT JOIN hockey_teams ta ON ta.id = g.away_team_id
+        WHERE EXTRACT(EPOCH FROM g.game_date) BETWEEN %s AND %s
+    """
+    return fetch_all(sql, (time_min, time_max))
+
+
 
 # ─────────────────────────────────────────
 # NOTIF MESSAGE
@@ -507,24 +564,25 @@ def run_once() -> bool:
       - False => slow interval recommended
     """
     now_utc = datetime.now(timezone.utc)
-    games = fetch_candidate_games(now_utc)
 
-    if not games:
-        log.info("tick: candidates=0")
+    # ✅ 구독 우선 (구독 경기 누락 방지)
+    sub_rows = fetch_subscription_rows(now_utc)
+    if not sub_rows:
+        log.info("tick: subs=0 (window=%sd/%sd)", PAST_DAYS, FUTURE_DAYS)
         return False
 
-    # fast 후보 (기존 판단 유지)
+    # fast 후보 (구독 경기 기준으로 판단)
     now_ts = now_utc.timestamp()
     has_fast_candidate = False
     if FAST_LEAGUE_SET:
-        for g in games:
+        for r in sub_rows:
             try:
-                lg = int(g.get("league_id") or 0)
+                lg = int(r.get("league_id") or 0)
             except Exception:
                 lg = 0
             if lg not in FAST_LEAGUE_SET:
                 continue
-            gd = g.get("game_date")
+            gd = r.get("game_date")
             gd_ts = gd.timestamp() if isinstance(gd, datetime) else None
             if gd_ts is None:
                 continue
@@ -532,14 +590,50 @@ def run_once() -> bool:
                 has_fast_candidate = True
                 break
 
-    game_ids = [int(g["id"]) for g in games]
-    subs = fetch_subscriptions_for_games(game_ids)
+    # rows → Subscription + game_map
+    subs: List[Subscription] = []
+    game_map: Dict[int, Dict[str, Any]] = {}
+
+    for r in sub_rows:
+        game_id = _to_int(r.get("game_id"), 0)
+        device_id = str(r.get("device_id") or "").strip()
+        token = str(r.get("fcm_token") or "").strip()
+        if not (game_id and device_id and token):
+            continue
+
+        subs.append(
+            Subscription(
+                device_id=device_id,
+                fcm_token=token,
+                game_id=game_id,
+                notify_score=bool(r.get("notify_score", True)),
+                notify_game_start=bool(r.get("notify_game_start", True)),
+                notify_game_end=bool(r.get("notify_game_end", True)),
+                notify_periods=bool(r.get("notify_periods", True)),
+            )
+        )
+
+        # game_id별 game dict (동일 game_id가 여러 device로 중복될 수 있으니 1회만)
+        if game_id not in game_map:
+            game_map[game_id] = {
+                "id": game_id,
+                "league_id": r.get("league_id"),
+                "game_date": r.get("game_date"),
+                "status": r.get("status"),
+                "status_long": r.get("status_long"),
+                "score_json": r.get("score_json"),
+                "home_team_id": r.get("home_team_id"),
+                "away_team_id": r.get("away_team_id"),
+                "home_name": r.get("home_name"),
+                "away_name": r.get("away_name"),
+            }
+
     if not subs:
-        log.info("tick: candidates=%d subs=0", len(games))
+        log.info("tick: subs(rows)=%d parsed=0", len(sub_rows))
         return has_fast_candidate
 
-    game_map: Dict[int, Dict[str, Any]] = {int(g["id"]): g for g in games}
-    log.info("tick: candidates=%d subs=%d", len(games), len(subs))
+    log.info("tick: subs=%d games=%d", len(subs), len(game_map))
+
 
     sent = 0
 
@@ -618,16 +712,43 @@ def run_once() -> bool:
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        if sub.notify_periods and (last_status_norm == "3P") and (status_norm == "OT"):
-            t, b = build_hockey_message("ot_start", g, home, away)
+        # ✅ 3P 종료 + OT/SO/Final 점프 대응
+        # - BT가 안 내려와도 3P -> OT/SO/AP/AOT/FT 로 바로 점프하는 케이스를 처리
+        if sub.notify_periods and (last_status_norm == "3P") and (status_norm in ("OT", "SO", "FT", "AP", "AOT")):
+            # 3P 종료 알림
+            t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
             if send_push(
                 token=sub.fcm_token,
                 title=t,
                 body=b,
-                data={"sport": "hockey", "game_id": str(sub.game_id), "type": "ot_start", "status": status_raw},
+                data={"sport": "hockey", "game_id": str(sub.game_id), "type": "period_end_3", "status": status_raw},
             ):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
+
+            # 이어서 다음 단계 시작 알림 (OT/SO만)
+            if status_norm == "OT":
+                t2, b2 = build_hockey_message("ot_start", g, home, away)
+                if send_push(
+                    token=sub.fcm_token,
+                    title=t2,
+                    body=b2,
+                    data={"sport": "hockey", "game_id": str(sub.game_id), "type": "ot_start", "status": status_raw},
+                ):
+                    sent += 1
+                    time.sleep(SEND_SLEEP_SEC)
+
+            elif status_norm == "SO":
+                t2, b2 = build_hockey_message("so_start", g, home, away)
+                if send_push(
+                    token=sub.fcm_token,
+                    title=t2,
+                    body=b2,
+                    data={"sport": "hockey", "game_id": str(sub.game_id), "type": "so_start", "status": status_raw},
+                ):
+                    sent += 1
+                    time.sleep(SEND_SLEEP_SEC)
+
 
         if sub.notify_periods and (last_status_norm == "OT") and (status_norm == "SO"):
             t, b = build_hockey_message("so_start", g, home, away)
@@ -645,7 +766,8 @@ def run_once() -> bool:
         # ─────────────────────────────
 
         score_changed = (home, away) != (last_home, last_away)
-        became_final = (status_norm == "FT") and (last_status_norm != "FT")
+        became_final = is_final_status(status_norm) and (not is_final_status(last_status_norm))
+
 
         # 옵션A 핵심:
         # OT/SO 구간에서 점수 변동이 발생하면 "승부 결정 득점"으로 간주하고
