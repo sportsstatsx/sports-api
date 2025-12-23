@@ -834,8 +834,13 @@ def run_once() -> bool:
 
         # 3P 종료 + OT/SO/Final 점프 대응
         if sub.notify_periods and last_status_norm == "3P" and status_norm in ("OT", "SO", "FT", "AP", "AOT"):
-            t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
-            _send_once(f"pe:{sub.game_id}:3P", t, b)
+            # ✅ 정규시간(3P) 종료 시점에 동점이 아니면 3P End는 스킵하고 Final만 가도록
+            # - FT로 끝났고 점수가 동점이 아니면 => OT가 아닌 경기 => 3P End 알림 생략
+            # - OT/SO로 가는 경우(동점) => 3P End 유지
+            # - AOT/AP는 OT/SO를 거친 종료이므로 3P End 유지(혹시 API가 중간 상태를 스킵해도 3P End는 보내는 쪽)
+            if not (status_norm == "FT" and home != away):
+                t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
+                _send_once(f"pe:{sub.game_id}:3P", t, b)
 
             if status_norm == "OT":
                 t2, b2 = build_hockey_message("ot_start", g, home, away)
@@ -843,6 +848,7 @@ def run_once() -> bool:
             elif status_norm == "SO":
                 t2, b2 = build_hockey_message("so_start", g, home, away)
                 _send_once(f"ss:{sub.game_id}", t2, b2)
+
 
         # OT -> SO start
         if sub.notify_periods and last_status_norm == "OT" and status_norm == "SO":
