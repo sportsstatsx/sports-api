@@ -604,13 +604,8 @@ def build_hockey_message(
     if event_type == "goal":
         who = team_name or "Goal"
 
-        parts: List[str] = []
-        if period:
-            parts.append(period)
-        if minute is not None and str(minute).strip():
-            parts.append(str(minute).strip())
-
-        prefix = " ".join(parts)
+        # ✅ period는 유지, minute은 무시
+        prefix = period.strip() if period else ""
 
         if prefix:
             title = f"🏒 {prefix} {who} Goal!"
@@ -622,6 +617,7 @@ def build_hockey_message(
             body = f"{score_line}\n{tag}"
 
         return (title, body)
+
 
 
     if event_type == "game_start":
@@ -865,6 +861,7 @@ def run_once() -> bool:
         decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
 
         # ✅ 골 알림은 "증가"일 때만 + dedupe
+        # ✅ period(1P/2P/3P)는 유지, minute(몇 분)만 제거
         if sub.notify_score and score_increased:
             goal_key = f"goal:{sub.game_id}:{home}:{away}"
             if goal_key not in sent_keys:
@@ -874,8 +871,7 @@ def run_once() -> bool:
                 elif away > last_away:
                     team_name = g.get("away_name") or "Away"
 
-                goal_minute = fetch_last_goal_minute(sub.game_id)
-
+                # ✅ minute 제거 (DB에서 minute 조회하지 않음)
                 t, b = build_hockey_message(
                     "goal",
                     g,
@@ -883,9 +879,9 @@ def run_once() -> bool:
                     away,
                     team_name=team_name,
                     period=status_norm,
-                    minute=goal_minute,
                 )
                 _send_once(goal_key, t, b)
+
 
         # Final 중복 방지
         if sub.notify_game_end and (became_final or decided_in_ot_or_so):
