@@ -580,7 +580,9 @@ def run_once() -> bool:
     """
     now_utc = datetime.now(timezone.utc)
 
-    # ✅ 구독 우선
+    # ─────────────────────────────
+    # 1) 구독 우선 로드
+    # ─────────────────────────────
     sub_rows = fetch_subscription_rows(now_utc)
     if not sub_rows:
         log.info("tick: subs=0 (window=%sd/%sd)", PAST_DAYS, FUTURE_DAYS)
@@ -604,6 +606,9 @@ def run_once() -> bool:
                     has_fast_candidate = True
                     break
 
+    # ─────────────────────────────
+    # 2) Subscription / Game Map
+    # ─────────────────────────────
     subs: List[Subscription] = []
     game_map: Dict[int, Dict[str, Any]] = {}
 
@@ -645,6 +650,9 @@ def run_once() -> bool:
 
     sent = 0
 
+    # ─────────────────────────────
+    # 3) FSM LOOP
+    # ─────────────────────────────
     for sub in subs:
         g = game_map.get(sub.game_id)
         if not g:
@@ -661,17 +669,16 @@ def run_once() -> bool:
         last_away = _to_int(st.get("last_away_score"), 0)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
-        # ──────────────
+        # ─────────────────────────
         # (A) STATUS FSM
-        # ──────────────
-
+        # ─────────────────────────
         if sub.notify_game_start and status_norm == "1P" and last_status_norm != "1P":
             t, b = build_hockey_message("game_start", g, home, away)
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        # 3P 종료 점프 대응
+        # 3P → OT/SO/Final 점프 대응
         if sub.notify_periods and last_status_norm == "3P" and status_norm in ("OT", "SO", "FT", "AP", "AOT"):
             t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
@@ -690,15 +697,14 @@ def run_once() -> bool:
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
 
-        # ──────────────
+        # ─────────────────────────
         # (B) SCORE / FINAL (옵션 A)
-        # ──────────────
-
+        # ─────────────────────────
         score_changed = (home, away) != (last_home, last_away)
         became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
         decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
 
-        # 골 중복 방지
+        # ── 골 중복 방지 (DB 기반)
         goal_key = f"goal:{sub.game_id}:{home}:{away}"
         if sub.notify_score and score_changed and goal_key not in sent_keys:
             team_name = ""
@@ -720,18 +726,30 @@ def run_once() -> bool:
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
                 sent_keys.append(goal_key)
+
+                # 🔒 중요: 즉시 state 저장 (race 차단)
+                save_state(
+                    device_id=sub.device_id,
+                    game_id=sub.game_id,
+                    last_status=last_status,
+                    last_home_score=home,
+                    last_away_score=away,
+                    sent_event_keys=sent_keys,
+                )
                 time.sleep(SEND_SLEEP_SEC)
 
-        # Final (골 성공 여부와 무관)
-        if sub.notify_game_end and (became_final or decided_in_ot_or_so):
+        # ── Final 중복 방지
+        final_key = f"final:{sub.game_id}"
+        if sub.notify_game_end and (became_final or decided_in_ot_or_so) and final_key not in sent_keys:
             t, b = build_hockey_message("final", g, home, away)
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
+                sent_keys.append(final_key)
                 time.sleep(SEND_SLEEP_SEC)
 
-        # ──────────────
+        # ─────────────────────────
         # (C) STATE SAVE (항상)
-        # ──────────────
+        # ─────────────────────────
         save_state(
             device_id=sub.device_id,
             game_id=sub.game_id,
@@ -743,6 +761,7 @@ def run_once() -> bool:
 
     log.info("tick: sent=%d", sent)
     return has_fast_candidate
+
 
 
 
