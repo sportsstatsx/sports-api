@@ -262,13 +262,6 @@ def is_final_status(status: Optional[str]) -> bool:
 
 
 
-def is_liveish_status(status: Optional[str]) -> bool:
-    s = (status or "").strip().upper()
-    if not s:
-        return False
-    return s in LIVE_STATUSES_HINT
-
-
 def normalize_status(status: Any) -> str:
     s = str(status or "").strip().upper()
     if not s:
@@ -322,13 +315,25 @@ class Subscription:
 def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
     row = fetch_one(
         """
-        SELECT last_status, last_home_score, last_away_score
+        SELECT
+          last_status,
+          last_home_score,
+          last_away_score,
+          sent_event_keys
         FROM hockey_game_notification_states
         WHERE device_id=%s AND game_id=%s
         """,
         (device_id, game_id),
     )
-    return row or {}
+
+    # ✅ state가 아직 없을 때 기본값 명확히
+    return row or {
+        "last_status": None,
+        "last_home_score": 0,
+        "last_away_score": 0,
+        "sent_event_keys": [],
+    }
+
 
 
 def save_state(
@@ -337,21 +342,31 @@ def save_state(
     last_status: Optional[str],
     last_home_score: int,
     last_away_score: int,
+    sent_event_keys: List[str],
 ) -> None:
     execute(
         """
         INSERT INTO hockey_game_notification_states
-          (device_id, game_id, last_status, last_home_score, last_away_score, updated_at)
-        VALUES (%s, %s, %s, %s, %s, now())
+          (device_id, game_id, last_status, last_home_score, last_away_score, sent_event_keys, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now())
         ON CONFLICT (device_id, game_id)
         DO UPDATE SET
           last_status = EXCLUDED.last_status,
           last_home_score = EXCLUDED.last_home_score,
           last_away_score = EXCLUDED.last_away_score,
+          sent_event_keys = EXCLUDED.sent_event_keys,
           updated_at = now()
         """,
-        (device_id, game_id, last_status, last_home_score, last_away_score),
+        (
+            device_id,
+            game_id,
+            last_status,
+            last_home_score,
+            last_away_score,
+            sent_event_keys,
+        ),
     )
+
 
 
 # ─────────────────────────────────────────
@@ -777,35 +792,40 @@ def run_once() -> bool:
 
         # 1) 골 알림
         sent_goal = False
-        if sub.notify_score and score_changed:
-            team_name = ""
-            if home > last_home:
-                team_name = str(g.get("home_name") or "Home")
-            elif away > last_away:
-                team_name = str(g.get("away_name") or "Away")
+sent_keys = list(st.get("sent_event_keys") or [])
 
-            period = status_norm
-            minute = (g.get("status_long") or "").strip()
+goal_key = f"goal:{sub.game_id}:{home}:{away}"
 
-            t, b = build_hockey_message(
-                "goal",
-                g,
-                home,
-                away,
-                team_name=team_name,
-                period=period,
-                minute=minute,
-            )
+if sub.notify_score and score_changed and goal_key not in sent_keys:
+    team_name = ""
+    if home > last_home:
+        team_name = str(g.get("home_name") or "Home")
+    elif away > last_away:
+        team_name = str(g.get("away_name") or "Away")
 
-            if send_push(
-                token=sub.fcm_token,
-                title=t,
-                body=b,
-                data={"sport": "hockey", "game_id": str(sub.game_id), "type": "goal", "status": status_raw},
-            ):
-                sent += 1
-                sent_goal = True
-                time.sleep(SEND_SLEEP_SEC)
+    period = status_norm
+    minute = (g.get("status_long") or "").strip()
+
+    t, b = build_hockey_message(
+        "goal",
+        g,
+        home,
+        away,
+        team_name=team_name,
+        period=period,
+        minute=minute,
+    )
+
+    if send_push(
+        token=sub.fcm_token,
+        title=t,
+        body=b,
+        data={"sport": "hockey", "game_id": str(sub.game_id), "type": "goal", "status": status_raw},
+    ):
+        sent += 1
+        sent_keys.append(goal_key)
+        time.sleep(SEND_SLEEP_SEC)
+
 
         # 2) Final 알림
         # - 기존: FT로 바뀌는 순간(became_final)
@@ -835,7 +855,9 @@ def run_once() -> bool:
             last_status=status_raw,
             last_home_score=home,
             last_away_score=away,
+            sent_event_keys=sent_keys,
         )
+
 
     log.info("tick: sent=%d", sent)
     return has_fast_candidate
