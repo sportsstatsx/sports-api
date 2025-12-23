@@ -670,41 +670,79 @@ def run_once() -> bool:
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
         # ─────────────────────────
-        # (A) STATUS FSM
+        # (A) STATUS FSM (Period Start/End 복구)
         # ─────────────────────────
+
+        # game_start: NS -> 1P
         if sub.notify_game_start and status_norm == "1P" and last_status_norm != "1P":
             t, b = build_hockey_message("game_start", g, home, away)
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
-        # 3P → OT/SO/Final 점프 대응
+        # 1P end: 1P -> BT
+        if sub.notify_periods and last_status_norm == "1P" and status_norm == "BT":
+            t, b = build_hockey_message("period_end", g, home, away, status_norm="1P")
+            if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
+        # 2P start: BT -> 2P
+        if sub.notify_periods and last_status_norm == "BT" and status_norm == "2P":
+            t, b = build_hockey_message("period_start", g, home, away, status_norm="2P")
+            if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
+        # 2P end: 2P -> BT
+        if sub.notify_periods and last_status_norm == "2P" and status_norm == "BT":
+            t, b = build_hockey_message("period_end", g, home, away, status_norm="2P")
+            if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
+        # 3P start: BT -> 3P
+        if sub.notify_periods and last_status_norm == "BT" and status_norm == "3P":
+            t, b = build_hockey_message("period_start", g, home, away, status_norm="3P")
+            if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
+        # 3P 종료 + OT/SO/Final 점프 대응 (BT 없이 점프하는 케이스)
         if sub.notify_periods and last_status_norm == "3P" and status_norm in ("OT", "SO", "FT", "AP", "AOT"):
+            # 3P end
             t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
             if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
                 sent += 1
                 time.sleep(SEND_SLEEP_SEC)
 
+            # OT/SO start
             if status_norm == "OT":
                 t2, b2 = build_hockey_message("ot_start", g, home, away)
                 if send_push(sub.fcm_token, t2, b2, {"sport": "hockey", "game_id": str(sub.game_id)}):
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
-
             elif status_norm == "SO":
                 t2, b2 = build_hockey_message("so_start", g, home, away)
                 if send_push(sub.fcm_token, t2, b2, {"sport": "hockey", "game_id": str(sub.game_id)}):
                     sent += 1
                     time.sleep(SEND_SLEEP_SEC)
 
+        # OT -> SO start (일부 리그에서 이런 전환 존재)
+        if sub.notify_periods and last_status_norm == "OT" and status_norm == "SO":
+            t, b = build_hockey_message("so_start", g, home, away)
+            if send_push(sub.fcm_token, t, b, {"sport": "hockey", "game_id": str(sub.game_id)}):
+                sent += 1
+                time.sleep(SEND_SLEEP_SEC)
+
         # ─────────────────────────
-        # (B) SCORE / FINAL (옵션 A)
+        # (B) SCORE / FINAL (옵션 A 유지)
         # ─────────────────────────
         score_changed = (home, away) != (last_home, last_away)
         became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
         decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
 
-        # ── 골 중복 방지 (DB 기반)
+        # 골 중복 방지 (DB 기반)
         goal_key = f"goal:{sub.game_id}:{home}:{away}"
         if sub.notify_score and score_changed and goal_key not in sent_keys:
             team_name = ""
@@ -727,7 +765,7 @@ def run_once() -> bool:
                 sent += 1
                 sent_keys.append(goal_key)
 
-                # 🔒 중요: 즉시 state 저장 (race 차단)
+                # 🔒 즉시 state 저장(중복골 race 차단)
                 save_state(
                     device_id=sub.device_id,
                     game_id=sub.game_id,
@@ -738,7 +776,7 @@ def run_once() -> bool:
                 )
                 time.sleep(SEND_SLEEP_SEC)
 
-        # ── Final 중복 방지
+        # Final 중복 방지
         final_key = f"final:{sub.game_id}"
         if sub.notify_game_end and (became_final or decided_in_ot_or_so) and final_key not in sent_keys:
             t, b = build_hockey_message("final", g, home, away)
@@ -761,6 +799,7 @@ def run_once() -> bool:
 
     log.info("tick: sent=%d", sent)
     return has_fast_candidate
+
 
 
 
