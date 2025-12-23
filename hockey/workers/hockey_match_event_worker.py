@@ -255,6 +255,61 @@ LIVE_STATUSES_HINT = {
     "P1", "P2", "P3", "OT", "SO", "LIVE",
 }
 
+def extract_ui_scores(score_json: Any, raw_json: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    UI(/api/hockey/fixtures)와 동일한 스코어 산출 규칙
+
+    1) score_json['home'/'away']
+    2) 없으면 raw_json['scores']['home'/'away']
+    3) 둘 다 없으면 (None, None)
+    """
+
+    def _safe_int(x: Any) -> Optional[int]:
+        try:
+            if x is None or isinstance(x, bool):
+                return None
+            if isinstance(x, (int, float)):
+                return int(x)
+            s = str(x).strip()
+            if not s:
+                return None
+            return int(float(s))
+        except Exception:
+            return None
+
+    # 1) score_json 우선
+    sj = score_json
+    if isinstance(sj, str):
+        try:
+            sj = json.loads(sj)
+        except Exception:
+            sj = None
+
+    if isinstance(sj, dict):
+        h = _safe_int(sj.get("home"))
+        a = _safe_int(sj.get("away"))
+        if h is not None or a is not None:
+            return h, a
+
+    # 2) raw_json fallback
+    rj = raw_json
+    if isinstance(rj, str):
+        try:
+            rj = json.loads(rj)
+        except Exception:
+            rj = None
+
+    if isinstance(rj, dict):
+        scores = rj.get("scores")
+        if isinstance(scores, dict):
+            h = _safe_int(scores.get("home"))
+            a = _safe_int(scores.get("away"))
+            if h is not None or a is not None:
+                return h, a
+
+    return None, None
+
+
 
 def is_final_status(status: Optional[str]) -> bool:
     s = (status or "").strip().upper()
@@ -491,6 +546,7 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
     - 구독된 game_id를 먼저 확정하고,
     - hockey_games를 조인해서 (점수/상태/팀명 포함) 한 번에 가져온다.
     - game_date window로만 제한해서 "오래된 구독"은 매 tick마다 보지 않게 한다.
+    - UI(/api/hockey/fixtures)와 동일한 스코어 산출을 위해 raw_json 포함
     """
     time_min = now_utc.timestamp() - (PAST_DAYS * 86400)
     time_max = now_utc.timestamp() + (FUTURE_DAYS * 86400)
@@ -510,6 +566,7 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
           g.status,
           g.status_long,
           g.score_json,
+          g.raw_json,
           g.home_team_id,
           g.away_team_id,
           th.name AS home_name,
@@ -523,7 +580,6 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
         WHERE EXTRACT(EPOCH FROM g.game_date) BETWEEN %s AND %s
     """
     return fetch_all(sql, (time_min, time_max))
-
 
 
 # ─────────────────────────────────────────
@@ -680,6 +736,7 @@ def run_once() -> bool:
                 "status": r.get("status"),
                 "status_long": r.get("status_long"),
                 "score_json": r.get("score_json"),
+                "raw_json": r.get("raw_json"),
                 "home_team_id": r.get("home_team_id"),
                 "away_team_id": r.get("away_team_id"),
                 "home_name": r.get("home_name"),
@@ -701,7 +758,20 @@ def run_once() -> bool:
 
         status_raw = str(g.get("status") or "").strip()
         status_norm = normalize_status(status_raw)
-        home, away = parse_score(g.get("score_json"))
+        ui_home, ui_away = extract_ui_scores(
+            g.get("score_json"),
+            g.get("raw_json"),
+        )
+
+        # UI와 동일 규칙:
+        # - 둘 다 None → 점수 미확정 tick → last 값 유지
+        # - 한쪽만 None → last 값 유지
+        if ui_home is None and ui_away is None:
+            home, away = last_home, last_away
+        else:
+            home = ui_home if ui_home is not None else last_home
+            away = ui_away if ui_away is not None else last_away
+
 
         st = load_state(sub.device_id, sub.game_id)
         last_status = st.get("last_status")
