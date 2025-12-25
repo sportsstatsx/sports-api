@@ -15,23 +15,51 @@ def route_hockey_games():
     - SELECT * 제거 (raw_json/score_json 등 대형 컬럼으로 응답 비대해지는 것 방지)
 
     Query:
+      - ids: str (선택)   예) "419206,419207"  → 해당 id들만 반환 (즐겨찾기 최신화용)
       - season: int (선택)
       - league_id: int (선택)
       - limit: int (선택, 기본 50, 최대 500)
       - live: int (선택, 1이면 진행중(P1/P2/P3/OT/SO)만 반환)
     """
+    ids_raw: Optional[str] = request.args.get("ids", type=str)
     season: Optional[int] = request.args.get("season", type=int)
     league_id: Optional[int] = request.args.get("league_id", type=int)
     limit: int = request.args.get("limit", type=int) or 50
     live: int = request.args.get("live", type=int) or 0
+
+    # ✅ ids 파싱 ("1,2,3" → [1,2,3])
+    ids: List[int] = []
+    if ids_raw:
+        parts = [p.strip() for p in str(ids_raw).split(",")]
+        for p in parts:
+            if not p:
+                continue
+            try:
+                ids.append(int(p))
+            except Exception:
+                # 숫자가 아닌 값은 무시(에러로 막고 싶으면 여기서 400 반환으로 바꿔도 됨)
+                continue
+        # 중복 제거 + 최대 500개 제한(서버 보호)
+        ids = list(dict.fromkeys(ids))[:500]
+
+    # ✅ ids가 있으면: 요청된 ids만 반환해야 하므로 limit을 ids 개수로 맞춘다(최대 500)
+    if ids:
+        limit = min(len(ids), 500)
 
     if limit < 1:
         limit = 1
     if limit > 500:
         limit = 500
 
+
     where: List[str] = []
     params: List[Any] = []
+
+    # ✅ ids가 있으면 해당 경기들만 필터링
+    if ids:
+        placeholders = ",".join(["%s"] * len(ids))
+        where.append(f"id IN ({placeholders})")
+        params.extend(ids)
 
     if season is not None:
         where.append("season = %s")
@@ -40,6 +68,7 @@ def route_hockey_games():
     if league_id is not None:
         where.append("league_id = %s")
         params.append(league_id)
+
 
     # ✅ 진행중만 보고 싶을 때
     if live == 1:
