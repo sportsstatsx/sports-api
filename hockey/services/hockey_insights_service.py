@@ -1305,22 +1305,74 @@ def hockey_get_game_insights(
         gm = game_meta.get(gid) or {}
         return (gm.get("status") or "").strip()
 
+    # ✅ OT/SO 계산식(조건 분모) 유틸
+    def _ot_den(gid: int) -> int:
+        if _status(gid) != "AOT":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is not None else 0  # OT 결판 경기만
+
+    def _ot_win_num(gid: int) -> int:
+        if _status(gid) != "AOT":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is True else 0
+
+    def _ot_loss_num(gid: int) -> int:
+        if _status(gid) != "AOT":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is False else 0
+
+    def _so_den(gid: int) -> int:
+        if _status(gid) != "AP":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is not None else 0  # SO 결판 경기만
+
+    def _so_win_num(gid: int) -> int:
+        if _status(gid) != "AP":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is True else 0
+
+    def _so_loss_num(gid: int) -> int:
+        if _status(gid) != "AP":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is False else 0
+
+    def _ot_or_so_den(gid: int) -> int:
+        s = _status(gid)
+        if s not in ("AOT", "AP"):
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is not None else 0  # OT 또는 SO 결판만
+
+    def _so_game_num(gid: int) -> int:
+        # OT→SO Rate 분자 = SO 결판 경기 수
+        if _status(gid) != "AP":
+            return 0
+        w = _final_winner_is_team(gid, sel_team_id)
+        return 1 if w is not None else 0
+
     sec_ot = _build_section(
         title="Overtime (OT)",
         rows=[
-            {"label": "Overtime Win", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is True)))},
-            {"label": "Overtime Draw (Shootout Reached)", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP")))},
-            {"label": "Overtime Loss", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is False)))},
+            {"label": "OT W", "values": _triple(_rate_by_bucket(_ot_win_num, _ot_den))},
+            {"label": "OT L", "values": _triple(_rate_by_bucket(_ot_loss_num, _ot_den))},
+            {"label": "OT→SO Rate", "values": _triple(_rate_by_bucket(_so_game_num, _ot_or_so_den))},
         ],
     )
 
     sec_so = _build_section(
         title="Shootout (SO)",
         rows=[
-            {"label": "Shootout Win", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP" and _final_winner_is_team(gid, sel_team_id) is True)))},
-            {"label": "Shootout Loss", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP" and _final_winner_is_team(gid, sel_team_id) is False)))},
+            {"label": "SO W", "values": _triple(_rate_by_bucket(_so_win_num, _so_den))},
+            {"label": "SO L", "values": _triple(_rate_by_bucket(_so_loss_num, _so_den))},
         ],
     )
+
 
     # ─────────────────────────────────────────
     # NEW) 섹션: Period Result Transitions (1P→2P, 2P→3P)
