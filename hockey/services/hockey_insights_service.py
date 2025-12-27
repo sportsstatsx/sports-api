@@ -1120,12 +1120,195 @@ def hockey_get_game_insights(
         ],
     )
 
-    # ✅ 지금 단계에서는 Full Time만 유지 (필터: team_id / last_n 동작만 확인)
-    # 나머지 섹션들은 새 설계로 다시 추가할 예정이므로 여기서 완전히 비워둔다.
-    sections = [
-        sec_full_time,
-    ]
+    # ─────────────────────────────────────────
+    # NEW) 섹션: Period (1P/2P/3P)
+    # ─────────────────────────────────────────
+    def _period_section(period: str, title: str) -> Dict[str, Any]:
+        p = _norm_period(period)
 
+        def team_goals(gid: int) -> int:
+            gf, _ = _period_scores(gid, p)
+            return gf
+
+        def opp_goals(gid: int) -> int:
+            _, ga = _period_scores(gid, p)
+            return ga
+
+        def total_goals(gid: int) -> int:
+            gf, ga = _period_scores(gid, p)
+            return gf + ga
+
+        def result_prob(res: str) -> Dict[str, Optional[float]]:
+            def pred(gid: int) -> bool:
+                gf, ga = _period_scores(gid, p)
+                return _result_from_scores(gf, ga) == res
+            return _bool_prob(pred)
+
+        def first_goal_prob() -> Dict[str, Optional[float]]:
+            def pred(gid: int) -> bool:
+                v = _first_goal_scored_by_team(gid, sel_team_id, period=p)
+                return v is True
+            return _bool_prob(pred)
+
+        def pp_occurred_prob() -> Dict[str, Optional[float]]:
+            def pred(gid: int) -> bool:
+                _, opp = _team_and_opp_ids(gid)
+                if opp is None:
+                    return False
+                return _has_penalty_by_team(gid, opp, period=p)
+            return _bool_prob(pred)
+
+        def penalty_prob() -> Dict[str, Optional[float]]:
+            return _bool_prob(lambda gid: _has_penalty_by_team(gid, sel_team_id, period=p))
+
+        def pp_goal_prob() -> Dict[str, Optional[float]]:
+            return _bool_prob(lambda gid: _has_goal_by_comment(gid, sel_team_id, "power", period=p))
+
+        def shg_prob() -> Dict[str, Optional[float]]:
+            return _bool_prob(lambda gid: _has_goal_by_comment(gid, sel_team_id, "short", period=p))
+
+        def clean_sheet_prob() -> Dict[str, Optional[float]]:
+            return _bool_prob(lambda gid: opp_goals(gid) == 0)
+
+        rows: List[Dict[str, Any]] = [
+            {"label": "Win", "values": _triple(result_prob("W"))},
+            {"label": "Draw", "values": _triple(result_prob("D"))},
+            {"label": "Loss", "values": _triple(result_prob("L"))},
+
+            {"label": f"First Goal in {p}", "values": _triple(first_goal_prob())},
+            {"label": "Power Play Occurred", "values": _triple(pp_occurred_prob())},
+            {"label": "Power Play Goal", "values": _triple(pp_goal_prob())},
+            {"label": "Penalty Occurred", "values": _triple(penalty_prob())},
+            {"label": "Short-Handed Goal", "values": _triple(shg_prob())},
+            {"label": "Clean Sheet", "values": _triple(clean_sheet_prob())},
+
+            {"label": "Team Over 0.5 Goals", "values": _triple(_count_ge_prob(1, team_goals))},
+            {"label": "Team Over 1.5 Goals", "values": _triple(_count_ge_prob(2, team_goals))},
+            {"label": "Team Over 2.5 Goals", "values": _triple(_count_ge_prob(3, team_goals))},
+
+            {"label": "Total Goals Over 0.5", "values": _triple(_count_ge_prob(1, total_goals))},
+            {"label": "Total Goals Over 1.5", "values": _triple(_count_ge_prob(2, total_goals))},
+            {"label": "Total Goals Over 2.5", "values": _triple(_count_ge_prob(3, total_goals))},
+
+            {"label": "Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
+            {"label": "Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
+
+            {"label": "Win & Over 1.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 2)))},
+            {"label": "Win & Over 2.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 3)))},
+
+            {"label": "Win & Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
+            {"label": "Win & Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
+            {"label": "Win & Both Teams to Score 3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 3 and opp_goals(gid) >= 3)))},
+        ]
+        return _build_section(title=title, rows=rows)
+
+    sec_1p = _period_section("P1", "1st Period (1P)")
+    sec_2p = _period_section("P2", "2nd Period (2P)")
+    sec_3p_period = _period_section("P3", "3rd Period (3P)")
+
+    # ─────────────────────────────────────────
+    # NEW) 섹션: Overtime (OT) / Shootout (SO)
+    # ─────────────────────────────────────────
+    def _final_winner_is_team(gid: int, team: int) -> Optional[bool]:
+        gm = game_meta.get(gid) or {}
+        h = _safe_int(gm.get("home_team_id"))
+        a = _safe_int(gm.get("away_team_id"))
+        sj = gm.get("score_json") or {}
+        hs = sj.get("home")
+        as_ = sj.get("away")
+        if h is None or a is None or hs is None or as_ is None:
+            return None
+        if hs == as_:
+            return None
+        winner = h if hs > as_ else a
+        return winner == team
+
+    def _status(gid: int) -> str:
+        gm = game_meta.get(gid) or {}
+        return (gm.get("status") or "").strip()
+
+    sec_ot = _build_section(
+        title="Overtime (OT)",
+        rows=[
+            {"label": "Overtime Win", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is True)))},
+            {"label": "Overtime Draw (Shootout Reached)", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP")))} ,
+            {"label": "Overtime Loss", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is False)))},
+        ],
+    )
+
+    sec_so = _build_section(
+        title="Shootout (SO)",
+        rows=[
+            {"label": "Shootout Win", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP" and _final_winner_is_team(gid, sel_team_id) is True)))},
+            {"label": "Shootout Loss", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP" and _final_winner_is_team(gid, sel_team_id) is False)))},
+        ],
+    )
+
+    # ─────────────────────────────────────────
+    # NEW) 섹션: Period Result Transitions (1P→2P, 2P→3P)
+    # ─────────────────────────────────────────
+    def _period_result(gid: int, period: str) -> Optional[str]:
+        gf, ga = _period_scores(gid, period)
+        # 득점이 둘 다 0이어도 Draw로 취급 (전이표에 필요)
+        return _result_from_scores(gf, ga)
+
+    def _transition_prob(from_p: str, to_p: str, from_res: str, to_res: str) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                fr = _period_result(gid, from_p)
+                tr = _period_result(gid, to_p)
+                if fr != from_res:
+                    continue
+                denom += 1
+                if tr == to_res:
+                    num += 1
+            out[b] = _safe_div(num, denom)
+        return out
+
+    trans_rows: List[Dict[str, Any]] = []
+    # 1P -> 2P
+    for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
+        trans_rows.append({"label": f"1P {fr_label} → 2P Win Probability", "values": _triple(_transition_prob("P1", "P2", fr, "W"))})
+        trans_rows.append({"label": f"1P {fr_label} → 2P Draw Probability", "values": _triple(_transition_prob("P1", "P2", fr, "D"))})
+        trans_rows.append({"label": f"1P {fr_label} → 2P Loss Probability", "values": _triple(_transition_prob("P1", "P2", fr, "L"))})
+
+    # 2P -> 3P
+    for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
+        trans_rows.append({"label": f"2P {fr_label} → 3P Win Probability", "values": _triple(_transition_prob("P2", "P3", fr, "W"))})
+        trans_rows.append({"label": f"2P {fr_label} → 3P Draw Probability", "values": _triple(_transition_prob("P2", "P3", fr, "D"))})
+        trans_rows.append({"label": f"2P {fr_label} → 3P Loss Probability", "values": _triple(_transition_prob("P2", "P3", fr, "L"))})
+
+    sec_transitions = _build_section(
+        title="Period Result Transitions",
+        rows=trans_rows,
+    )
+
+        
+
+    sections = [
+    sec_full_time,
+
+    sec_1p,
+    sec_2p,
+    sec_3p_period,
+
+    sec_ot,
+    sec_so,
+
+    sec_transitions,
+
+    # 3rd Period Clutch Situations (이미 구현된 것들)
+    sec_last,
+    sec_p3,
+    sec_fg,
+
+    # Goal Timing (이미 구현됨)
+    sec_goal_time,
+]
 
 
     return {
