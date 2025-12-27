@@ -686,54 +686,134 @@ def hockey_get_game_insights(
 
 
     # ─────────────────────────────────────────
-    # B) 3rd Period Start Score Impact (Regular Time)
+    # B) 3P Start: W/D/L + Goals Over (Regular Time)
     # ─────────────────────────────────────────
-    def p3_start_state_prob(state: str, outcome: str) -> Dict[str, Optional[float]]:
-        """
-        state: LEAD/TIED/TRAIL at start of P3 (after P2)
-        outcome: W/D/L at end of regulation
-        """
+    # 정의:
+    # - 3P Start 상태 = 2P 종료 스코어 기준
+    #   diff_3p_start = team_score_end_2p - opp_score_end_2p
+    # - 정규시간 최종결과(OT/SO 제외) = 3P 종료 스코어 기준
+    #   rt_diff_final = team_score_rt_final - opp_score_rt_final
+    # - 3P 득점/실점 = (3P 종료 스코어 - 2P 종료 스코어)
+    # ─────────────────────────────────────────
+
+    _p3_cache: Dict[int, Dict[str, int]] = {}
+
+    def _p3_vals(gid: int) -> Dict[str, int]:
+        cached = _p3_cache.get(gid)
+        if cached is not None:
+            return cached
+
+        evs = goal_by_game.get(gid, [])
+
+        # 2P 종료(=3P 시작) 스코어
+        gf2, ga2 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
+        # 정규시간(3P 종료) 스코어
+        gf3, ga3 = _score_after_regulation(evs, sel_team_id)
+
+        d_start = gf2 - ga2
+        d_final = gf3 - ga3
+
+        team_goals_3p = gf3 - gf2
+        opp_goals_3p = ga3 - ga2
+
+        out = {
+            "gf2": gf2,
+            "ga2": ga2,
+            "gf3": gf3,
+            "ga3": ga3,
+            "d_start": d_start,
+            "d_final": d_final,
+            "team_goals_3p": team_goals_3p,
+            "opp_goals_3p": opp_goals_3p,
+        }
+        _p3_cache[gid] = out
+        return out
+
+    def _p3_cond_rate(denom_pred, num_pred) -> Dict[str, Optional[float]]:
         out: Dict[str, Optional[float]] = {}
         for b in ("totals", "home", "away"):
             ids = iter_bucket(b)
             denom = 0
             num = 0
             for gid in ids:
-                evs = goal_by_game.get(gid, [])
-                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
-                diff0 = gf0 - ga0
-
-                ok = False
-                if state == "LEAD" and diff0 > 0:
-                    ok = True
-                elif state == "TIED" and diff0 == 0:
-                    ok = True
-                elif state == "TRAIL" and diff0 < 0:
-                    ok = True
-                if not ok:
-                    continue
-
-                denom += 1
-                res = reg_result_for_game(gid)
-                if res == outcome:
-                    num += 1
+                if denom_pred(gid):
+                    denom += 1
+                    if num_pred(gid):
+                        num += 1
             out[b] = _safe_div(num, denom)
         return out
 
+    def _is_rt_w(gid: int) -> bool:
+        return _p3_vals(gid)["d_final"] > 0
+
+    def _is_rt_d(gid: int) -> bool:
+        return _p3_vals(gid)["d_final"] == 0
+
+    def _is_rt_l(gid: int) -> bool:
+        return _p3_vals(gid)["d_final"] < 0
+
+    def _start_diff_is(v: int):
+        return lambda gid: _p3_vals(gid)["d_start"] == v
+
+    def _start_is_00(gid: int) -> bool:
+        v = _p3_vals(gid)
+        return v["gf2"] == 0 and v["ga2"] == 0
+
+    def _start_is_tied(gid: int) -> bool:
+        # ✅ 0-0도 포함 (요구사항: Tied = diff_3p_start == 0)
+        return _p3_vals(gid)["d_start"] == 0
+
+    def _team_g3_ge(th: int):
+        return lambda gid: _p3_vals(gid)["team_goals_3p"] >= th
+
+    def _opp_g3_ge(th: int):
+        return lambda gid: _p3_vals(gid)["opp_goals_3p"] >= th
+
     sec_p3 = _build_section(
-        "3rd Period Start Score Impact (Regular Time)",
+        "3P Start: W/D/L + Goals Over",
         rows=[
-            {"label": "Leading at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("LEAD", "W"))},
-            {"label": "Leading at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("LEAD", "D"))},
-            {"label": "Leading at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("LEAD", "L"))},
-            {"label": "Tied at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("TIED", "W"))},
-            {"label": "Tied at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("TIED", "D"))},
-            {"label": "Tied at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("TIED", "L"))},
-            {"label": "Trailing at 3P Start → Win Probability", "values": _triple(p3_start_state_prob("TRAIL", "W"))},
-            {"label": "Trailing at 3P Start → Draw Probability", "values": _triple(p3_start_state_prob("TRAIL", "D"))},
-            {"label": "Trailing at 3P Start → Loss Probability", "values": _triple(p3_start_state_prob("TRAIL", "L"))},
+            # S+1
+            {"label": "3P · S+1 · RT W", "values": _triple(_p3_cond_rate(_start_diff_is(+1), lambda gid: _start_diff_is(+1)(gid) and _is_rt_w(gid)))},
+            {"label": "3P · S+1 · RT D", "values": _triple(_p3_cond_rate(_start_diff_is(+1), lambda gid: _start_diff_is(+1)(gid) and _is_rt_d(gid)))},
+            {"label": "3P · S+1 · RT L", "values": _triple(_p3_cond_rate(_start_diff_is(+1), lambda gid: _start_diff_is(+1)(gid) and _is_rt_l(gid)))},
+
+            # S-1
+            {"label": "3P · S-1 · RT W", "values": _triple(_p3_cond_rate(_start_diff_is(-1), lambda gid: _start_diff_is(-1)(gid) and _is_rt_w(gid)))},
+            {"label": "3P · S-1 · RT D", "values": _triple(_p3_cond_rate(_start_diff_is(-1), lambda gid: _start_diff_is(-1)(gid) and _is_rt_d(gid)))},
+            {"label": "3P · S-1 · RT L", "values": _triple(_p3_cond_rate(_start_diff_is(-1), lambda gid: _start_diff_is(-1)(gid) and _is_rt_l(gid)))},
+
+            # S+2
+            {"label": "3P · S+2 · RT W", "values": _triple(_p3_cond_rate(_start_diff_is(+2), lambda gid: _start_diff_is(+2)(gid) and _is_rt_w(gid)))},
+            {"label": "3P · S+2 · RT D", "values": _triple(_p3_cond_rate(_start_diff_is(+2), lambda gid: _start_diff_is(+2)(gid) and _is_rt_d(gid)))},
+            {"label": "3P · S+2 · RT L", "values": _triple(_p3_cond_rate(_start_diff_is(+2), lambda gid: _start_diff_is(+2)(gid) and _is_rt_l(gid)))},
+
+            # S-2
+            {"label": "3P · S-2 · RT W", "values": _triple(_p3_cond_rate(_start_diff_is(-2), lambda gid: _start_diff_is(-2)(gid) and _is_rt_w(gid)))},
+            {"label": "3P · S-2 · RT D", "values": _triple(_p3_cond_rate(_start_diff_is(-2), lambda gid: _start_diff_is(-2)(gid) and _is_rt_d(gid)))},
+            {"label": "3P · S-2 · RT L", "values": _triple(_p3_cond_rate(_start_diff_is(-2), lambda gid: _start_diff_is(-2)(gid) and _is_rt_l(gid)))},
+
+            # S 0-0 (TG over)
+            {"label": "3P · S 0-0 · 3P TG 0.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _team_g3_ge(1)(gid)))},
+            {"label": "3P · S 0-0 · 3P TG 1.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _team_g3_ge(2)(gid)))},
+            {"label": "3P · S 0-0 · 3P TG 2.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _team_g3_ge(3)(gid)))},
+
+            # S 0-0 (CG over)
+            {"label": "3P · S 0-0 · 3P CG 0.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _opp_g3_ge(1)(gid)))},
+            {"label": "3P · S 0-0 · 3P CG 1.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _opp_g3_ge(2)(gid)))},
+            {"label": "3P · S 0-0 · 3P CG 2.5+", "values": _triple(_p3_cond_rate(_start_is_00, lambda gid: _start_is_00(gid) and _opp_g3_ge(3)(gid)))},
+
+            # S Tied (TG over)  ✅ 0-0 포함
+            {"label": "3P · S Tied · 3P TG 0.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _team_g3_ge(1)(gid)))},
+            {"label": "3P · S Tied · 3P TG 1.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _team_g3_ge(2)(gid)))},
+            {"label": "3P · S Tied · 3P TG 2.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _team_g3_ge(3)(gid)))},
+
+            # S Tied (CG over)  ✅ 0-0 포함
+            {"label": "3P · S Tied · 3P CG 0.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _opp_g3_ge(1)(gid)))},
+            {"label": "3P · S Tied · 3P CG 1.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _opp_g3_ge(2)(gid)))},
+            {"label": "3P · S Tied · 3P CG 2.5+", "values": _triple(_p3_cond_rate(_start_is_tied, lambda gid: _start_is_tied(gid) and _opp_g3_ge(3)(gid)))},
         ],
     )
+
 
 
     # ─────────────────────────────────────────
