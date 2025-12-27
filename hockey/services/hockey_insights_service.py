@@ -1093,43 +1093,45 @@ def hockey_get_game_insights(
             {"label": "RT D", "values": _triple(_ft_result_prob("D"))},
             {"label": "RT L", "values": _triple(_ft_result_prob("L"))},
 
-            {"label": "Team O0.5", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
-            {"label": "Team O1.5", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
-            {"label": "Team O2.5", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
-            {"label": "Team O3.5", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
-            {"label": "Team O4.5", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
+            {"label": "RT TG 0.5+", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
+            {"label": "RT TG 1.5+", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
+            {"label": "RT TG 2.5+", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
+            {"label": "RT TG 3.5+", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
+            {"label": "RT TG 4.5+", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
 
-            {"label": "Total O1.5", "values": _triple(_count_ge_prob(2, _ft_total_goals))},
-            {"label": "Total O2.5", "values": _triple(_count_ge_prob(3, _ft_total_goals))},
-            {"label": "Total O3.5", "values": _triple(_count_ge_prob(4, _ft_total_goals))},
-            {"label": "Total O4.5", "values": _triple(_count_ge_prob(5, _ft_total_goals))},
-            {"label": "Total O5.5", "values": _triple(_count_ge_prob(6, _ft_total_goals))},
+            {"label": "RT Total 1.5+", "values": _triple(_count_ge_prob(2, _ft_total_goals))},
+            {"label": "RT Total 2.5+", "values": _triple(_count_ge_prob(3, _ft_total_goals))},
+            {"label": "RT Total 3.5+", "values": _triple(_count_ge_prob(4, _ft_total_goals))},
+            {"label": "RT Total 4.5+", "values": _triple(_count_ge_prob(5, _ft_total_goals))},
+            {"label": "RT Total 5.5+", "values": _triple(_count_ge_prob(6, _ft_total_goals))},
 
-            {"label": "BTTS 1+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
-            {"label": "BTTS 2+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
-            {"label": "BTTS 3+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
+            {"label": "RT BTTS 1+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
+            {"label": "RT BTTS 2+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
+            {"label": "RT BTTS 3+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
 
-            {"label": "W & O1.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 2)))},
-            {"label": "W & O2.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 3)))},
-            {"label": "W & O3.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 4)))},
-            {"label": "W & O4.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 5)))},
-            {"label": "W & O5.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 6)))},
+            {"label": "RT W & Total 1.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 2)))},
+            {"label": "RT W & Total 2.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 3)))},
+            {"label": "RT W & Total 3.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 4)))},
+            {"label": "RT W & Total 4.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 5)))},
+            {"label": "RT W & Total 5.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 6)))},
 
-            {"label": "W & BTTS1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
-            {"label": "W & BTTS2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
-            {"label": "W & BTTS3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
+            {"label": "RT W & BTTS 1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
+            {"label": "RT W & BTTS 2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
+            {"label": "RT W & BTTS 3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
 
-            {"label": "First Goal", "values": _triple(_ft_first_goal_scored_prob())},
+            {"label": "RT First Goal", "values": _triple(_ft_first_goal_scored_prob())},
 
-            {"label": "PP Avg", "values": _triple(_avg_by_bucket(_ft_pp_opportunities))},
-            {"label": "PEN Avg", "values": _triple(_avg_by_bucket(_ft_pk_opportunities))},
+            {"label": "RT PP Occ (AVG)", "values": _triple(_avg_by_bucket(_ft_pp_opportunities))},
+            {"label": "RT Penalty (AVG)", "values": _triple(_avg_by_bucket(_ft_pk_opportunities))},
 
-            {"label": "PPG/PP", "values": _triple(_rate_by_bucket(_ft_team_pp_goals, _ft_pp_opportunities))},
-            {"label": "SHGA/PP", "values": _triple(_rate_by_bucket(_ft_opp_sh_goals, _ft_pp_opportunities))},
-            {"label": "SHG/PK", "values": _triple(_rate_by_bucket(_ft_team_sh_goals, _ft_pk_opportunities))},
-            {"label": "PPGA/PK", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
+            {"label": "RT PPG/PP", "values": _triple(_rate_by_bucket(_ft_team_pp_goals, _ft_pp_opportunities))},
+            {"label": "RT SHGA/PP", "values": _triple(_rate_by_bucket(_ft_opp_sh_goals, _ft_pp_opportunities))},
+
+            {"label": "RT SHG/PK", "values": _triple(_rate_by_bucket(_ft_team_sh_goals, _ft_pk_opportunities))},
+            {"label": "RT PPGA/PK", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
         ],
     )
+
 
 
     # ─────────────────────────────────────────
