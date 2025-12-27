@@ -318,12 +318,16 @@ def _triple(values_by_bucket: Dict[str, Optional[float]]) -> Dict[str, Any]:
     }
 
 
-def _build_section(title: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {
+def _build_section(title: str, rows: List[Dict[str, Any]], subtitle: Optional[str] = None) -> Dict[str, Any]:
+    out = {
         "title": title,
         "columns": ["Totals", "Home", "Away"],
         "rows": rows,
     }
+    if subtitle is not None:
+        out["subtitle"] = subtitle
+    return out
+
 
 
 def hockey_get_game_insights(
@@ -1305,73 +1309,99 @@ def hockey_get_game_insights(
         gm = game_meta.get(gid) or {}
         return (gm.get("status") or "").strip()
 
-    # ✅ OT/SO 계산식(조건 분모) 유틸
-    def _ot_den(gid: int) -> int:
-        if _status(gid) != "AOT":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is not None else 0  # OT 결판 경기만
+    def _count_by_bucket(pred) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            out[b] = sum(1 for gid in ids if pred(gid))
+        return out
 
-    def _ot_win_num(gid: int) -> int:
-        if _status(gid) != "AOT":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is True else 0
+    def _cond_rate(num_pred, denom_pred) -> Dict[str, Optional[float]]:
+        """
+        조건부 비율:
+        - 분모: denom_pred를 만족하는 경기 수
+        - 분자: num_pred를 만족하는 경기 수
+        - 분모==0 => None (앱에서 '-' 로 표시)
+        """
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                if denom_pred(gid):
+                    denom += 1
+                    if num_pred(gid):
+                        num += 1
+            out[b] = (float(num) / float(denom)) if denom > 0 else None
+        return out
 
-    def _ot_loss_num(gid: int) -> int:
-        if _status(gid) != "AOT":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is False else 0
+    # ✅ 판정(네 DB 기준): AOT=OT 결판, AP=SO 결판
+    is_ot_decided = lambda gid: (_status(gid) == "AOT")
+    is_so_decided = lambda gid: (_status(gid) == "AP")
+    is_ot_or_so_decided = lambda gid: (_status(gid) in ("AOT", "AP"))
 
-    def _so_den(gid: int) -> int:
-        if _status(gid) != "AP":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is not None else 0  # SO 결판 경기만
+    # ✅ count(표기용 n)
+    ot_n = _count_by_bucket(is_ot_decided)   # OT 결판 경기 수
+    so_n = _count_by_bucket(is_so_decided)   # SO 결판 경기 수
 
-    def _so_win_num(gid: int) -> int:
-        if _status(gid) != "AP":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is True else 0
-
-    def _so_loss_num(gid: int) -> int:
-        if _status(gid) != "AP":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is False else 0
-
-    def _ot_or_so_den(gid: int) -> int:
-        s = _status(gid)
-        if s not in ("AOT", "AP"):
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is not None else 0  # OT 또는 SO 결판만
-
-    def _so_game_num(gid: int) -> int:
-        # OT→SO Rate 분자 = SO 결판 경기 수
-        if _status(gid) != "AP":
-            return 0
-        w = _final_winner_is_team(gid, sel_team_id)
-        return 1 if w is not None else 0
+    ot_subtitle = f"n OT {ot_n['totals']}/{ot_n['home']}/{ot_n['away']} · SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
+    so_subtitle = f"n SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
 
     sec_ot = _build_section(
         title="Overtime (OT)",
+        subtitle=ot_subtitle,  # ✅ 타이틀 오른쪽에 붙여서 보여줄 용도(앱에서 inline 처리)
         rows=[
-            {"label": "OT W", "values": _triple(_rate_by_bucket(_ot_win_num, _ot_den))},
-            {"label": "OT L", "values": _triple(_rate_by_bucket(_ot_loss_num, _ot_den))},
-            {"label": "OT→SO Rate", "values": _triple(_rate_by_bucket(_so_game_num, _ot_or_so_den))},
+            # OT W = OT_Wins / OT_Games
+            {
+                "label": "OT W",
+                "values": _triple(_cond_rate(
+                    num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
+                    denom_pred=is_ot_decided,
+                )),
+            },
+            # OT L = OT_Losses / OT_Games
+            {
+                "label": "OT L",
+                "values": _triple(_cond_rate(
+                    num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
+                    denom_pred=is_ot_decided,
+                )),
+            },
+            # OT→SO Rate = SO_Games / (OT_Games + SO_Games)
+            {
+                "label": "OT→SO Rate",
+                "values": _triple(_cond_rate(
+                    num_pred=is_so_decided,
+                    denom_pred=is_ot_or_so_decided,
+                )),
+            },
         ],
     )
 
     sec_so = _build_section(
         title="Shootout (SO)",
+        subtitle=so_subtitle,  # ✅ 표기용 n
         rows=[
-            {"label": "SO W", "values": _triple(_rate_by_bucket(_so_win_num, _so_den))},
-            {"label": "SO L", "values": _triple(_rate_by_bucket(_so_loss_num, _so_den))},
+            # SO W = SO_Wins / SO_Games
+            {
+                "label": "SO W",
+                "values": _triple(_cond_rate(
+                    num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
+                    denom_pred=is_so_decided,
+                )),
+            },
+            # SO L = SO_Losses / SO_Games
+            {
+                "label": "SO L",
+                "values": _triple(_cond_rate(
+                    num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
+                    denom_pred=is_so_decided,
+                )),
+            },
         ],
     )
+
 
 
     # ─────────────────────────────────────────
