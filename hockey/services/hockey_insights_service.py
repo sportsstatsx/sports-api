@@ -1038,24 +1038,31 @@ def hockey_get_game_insights(
     def _ft_first_goal_scored_prob() -> Dict[str, Optional[float]]:
         """
         정규시간(P1~P3)에서 '첫 득점' 팀이 sel_team_id 인 비율.
-        정규시간 0-0(첫 득점 없음) 경기는 분모에서 제외 → 모두 제외되면 None(-)
+        ✅ 정규시간 0-0(첫 득점 없음) 경기도 분모(N)에 포함한다.
+           - 즉, 분모 = bucket 경기 수
+           - 0-0 경기는 '우리가 선제득점 못함'으로 처리(분자 증가 없음)
         """
         out: Dict[str, Optional[float]] = {}
         for b in ("totals", "home", "away"):
             ids = iter_bucket(b)
-            denom = 0
+            denom = len(ids)
+            if denom <= 0:
+                out[b] = None
+                continue
+
             num = 0
             for gid in ids:
                 evs = goal_by_game.get(gid, [])
-                fg = _first_goal_of_game(evs)  # ✅ 이미 P1~P3만 필터함
+                fg = _first_goal_of_game(evs)  # P1~P3만, 없으면 정규시간 0-0
                 if not fg:
-                    continue  # ✅ 정규시간 첫 득점 없음 → 제외
-                denom += 1
+                    continue  # ✅ 분모에는 포함, 분자는 증가 안함(=0으로 반영)
                 tid = _safe_int(fg.get("team_id"))
                 if tid == sel_team_id:
                     num += 1
+
             out[b] = _safe_div(num, denom)
         return out
+
 
     def _ft_pp_opportunities(gid: int) -> int:
         # 우리 PP 기회 = 상대 팀 penalty 수 (정규시간)
