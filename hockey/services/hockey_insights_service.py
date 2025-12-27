@@ -335,12 +335,25 @@ def _build_section(
         out["subtitle"] = str(subtitle)
 
     if counts is not None:
-        # ✅ totals/home/away 경기 수 (해당 섹션 분모가 되는 경기 수)
+        t = int(counts.get("totals", 0))
+        h = int(counts.get("home", 0))
+        a = int(counts.get("away", 0))
+
+        # ✅ 기본: counts(totals/home/away)
         out["counts"] = {
-            "totals": int(counts.get("totals", 0)),
-            "home": int(counts.get("home", 0)),
-            "away": int(counts.get("away", 0)),
+            "totals": t,
+            "total": t,   # ✅ 호환(혹시 total을 기대하는 앱 대비)
+            "home": h,
+            "away": a,
         }
+
+        # ✅ 추가 호환: count(total/home/away) 형태를 기대하는 앱 대비
+        out["count"] = {
+            "total": t,
+            "home": h,
+            "away": a,
+        }
+
     return out
 
 
@@ -651,14 +664,18 @@ def hockey_get_game_insights(
 
     def _build_last3_section(state: str) -> Dict[str, Any]:
         lab = _STATE_LABEL.get(state, state)
+        cnt = _count_last3_state(state)
+
         return _build_section(
             title=_last3_title(lab),
-            counts=_count_last3_state(state),  # ✅ 헤더 T/H/A 경기수
+            counts=cnt,  # ✅ 헤더 T/H/A 경기수
+            subtitle=f"T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}",  # ✅ 앱 fallback용
             rows=[
                 {"label": f"L3 · {lab} · Score",   "values": _triple(last_minutes_score_prob(state))},
                 {"label": f"L3 · {lab} · Concede", "values": _triple(last_minutes_concede_prob(state))},
             ],
         )
+
 
     sec_last_lead1 = _build_last3_section("LEAD1")
     sec_last_lead2 = _build_last3_section("LEAD2")
