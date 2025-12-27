@@ -818,14 +818,33 @@ def hockey_get_game_insights(
 
     # ─────────────────────────────────────────
     # D) Goal Timing Distribution (2-Minute Intervals)
+    # - ✅ 득점(GF) + 실점(GA) 둘 다 제공
+    # - ✅ 각 2분 구간 "골 개수(counts)"를 함께 내려보냄 (UI에서 박스 안 숫자 표기용)
+    # - values는 "해당 bucket+GF/GA 내에서의 비중(share)" (합=1), total==0이면 None
     # ─────────────────────────────────────────
-    def goal_timing_distribution(period: str) -> Dict[str, List[Optional[float]]]:
-        out: Dict[str, List[Optional[float]]] = {}
+    def goal_timing_distribution(period: str, kind: str) -> Dict[str, Dict[str, Any]]:
+        """
+        kind:
+          - "GF": sel_team_id 득점
+          - "GA": sel_team_id 실점(상대 득점)
+
+        return:
+          {
+            "totals": {"values": [..10], "counts": [..10], "total": int},
+            "home":   {"values": [..10], "counts": [..10], "total": int},
+            "away":   {"values": [..10], "counts": [..10], "total": int},
+          }
+        """
+        kind_u = (kind or "GF").strip().upper()
+        if kind_u not in ("GF", "GA"):
+            kind_u = "GF"
+
+        out: Dict[str, Dict[str, Any]] = {}
 
         for b in ("totals", "home", "away"):
             ids = iter_bucket(b)
 
-            counts = [0] * 10  # 0-2,2-4,...,18-20
+            counts: List[int] = [0] * 10  # 0-2,2-4,...,18-20
             total_goals = 0
 
             for gid in ids:
@@ -835,17 +854,32 @@ def hockey_get_game_insights(
                         continue
                     tid = _safe_int(ev.get("team_id"))
                     mi = _safe_int(ev.get("minute"))
-                    if tid != sel_team_id or mi is None:
+                    if tid is None or mi is None:
                         continue
+
+                    is_gf = (tid == sel_team_id)
+                    if kind_u == "GF":
+                        if not is_gf:
+                            continue
+                    else:  # "GA"
+                        if is_gf:
+                            continue
+
                     idx = mi // 2
                     if 0 <= idx <= 9:
                         counts[idx] += 1
                         total_goals += 1
 
             if total_goals <= 0:
-                out[b] = [None] * 10
+                values: List[Optional[float]] = [None] * 10
             else:
-                out[b] = [c / total_goals for c in counts]
+                values = [c / total_goals for c in counts]
+
+            out[b] = {
+                "values": values,
+                "counts": counts,
+                "total": total_goals,
+            }
 
         return out
 
@@ -854,17 +888,24 @@ def hockey_get_game_insights(
         end = start + 2
         return f"{start:02d}–{end:02d}"
 
-    def _dist_rows(period: str, title_prefix: str) -> List[Dict[str, Any]]:
-        dist = goal_timing_distribution(period)
+    def _dist_rows(period: str, title_prefix: str, kind: str) -> List[Dict[str, Any]]:
+        dist = goal_timing_distribution(period, kind)
+
         rows: List[Dict[str, Any]] = []
         for i in range(10):
             rows.append(
                 {
                     "label": f"{title_prefix} { _interval_label(i) }",
                     "values": {
-                        "totals": dist["totals"][i],
-                        "home": dist["home"][i],
-                        "away": dist["away"][i],
+                        "totals": dist["totals"]["values"][i],
+                        "home": dist["home"]["values"][i],
+                        "away": dist["away"]["values"][i],
+                    },
+                    # ✅ UI에서 10칸 박스 안에 숫자를 찍기 위한 counts
+                    "counts": {
+                        "totals": dist["totals"]["counts"][i],
+                        "home": dist["home"]["counts"][i],
+                        "away": dist["away"]["counts"][i],
                     },
                 }
             )
@@ -873,11 +914,16 @@ def hockey_get_game_insights(
     sec_goal_time = _build_section(
         "Goal Timing Distribution",
         rows=(
-            _dist_rows("P1", "1st Period (2-min)") +
-            _dist_rows("P2", "2nd Period (2-min)") +
-            _dist_rows("P3", "3rd Period (2-min)")
+            # ✅ Period별로 득점(GF) / 실점(GA) 둘 다 내려보냄
+            _dist_rows("P1", "1st Period GF (2-min)", "GF") +
+            _dist_rows("P1", "1st Period GA (2-min)", "GA") +
+            _dist_rows("P2", "2nd Period GF (2-min)", "GF") +
+            _dist_rows("P2", "2nd Period GA (2-min)", "GA") +
+            _dist_rows("P3", "3rd Period GF (2-min)", "GF") +
+            _dist_rows("P3", "3rd Period GA (2-min)", "GA")
         ),
     )
+
 
     # ─────────────────────────────────────────
     # NEW) 공통 계산 유틸 (Full Time / Period / OT/SO / Transition)
