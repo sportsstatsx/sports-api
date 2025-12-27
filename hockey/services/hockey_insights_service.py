@@ -322,12 +322,18 @@ def _build_section(
     title: str,
     rows: List[Dict[str, Any]],
     counts: Optional[Dict[str, int]] = None,
+    subtitle: Optional[str] = None,  # ✅ 추가
 ) -> Dict[str, Any]:
     out = {
         "title": title,
         "columns": ["Totals", "Home", "Away"],
         "rows": rows,
     }
+
+    # ✅ subtitle 있으면 내려보냄 (앱에서 바로 표시 가능)
+    if subtitle is not None and str(subtitle).strip() != "":
+        out["subtitle"] = str(subtitle)
+
     if counts is not None:
         # ✅ totals/home/away 경기 수 (해당 섹션 분모가 되는 경기 수)
         out["counts"] = {
@@ -336,6 +342,7 @@ def _build_section(
             "away": int(counts.get("away", 0)),
         }
     return out
+
 
 
 
@@ -1358,59 +1365,58 @@ def hockey_get_game_insights(
     ot_subtitle = f"n OT {ot_n['totals']}/{ot_n['home']}/{ot_n['away']} · SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
     so_subtitle = f"n SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
 
-    sec_ot = _build_section(
-        title="Overtime (OT)",
-        counts=ot_n,
-        rows=[
-            # OT W = OT_Wins / OT_Games
-            {
-                "label": "OT W",
-                "values": _triple(_cond_rate(
-                    num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
-                    denom_pred=is_ot_decided,
-                )),
-            },
-            # OT L = OT_Losses / OT_Games
-            {
-                "label": "OT L",
-                "values": _triple(_cond_rate(
-                    num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
-                    denom_pred=is_ot_decided,
-                )),
-            },
-            # OT→SO Rate = SO_Games / (OT_Games + SO_Games)
-            {
-                "label": "OT→SO Rate",
-                "values": _triple(_cond_rate(
-                    num_pred=is_so_decided,
-                    denom_pred=is_ot_or_so_decided,
-                )),
-            },
-        ],
-    )
+sec_ot = _build_section(
+    title="Overtime (OT)",
+    subtitle=ot_subtitle,  # ✅ 추가
+    counts=ot_n,
+    rows=[
+        {
+            "label": "OT W",
+            "values": _triple(_cond_rate(
+                num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
+                denom_pred=is_ot_decided,
+            )),
+        },
+        {
+            "label": "OT L",
+            "values": _triple(_cond_rate(
+                num_pred=lambda gid: (is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
+                denom_pred=is_ot_decided,
+            )),
+        },
+        {
+            "label": "OT→SO Rate",
+            "values": _triple(_cond_rate(
+                num_pred=is_so_decided,
+                denom_pred=is_ot_or_so_decided,
+            )),
+        },
+    ],
+)
 
-    sec_so = _build_section(
-        title="Shootout (SO)",
-        counts=so_n,
-        rows=[
-            # SO W = SO_Wins / SO_Games
-            {
-                "label": "SO W",
-                "values": _triple(_cond_rate(
-                    num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
-                    denom_pred=is_so_decided,
-                )),
-            },
-            # SO L = SO_Losses / SO_Games
-            {
-                "label": "SO L",
-                "values": _triple(_cond_rate(
-                    num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
-                    denom_pred=is_so_decided,
-                )),
-            },
-        ],
-    )
+
+sec_so = _build_section(
+    title="Shootout (SO)",
+    subtitle=so_subtitle,  # ✅ 추가
+    counts=so_n,
+    rows=[
+        {
+            "label": "SO W",
+            "values": _triple(_cond_rate(
+                num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True),
+                denom_pred=is_so_decided,
+            )),
+        },
+        {
+            "label": "SO L",
+            "values": _triple(_cond_rate(
+                num_pred=lambda gid: (is_so_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False),
+                denom_pred=is_so_decided,
+            )),
+        },
+    ],
+)
+
 
 
 
