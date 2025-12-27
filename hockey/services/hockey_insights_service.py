@@ -1036,10 +1036,26 @@ def hockey_get_game_insights(
         return gf + ga
 
     def _ft_first_goal_scored_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            v = _first_goal_scored_by_team(gid, sel_team_id, period=None)
-            return v is True
-        return _bool_prob(pred)
+        """
+        정규시간(P1~P3)에서 '첫 득점' 팀이 sel_team_id 인 비율.
+        정규시간 0-0(첫 득점 없음) 경기는 분모에서 제외 → 모두 제외되면 None(-)
+        """
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            num = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                fg = _first_goal_of_game(evs)  # ✅ 이미 P1~P3만 필터함
+                if not fg:
+                    continue  # ✅ 정규시간 첫 득점 없음 → 제외
+                denom += 1
+                tid = _safe_int(fg.get("team_id"))
+                if tid == sel_team_id:
+                    num += 1
+            out[b] = _safe_div(num, denom)
+        return out
 
     def _ft_pp_opportunities(gid: int) -> int:
         # 우리 PP 기회 = 상대 팀 penalty 수 (정규시간)
@@ -1070,57 +1086,51 @@ def hockey_get_game_insights(
             return 0
         return _goal_count_by_comment_reg(gid, opp, "short")
 
-    def _ft_clean_sheet_prob() -> Dict[str, Optional[float]]:
-        return _bool_prob(lambda gid: _ft_opp_goals(gid) == 0)
-
     sec_full_time = _build_section(
         title="Full Time (Regular Time)",
         rows=[
-            {"label": "Win", "values": _triple(_ft_result_prob("W"))},
-            {"label": "Draw", "values": _triple(_ft_result_prob("D"))},
-            {"label": "Loss", "values": _triple(_ft_result_prob("L"))},
+            {"label": "RT W", "values": _triple(_ft_result_prob("W"))},
+            {"label": "RT D", "values": _triple(_ft_result_prob("D"))},
+            {"label": "RT L", "values": _triple(_ft_result_prob("L"))},
 
-            {"label": "First Goal Scored", "values": _triple(_ft_first_goal_scored_prob())},
+            {"label": "Team O0.5", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
+            {"label": "Team O1.5", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
+            {"label": "Team O2.5", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
+            {"label": "Team O3.5", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
+            {"label": "Team O4.5", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
 
-            # ✅ 네가 요구한 AVG/Rate 세트
-            {"label": "Power Play Occurred (AVG)", "values": _triple(_avg_by_bucket(_ft_pp_opportunities))},
-            {"label": "Penalty Occurred (AVG)", "values": _triple(_avg_by_bucket(_ft_pk_opportunities))},
+            {"label": "Total O1.5", "values": _triple(_count_ge_prob(2, _ft_total_goals))},
+            {"label": "Total O2.5", "values": _triple(_count_ge_prob(3, _ft_total_goals))},
+            {"label": "Total O3.5", "values": _triple(_count_ge_prob(4, _ft_total_goals))},
+            {"label": "Total O4.5", "values": _triple(_count_ge_prob(5, _ft_total_goals))},
+            {"label": "Total O5.5", "values": _triple(_count_ge_prob(6, _ft_total_goals))},
 
-            {"label": "PP Goal Rate (PPG/PP)", "values": _triple(_rate_by_bucket(_ft_team_pp_goals, _ft_pp_opportunities))},
-            {"label": "Concede Rate on PP (SHGA/PP)", "values": _triple(_rate_by_bucket(_ft_opp_sh_goals, _ft_pp_opportunities))},
+            {"label": "BTTS 1+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
+            {"label": "BTTS 2+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
+            {"label": "BTTS 3+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
 
-            {"label": "SH Goal Rate (SHG/PK)", "values": _triple(_rate_by_bucket(_ft_team_sh_goals, _ft_pk_opportunities))},
-            {"label": "Concede Rate on PK (PPGA/PK)", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
+            {"label": "W & O1.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 2)))},
+            {"label": "W & O2.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 3)))},
+            {"label": "W & O3.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 4)))},
+            {"label": "W & O4.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 5)))},
+            {"label": "W & O5.5", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 6)))},
 
-            {"label": "Clean Sheet", "values": _triple(_ft_clean_sheet_prob())},
+            {"label": "W & BTTS1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
+            {"label": "W & BTTS2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
+            {"label": "W & BTTS3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
 
-            {"label": "Team Goals Over 0.5", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
-            {"label": "Team Goals Over 1.5", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
-            {"label": "Team Goals Over 2.5", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
-            {"label": "Team Goals Over 3.5", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
-            {"label": "Team Goals Over 4.5", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
+            {"label": "First Goal", "values": _triple(_ft_first_goal_scored_prob())},
 
-            {"label": "Total Goals Over 1.5", "values": _triple(_count_ge_prob(2, _ft_total_goals))},
-            {"label": "Total Goals Over 2.5", "values": _triple(_count_ge_prob(3, _ft_total_goals))},
-            {"label": "Total Goals Over 3.5", "values": _triple(_count_ge_prob(4, _ft_total_goals))},
-            {"label": "Total Goals Over 4.5", "values": _triple(_count_ge_prob(5, _ft_total_goals))},
-            {"label": "Total Goals Over 5.5", "values": _triple(_count_ge_prob(6, _ft_total_goals))},
+            {"label": "PP Avg", "values": _triple(_avg_by_bucket(_ft_pp_opportunities))},
+            {"label": "PEN Avg", "values": _triple(_avg_by_bucket(_ft_pk_opportunities))},
 
-            {"label": "Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
-            {"label": "Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
-            {"label": "Both Teams to Score 3+", "values": _triple(_bool_prob(lambda gid: (_ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
-
-            {"label": "Win & Over 1.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 2)))},
-            {"label": "Win & Over 2.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 3)))},
-            {"label": "Win & Over 3.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 4)))},
-            {"label": "Win & Over 4.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 5)))},
-            {"label": "Win & Over 5.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_total_goals(gid) >= 6)))},
-
-            {"label": "Win & Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 1 and _ft_opp_goals(gid) >= 1)))},
-            {"label": "Win & Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 2 and _ft_opp_goals(gid) >= 2)))},
-            {"label": "Win & Both Teams to Score 3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_reg_scores(gid)) == "W" and _ft_team_goals(gid) >= 3 and _ft_opp_goals(gid) >= 3)))},
+            {"label": "PPG/PP", "values": _triple(_rate_by_bucket(_ft_team_pp_goals, _ft_pp_opportunities))},
+            {"label": "SHGA/PP", "values": _triple(_rate_by_bucket(_ft_opp_sh_goals, _ft_pp_opportunities))},
+            {"label": "SHG/PK", "values": _triple(_rate_by_bucket(_ft_team_sh_goals, _ft_pk_opportunities))},
+            {"label": "PPGA/PK", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
         ],
     )
+
 
     # ─────────────────────────────────────────
     # NEW) 섹션: Period (1P/2P/3P)
