@@ -1241,11 +1241,14 @@ def hockey_get_game_insights(
     is_ot_or_so_decided = lambda gid: (_status(gid) in ("AOT", "AP"))
 
     # ✅ count(표기용 n)
-    ot_n = _count_by_bucket(is_ot_decided)   # OT 결판 경기 수
-    so_n = _count_by_bucket(is_so_decided)   # SO 결판 경기 수
+    # OT 섹션의 표기용 n(=오른쪽 T/H/A)은 "OT에 간 경기(OT 또는 SO로 결판)"가 분모가 되어야 함
+    ot_n = _count_by_bucket(is_ot_or_so_decided)  # OT에 간 경기 수(OT+SO)
+    so_n = _count_by_bucket(is_so_decided)        # SO 결판 경기 수
 
+    # subtitle은 UI에서 OT/SO는 숨기고 있지만(혹시 fallback 파싱 대비) 기존 포맷 유지
     ot_subtitle = f"n OT {ot_n['totals']}/{ot_n['home']}/{ot_n['away']} · SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
     so_subtitle = f"n SO {so_n['totals']}/{so_n['home']}/{so_n['away']}"
+
 
     sec_ot = _build_section(
         title="Overtime (OT)",
@@ -1256,10 +1259,12 @@ def hockey_get_game_insights(
                 "label": "OT W",
                 "values": _triple(
                     _cond_rate(
+                        # 분자: OT로 결판 + 해당팀 승
                         num_pred=lambda gid: (
                             is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is True
                         ),
-                        denom_pred=is_ot_decided,
+                        # 분모: OT에 간 경기(OT 또는 SO로 결판)
+                        denom_pred=is_ot_or_so_decided,
                     )
                 ),
             },
@@ -1267,13 +1272,16 @@ def hockey_get_game_insights(
                 "label": "OT L",
                 "values": _triple(
                     _cond_rate(
+                        # 분자: OT로 결판 + 해당팀 패
                         num_pred=lambda gid: (
                             is_ot_decided(gid) and _final_winner_is_team(gid, sel_team_id) is False
                         ),
-                        denom_pred=is_ot_decided,
+                        # 분모: OT에 간 경기(OT 또는 SO로 결판)
+                        denom_pred=is_ot_or_so_decided,
                     )
                 ),
             },
+
             {
                 "label": "OT→SO Rate",
                 "values": _triple(
