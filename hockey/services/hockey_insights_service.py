@@ -603,7 +603,7 @@ def hockey_get_game_insights(
         return out
 
     sec_last = _build_section(
-            "3P Clutch · Last 3 Minutes · Score State",
+            "3P Clutch · Last 3 Min",
             rows=[
                 {"label": "L3 · Lead1 · Score",    "values": _triple(last_minutes_score_prob("LEAD1"))},
                 {"label": "L3 · Lead1 · Concede",  "values": _triple(last_minutes_concede_prob("LEAD1"))},
