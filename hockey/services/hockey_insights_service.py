@@ -318,15 +318,25 @@ def _triple(values_by_bucket: Dict[str, Optional[float]]) -> Dict[str, Any]:
     }
 
 
-def _build_section(title: str, rows: List[Dict[str, Any]], subtitle: Optional[str] = None) -> Dict[str, Any]:
+def _build_section(
+    title: str,
+    rows: List[Dict[str, Any]],
+    counts: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     out = {
         "title": title,
         "columns": ["Totals", "Home", "Away"],
         "rows": rows,
     }
-    if subtitle is not None:
-        out["subtitle"] = subtitle
+    if counts is not None:
+        # ✅ totals/home/away 경기 수 (해당 섹션 분모가 되는 경기 수)
+        out["counts"] = {
+            "totals": int(counts.get("totals", 0)),
+            "home": int(counts.get("home", 0)),
+            "away": int(counts.get("away", 0)),
+        }
     return out
+
 
 
 
@@ -1350,7 +1360,7 @@ def hockey_get_game_insights(
 
     sec_ot = _build_section(
         title="Overtime (OT)",
-        subtitle=ot_subtitle,  # ✅ 타이틀 오른쪽에 붙여서 보여줄 용도(앱에서 inline 처리)
+        counts=ot_n,
         rows=[
             # OT W = OT_Wins / OT_Games
             {
@@ -1381,7 +1391,7 @@ def hockey_get_game_insights(
 
     sec_so = _build_section(
         title="Shootout (SO)",
-        subtitle=so_subtitle,  # ✅ 표기용 n
+        counts=so_n,
         rows=[
             # SO W = SO_Wins / SO_Games
             {
