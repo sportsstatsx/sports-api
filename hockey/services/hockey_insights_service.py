@@ -602,25 +602,70 @@ def hockey_get_game_insights(
             out[b] = _safe_div(num, denom)
         return out
 
-    sec_last = _build_section(
-            "3P Clutch · Last 3 Min",
+    def _count_last3_state(state: str) -> Dict[str, int]:
+        """
+        섹션 헤더에 표시할 분모 경기수(T/H/A)
+        = 해당 bucket 경기들 중에서
+          '3P 남은 3:00 시점(=P3 minute<threshold_minute) 스코어차(diff0)'가
+          state에 해당하는 경기 수
+        """
+        out: Dict[str, int] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            denom = 0
+            for gid in ids:
+                evs = goal_by_game.get(gid, [])
+                gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", threshold_minute))
+                diff0 = gf0 - ga0
+
+                ok = False
+                if state == "LEAD1" and diff0 == 1:
+                    ok = True
+                elif state == "LEAD2" and diff0 == 2:
+                    ok = True
+                elif state == "TRAIL1" and diff0 == -1:
+                    ok = True
+                elif state == "TRAIL2" and diff0 == -2:
+                    ok = True
+                elif state == "TIED" and diff0 == 0:
+                    ok = True
+
+                if ok:
+                    denom += 1
+
+            out[b] = denom
+        return out
+
+    def _last3_title(state_label: str) -> str:
+        # 섹션 타이틀(축약형)
+        return f"3P Clutch · L3 · {state_label}"
+
+    # state 라벨 매핑(표기용)
+    _STATE_LABEL = {
+        "LEAD1": "Lead1",
+        "LEAD2": "Lead2",
+        "TRAIL1": "Trail1",
+        "TRAIL2": "Trail2",
+        "TIED": "Tied",
+    }
+
+    def _build_last3_section(state: str) -> Dict[str, Any]:
+        lab = _STATE_LABEL.get(state, state)
+        return _build_section(
+            title=_last3_title(lab),
+            counts=_count_last3_state(state),  # ✅ 헤더 T/H/A 경기수
             rows=[
-                {"label": "L3 · Lead1 · Score",    "values": _triple(last_minutes_score_prob("LEAD1"))},
-                {"label": "L3 · Lead1 · Concede",  "values": _triple(last_minutes_concede_prob("LEAD1"))},
-
-                {"label": "L3 · Lead2 · Score",    "values": _triple(last_minutes_score_prob("LEAD2"))},
-                {"label": "L3 · Lead2 · Concede",  "values": _triple(last_minutes_concede_prob("LEAD2"))},
-
-                {"label": "L3 · Trail1 · Score",   "values": _triple(last_minutes_score_prob("TRAIL1"))},
-                {"label": "L3 · Trail1 · Concede", "values": _triple(last_minutes_concede_prob("TRAIL1"))},
-
-                {"label": "L3 · Trail2 · Score",   "values": _triple(last_minutes_score_prob("TRAIL2"))},
-                {"label": "L3 · Trail2 · Concede", "values": _triple(last_minutes_concede_prob("TRAIL2"))},
-
-                {"label": "L3 · Tied · Score",     "values": _triple(last_minutes_score_prob("TIED"))},
-                {"label": "L3 · Tied · Concede",   "values": _triple(last_minutes_concede_prob("TIED"))},
+                {"label": f"L3 · {lab} · Score",   "values": _triple(last_minutes_score_prob(state))},
+                {"label": f"L3 · {lab} · Concede", "values": _triple(last_minutes_concede_prob(state))},
             ],
         )
+
+    sec_last_lead1 = _build_last3_section("LEAD1")
+    sec_last_lead2 = _build_last3_section("LEAD2")
+    sec_last_trail1 = _build_last3_section("TRAIL1")
+    sec_last_trail2 = _build_last3_section("TRAIL2")
+    sec_last_tied  = _build_last3_section("TIED")
+
 
 
     # ─────────────────────────────────────────
