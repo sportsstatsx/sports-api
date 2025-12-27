@@ -698,124 +698,6 @@ def hockey_get_game_insights(
         ],
     )
 
-    # ─────────────────────────────────────────
-    # C) First Goal Impact (Regular Time)
-    # ─────────────────────────────────────────
-    def first_goal_condition_prob(cond: str, outcome: str) -> Dict[str, Optional[float]]:
-        """
-        cond:
-          - P1_FIRST_FOR / P1_FIRST_AGAINST
-          - P2_00_FIRST_FOR / P2_00_FIRST_AGAINST (P1 0-0)
-          - P3_00_FIRST_FOR / P3_00_FIRST_AGAINST (P1+P2 0-0)
-        """
-        out: Dict[str, Optional[float]] = {}
-        for b in ("totals", "home", "away"):
-            ids = iter_bucket(b)
-            denom = 0
-            num = 0
-            for gid in ids:
-                evs = goal_by_game.get(gid, [])
-                res = reg_result_for_game(gid)
-                if res is None:
-                    continue
-
-                ok = False
-
-                if cond in ("P1_FIRST_FOR", "P1_FIRST_AGAINST"):
-                    fg = _first_goal_of_game(evs)
-                    if not fg:
-                        continue
-                    if _norm_period(fg.get("period")) != "P1":
-                        continue
-                    tid = _safe_int(fg.get("team_id"))
-                    if tid is None:
-                        continue
-                    if cond == "P1_FIRST_FOR" and tid == sel_team_id:
-                        ok = True
-                    if cond == "P1_FIRST_AGAINST" and tid != sel_team_id:
-                        ok = True
-
-                elif cond in ("P2_00_FIRST_FOR", "P2_00_FIRST_AGAINST"):
-                    gf1 = 0
-                    ga1 = 0
-                    for ev in evs:
-                        if _norm_period(ev.get("period")) != "P1":
-                            continue
-                        tid = _safe_int(ev.get("team_id"))
-                        if tid is None:
-                            continue
-                        if tid == sel_team_id:
-                            gf1 += 1
-                        else:
-                            ga1 += 1
-                    if (gf1 + ga1) != 0:
-                        continue
-
-                    fg2 = _first_goal_after_checkpoint(evs, ("P2", "P3"))
-                    if not fg2:
-                        continue
-                    tid = _safe_int(fg2.get("team_id"))
-                    if tid is None:
-                        continue
-                    if cond == "P2_00_FIRST_FOR" and tid == sel_team_id:
-                        ok = True
-                    if cond == "P2_00_FIRST_AGAINST" and tid != sel_team_id:
-                        ok = True
-
-                elif cond in ("P3_00_FIRST_FOR", "P3_00_FIRST_AGAINST"):
-                    gf12, ga12 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
-                    if (gf12 + ga12) != 0:
-                        continue
-
-                    fg3 = _first_goal_after_checkpoint(evs, ("P3",))
-                    if not fg3:
-                        continue
-                    tid = _safe_int(fg3.get("team_id"))
-                    if tid is None:
-                        continue
-                    if cond == "P3_00_FIRST_FOR" and tid == sel_team_id:
-                        ok = True
-                    if cond == "P3_00_FIRST_AGAINST" and tid != sel_team_id:
-                        ok = True
-
-                if not ok:
-                    continue
-
-                denom += 1
-                if res == outcome:
-                    num += 1
-
-            out[b] = _safe_div(num, denom)
-        return out
-
-    sec_fg = _build_section(
-        "First Goal Impact (Regular Time)",
-        rows=[
-            {"label": "1P First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "W"))},
-            {"label": "1P First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "D"))},
-            {"label": "1P First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_FOR", "L"))},
-
-            {"label": "1P Conceded First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "W"))},
-            {"label": "1P Conceded First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "D"))},
-            {"label": "1P Conceded First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P1_FIRST_AGAINST", "L"))},
-
-            {"label": "2P Start 0–0 → First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "W"))},
-            {"label": "2P Start 0–0 → First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "D"))},
-            {"label": "2P Start 0–0 → First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_FOR", "L"))},
-
-            {"label": "2P Start 0–0 → First Goal Conceded → Win Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "W"))},
-            {"label": "2P Start 0–0 → First Goal Conceded → Draw Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "D"))},
-            {"label": "2P Start 0–0 → First Goal Conceded → Loss Probability", "values": _triple(first_goal_condition_prob("P2_00_FIRST_AGAINST", "L"))},
-
-            {"label": "3P Start 0–0 → First Goal → Win Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "W"))},
-            {"label": "3P Start 0–0 → First Goal → Draw Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "D"))},
-            {"label": "3P Start 0–0 → First Goal → Loss Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_FOR", "L"))},
-
-            {"label": "3P Start 0–0 → First Goal Conceded → Win Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "W"))},
-            {"label": "3P Start 0–0 → First Goal Conceded → Draw Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "D"))},
-            {"label": "3P Start 0–0 → First Goal Conceded → Loss Probability", "values": _triple(first_goal_condition_prob("P3_00_FIRST_AGAINST", "L"))},
-        ],
-    )
 
     # ─────────────────────────────────────────
     # D) Goal Timing Distribution (2-Minute Intervals)
@@ -1436,48 +1318,6 @@ def hockey_get_game_insights(
 
 
 
-
-
-    # ─────────────────────────────────────────
-    # NEW) 섹션: Period Result Transitions (1P→2P, 2P→3P)
-    # ─────────────────────────────────────────
-    def _period_result(gid: int, period: str) -> Optional[str]:
-        gf, ga = _period_scores(gid, period)
-        return _result_from_scores(gf, ga)
-
-    def _transition_prob(from_p: str, to_p: str, from_res: str, to_res: str) -> Dict[str, Optional[float]]:
-        out: Dict[str, Optional[float]] = {}
-        for b in ("totals", "home", "away"):
-            ids = iter_bucket(b)
-            denom = 0
-            num = 0
-            for gid in ids:
-                fr = _period_result(gid, from_p)
-                tr = _period_result(gid, to_p)
-                if fr != from_res:
-                    continue
-                denom += 1
-                if tr == to_res:
-                    num += 1
-            out[b] = _safe_div(num, denom)
-        return out
-
-    trans_rows: List[Dict[str, Any]] = []
-    for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
-        trans_rows.append({"label": f"1P {fr_label} → 2P Win Probability", "values": _triple(_transition_prob("P1", "P2", fr, "W"))})
-        trans_rows.append({"label": f"1P {fr_label} → 2P Draw Probability", "values": _triple(_transition_prob("P1", "P2", fr, "D"))})
-        trans_rows.append({"label": f"1P {fr_label} → 2P Loss Probability", "values": _triple(_transition_prob("P1", "P2", fr, "L"))})
-
-    for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
-        trans_rows.append({"label": f"2P {fr_label} → 3P Win Probability", "values": _triple(_transition_prob("P2", "P3", fr, "W"))})
-        trans_rows.append({"label": f"2P {fr_label} → 3P Draw Probability", "values": _triple(_transition_prob("P2", "P3", fr, "D"))})
-        trans_rows.append({"label": f"2P {fr_label} → 3P Loss Probability", "values": _triple(_transition_prob("P2", "P3", fr, "L"))})
-
-    sec_transitions = _build_section(
-        title="Period Result Transitions",
-        rows=trans_rows,
-    )
-
     sections = [
         sec_full_time,
 
@@ -1488,16 +1328,14 @@ def hockey_get_game_insights(
         sec_ot,
         sec_so,
 
-        sec_transitions,
-
         # 3rd Period Clutch Situations (이미 구현된 것들)
         sec_last,
         sec_p3,
-        sec_fg,
 
         # Goal Timing (이미 구현됨)
         sec_goal_time,
     ]
+
 
     return {
         "ok": True,
