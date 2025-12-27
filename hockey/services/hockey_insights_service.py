@@ -603,50 +603,25 @@ def hockey_get_game_insights(
         return out
 
     sec_last = _build_section(
-        "Last 3 Minutes · 1–2 Goal Margin",
-        rows=[
-            {
-                "label": "Leading by 1 Goal – Score Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_score_prob("LEAD1")),
-            },
-            {
-                "label": "Leading by 1 Goal – Concede Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_concede_prob("LEAD1")),
-            },
-            {
-                "label": "Leading by 2 Goals – Score Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_score_prob("LEAD2")),
-            },
-            {
-                "label": "Leading by 2 Goals – Concede Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_concede_prob("LEAD2")),
-            },
-            {
-                "label": "Trailing by 1 Goal – Score Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_score_prob("TRAIL1")),
-            },
-            {
-                "label": "Trailing by 1 Goal – Concede Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_concede_prob("TRAIL1")),
-            },
-            {
-                "label": "Trailing by 2 Goals – Score Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_score_prob("TRAIL2")),
-            },
-            {
-                "label": "Trailing by 2 Goals – Concede Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_concede_prob("TRAIL2")),
-            },
-            {
-                "label": "Tied Game – Score Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_score_prob("TIED")),
-            },
-            {
-                "label": "Tied Game – Concede Probability (Last 3 Minutes)",
-                "values": _triple(last_minutes_concede_prob("TIED")),
-            },
-        ],
-    )
+            "3P Clutch · Last 3 Minutes · Score State",
+            rows=[
+                {"label": "L3 · Lead1 · Score",    "values": _triple(last_minutes_score_prob("LEAD1"))},
+                {"label": "L3 · Lead1 · Concede",  "values": _triple(last_minutes_concede_prob("LEAD1"))},
+
+                {"label": "L3 · Lead2 · Score",    "values": _triple(last_minutes_score_prob("LEAD2"))},
+                {"label": "L3 · Lead2 · Concede",  "values": _triple(last_minutes_concede_prob("LEAD2"))},
+
+                {"label": "L3 · Trail1 · Score",   "values": _triple(last_minutes_score_prob("TRAIL1"))},
+                {"label": "L3 · Trail1 · Concede", "values": _triple(last_minutes_concede_prob("TRAIL1"))},
+
+                {"label": "L3 · Trail2 · Score",   "values": _triple(last_minutes_score_prob("TRAIL2"))},
+                {"label": "L3 · Trail2 · Concede", "values": _triple(last_minutes_concede_prob("TRAIL2"))},
+
+                {"label": "L3 · Tied · Score",     "values": _triple(last_minutes_score_prob("TIED"))},
+                {"label": "L3 · Tied · Concede",   "values": _triple(last_minutes_concede_prob("TIED"))},
+            ],
+        )
+
 
     # ─────────────────────────────────────────
     # B) 3rd Period Start Score Impact (Regular Time)
