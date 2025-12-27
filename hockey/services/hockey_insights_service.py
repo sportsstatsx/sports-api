@@ -970,6 +970,37 @@ def hockey_get_game_insights(
                 c += 1
         return c
 
+    def _penalty_count_by_team_period(gid: int, team: int, period: str) -> int:
+        p = _norm_period(period)
+        c = 0
+        for ev in _evs(gid):
+            if ev.get("type") != "penalty":
+                continue
+            if _norm_period(ev.get("period")) != p:
+                continue
+            tid = _safe_int(ev.get("team_id"))
+            if tid == team:
+                c += 1
+        return c
+
+    def _goal_count_by_comment_period(gid: int, team: int, keyword: str, period: str) -> int:
+        p = _norm_period(period)
+        kw = (keyword or "").strip().lower()
+        c = 0
+        for ev in _evs(gid):
+            if ev.get("type") != "goal":
+                continue
+            if _norm_period(ev.get("period")) != p:
+                continue
+            tid = _safe_int(ev.get("team_id"))
+            if tid != team:
+                continue
+            com = (ev.get("comment") or "").strip().lower()
+            if kw and kw in com:
+                c += 1
+        return c
+
+
     def _first_goal_scored_by_team(gid: int, team: int, period: Optional[str] = None) -> Optional[bool]:
         evs = goal_by_game.get(gid, [])
         if not evs:
@@ -1147,6 +1178,9 @@ def hockey_get_game_insights(
     def _period_section(period: str, title: str) -> Dict[str, Any]:
         p = _norm_period(period)
 
+        # "P1" -> "1P", "P2" -> "2P", "P3" -> "3P"
+        prefix = (p[1:] + "P") if p.startswith("P") else p
+
         def team_goals(gid: int) -> int:
             gf, _ = _period_scores(gid, p)
             return gf
@@ -1166,41 +1200,85 @@ def hockey_get_game_insights(
             return _bool_prob(pred)
 
         def first_goal_prob() -> Dict[str, Optional[float]]:
+            # ✅ 해당 period에 골이 하나도 없으면 v=None -> False 처리
+            # ✅ 분모(N)에서 제외하지 않음 (0 처리)
             def pred(gid: int) -> bool:
                 v = _first_goal_scored_by_team(gid, sel_team_id, period=p)
                 return v is True
             return _bool_prob(pred)
 
-        def clean_sheet_prob() -> Dict[str, Optional[float]]:
-            return _bool_prob(lambda gid: opp_goals(gid) == 0)
+        # ── PP/PK (period 전용) ─────────────────────
+        def _pp_opportunities(gid: int) -> int:
+            # 우리 PP 기회 = 상대 팀 penalty 이벤트 수 (해당 period)
+            _, opp = _team_and_opp_ids(gid)
+            if opp is None:
+                return 0
+            return _penalty_count_by_team_period(gid, opp, p)
+
+        def _pk_opportunities(gid: int) -> int:
+            # 우리 PK 기회 = 우리 penalty 이벤트 수 (해당 period)
+            return _penalty_count_by_team_period(gid, sel_team_id, p)
+
+        def _team_pp_goals(gid: int) -> int:
+            return _goal_count_by_comment_period(gid, sel_team_id, "power", p)
+
+        def _team_sh_goals(gid: int) -> int:
+            return _goal_count_by_comment_period(gid, sel_team_id, "short", p)
+
+        def _opp_pp_goals(gid: int) -> int:
+            _, opp = _team_and_opp_ids(gid)
+            if opp is None:
+                return 0
+            return _goal_count_by_comment_period(gid, opp, "power", p)
+
+        def _opp_sh_goals(gid: int) -> int:
+            _, opp = _team_and_opp_ids(gid)
+            if opp is None:
+                return 0
+            return _goal_count_by_comment_period(gid, opp, "short", p)
 
         rows: List[Dict[str, Any]] = [
-            {"label": "Win", "values": _triple(result_prob("W"))},
-            {"label": "Draw", "values": _triple(result_prob("D"))},
-            {"label": "Loss", "values": _triple(result_prob("L"))},
+            # 1) W/D/L
+            {"label": f"{prefix} W", "values": _triple(result_prob("W"))},
+            {"label": f"{prefix} D", "values": _triple(result_prob("D"))},
+            {"label": f"{prefix} L", "values": _triple(result_prob("L"))},
 
-            {"label": f"First Goal in {p}", "values": _triple(first_goal_prob())},
-            {"label": "Clean Sheet", "values": _triple(clean_sheet_prob())},
+            # 2) Team Goals Over (TG)
+            {"label": f"{prefix} TG 0.5+", "values": _triple(_count_ge_prob(1, team_goals))},
+            {"label": f"{prefix} TG 1.5+", "values": _triple(_count_ge_prob(2, team_goals))},
 
-            {"label": "Team Over 0.5 Goals", "values": _triple(_count_ge_prob(1, team_goals))},
-            {"label": "Team Over 1.5 Goals", "values": _triple(_count_ge_prob(2, team_goals))},
-            {"label": "Team Over 2.5 Goals", "values": _triple(_count_ge_prob(3, team_goals))},
+            # 3) Total Goals Over (Total)
+            {"label": f"{prefix} Total 0.5+", "values": _triple(_count_ge_prob(1, total_goals))},
+            {"label": f"{prefix} Total 1.5+", "values": _triple(_count_ge_prob(2, total_goals))},
 
-            {"label": "Total Goals Over 0.5", "values": _triple(_count_ge_prob(1, total_goals))},
-            {"label": "Total Goals Over 1.5", "values": _triple(_count_ge_prob(2, total_goals))},
-            {"label": "Total Goals Over 2.5", "values": _triple(_count_ge_prob(3, total_goals))},
+            # 4) BTTS
+            {"label": f"{prefix} BTTS 0.5+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
+            {"label": f"{prefix} BTTS 1.5+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
 
-            {"label": "Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
-            {"label": "Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
+            # 5) W & Total
+            {"label": f"{prefix} W & Total 0.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 1)))},
+            {"label": f"{prefix} W & Total 1.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 2)))},
 
-            {"label": "Win & Over 1.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 2)))},
-            {"label": "Win & Over 2.5 Goals", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and total_goals(gid) >= 3)))},
+            # 6) W & BTTS
+            {"label": f"{prefix} W & BTTS 0.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
+            {"label": f"{prefix} W & BTTS 1.5+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
 
-            {"label": "Win & Both Teams to Score 1+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 1 and opp_goals(gid) >= 1)))},
-            {"label": "Win & Both Teams to Score 2+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 2 and opp_goals(gid) >= 2)))},
-            {"label": "Win & Both Teams to Score 3+", "values": _triple(_bool_prob(lambda gid: (_result_from_scores(*_period_scores(gid, p)) == "W" and team_goals(gid) >= 3 and opp_goals(gid) >= 3)))},
+            # 7) First Goal (해당 period 내 첫 골)
+            {"label": f"{prefix} First Goal", "values": _triple(first_goal_prob())},
+
+            # 8) PP/PK (AVG / Rate)
+            {"label": f"{prefix} PP Occ (AVG)", "values": _triple(_avg_by_bucket(_pp_opportunities))},
+            {"label": f"{prefix} Penalty (AVG)", "values": _triple(_avg_by_bucket(_pk_opportunities))},
+
+            {"label": f"{prefix} PPG/PP", "values": _triple(_rate_by_bucket(_team_pp_goals, _pp_opportunities))},
+            {"label": f"{prefix} SHGA/PP", "values": _triple(_rate_by_bucket(_opp_sh_goals, _pp_opportunities))},
+
+            {"label": f"{prefix} SHG/PK", "values": _triple(_rate_by_bucket(_team_sh_goals, _pk_opportunities))},
+            {"label": f"{prefix} PPGA/PK", "values": _triple(_rate_by_bucket(_opp_pp_goals, _pk_opportunities))},
         ]
+
         return _build_section(title=title, rows=rows)
+
 
     sec_1p = _period_section("P1", "1st Period (1P)")
     sec_2p = _period_section("P2", "2nd Period (2P)")
