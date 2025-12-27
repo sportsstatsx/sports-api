@@ -1356,8 +1356,12 @@ def hockey_get_game_insights(
         sec_ot,
         sec_so,
 
-        # 3rd Period Clutch Situations (이미 구현된 것들)
-        sec_last,
+        # 3rd Period Clutch Situations (state별 분리)
+        sec_last_lead1,
+        sec_last_lead2,
+        sec_last_trail1,
+        sec_last_trail2,
+        sec_last_tied,
         sec_p3,
 
         # Goal Timing (이미 구현됨)
