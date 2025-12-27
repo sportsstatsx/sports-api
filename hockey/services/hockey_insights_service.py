@@ -384,7 +384,6 @@ def hockey_get_game_insights(
 
     game_ids = bucket.games
 
-
     goal_by_game = _load_goal_events(game_ids)
     all_events_by_game = _load_all_events(game_ids)
 
@@ -408,7 +407,6 @@ def hockey_get_game_insights(
             if gid is None:
                 continue
             game_meta[gid] = r
-
 
     # bucket별 game_ids
     totals_ids = list(game_ids)
@@ -494,9 +492,6 @@ def hockey_get_game_insights(
                 if conceded:
                     num_concede += 1
 
-            # 이 함수는 “Score/Concede”를 나눠서 쓰려고,
-            # 여기선 임시로 dict에 담지 않고 호출부에서 분리 계산할 것.
-            # (아래에서 별도 함수로 쓴다)
             out[b] = None
         return out
 
@@ -647,8 +642,6 @@ def hockey_get_game_insights(
             num = 0
             for gid in ids:
                 evs = goal_by_game.get(gid, [])
-                # P3 시작 = P1,P2까지만 반영
-                # checkpoint를 ("P3", 0) 로 보면 P1,P2는 다 포함되고 P3 minute<0 없음
                 gf0, ga0 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
                 diff0 = gf0 - ga0
 
@@ -701,7 +694,6 @@ def hockey_get_game_insights(
             num = 0
             for gid in ids:
                 evs = goal_by_game.get(gid, [])
-                # 결과
                 res = reg_result_for_game(gid)
                 if res is None:
                     continue
@@ -723,7 +715,6 @@ def hockey_get_game_insights(
                         ok = True
 
                 elif cond in ("P2_00_FIRST_FOR", "P2_00_FIRST_AGAINST"):
-                    # P1 0-0
                     gf1 = 0
                     ga1 = 0
                     for ev in evs:
@@ -751,7 +742,6 @@ def hockey_get_game_insights(
                         ok = True
 
                 elif cond in ("P3_00_FIRST_FOR", "P3_00_FIRST_AGAINST"):
-                    # P1+P2 0-0
                     gf12, ga12 = _score_at_checkpoint(evs, sel_team_id, ("P3", 0))
                     if (gf12 + ga12) != 0:
                         continue
@@ -808,13 +798,8 @@ def hockey_get_game_insights(
 
     # ─────────────────────────────────────────
     # D) Goal Timing Distribution (2-Minute Intervals)
-    #    - 앱에서 게이지바 그릴 수 있게 “분포(합=1)”로 내려줌
     # ─────────────────────────────────────────
     def goal_timing_distribution(period: str) -> Dict[str, List[Optional[float]]]:
-        """
-        return {totals:[10], home:[10], away:[10]}
-        각 버킷은 해당 period에서 나온 '선택팀 득점'을 2분 구간으로 나눈 비율
-        """
         out: Dict[str, List[Optional[float]]] = {}
 
         for b in ("totals", "home", "away"):
@@ -832,7 +817,6 @@ def hockey_get_game_insights(
                     mi = _safe_int(ev.get("minute"))
                     if tid != sel_team_id or mi is None:
                         continue
-                    # minute 0~19 가정 (너가 확인한 raw_json minute="00")
                     idx = mi // 2
                     if 0 <= idx <= 9:
                         counts[idx] += 1
@@ -878,6 +862,11 @@ def hockey_get_game_insights(
     # ─────────────────────────────────────────
     # NEW) 공통 계산 유틸 (Full Time / Period / OT/SO / Transition)
     # ─────────────────────────────────────────
+    REG_PERIODS = ("P1", "P2", "P3")
+
+    def _is_reg_period(p: Any) -> bool:
+        return _norm_period(p) in REG_PERIODS
+
     def _team_and_opp_ids(gid: int) -> Tuple[Optional[int], Optional[int]]:
         gm = game_meta.get(gid) or {}
         h = _safe_int(gm.get("home_team_id"))
@@ -888,17 +877,14 @@ def hockey_get_game_insights(
             return h, a
         if sel_team_id == a:
             return a, h
-        # 혹시 최근경기 로딩이 꼬였을 때
         return sel_team_id, (a if h == sel_team_id else h)
 
     def _reg_scores(gid: int) -> Tuple[int, int]:
-        # 정규시간(P1,P2,P3) 득점만 사용
         evs = goal_by_game.get(gid, [])
         gf, ga = _score_after_regulation(evs, sel_team_id)
         return gf, ga
 
     def _period_scores(gid: int, period: str) -> Tuple[int, int]:
-        # period 내 득점만 (P1/P2/P3)
         evs = goal_by_game.get(gid, [])
         gf = 0
         ga = 0
@@ -937,25 +923,7 @@ def hockey_get_game_insights(
             out[b] = num / denom
         return out
 
-    def _count_prob(threshold: int, getter) -> Dict[str, Optional[float]]:
-        # getter(gid) -> int 카운트
-        out: Dict[str, Optional[float]] = {}
-        for b in ("totals", "home", "away"):
-            ids = iter_bucket(b)
-            denom = len(ids)
-            if denom <= 0:
-                out[b] = None
-                continue
-            num = 0
-            for gid in ids:
-                v = getter(gid)
-                if v > threshold:
-                    num += 1
-            out[b] = num / denom
-        return out
-
     def _count_ge_prob(threshold: int, getter) -> Dict[str, Optional[float]]:
-        # getter(gid) -> int, v >= threshold
         out: Dict[str, Optional[float]] = {}
         for b in ("totals", "home", "away"):
             ids = iter_bucket(b)
@@ -974,38 +942,38 @@ def hockey_get_game_insights(
     def _evs(gid: int) -> List[Dict[str, Any]]:
         return all_events_by_game.get(gid, [])
 
-    def _has_penalty_by_team(gid: int, team: int, period: Optional[str] = None) -> bool:
+    def _penalty_count_by_team_reg(gid: int, team: int) -> int:
+        c = 0
         for ev in _evs(gid):
             if ev.get("type") != "penalty":
                 continue
-            if period is not None and _norm_period(ev.get("period")) != _norm_period(period):
+            if not _is_reg_period(ev.get("period")):
                 continue
             tid = _safe_int(ev.get("team_id"))
             if tid == team:
-                return True
-        return False
+                c += 1
+        return c
 
-    def _has_goal_by_comment(gid: int, team: int, keyword: str, period: Optional[str] = None) -> bool:
+    def _goal_count_by_comment_reg(gid: int, team: int, keyword: str) -> int:
         kw = (keyword or "").strip().lower()
+        c = 0
         for ev in _evs(gid):
             if ev.get("type") != "goal":
                 continue
-            if period is not None and _norm_period(ev.get("period")) != _norm_period(period):
+            if not _is_reg_period(ev.get("period")):
                 continue
             tid = _safe_int(ev.get("team_id"))
             if tid != team:
                 continue
-            c = (ev.get("comment") or "").strip().lower()
-            if kw in c:
-                return True
-        return False
+            com = (ev.get("comment") or "").strip().lower()
+            if kw and kw in com:
+                c += 1
+        return c
 
     def _first_goal_scored_by_team(gid: int, team: int, period: Optional[str] = None) -> Optional[bool]:
-        # goal_by_game에는 comment가 없어서 순서만 사용
         evs = goal_by_game.get(gid, [])
         if not evs:
             return None
-        # period 지정이면 그 period 안에서만 first goal
         if period is not None:
             p = _norm_period(period)
             pevs = [e for e in evs if _norm_period(e.get("period")) == p]
@@ -1013,7 +981,6 @@ def hockey_get_game_insights(
                 return None
             first = min(pevs, key=_event_sort_key)
         else:
-            # 게임 전체 first goal
             first = min(evs, key=_event_sort_key)
 
         tid = _safe_int(first.get("team_id"))
@@ -1021,8 +988,34 @@ def hockey_get_game_insights(
             return None
         return tid == team
 
+    def _avg_by_bucket(get_count) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            n = len(ids)
+            if n <= 0:
+                out[b] = None
+                continue
+            s = 0
+            for gid in ids:
+                s += int(get_count(gid))
+            out[b] = float(s) / float(n)
+        return out
+
+    def _rate_by_bucket(get_num, get_den) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids = iter_bucket(b)
+            num_sum = 0
+            den_sum = 0
+            for gid in ids:
+                num_sum += int(get_num(gid))
+                den_sum += int(get_den(gid))
+            out[b] = _safe_div(num_sum, den_sum)  # den_sum==0 -> None
+        return out
+
     # ─────────────────────────────────────────
-    # NEW) 섹션: Full Time (Regular Time)
+    # NEW) 섹션: Full Time (Regular Time)  ✅ 네가 준 항목(AVG/Rate) 포함
     # ─────────────────────────────────────────
     def _ft_result_prob(result: str) -> Dict[str, Optional[float]]:
         def pred(gid: int) -> bool:
@@ -1034,49 +1027,51 @@ def hockey_get_game_insights(
         gf, _ = _reg_scores(gid)
         return gf
 
-    def _ft_total_goals(gid: int) -> int:
-        gf, ga = _reg_scores(gid)
-        return gf + ga
-
     def _ft_opp_goals(gid: int) -> int:
         _, ga = _reg_scores(gid)
         return ga
 
-    def _ft_pp_occurred_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            _, opp = _team_and_opp_ids(gid)
-            if opp is None:
-                return False
-            # 상대가 받은 페널티가 있으면 우리 PP 발생
-            return _has_penalty_by_team(gid, opp, period=None)
-        return _bool_prob(pred)
-
-    def _ft_penalty_occurred_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            return _has_penalty_by_team(gid, sel_team_id, period=None)
-        return _bool_prob(pred)
-
-    def _ft_pp_goal_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            # comment: "Power-play" / "Power-" 등이 있으니 power로 통일
-            return _has_goal_by_comment(gid, sel_team_id, "power", period=None)
-        return _bool_prob(pred)
-
-    def _ft_shg_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            return _has_goal_by_comment(gid, sel_team_id, "short", period=None)
-        return _bool_prob(pred)
-
-    def _ft_clean_sheet_prob() -> Dict[str, Optional[float]]:
-        def pred(gid: int) -> bool:
-            return _ft_opp_goals(gid) == 0
-        return _bool_prob(pred)
+    def _ft_total_goals(gid: int) -> int:
+        gf, ga = _reg_scores(gid)
+        return gf + ga
 
     def _ft_first_goal_scored_prob() -> Dict[str, Optional[float]]:
         def pred(gid: int) -> bool:
             v = _first_goal_scored_by_team(gid, sel_team_id, period=None)
             return v is True
         return _bool_prob(pred)
+
+    def _ft_pp_opportunities(gid: int) -> int:
+        # 우리 PP 기회 = 상대 팀 penalty 수 (정규시간)
+        _, opp = _team_and_opp_ids(gid)
+        if opp is None:
+            return 0
+        return _penalty_count_by_team_reg(gid, opp)
+
+    def _ft_pk_opportunities(gid: int) -> int:
+        # 우리 PK 기회 = 우리 penalty 수 (정규시간)
+        return _penalty_count_by_team_reg(gid, sel_team_id)
+
+    def _ft_team_pp_goals(gid: int) -> int:
+        return _goal_count_by_comment_reg(gid, sel_team_id, "power")
+
+    def _ft_team_sh_goals(gid: int) -> int:
+        return _goal_count_by_comment_reg(gid, sel_team_id, "short")
+
+    def _ft_opp_pp_goals(gid: int) -> int:
+        _, opp = _team_and_opp_ids(gid)
+        if opp is None:
+            return 0
+        return _goal_count_by_comment_reg(gid, opp, "power")
+
+    def _ft_opp_sh_goals(gid: int) -> int:
+        _, opp = _team_and_opp_ids(gid)
+        if opp is None:
+            return 0
+        return _goal_count_by_comment_reg(gid, opp, "short")
+
+    def _ft_clean_sheet_prob() -> Dict[str, Optional[float]]:
+        return _bool_prob(lambda gid: _ft_opp_goals(gid) == 0)
 
     sec_full_time = _build_section(
         title="Full Time (Regular Time)",
@@ -1086,17 +1081,24 @@ def hockey_get_game_insights(
             {"label": "Loss", "values": _triple(_ft_result_prob("L"))},
 
             {"label": "First Goal Scored", "values": _triple(_ft_first_goal_scored_prob())},
-            {"label": "Power Play Occurred", "values": _triple(_ft_pp_occurred_prob())},
-            {"label": "Power Play Goal", "values": _triple(_ft_pp_goal_prob())},
-            {"label": "Penalty Occurred", "values": _triple(_ft_penalty_occurred_prob())},
-            {"label": "Short-Handed Goal", "values": _triple(_ft_shg_prob())},
+
+            # ✅ 네가 요구한 AVG/Rate 세트
+            {"label": "Power Play Occurred (AVG)", "values": _triple(_avg_by_bucket(_ft_pp_opportunities))},
+            {"label": "Penalty Occurred (AVG)", "values": _triple(_avg_by_bucket(_ft_pk_opportunities))},
+
+            {"label": "PP Goal Rate (PPG/PP)", "values": _triple(_rate_by_bucket(_ft_team_pp_goals, _ft_pp_opportunities))},
+            {"label": "Concede Rate on PP (SHGA/PP)", "values": _triple(_rate_by_bucket(_ft_opp_sh_goals, _ft_pp_opportunities))},
+
+            {"label": "SH Goal Rate (SHG/PK)", "values": _triple(_rate_by_bucket(_ft_team_sh_goals, _ft_pk_opportunities))},
+            {"label": "Concede Rate on PK (PPGA/PK)", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
+
             {"label": "Clean Sheet", "values": _triple(_ft_clean_sheet_prob())},
 
-            {"label": "Team Over 0.5 Goals", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
-            {"label": "Team Over 1.5 Goals", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
-            {"label": "Team Over 2.5 Goals", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
-            {"label": "Team Over 3.5 Goals", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
-            {"label": "Team Over 4.5 Goals", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
+            {"label": "Team Goals Over 0.5", "values": _triple(_count_ge_prob(1, _ft_team_goals))},
+            {"label": "Team Goals Over 1.5", "values": _triple(_count_ge_prob(2, _ft_team_goals))},
+            {"label": "Team Goals Over 2.5", "values": _triple(_count_ge_prob(3, _ft_team_goals))},
+            {"label": "Team Goals Over 3.5", "values": _triple(_count_ge_prob(4, _ft_team_goals))},
+            {"label": "Team Goals Over 4.5", "values": _triple(_count_ge_prob(5, _ft_team_goals))},
 
             {"label": "Total Goals Over 1.5", "values": _triple(_count_ge_prob(2, _ft_total_goals))},
             {"label": "Total Goals Over 2.5", "values": _triple(_count_ge_prob(3, _ft_total_goals))},
@@ -1150,23 +1152,6 @@ def hockey_get_game_insights(
                 return v is True
             return _bool_prob(pred)
 
-        def pp_occurred_prob() -> Dict[str, Optional[float]]:
-            def pred(gid: int) -> bool:
-                _, opp = _team_and_opp_ids(gid)
-                if opp is None:
-                    return False
-                return _has_penalty_by_team(gid, opp, period=p)
-            return _bool_prob(pred)
-
-        def penalty_prob() -> Dict[str, Optional[float]]:
-            return _bool_prob(lambda gid: _has_penalty_by_team(gid, sel_team_id, period=p))
-
-        def pp_goal_prob() -> Dict[str, Optional[float]]:
-            return _bool_prob(lambda gid: _has_goal_by_comment(gid, sel_team_id, "power", period=p))
-
-        def shg_prob() -> Dict[str, Optional[float]]:
-            return _bool_prob(lambda gid: _has_goal_by_comment(gid, sel_team_id, "short", period=p))
-
         def clean_sheet_prob() -> Dict[str, Optional[float]]:
             return _bool_prob(lambda gid: opp_goals(gid) == 0)
 
@@ -1176,10 +1161,6 @@ def hockey_get_game_insights(
             {"label": "Loss", "values": _triple(result_prob("L"))},
 
             {"label": f"First Goal in {p}", "values": _triple(first_goal_prob())},
-            {"label": "Power Play Occurred", "values": _triple(pp_occurred_prob())},
-            {"label": "Power Play Goal", "values": _triple(pp_goal_prob())},
-            {"label": "Penalty Occurred", "values": _triple(penalty_prob())},
-            {"label": "Short-Handed Goal", "values": _triple(shg_prob())},
             {"label": "Clean Sheet", "values": _triple(clean_sheet_prob())},
 
             {"label": "Team Over 0.5 Goals", "values": _triple(_count_ge_prob(1, team_goals))},
@@ -1231,7 +1212,7 @@ def hockey_get_game_insights(
         title="Overtime (OT)",
         rows=[
             {"label": "Overtime Win", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is True)))},
-            {"label": "Overtime Draw (Shootout Reached)", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP")))} ,
+            {"label": "Overtime Draw (Shootout Reached)", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AP")))},
             {"label": "Overtime Loss", "values": _triple(_bool_prob(lambda gid: (_status(gid) == "AOT" and _final_winner_is_team(gid, sel_team_id) is False)))},
         ],
     )
@@ -1249,7 +1230,6 @@ def hockey_get_game_insights(
     # ─────────────────────────────────────────
     def _period_result(gid: int, period: str) -> Optional[str]:
         gf, ga = _period_scores(gid, period)
-        # 득점이 둘 다 0이어도 Draw로 취급 (전이표에 필요)
         return _result_from_scores(gf, ga)
 
     def _transition_prob(from_p: str, to_p: str, from_res: str, to_res: str) -> Dict[str, Optional[float]]:
@@ -1270,13 +1250,11 @@ def hockey_get_game_insights(
         return out
 
     trans_rows: List[Dict[str, Any]] = []
-    # 1P -> 2P
     for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
         trans_rows.append({"label": f"1P {fr_label} → 2P Win Probability", "values": _triple(_transition_prob("P1", "P2", fr, "W"))})
         trans_rows.append({"label": f"1P {fr_label} → 2P Draw Probability", "values": _triple(_transition_prob("P1", "P2", fr, "D"))})
         trans_rows.append({"label": f"1P {fr_label} → 2P Loss Probability", "values": _triple(_transition_prob("P1", "P2", fr, "L"))})
 
-    # 2P -> 3P
     for fr_label, fr in [("Win", "W"), ("Draw", "D"), ("Loss", "L")]:
         trans_rows.append({"label": f"2P {fr_label} → 3P Win Probability", "values": _triple(_transition_prob("P2", "P3", fr, "W"))})
         trans_rows.append({"label": f"2P {fr_label} → 3P Draw Probability", "values": _triple(_transition_prob("P2", "P3", fr, "D"))})
@@ -1287,29 +1265,26 @@ def hockey_get_game_insights(
         rows=trans_rows,
     )
 
-        
-
     sections = [
-    sec_full_time,
+        sec_full_time,
 
-    sec_1p,
-    sec_2p,
-    sec_3p_period,
+        sec_1p,
+        sec_2p,
+        sec_3p_period,
 
-    sec_ot,
-    sec_so,
+        sec_ot,
+        sec_so,
 
-    sec_transitions,
+        sec_transitions,
 
-    # 3rd Period Clutch Situations (이미 구현된 것들)
-    sec_last,
-    sec_p3,
-    sec_fg,
+        # 3rd Period Clutch Situations (이미 구현된 것들)
+        sec_last,
+        sec_p3,
+        sec_fg,
 
-    # Goal Timing (이미 구현됨)
-    sec_goal_time,
-]
-
+        # Goal Timing (이미 구현됨)
+        sec_goal_time,
+    ]
 
     return {
         "ok": True,
@@ -1333,3 +1308,4 @@ def hockey_get_game_insights(
             },
         },
     }
+
