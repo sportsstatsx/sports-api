@@ -76,8 +76,10 @@ def route_hockey_games():
 
 
     # ✅ 진행중만 보고 싶을 때
+    # BT(Break Time, 인터미션)도 "진행중"으로 취급해야 라이브 목록에서 사라지지 않는다.
     if live == 1:
-        where.append("status IN ('P1','P2','P3','OT','SO')")
+        where.append("status IN ('P1','P2','P3','BT','OT','SO')")
+
 
     where_sql = ""
     if where:
