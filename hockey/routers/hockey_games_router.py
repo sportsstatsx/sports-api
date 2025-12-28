@@ -25,7 +25,12 @@ def route_hockey_games():
     season: Optional[int] = request.args.get("season", type=int)
     league_id: Optional[int] = request.args.get("league_id", type=int)
     limit: int = request.args.get("limit", type=int) or 50
-    live: int = request.args.get("live", type=int) or 0
+
+    # ✅ live 파라미터는 앱/클라에서 "1" 말고 "true" 등으로 올 수 있어서 문자열도 허용한다.
+    live_raw = request.args.get("live", default="0")
+    live_s = str(live_raw).strip().lower()
+    live: int = 1 if live_s in ("1", "true", "t", "yes", "y", "on", "live") else 0
+
 
     # ✅ ids 파싱 ("1,2,3" → [1,2,3])
     ids: List[int] = []
