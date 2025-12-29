@@ -5,12 +5,7 @@ from typing import Any, Dict, Optional, List
 
 from db import fetch_all
 from services.insights.insights_overall_outcome_totals import enrich_overall_outcome_totals
-from services.insights.insights_overall_timing import enrich_overall_timing
-from services.insights.insights_overall_firstgoal_momentum import enrich_overall_firstgoal_momentum
-from services.insights.insights_overall_shooting_efficiency import enrich_overall_shooting_efficiency
-from services.insights.insights_overall_discipline_setpieces import enrich_overall_discipline_setpieces
 from services.insights.insights_overall_goalsbytime import enrich_overall_goals_by_time
-from services.insights.insights_overall_resultscombos_draw import enrich_overall_resultscombos_draw
 from services.insights.utils import parse_last_n, normalize_comp
 
 
@@ -349,9 +344,7 @@ def _build_side_insights(
     # 섹션들에서 공통으로 사용할 필터 정보
     stats["insights_filters"] = merged_filters
 
-    # 아래 모든 섹션은 동일한 stats["insights_filters"] 기준으로
-    # league_ids_for_query + last_n 을 적용해서 같은 샘플을 사용한다.
-
+    # ✅ 유지: Outcome + Totals
     enrich_overall_outcome_totals(
         stats,
         insights,
@@ -362,44 +355,7 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    enrich_overall_timing(
-        stats,
-        insights,
-        league_id=league_id,
-        season_int=season_int,
-        team_id=team_id,
-        last_n=last_n,
-    )
-
-    enrich_overall_firstgoal_momentum(
-        stats,
-        insights,
-        league_id=league_id,
-        season_int=season_int,
-        team_id=team_id,
-        last_n=last_n,
-    )
-
-    enrich_overall_shooting_efficiency(
-        stats,
-        insights,
-        league_id=league_id,
-        season_int=season_int,
-        team_id=team_id,
-        matches_total_api=0,
-        last_n=last_n,
-    )
-
-    enrich_overall_discipline_setpieces(
-        stats,
-        insights,
-        league_id=league_id,
-        season_int=season_int,
-        team_id=team_id,
-        matches_total_api=0,
-        last_n=last_n,
-    )
-
+    # ✅ 유지: Goals by Time
     enrich_overall_goals_by_time(
         stats,
         insights,
@@ -409,14 +365,6 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    enrich_overall_resultscombos_draw(
-        stats,
-        insights,
-        league_id=league_id,
-        season_int=season_int,
-        team_id=team_id,
-        matches_total_api=0,
-    )
 
     # ───────── Game Sample 홈/원정 분포 계산 ─────────
     events_sample = insights.get("events_sample")
