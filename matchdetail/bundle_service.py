@@ -9,7 +9,7 @@ from .lineups_block import build_lineups_block
 from .stats_block import build_stats_block
 from .h2h_block import build_h2h_block
 from .standings_block import build_standings_block
-from services.insights.football_insights_overall import build_insights_overall_block
+from services.insights.football_insights_overall import build_insights_block
 from .ai_predictions_block import build_ai_predictions_block
 
 
