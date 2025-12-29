@@ -4,9 +4,12 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
 from db import fetch_all
-from services.insights.insights_overall_outcome_totals import enrich_overall_outcome_totals
-from services.insights.insights_overall_goalsbytime import enrich_overall_goals_by_time
+from services.insights.football_insights_overall import (
+    enrich_overall_outcome_totals,
+    enrich_overall_goals_by_time,
+)
 from services.insights.utils import parse_last_n, normalize_comp
+
 
 
 
