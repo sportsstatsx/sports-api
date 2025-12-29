@@ -9,15 +9,11 @@ import pytz
 from db import fetch_all
 
 from .insights.football_insights_overall import (
-    enrich_overall_shooting_efficiency,
     enrich_overall_outcome_totals,
     enrich_overall_goals_by_time,
-    enrich_overall_timing,
-    enrich_overall_firstgoal_momentum,
-    enrich_overall_discipline_setpieces,
-    normalize_comp,
-    parse_last_n,
 )
+from .insights.utils import normalize_comp, parse_last_n
+
 
 from .league_directory_service import build_league_directory
 
