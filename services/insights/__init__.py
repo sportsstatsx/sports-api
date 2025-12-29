@@ -9,6 +9,10 @@ Insights 패키지.
 """
 
 __all__ = [
-    "football_insights_overall",
+    "insights_overall_shooting_efficiency",
+    "insights_overall_outcome_totals",
+    "insights_overall_goalsbytime",
+    "insights_overall_timing",
+    "insights_overall_firstgoal_momentum",
+    "insights_overall_discipline_setpieces",
 ]
-
