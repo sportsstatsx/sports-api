@@ -8,23 +8,14 @@ import pytz
 
 from db import fetch_all
 
-from .insights.insights_overall_shooting_efficiency import (
-    enrich_overall_shooting_efficiency,
-)
 from .insights.insights_overall_outcome_totals import (
     enrich_overall_outcome_totals,
 )
 from .insights.insights_overall_goalsbytime import (
     enrich_overall_goals_by_time,
 )
-from .insights.insights_overall_timing import enrich_overall_timing
-from .insights.insights_overall_firstgoal_momentum import (
-    enrich_overall_firstgoal_momentum,
-)
-from .insights.insights_overall_discipline_setpieces import (
-    enrich_overall_discipline_setpieces,
-)
 from .insights.utils import normalize_comp, parse_last_n
+
 from .league_directory_service import build_league_directory
 
 
@@ -626,81 +617,37 @@ def get_team_season_stats(
     except (TypeError, ValueError):
         season_int = None
 
-    # season_int 가 있어야 나머지 enrich_* 계산 가능
-    if season_int is not None:
-        # Shooting & Efficiency
-        try:
-            enrich_overall_shooting_efficiency(
-                stats,
-                insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-                matches_total_api=matches_total_api,
-            )
-        except Exception:
-            pass
+    if last_n_int and last_n_int > 0 and season_int_meta is not None:
+        season_int = season_int_meta
 
-        # Outcome & Totals + Result Combos & Draw
+        # ✅ Outcome & Totals (Last N)
         try:
             enrich_overall_outcome_totals(
-                stats,
-                insights,
+                stats=value,
+                insights=insights,
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                matches_total_api=0,
+                last_n=last_n_int,
             )
         except Exception:
             pass
 
-        # Goals by Time (For / Against)
+        # ✅ Goals by Time (Last N)
         try:
             enrich_overall_goals_by_time(
-                stats,
-                insights,
+                stats=value,
+                insights=insights,
                 league_id=league_id,
                 season_int=season_int,
                 team_id=team_id,
+                last_n=last_n_int,
             )
         except Exception:
             pass
 
-        # Discipline & Set Pieces
-        try:
-            enrich_overall_discipline_setpieces(
-                stats,
-                insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-                matches_total_api=matches_total_api,
-            )
-        except Exception:
-            pass
 
-        # Timing
-        try:
-            enrich_overall_timing(
-                stats,
-                insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-            )
-        except Exception:
-            pass
-
-        # First Goal & Momentum
-        try:
-            enrich_overall_firstgoal_momentum(
-                stats,
-                insights,
-                league_id=league_id,
-                season_int=season_int,
-                team_id=team_id,
-            )
-        except Exception:
-            pass
 
     # 최종 결과 row 형태로 반환
     return {
