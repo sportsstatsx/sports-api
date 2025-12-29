@@ -8,13 +8,23 @@ import pytz
 
 from db import fetch_all
 
-from .insights.football_insights_overall import (
+from .insights.insights_overall_shooting_efficiency import (
+    enrich_overall_shooting_efficiency,
+)
+from .insights.insights_overall_outcome_totals import (
     enrich_overall_outcome_totals,
+)
+from .insights.insights_overall_goalsbytime import (
     enrich_overall_goals_by_time,
 )
+from .insights.insights_overall_timing import enrich_overall_timing
+from .insights.insights_overall_firstgoal_momentum import (
+    enrich_overall_firstgoal_momentum,
+)
+from .insights.insights_overall_discipline_setpieces import (
+    enrich_overall_discipline_setpieces,
+)
 from .insights.utils import normalize_comp, parse_last_n
-
-
 from .league_directory_service import build_league_directory
 
 
