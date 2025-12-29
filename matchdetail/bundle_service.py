@@ -9,7 +9,7 @@ from .lineups_block import build_lineups_block
 from .stats_block import build_stats_block
 from .h2h_block import build_h2h_block
 from .standings_block import build_standings_block
-from .insights_block import build_insights_overall_block
+from .insights_block import build_team_insights_overall_block
 from .ai_predictions_block import build_ai_predictions_block
 
 
@@ -55,7 +55,74 @@ def get_match_detail_bundle(
     standings = build_standings_block(header)
 
     # 🔥 여기서부터 comp + last_n 필터를 사용하는 insights 계산
-    insights_overall = build_insights_overall_block(header)
+    filters_for_client = header.get("filters") or {}
+    if not isinstance(filters_for_client, dict):
+        filters_for_client = {}
+
+    # header.filters 우선, 없으면 함수 인자 comp/last_n 사용
+    comp_val = filters_for_client.get("comp", comp)
+    last_n_val = filters_for_client.get("last_n", last_n)
+
+    def _pick_team_id(h: Dict[str, Any], side: str) -> Optional[int]:
+        """
+        header 구조가 버전마다 달라도 team_id를 최대한 뽑는다.
+        """
+        candidates = [
+            h.get(f"{side}_team_id"),
+            (h.get(side) or {}).get("team_id") if isinstance(h.get(side), dict) else None,
+            (h.get(side) or {}).get("id") if isinstance(h.get(side), dict) else None,
+            ((h.get("teams") or {}).get(side) or {}).get("id")
+            if isinstance(h.get("teams"), dict) and isinstance((h.get("teams") or {}).get(side), dict)
+            else None,
+            ((h.get("teams") or {}).get(side) or {}).get("team_id")
+            if isinstance(h.get("teams"), dict) and isinstance((h.get("teams") or {}).get(side), dict)
+            else None,
+        ]
+        for v in candidates:
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    home_team_id = _pick_team_id(header, "home")
+    away_team_id = _pick_team_id(header, "away")
+
+    home_ins: Dict[str, Any] = {}
+    away_ins: Dict[str, Any] = {}
+
+    if home_team_id is not None:
+        home_ins = build_team_insights_overall_block(
+            league_id=league_id,
+            season=season,
+            team_id=home_team_id,
+            comp=comp_val or "All",
+            last_n=last_n_val or 0,
+        )
+
+    if away_team_id is not None:
+        away_ins = build_team_insights_overall_block(
+            league_id=league_id,
+            season=season,
+            team_id=away_team_id,
+            comp=comp_val or "All",
+            last_n=last_n_val or 0,
+        )
+
+    # ✅ (중요) 예전 build_insights_overall_block(header)와 동일한 스키마로 맞춤
+    insights_overall = {
+        "league_id": league_id,
+        "season": season,
+        "last_n": last_n_val,
+        "home_team_id": home_team_id,
+        "away_team_id": away_team_id,
+        "filters": filters_for_client,
+        "home": home_ins,
+        "away": away_ins,
+    }
+
 
 
 
