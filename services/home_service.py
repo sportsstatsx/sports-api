@@ -8,13 +8,13 @@ import pytz
 
 from db import fetch_all
 
-from .insights.insights_overall_outcome_totals import (
+from matchdetail.insights_block import (
     enrich_overall_outcome_totals,
-)
-from .insights.insights_overall_goalsbytime import (
     enrich_overall_goals_by_time,
+    parse_last_n,
+    normalize_comp,
 )
-from .insights.utils import normalize_comp, parse_last_n
+
 
 from .league_directory_service import build_league_directory
 
