@@ -602,6 +602,12 @@ def enrich_overall_outcome_totals(
                 else:
                     own_red_num_a += 1
 
+    # ✅ Game Sample: 이 섹션 계산에 실제 사용된 경기 수(Last N 반영)
+    insights["events_sample"] = eff_tot
+    insights["events_sample_home"] = eff_home
+    insights["events_sample_away"] = eff_away
+
+
     # ─────────────────────────────────────
     # 5) insights 키(앱이 쓰는 구조)로 세팅
     # ─────────────────────────────────────
@@ -1952,6 +1958,11 @@ def _build_side_insights(
         last_n=last_n,
     )
 
+    # ✅ 1H/2H 함수가 stats["insights_overall"]에 써둔 값을 insights로 병합
+    for k, v in (stats.get("insights_overall") or {}).items():
+        if k not in insights:
+            insights[k] = v
+
     # ✅ 유지: Goals by Time
     enrich_overall_goals_by_time(
         stats,
@@ -1963,9 +1974,14 @@ def _build_side_insights(
     )
 
 
+
     # ───────── Game Sample 홈/원정 분포 계산 ─────────
     events_sample = insights.get("events_sample")
-    if isinstance(events_sample, (int, float)) and events_sample > 0:
+    if (
+        isinstance(events_sample, (int, float))
+        and events_sample > 0
+        and ("events_sample_home" not in insights or "events_sample_away" not in insights)
+    ):
         sample_split = _compute_events_sample_home_away(
             season_int=season_int,
             team_id=team_id,
@@ -1973,10 +1989,11 @@ def _build_side_insights(
             filters=stats.get("insights_filters", {}),
             events_sample=int(events_sample),
         )
-        if sample_split.get("events_sample_home") is not None:
+        if "events_sample_home" not in insights and sample_split.get("events_sample_home") is not None:
             insights["events_sample_home"] = sample_split["events_sample_home"]
-        if sample_split.get("events_sample_away") is not None:
+        if "events_sample_away" not in insights and sample_split.get("events_sample_away") is not None:
             insights["events_sample_away"] = sample_split["events_sample_away"]
+
 
     return insights
 
