@@ -524,6 +524,29 @@ def upsert_match_events_raw(
         ),
     )
 
+def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: dict) -> None:
+    """
+    fixtures 원본(단일 fixture response object)을 match_fixtures_raw에 저장/갱신한다.
+    - B안: HT/기타 정보는 나중에 필요할 때 raw에서 꺼내 쓰거나, 별도 컬럼에 미러링할 수 있게 원본을 보관.
+    """
+    import json
+
+    # 최대한 그대로 저장(UTF-8 보존)
+    raw = json.dumps(fixture_obj, ensure_ascii=False)
+
+    execute(
+        """
+        INSERT INTO match_fixtures_raw (fixture_id, data_json, fetched_at, updated_at)
+        VALUES (%s, %s, now(), now())
+        ON CONFLICT (fixture_id) DO UPDATE
+        SET data_json = EXCLUDED.data_json,
+            fetched_at = now(),
+            updated_at = now()
+        """,
+        (fixture_id, raw),
+    )
+
+
 
 def upsert_match_lineups(
     fixture_id: int,
