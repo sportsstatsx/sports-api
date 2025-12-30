@@ -262,8 +262,12 @@ def main() -> None:
                 date_utc = basic["date_utc"]
                 elapsed = basic.get("elapsed")
 
+                # ✅ raw fixtures 저장 (항상 1번)
+                upsert_match_fixtures_raw(fixture_id, fx)
+
                 # 3) matches row 상태/스코어/elapsed 갱신 (NS / INPLAY / FINISHED 공통)
                 upsert_match_row(fx, lid, None)
+
 
                 # 4) FINISHED 경기는 여기서 라이브 처리만 스킵
                 #    (라인업 / 이벤트 / 스탯 같은 추가 작업만 막고, matches 갱신은 이미 위에서 한 번 수행)
