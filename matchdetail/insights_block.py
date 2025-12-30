@@ -87,9 +87,11 @@ def normalize_comp(raw: Any) -> str:
     if "acl" in lower or "afc champions" in lower or "continental" in lower:
         return "ACL"
 
+    return s
 
 
 def parse_last_n(raw: Any) -> int:
+
     """
     UI에서 내려오는 lastN 값을 안전하게 정수 N 으로 변환.
     """
@@ -1470,6 +1472,513 @@ def enrich_overall_2h_performance(
     insights["h2_red_avg"] = {"total": fmt_avg(r_sum_t, eff_tot), "home": fmt_avg(r_sum_h, eff_home), "away": fmt_avg(r_sum_a, eff_away)}
 
 
+def enrich_overall_game_state(
+    stats: Dict[str, Any],
+    insights: Dict[str, Any],
+    *,
+    league_id: int,
+    season_int: Optional[int],
+    team_id: int,
+    last_n: Optional[int] = None,
+) -> None:
+    """
+    Game State 섹션:
+      - First Score Impact (FT)
+      - HT State (HT 스코어 상태별 FT 결과)
+      - Clutch (80'/85')
+    """
+    if not season_int:
+        return
+
+    league_ids_for_query = build_league_ids_for_query(stats, league_id)
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    base_sql = f"""
+        SELECT
+            m.fixture_id,
+            m.home_id,
+            m.away_id,
+            m.home_ht,
+            m.away_ht,
+            m.home_ft,
+            m.away_ft,
+            m.status_group,
+            m.date_utc
+        FROM matches m
+        WHERE m.league_id IN ({placeholders})
+          AND m.season    = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+          AND lower(m.status_group) = 'finished'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
+          AND m.home_ht IS NOT NULL
+          AND m.away_ht IS NOT NULL
+        ORDER BY m.date_utc DESC
+    """
+
+    params: List[Any] = []
+    params.extend(league_ids_for_query)
+    params.extend([season_int, team_id, team_id])
+
+    rows = fetch_all(base_sql, tuple(params)) or []
+    if not rows:
+        return
+
+    if last_n and last_n > 0:
+        rows = rows[:last_n]
+
+    fixture_ids: List[int] = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+    if not fixture_ids:
+        return
+
+    # goals (FT 범위만)
+    in_fix = ",".join(["%s"] * len(fixture_ids))
+    goals_sql = f"""
+        SELECT
+            e.id,
+            e.fixture_id,
+            e.team_id,
+            e.minute,
+            COALESCE(e.extra, 0) AS extra
+        FROM match_events e
+        WHERE e.fixture_id IN ({in_fix})
+          AND lower(e.type) = 'goal'
+          AND e.minute <= 90
+        ORDER BY e.fixture_id, e.minute, COALESCE(e.extra,0), e.id
+    """
+    g_rows = fetch_all(goals_sql, tuple(fixture_ids)) or []
+    goals_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
+    for g in g_rows:
+        try:
+            fx = int(g.get("fixture_id"))
+        except Exception:
+            continue
+        goals_by_fixture.setdefault(fx, []).append(g)
+
+    # ─────────────────────────────
+    # 카운터들
+    # ─────────────────────────────
+    eff_tot = len(rows)
+    eff_home = 0
+    eff_away = 0
+
+    # First Score Impact (분모=FS / FC)
+    fs_den_t = fs_den_h = fs_den_a = 0
+    fs_w_t = fs_d_t = fs_l_t = 0
+    fs_w_h = fs_d_h = fs_l_h = 0
+    fs_w_a = fs_d_a = fs_l_a = 0
+
+    fc_den_t = fc_den_h = fc_den_a = 0
+    fc_w_t = fc_d_t = fc_l_t = 0
+    fc_w_h = fc_d_h = fc_l_h = 0
+    fc_w_a = fc_d_a = fc_l_a = 0
+
+    # HT State 분모/분자
+    # Lead/Draw/Trail/00 각각 W/D/L
+    ht_lead_den_t = ht_lead_den_h = ht_lead_den_a = 0
+    ht_lead_w_t = ht_lead_d_t = ht_lead_l_t = 0
+    ht_lead_w_h = ht_lead_d_h = ht_lead_l_h = 0
+    ht_lead_w_a = ht_lead_d_a = ht_lead_l_a = 0
+
+    ht_draw_den_t = ht_draw_den_h = ht_draw_den_a = 0
+    ht_draw_w_t = ht_draw_d_t = ht_draw_l_t = 0
+    ht_draw_w_h = ht_draw_d_h = ht_draw_l_h = 0
+    ht_draw_w_a = ht_draw_d_a = ht_draw_l_a = 0
+
+    ht_trail_den_t = ht_trail_den_h = ht_trail_den_a = 0
+    ht_trail_w_t = ht_trail_d_t = ht_trail_l_t = 0
+    ht_trail_w_h = ht_trail_d_h = ht_trail_l_h = 0
+    ht_trail_w_a = ht_trail_d_a = ht_trail_l_a = 0
+
+    ht_00_den_t = ht_00_den_h = ht_00_den_a = 0
+    ht_00_w_t = ht_00_d_t = ht_00_l_t = 0
+    ht_00_w_h = ht_00_d_h = ht_00_l_h = 0
+    ht_00_w_a = ht_00_d_a = ht_00_l_a = 0
+
+    # Clutch 80' Draw → FT W/D/L
+    c80_draw_den_t = c80_draw_den_h = c80_draw_den_a = 0
+    c80_draw_w_t = c80_draw_d_t = c80_draw_l_t = 0
+    c80_draw_w_h = c80_draw_d_h = c80_draw_l_h = 0
+    c80_draw_w_a = c80_draw_d_a = c80_draw_l_a = 0
+
+    # 80~FT 이벤트 확률(분모=전체 FT 경기)
+    team_score80_t = team_score80_h = team_score80_a = 0
+    team_concede80_t = team_concede80_h = team_concede80_a = 0
+    total80_over05_t = total80_over05_h = total80_over05_a = 0
+
+    # 85~FT 총득점 0.5+
+    total85_over05_t = total85_over05_h = total85_over05_a = 0
+
+    def _result_bucket(gf: int, ga: int) -> str:
+        if gf > ga:
+            return "W"
+        if gf == ga:
+            return "D"
+        return "L"
+
+    def _score_at_minute(goals: List[Dict[str, Any]], home_id: int, away_id: int, cut_min: int) -> tuple[int, int]:
+        """
+        cut_min 기준(<= cut_min)까지의 누적 스코어(홈,원정)
+        """
+        hs = 0
+        a_s = 0
+        for g in goals:
+            try:
+                m = int(g.get("minute") or 0)
+            except Exception:
+                continue
+            if m > cut_min:
+                continue
+            tid = g.get("team_id")
+            if tid is None:
+                continue
+            try:
+                tid = int(tid)
+            except Exception:
+                continue
+            if tid == home_id:
+                hs += 1
+            elif tid == away_id:
+                a_s += 1
+        return hs, a_s
+
+    def _any_goal_in_window(goals: List[Dict[str, Any]], *, team: Optional[int], gt_min: int) -> bool:
+        """
+        minute > gt_min 인 구간에 goal 존재?
+        team=None이면 어떤 팀이든 상관없이 하나라도
+        """
+        for g in goals:
+            try:
+                m = int(g.get("minute") or 0)
+            except Exception:
+                continue
+            if m <= gt_min:
+                continue
+            tid = g.get("team_id")
+            if tid is None:
+                continue
+            try:
+                tid = int(tid)
+            except Exception:
+                continue
+            if team is None:
+                return True
+            if tid == team:
+                return True
+        return False
+
+    # ─────────────────────────────
+    # 경기별 집계
+    # ─────────────────────────────
+    for r in rows:
+        try:
+            fx = int(r.get("fixture_id"))
+            home_id = int(r.get("home_id"))
+            away_id = int(r.get("away_id"))
+            home_ht = int(r.get("home_ht"))
+            away_ht = int(r.get("away_ht"))
+            home_ft = int(r.get("home_ft"))
+            away_ft = int(r.get("away_ft"))
+        except Exception:
+            continue
+
+        is_home = (home_id == team_id)
+        is_away = (away_id == team_id)
+        if not (is_home or is_away):
+            continue
+
+        if is_home:
+            eff_home += 1
+            gf_ft = home_ft
+            ga_ft = away_ft
+            gf_ht = home_ht
+            ga_ht = away_ht
+            opp_id = away_id
+        else:
+            eff_away += 1
+            gf_ft = away_ft
+            ga_ft = home_ft
+            gf_ht = away_ht
+            ga_ht = home_ht
+            opp_id = home_id
+
+        ft_res = _result_bucket(gf_ft, ga_ft)
+
+        goals = goals_by_fixture.get(fx, []) or []
+
+        # ───── First Score Impact ─────
+        first_team: Optional[int] = None
+        if goals:
+            g0 = goals[0]
+            if g0.get("team_id") is not None:
+                try:
+                    first_team = int(g0.get("team_id"))
+                except Exception:
+                    first_team = None
+
+        if first_team == team_id:
+            fs_den_t += 1
+            if is_home:
+                fs_den_h += 1
+            else:
+                fs_den_a += 1
+
+            if ft_res == "W":
+                fs_w_t += 1
+                if is_home:
+                    fs_w_h += 1
+                else:
+                    fs_w_a += 1
+            elif ft_res == "D":
+                fs_d_t += 1
+                if is_home:
+                    fs_d_h += 1
+                else:
+                    fs_d_a += 1
+            else:
+                fs_l_t += 1
+                if is_home:
+                    fs_l_h += 1
+                else:
+                    fs_l_a += 1
+
+        elif first_team == opp_id:
+            fc_den_t += 1
+            if is_home:
+                fc_den_h += 1
+            else:
+                fc_den_a += 1
+
+            if ft_res == "W":
+                fc_w_t += 1
+                if is_home:
+                    fc_w_h += 1
+                else:
+                    fc_w_a += 1
+            elif ft_res == "D":
+                fc_d_t += 1
+                if is_home:
+                    fc_d_h += 1
+                else:
+                    fc_d_a += 1
+            else:
+                fc_l_t += 1
+                if is_home:
+                    fc_l_h += 1
+                else:
+                    fc_l_a += 1
+
+        # ───── HT State ─────
+        if gf_ht == 0 and ga_ht == 0:
+            ht_00_den_t += 1
+            if is_home:
+                ht_00_den_h += 1
+            else:
+                ht_00_den_a += 1
+
+            if ft_res == "W":
+                ht_00_w_t += 1
+                if is_home:
+                    ht_00_w_h += 1
+                else:
+                    ht_00_w_a += 1
+            elif ft_res == "D":
+                ht_00_d_t += 1
+                if is_home:
+                    ht_00_d_h += 1
+                else:
+                    ht_00_d_a += 1
+            else:
+                ht_00_l_t += 1
+                if is_home:
+                    ht_00_l_h += 1
+                else:
+                    ht_00_l_a += 1
+
+        # Lead/Draw/Trail (0-0도 Draw이지만, 너 정의대로 0-0은 별도 트랙으로도 같이 계산)
+        if gf_ht > ga_ht:
+            ht_lead_den_t += 1
+            if is_home:
+                ht_lead_den_h += 1
+            else:
+                ht_lead_den_a += 1
+
+            if ft_res == "W":
+                ht_lead_w_t += 1
+                if is_home:
+                    ht_lead_w_h += 1
+                else:
+                    ht_lead_w_a += 1
+            elif ft_res == "D":
+                ht_lead_d_t += 1
+                if is_home:
+                    ht_lead_d_h += 1
+                else:
+                    ht_lead_d_a += 1
+            else:
+                ht_lead_l_t += 1
+                if is_home:
+                    ht_lead_l_h += 1
+                else:
+                    ht_lead_l_a += 1
+
+        elif gf_ht == ga_ht:
+            ht_draw_den_t += 1
+            if is_home:
+                ht_draw_den_h += 1
+            else:
+                ht_draw_den_a += 1
+
+            if ft_res == "W":
+                ht_draw_w_t += 1
+                if is_home:
+                    ht_draw_w_h += 1
+                else:
+                    ht_draw_w_a += 1
+            elif ft_res == "D":
+                ht_draw_d_t += 1
+                if is_home:
+                    ht_draw_d_h += 1
+                else:
+                    ht_draw_d_a += 1
+            else:
+                ht_draw_l_t += 1
+                if is_home:
+                    ht_draw_l_h += 1
+                else:
+                    ht_draw_l_a += 1
+
+        else:
+            ht_trail_den_t += 1
+            if is_home:
+                ht_trail_den_h += 1
+            else:
+                ht_trail_den_a += 1
+
+            if ft_res == "W":
+                ht_trail_w_t += 1
+                if is_home:
+                    ht_trail_w_h += 1
+                else:
+                    ht_trail_w_a += 1
+            elif ft_res == "D":
+                ht_trail_d_t += 1
+                if is_home:
+                    ht_trail_d_h += 1
+                else:
+                    ht_trail_d_a += 1
+            else:
+                ht_trail_l_t += 1
+                if is_home:
+                    ht_trail_l_h += 1
+                else:
+                    ht_trail_l_a += 1
+
+        # ───── Clutch (80') ─────
+        hs80, as80 = _score_at_minute(goals, home_id, away_id, 80)
+        if is_home:
+            gf80 = hs80
+            ga80 = as80
+        else:
+            gf80 = as80
+            ga80 = hs80
+
+        if gf80 == ga80:
+            c80_draw_den_t += 1
+            if is_home:
+                c80_draw_den_h += 1
+            else:
+                c80_draw_den_a += 1
+
+            if ft_res == "W":
+                c80_draw_w_t += 1
+                if is_home:
+                    c80_draw_w_h += 1
+                else:
+                    c80_draw_w_a += 1
+            elif ft_res == "D":
+                c80_draw_d_t += 1
+                if is_home:
+                    c80_draw_d_h += 1
+                else:
+                    c80_draw_d_a += 1
+            else:
+                c80_draw_l_t += 1
+                if is_home:
+                    c80_draw_l_h += 1
+                else:
+                    c80_draw_l_a += 1
+
+        # 80~FT 득/실/총 0.5+
+        if _any_goal_in_window(goals, team=team_id, gt_min=80):
+            team_score80_t += 1
+            if is_home:
+                team_score80_h += 1
+            else:
+                team_score80_a += 1
+
+        if _any_goal_in_window(goals, team=opp_id, gt_min=80):
+            team_concede80_t += 1
+            if is_home:
+                team_concede80_h += 1
+            else:
+                team_concede80_a += 1
+
+        if _any_goal_in_window(goals, team=None, gt_min=80):
+            total80_over05_t += 1
+            if is_home:
+                total80_over05_h += 1
+            else:
+                total80_over05_a += 1
+
+        # 85~FT 총득점 0.5+
+        if _any_goal_in_window(goals, team=None, gt_min=85):
+            total85_over05_t += 1
+            if is_home:
+                total85_over05_h += 1
+            else:
+                total85_over05_a += 1
+
+    # ─────────────────────────────
+    # insights 키로 저장 (pct_hoa)
+    # ─────────────────────────────
+    insights["ft_first_score_to_win_pct"] = {"total": fmt_pct(fs_w_t, fs_den_t), "home": fmt_pct(fs_w_h, fs_den_h), "away": fmt_pct(fs_w_a, fs_den_a)}
+    insights["ft_first_score_to_draw_pct"] = {"total": fmt_pct(fs_d_t, fs_den_t), "home": fmt_pct(fs_d_h, fs_den_h), "away": fmt_pct(fs_d_a, fs_den_a)}
+    insights["ft_first_score_to_loss_pct"] = {"total": fmt_pct(fs_l_t, fs_den_t), "home": fmt_pct(fs_l_h, fs_den_h), "away": fmt_pct(fs_l_a, fs_den_a)}
+
+    insights["ft_first_concede_to_win_pct"] = {"total": fmt_pct(fc_w_t, fc_den_t), "home": fmt_pct(fc_w_h, fc_den_h), "away": fmt_pct(fc_w_a, fc_den_a)}
+    insights["ft_first_concede_to_draw_pct"] = {"total": fmt_pct(fc_d_t, fc_den_t), "home": fmt_pct(fc_d_h, fc_den_h), "away": fmt_pct(fc_d_a, fc_den_a)}
+    insights["ft_first_concede_to_loss_pct"] = {"total": fmt_pct(fc_l_t, fc_den_t), "home": fmt_pct(fc_l_h, fc_den_h), "away": fmt_pct(fc_l_a, fc_den_a)}
+
+    insights["ht_lead_to_win_pct"] = {"total": fmt_pct(ht_lead_w_t, ht_lead_den_t), "home": fmt_pct(ht_lead_w_h, ht_lead_den_h), "away": fmt_pct(ht_lead_w_a, ht_lead_den_a)}
+    insights["ht_lead_to_draw_pct"] = {"total": fmt_pct(ht_lead_d_t, ht_lead_den_t), "home": fmt_pct(ht_lead_d_h, ht_lead_den_h), "away": fmt_pct(ht_lead_d_a, ht_lead_den_a)}
+    insights["ht_lead_to_loss_pct"] = {"total": fmt_pct(ht_lead_l_t, ht_lead_den_t), "home": fmt_pct(ht_lead_l_h, ht_lead_den_h), "away": fmt_pct(ht_lead_l_a, ht_lead_den_a)}
+
+    insights["ht_draw_to_win_pct"] = {"total": fmt_pct(ht_draw_w_t, ht_draw_den_t), "home": fmt_pct(ht_draw_w_h, ht_draw_den_h), "away": fmt_pct(ht_draw_w_a, ht_draw_den_a)}
+    insights["ht_draw_to_draw_pct"] = {"total": fmt_pct(ht_draw_d_t, ht_draw_den_t), "home": fmt_pct(ht_draw_d_h, ht_draw_den_h), "away": fmt_pct(ht_draw_d_a, ht_draw_den_a)}
+    insights["ht_draw_to_loss_pct"] = {"total": fmt_pct(ht_draw_l_t, ht_draw_den_t), "home": fmt_pct(ht_draw_l_h, ht_draw_den_h), "away": fmt_pct(ht_draw_l_a, ht_draw_den_a)}
+
+    insights["ht_trail_to_win_pct"] = {"total": fmt_pct(ht_trail_w_t, ht_trail_den_t), "home": fmt_pct(ht_trail_w_h, ht_trail_den_h), "away": fmt_pct(ht_trail_w_a, ht_trail_den_a)}
+    insights["ht_trail_to_draw_pct"] = {"total": fmt_pct(ht_trail_d_t, ht_trail_den_t), "home": fmt_pct(ht_trail_d_h, ht_trail_den_h), "away": fmt_pct(ht_trail_d_a, ht_trail_den_a)}
+    insights["ht_trail_to_loss_pct"] = {"total": fmt_pct(ht_trail_l_t, ht_trail_den_t), "home": fmt_pct(ht_trail_l_h, ht_trail_den_h), "away": fmt_pct(ht_trail_l_a, ht_trail_den_a)}
+
+    insights["ht_00_to_win_pct"] = {"total": fmt_pct(ht_00_w_t, ht_00_den_t), "home": fmt_pct(ht_00_w_h, ht_00_den_h), "away": fmt_pct(ht_00_w_a, ht_00_den_a)}
+    insights["ht_00_to_draw_pct"] = {"total": fmt_pct(ht_00_d_t, ht_00_den_t), "home": fmt_pct(ht_00_d_h, ht_00_den_h), "away": fmt_pct(ht_00_d_a, ht_00_den_a)}
+    insights["ht_00_to_loss_pct"] = {"total": fmt_pct(ht_00_l_t, ht_00_den_t), "home": fmt_pct(ht_00_l_h, ht_00_den_h), "away": fmt_pct(ht_00_l_a, ht_00_den_a)}
+
+    insights["clutch80_draw_to_win_pct"] = {"total": fmt_pct(c80_draw_w_t, c80_draw_den_t), "home": fmt_pct(c80_draw_w_h, c80_draw_den_h), "away": fmt_pct(c80_draw_w_a, c80_draw_den_a)}
+    insights["clutch80_draw_to_draw_pct"] = {"total": fmt_pct(c80_draw_d_t, c80_draw_den_t), "home": fmt_pct(c80_draw_d_h, c80_draw_den_h), "away": fmt_pct(c80_draw_d_a, c80_draw_den_a)}
+    insights["clutch80_draw_to_loss_pct"] = {"total": fmt_pct(c80_draw_l_t, c80_draw_den_t), "home": fmt_pct(c80_draw_l_h, c80_draw_den_h), "away": fmt_pct(c80_draw_l_a, c80_draw_den_a)}
+
+    insights["clutch80_team_score_pct"] = {"total": fmt_pct(team_score80_t, eff_tot), "home": fmt_pct(team_score80_h, eff_home), "away": fmt_pct(team_score80_a, eff_away)}
+    insights["clutch80_team_concede_pct"] = {"total": fmt_pct(team_concede80_t, eff_tot), "home": fmt_pct(team_concede80_h, eff_home), "away": fmt_pct(team_concede80_a, eff_away)}
+    insights["clutch80_total_goals_over05_pct"] = {"total": fmt_pct(total80_over05_t, eff_tot), "home": fmt_pct(total80_over05_h, eff_home), "away": fmt_pct(total80_over05_a, eff_away)}
+
+    insights["clutch85_total_goals_over05_pct"] = {"total": fmt_pct(total85_over05_t, eff_tot), "home": fmt_pct(total85_over05_h, eff_home), "away": fmt_pct(total85_over05_a, eff_away)}
+
+
 
 def enrich_overall_goals_by_time(
     stats: Dict[str, Any],
@@ -1996,6 +2505,17 @@ def _build_side_insights(
         last_n=last_n,
     )
 
+    # ✅ NEW: Game State (First Score Impact / HT State / Clutch)
+    enrich_overall_game_state(
+        stats,
+        insights,
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        last_n=last_n,
+    )
+
+
 
 
     # ───────── Game Sample 홈/원정 분포 계산 ─────────
@@ -2330,7 +2850,69 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"from": 76, "to": 90},
             ],
         },
+
+        # ✅ NEW: Game state (그룹 섹션)
+        {
+            "id": "game_state",
+            "title": "Game state",
+            "renderer": "section_group",
+            "sections": [
+                {
+                    "id": "game_state_first_score_impact",
+                    "title": "First Score Impact",
+                    "renderer": "metrics_table",
+                    "metrics": [
+                        {"key": "ft_first_score_to_win_pct", "label": "FT First Score → W", "format": "pct_hoa"},
+                        {"key": "ft_first_score_to_draw_pct", "label": "FT First Score → D", "format": "pct_hoa"},
+                        {"key": "ft_first_score_to_loss_pct", "label": "FT First Score → L", "format": "pct_hoa"},
+
+                        {"key": "ft_first_concede_to_win_pct", "label": "FT First Concede → W", "format": "pct_hoa"},
+                        {"key": "ft_first_concede_to_draw_pct", "label": "FT First Concede → D", "format": "pct_hoa"},
+                        {"key": "ft_first_concede_to_loss_pct", "label": "FT First Concede → L", "format": "pct_hoa"},
+                    ],
+                },
+                {
+                    "id": "game_state_ht_state",
+                    "title": "HT State",
+                    "renderer": "metrics_table",
+                    "metrics": [
+                        {"key": "ht_lead_to_win_pct", "label": "HT Lead → W", "format": "pct_hoa"},
+                        {"key": "ht_lead_to_draw_pct", "label": "HT Lead → D", "format": "pct_hoa"},
+                        {"key": "ht_lead_to_loss_pct", "label": "HT Lead → L", "format": "pct_hoa"},
+
+                        {"key": "ht_draw_to_win_pct", "label": "HT Draw → W", "format": "pct_hoa"},
+                        {"key": "ht_draw_to_draw_pct", "label": "HT Draw → D", "format": "pct_hoa"},
+                        {"key": "ht_draw_to_loss_pct", "label": "HT Draw → L", "format": "pct_hoa"},
+
+                        {"key": "ht_trail_to_win_pct", "label": "HT Trail → W", "format": "pct_hoa"},
+                        {"key": "ht_trail_to_draw_pct", "label": "HT Trail → D", "format": "pct_hoa"},
+                        {"key": "ht_trail_to_loss_pct", "label": "HT Trail → L", "format": "pct_hoa"},
+
+                        {"key": "ht_00_to_win_pct", "label": "HT 0-0 → W", "format": "pct_hoa"},
+                        {"key": "ht_00_to_draw_pct", "label": "HT 0-0 → D", "format": "pct_hoa"},
+                        {"key": "ht_00_to_loss_pct", "label": "HT 0-0 → L", "format": "pct_hoa"},
+                    ],
+                },
+                {
+                    "id": "game_state_clutch",
+                    "title": "Clutch (80'/85')",
+                    "renderer": "metrics_table",
+                    "metrics": [
+                        {"key": "clutch80_draw_to_win_pct", "label": "Draw & 80'+ → W", "format": "pct_hoa"},
+                        {"key": "clutch80_draw_to_draw_pct", "label": "Draw & 80'+ → D", "format": "pct_hoa"},
+                        {"key": "clutch80_draw_to_loss_pct", "label": "Draw & 80'+ → L", "format": "pct_hoa"},
+
+                        {"key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
+                        {"key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
+                        {"key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
+
+                        {"key": "clutch85_total_goals_over05_pct", "label": "Total Goals 85'+ 0.5+", "format": "pct_hoa"},
+                    ],
+                },
+            ],
+        },
     ]
+
 
 
 
