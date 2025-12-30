@@ -2833,6 +2833,50 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"key": "h2_red_avg", "label": "2H Red Card (AVG)", "format": "avg_hoa"},
             ]
         },
+        # ✅ Game state (앱 호환: metrics_table로 평탄화)
+        {
+            "id": "game_state",
+            "title": "Game state",
+            "renderer": "metrics_table",
+            "metrics": [
+                # ── First Score Impact ──
+                {"key": "ft_first_score_to_win_pct", "label": "[First Score] FT First Score → W", "format": "pct_hoa"},
+                {"key": "ft_first_score_to_draw_pct", "label": "[First Score] FT First Score → D", "format": "pct_hoa"},
+                {"key": "ft_first_score_to_loss_pct", "label": "[First Score] FT First Score → L", "format": "pct_hoa"},
+
+                {"key": "ft_first_concede_to_win_pct", "label": "[First Score] FT First Concede → W", "format": "pct_hoa"},
+                {"key": "ft_first_concede_to_draw_pct", "label": "[First Score] FT First Concede → D", "format": "pct_hoa"},
+                {"key": "ft_first_concede_to_loss_pct", "label": "[First Score] FT First Concede → L", "format": "pct_hoa"},
+
+                # ── HT State ──
+                {"key": "ht_lead_to_win_pct", "label": "[HT State] HT Lead → W", "format": "pct_hoa"},
+                {"key": "ht_lead_to_draw_pct", "label": "[HT State] HT Lead → D", "format": "pct_hoa"},
+                {"key": "ht_lead_to_loss_pct", "label": "[HT State] HT Lead → L", "format": "pct_hoa"},
+
+                {"key": "ht_draw_to_win_pct", "label": "[HT State] HT Draw → W", "format": "pct_hoa"},
+                {"key": "ht_draw_to_draw_pct", "label": "[HT State] HT Draw → D", "format": "pct_hoa"},
+                {"key": "ht_draw_to_loss_pct", "label": "[HT State] HT Draw → L", "format": "pct_hoa"},
+
+                {"key": "ht_trail_to_win_pct", "label": "[HT State] HT Trail → W", "format": "pct_hoa"},
+                {"key": "ht_trail_to_draw_pct", "label": "[HT State] HT Trail → D", "format": "pct_hoa"},
+                {"key": "ht_trail_to_loss_pct", "label": "[HT State] HT Trail → L", "format": "pct_hoa"},
+
+                {"key": "ht_00_to_win_pct", "label": "[HT State] HT 0-0 → W", "format": "pct_hoa"},
+                {"key": "ht_00_to_draw_pct", "label": "[HT State] HT 0-0 → D", "format": "pct_hoa"},
+                {"key": "ht_00_to_loss_pct", "label": "[HT State] HT 0-0 → L", "format": "pct_hoa"},
+
+                # ── Clutch ──
+                {"key": "clutch80_draw_to_win_pct", "label": "[Clutch] Draw & 80'+ → W", "format": "pct_hoa"},
+                {"key": "clutch80_draw_to_draw_pct", "label": "[Clutch] Draw & 80'+ → D", "format": "pct_hoa"},
+                {"key": "clutch80_draw_to_loss_pct", "label": "[Clutch] Draw & 80'+ → L", "format": "pct_hoa"},
+
+                {"key": "clutch80_team_score_pct", "label": "[Clutch] Team Score 80'+", "format": "pct_hoa"},
+                {"key": "clutch80_team_concede_pct", "label": "[Clutch] Team Concede 80'+", "format": "pct_hoa"},
+                {"key": "clutch80_total_goals_over05_pct", "label": "[Clutch] Total Goals 80'+ 0.5+", "format": "pct_hoa"},
+                {"key": "clutch85_total_goals_over05_pct", "label": "[Clutch] Total Goals 85'+ 0.5+", "format": "pct_hoa"},
+            ],
+        },
+
         {
             "id": "goals_by_time",
             "title": "Goals by Time",
@@ -2851,66 +2895,6 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
             ],
         },
 
-        # ✅ NEW: Game state (그룹 섹션)
-        {
-            "id": "game_state",
-            "title": "Game state",
-            "renderer": "section_group",
-            "sections": [
-                {
-                    "id": "game_state_first_score_impact",
-                    "title": "First Score Impact",
-                    "renderer": "metrics_table",
-                    "metrics": [
-                        {"key": "ft_first_score_to_win_pct", "label": "FT First Score → W", "format": "pct_hoa"},
-                        {"key": "ft_first_score_to_draw_pct", "label": "FT First Score → D", "format": "pct_hoa"},
-                        {"key": "ft_first_score_to_loss_pct", "label": "FT First Score → L", "format": "pct_hoa"},
-
-                        {"key": "ft_first_concede_to_win_pct", "label": "FT First Concede → W", "format": "pct_hoa"},
-                        {"key": "ft_first_concede_to_draw_pct", "label": "FT First Concede → D", "format": "pct_hoa"},
-                        {"key": "ft_first_concede_to_loss_pct", "label": "FT First Concede → L", "format": "pct_hoa"},
-                    ],
-                },
-                {
-                    "id": "game_state_ht_state",
-                    "title": "HT State",
-                    "renderer": "metrics_table",
-                    "metrics": [
-                        {"key": "ht_lead_to_win_pct", "label": "HT Lead → W", "format": "pct_hoa"},
-                        {"key": "ht_lead_to_draw_pct", "label": "HT Lead → D", "format": "pct_hoa"},
-                        {"key": "ht_lead_to_loss_pct", "label": "HT Lead → L", "format": "pct_hoa"},
-
-                        {"key": "ht_draw_to_win_pct", "label": "HT Draw → W", "format": "pct_hoa"},
-                        {"key": "ht_draw_to_draw_pct", "label": "HT Draw → D", "format": "pct_hoa"},
-                        {"key": "ht_draw_to_loss_pct", "label": "HT Draw → L", "format": "pct_hoa"},
-
-                        {"key": "ht_trail_to_win_pct", "label": "HT Trail → W", "format": "pct_hoa"},
-                        {"key": "ht_trail_to_draw_pct", "label": "HT Trail → D", "format": "pct_hoa"},
-                        {"key": "ht_trail_to_loss_pct", "label": "HT Trail → L", "format": "pct_hoa"},
-
-                        {"key": "ht_00_to_win_pct", "label": "HT 0-0 → W", "format": "pct_hoa"},
-                        {"key": "ht_00_to_draw_pct", "label": "HT 0-0 → D", "format": "pct_hoa"},
-                        {"key": "ht_00_to_loss_pct", "label": "HT 0-0 → L", "format": "pct_hoa"},
-                    ],
-                },
-                {
-                    "id": "game_state_clutch",
-                    "title": "Clutch (80'/85')",
-                    "renderer": "metrics_table",
-                    "metrics": [
-                        {"key": "clutch80_draw_to_win_pct", "label": "Draw & 80'+ → W", "format": "pct_hoa"},
-                        {"key": "clutch80_draw_to_draw_pct", "label": "Draw & 80'+ → D", "format": "pct_hoa"},
-                        {"key": "clutch80_draw_to_loss_pct", "label": "Draw & 80'+ → L", "format": "pct_hoa"},
-
-                        {"key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
-                        {"key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
-                        {"key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
-
-                        {"key": "clutch85_total_goals_over05_pct", "label": "Total Goals 85'+ 0.5+", "format": "pct_hoa"},
-                    ],
-                },
-            ],
-        },
     ]
 
 
