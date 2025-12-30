@@ -400,7 +400,7 @@ def enrich_overall_outcome_totals(
             else:
                 ng_a += 1
 
-            # Team Goals Over (팀 득점 기준)
+        # Team Goals Over (팀 득점 기준)
         if gf >= 1:
             team_o05_t += 1
             if is_home:
@@ -457,7 +457,7 @@ def enrich_overall_outcome_totals(
     out["home_loss_pct"] = fmt_pct(l_h, mt_h) if mt_h else 0
 
     out["away_win_pct"] = fmt_pct(w_a, mt_a) if mt_a else 0
-        out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
+    out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
     out["away_loss_pct"] = fmt_pct(l_a, mt_a) if mt_a else 0
 
     # ─────────────────────────────────────
