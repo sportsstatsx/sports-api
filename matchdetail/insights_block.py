@@ -3,6 +3,8 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
+import json
+
 from db import fetch_all
 
 
@@ -192,25 +194,37 @@ def enrich_overall_outcome_totals(
     last_n: int = 0,
 ) -> None:
     """
-    Outcome + Totals 섹션 생성.
+    FT Results(기존 Outcome + Totals) 섹션 생성.
+
+    참고(현재 DB/이벤트 저장 방식 기준)
+    - matches.status_group: FINISHED / UPCOMING
+    - FT 스코어: matches.home_ft / matches.away_ft
+      (FINISHED 중 FT NULL 1건 존재 → FT 지표 계산 불가이므로 제외)
+    - 코너/카드: match_team_stats.name = 'Corner Kicks' / 'Yellow Cards' / 'Red Cards'
+    - PK:
+      * 시도 = Goal(detail='Penalty' 또는 'Missed Penalty')  (FT 시간대만)
+      * 성공 = Goal(detail='Penalty')
+      * Pen Won(AVG) = 시도/경기수
+      * Pen Conv%   = 성공/시도 * 100
+    - Own Goal:
+      * match_events의 Goal(detail='Own Goal')에서 team_id는 '득점으로 기록된 팀(beneficiary)'으로 처리
+        (예: fixture 1469785는 away_ft=2인데 own goal event team_id=303(away)로 기록되어 있어
+             team_id를 '자책한 팀'으로 보면 스코어와 모순이 발생)
+    - FT 범위: minute <= 90 (90+추가시간은 minute=90, extra로 들어오므로 포함)
+              연장(105/120 등)은 minute>90으로 제외
     """
     if not season_int:
         return
 
     # ─────────────────────────────────────
-    # 1) Competition + Last N 기준 league_id 집합 생성
+    # 1) Finished(FT 계산 가능) 경기만 기준으로 matches 가져오기
     # ─────────────────────────────────────
-    league_ids_for_query = build_league_ids_for_query(stats, league_id)
-    if not league_ids_for_query:
-        league_ids_for_query = [league_id]
-
+    league_ids_for_query = [league_id]
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
-    # ─────────────────────────────────────
-    # 2) Finished 경기만 기준으로 집계할 matches 가져오기
-    # ─────────────────────────────────────
     base_sql = f"""
         SELECT
+            m.fixture_id,
             m.home_id,
             m.away_id,
             m.home_ft,
@@ -221,7 +235,9 @@ def enrich_overall_outcome_totals(
         WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          AND lower(m.status_group) IN ('finished','ft','fulltime')
+          AND lower(m.status_group) = 'finished'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
         ORDER BY m.date_utc DESC
     """
 
@@ -233,79 +249,147 @@ def enrich_overall_outcome_totals(
     if not rows:
         return
 
-    # Last N 적용 (0이면 시즌 전체)
     if last_n and last_n > 0:
         rows = rows[:last_n]
 
-    # ─────────────────────────────────────
-    # 3) 집계
-    # ─────────────────────────────────────
-    mt_t = mt_h = mt_a = 0
+    # 경기 집합(분모)
+    eff_tot = len(rows)
+    eff_home = 0
+    eff_away = 0
 
+    # 카운터(총/홈/원정)
     w_t = w_h = w_a = 0
     d_t = d_h = d_a = 0
     l_t = l_h = l_a = 0
 
-    btts_t = btts_h = btts_a = 0
-    nbtts_t = nbtts_h = nbtts_a = 0
-
-    o15_t = o15_h = o15_a = 0
-    o25_t = o25_h = o25_a = 0
-
-    win_o25_t = win_o25_h = win_o25_a = 0
-    lose_btts_t = lose_btts_h = lose_btts_a = 0
-    win_btts_t = win_btts_h = win_btts_a = 0
-    draw_btts_t = draw_btts_h = draw_btts_a = 0
-
     cs_t = cs_h = cs_a = 0
-    ng_t = ng_h = ng_a = 0
+    btts_t = btts_h = btts_a = 0
 
-    gf_sum_t = gf_sum_h = gf_sum_a = 0
-    ga_sum_t = ga_sum_h = ga_sum_a = 0
+    tg05_t = tg05_h = tg05_a = 0
+    tg15_t = tg15_h = tg15_a = 0
+    tg25_t = tg25_h = tg25_a = 0
 
-    team_o05_t = team_o05_h = team_o05_a = 0
-    team_o15_t = team_o15_h = team_o15_a = 0
+    tot15_t = tot15_h = tot15_a = 0
+    tot25_t = tot25_h = tot25_a = 0
 
+    w_btts_t = w_btts_h = w_btts_a = 0
+    w_tot15_t = w_tot15_h = w_tot15_a = 0
+    w_tot25_t = w_tot25_h = w_tot25_a = 0
 
+    # First Goal / First Concede (분모=전체 경기, 0:0 포함)
+    fg_t = fg_h = fg_a = 0
+    fc_t = fc_h = fc_a = 0
+
+    # Corners / Cards (AVG)
+    corners_sum_t = corners_sum_h = corners_sum_a = 0
+    yellow_sum_t = yellow_sum_h = yellow_sum_a = 0
+    red_sum_t = red_sum_h = red_sum_a = 0
+
+    # Pen Won (AVG) / Pen Conv%
+    pen_att_t = pen_att_h = pen_att_a = 0
+    pen_sc_t = pen_sc_h = pen_sc_a = 0
+
+    # Red Card → Score/Concede
+    opp_red_den_t = opp_red_den_h = opp_red_den_a = 0
+    opp_red_num_t = opp_red_num_h = opp_red_num_a = 0
+
+    own_red_den_t = own_red_den_h = own_red_den_a = 0
+    own_red_num_t = own_red_num_h = own_red_num_a = 0
+
+    fixture_ids: List[int] = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+
+    # ─────────────────────────────────────
+    # 2) match_team_stats(코너/카드) bulk fetch
+    # ─────────────────────────────────────
+    stats_map: Dict[tuple, int] = {}
+    if fixture_ids:
+        in_fix = ",".join(["%s"] * len(fixture_ids))
+        stats_sql = f"""
+            SELECT fixture_id, team_id, name, value
+            FROM match_team_stats
+            WHERE fixture_id IN ({in_fix})
+              AND name IN ('Corner Kicks','Yellow Cards','Red Cards')
+        """
+        s_rows = fetch_all(stats_sql, tuple(fixture_ids))
+        for sr in s_rows or []:
+            try:
+                fx = int(sr.get("fixture_id"))
+                tid = int(sr.get("team_id"))
+                name = str(sr.get("name") or "").strip()
+                raw = sr.get("value")
+                # value는 보통 숫자 문자열이지만, 예외는 0으로 처리
+                val = int(str(raw).strip()) if raw is not None and str(raw).strip().isdigit() else 0
+                stats_map[(fx, tid, name)] = val
+            except Exception:
+                continue
+
+    # ─────────────────────────────────────
+    # 3) match_events(goal/card) bulk fetch (FT 범위만)
+    # ─────────────────────────────────────
+    events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
+    if fixture_ids:
+        in_fix = ",".join(["%s"] * len(fixture_ids))
+        ev_sql = f"""
+            SELECT
+                e.id,
+                e.fixture_id,
+                e.team_id,
+                e.type,
+                e.detail,
+                e.minute,
+                COALESCE(e.extra, 0) AS extra
+            FROM match_events e
+            WHERE e.fixture_id IN ({in_fix})
+              AND lower(e.type) IN ('goal','card')
+              AND e.minute <= 90
+            ORDER BY e.fixture_id, e.minute, COALESCE(e.extra,0), e.id
+        """
+        ev_rows = fetch_all(ev_sql, tuple(fixture_ids))
+        for ev in ev_rows or []:
+            try:
+                fx = int(ev.get("fixture_id"))
+            except Exception:
+                continue
+            events_by_fixture.setdefault(fx, []).append(ev)
+
+    def _is_after(ev: Dict[str, Any], ref: tuple) -> bool:
+        try:
+            return (int(ev.get("minute") or 0), int(ev.get("extra") or 0), int(ev.get("id") or 0)) > ref
+        except Exception:
+            return False
+
+    # ─────────────────────────────────────
+    # 4) 경기별 집계
+    # ─────────────────────────────────────
     for r in rows:
         try:
+            fx = int(r.get("fixture_id"))
             home_id = int(r.get("home_id"))
             away_id = int(r.get("away_id"))
+            home_ft = int(r.get("home_ft"))
+            away_ft = int(r.get("away_ft"))
         except Exception:
             continue
-
-        try:
-            home_ft = int(r.get("home_ft") or 0)
-            away_ft = int(r.get("away_ft") or 0)
-        except Exception:
-            home_ft = 0
-            away_ft = 0
 
         is_home = (home_id == team_id)
         is_away = (away_id == team_id)
         if not (is_home or is_away):
             continue
 
-        mt_t += 1
         if is_home:
-            mt_h += 1
+            eff_home += 1
+            gf = home_ft
+            ga = away_ft
+            opp_team_id = away_id
         else:
-            mt_a += 1
+            eff_away += 1
+            gf = away_ft
+            ga = home_ft
+            opp_team_id = home_id
 
-        # 팀 기준 gf/ga
-        gf = home_ft if is_home else away_ft
-        ga = away_ft if is_home else home_ft
+        tg = gf + ga
 
-        gf_sum_t += gf
-        ga_sum_t += ga
-        if is_home:
-            gf_sum_h += gf
-            ga_sum_h += ga
-        else:
-            gf_sum_a += gf
-            ga_sum_a += ga
-
-        # W/D/L
+        # ── W/D/L
         if gf > ga:
             w_t += 1
             if is_home:
@@ -325,260 +409,261 @@ def enrich_overall_outcome_totals(
             else:
                 l_a += 1
 
-        # BTTS / No BTTS
-        if home_ft > 0 and away_ft > 0:
-            btts_t += 1
-            if is_home:
-                btts_h += 1
-            else:
-                btts_a += 1
-        else:
-            nbtts_t += 1
-            if is_home:
-                nbtts_h += 1
-            else:
-                nbtts_a += 1
-
-        # Over 1.5 / 2.5 (Total Goals)
-        tg = home_ft + away_ft
-        if tg >= 2:
-            o15_t += 1
-            if is_home:
-                o15_h += 1
-            else:
-                o15_a += 1
-        if tg >= 3:
-            o25_t += 1
-            if is_home:
-                o25_h += 1
-            else:
-                o25_a += 1
-
-        # Win & Over2.5
-        if (gf > ga) and (tg >= 3):
-            win_o25_t += 1
-            if is_home:
-                win_o25_h += 1
-            else:
-                win_o25_a += 1
-
-        # Lose & BTTS
-        if (gf < ga) and (home_ft > 0 and away_ft > 0):
-            lose_btts_t += 1
-            if is_home:
-                lose_btts_h += 1
-            else:
-                lose_btts_a += 1
-
-        # Win & BTTS
-        if (gf > ga) and (home_ft > 0 and away_ft > 0):
-            win_btts_t += 1
-            if is_home:
-                win_btts_h += 1
-            else:
-                win_btts_a += 1
-
-        # Draw & BTTS (0-0 제외)
-        if (gf == ga) and (gf > 0):
-            draw_btts_t += 1
-            if is_home:
-                draw_btts_h += 1
-            else:
-                draw_btts_a += 1
-
-        # Clean Sheet / No Goals
+        # ── Clean Sheet / BTTS
         if ga == 0:
             cs_t += 1
             if is_home:
                 cs_h += 1
             else:
                 cs_a += 1
-        if gf == 0:
-            ng_t += 1
-            if is_home:
-                ng_h += 1
-            else:
-                ng_a += 1
 
-        # Team Goals Over (팀 득점 기준)
+        if gf >= 1 and ga >= 1:
+            btts_t += 1
+            if is_home:
+                btts_h += 1
+            else:
+                btts_a += 1
+
+        # ── TG x+ (우리 득점)
         if gf >= 1:
-            team_o05_t += 1
+            tg05_t += 1
             if is_home:
-                team_o05_h += 1
+                tg05_h += 1
             else:
-                team_o05_a += 1
-
+                tg05_a += 1
         if gf >= 2:
-            team_o15_t += 1
+            tg15_t += 1
             if is_home:
-                team_o15_h += 1
+                tg15_h += 1
             else:
-                team_o15_a += 1
+                tg15_a += 1
+        if gf >= 3:
+            tg25_t += 1
+            if is_home:
+                tg25_h += 1
+            else:
+                tg25_a += 1
 
+        # ── Total x+ (총득점)
+        if tg >= 2:
+            tot15_t += 1
+            if is_home:
+                tot15_h += 1
+            else:
+                tot15_a += 1
+        if tg >= 3:
+            tot25_t += 1
+            if is_home:
+                tot25_h += 1
+            else:
+                tot25_a += 1
 
-    # 분모는 실제 집계 경기 수 우선
-    eff_tot = mt_t if mt_t > 0 else int(matches_total_api or 0)
-    if eff_tot <= 0:
-        return
+        # ── 콤보
+        if (gf > ga) and (gf >= 1 and ga >= 1):
+            w_btts_t += 1
+            if is_home:
+                w_btts_h += 1
+            else:
+                w_btts_a += 1
 
-    out: Dict[str, Any] = {}
+        if (gf > ga) and (tg >= 2):
+            w_tot15_t += 1
+            if is_home:
+                w_tot15_h += 1
+            else:
+                w_tot15_a += 1
 
-    out["ft_w_pct"] = fmt_pct(w_t, eff_tot)
-    out["ft_d_pct"] = fmt_pct(d_t, eff_tot)
-    out["ft_l_pct"] = fmt_pct(l_t, eff_tot)
+        if (gf > ga) and (tg >= 3):
+            w_tot25_t += 1
+            if is_home:
+                w_tot25_h += 1
+            else:
+                w_tot25_a += 1
 
-    out["win_pct"] = out["ft_w_pct"]
-    out["draw_pct"] = out["ft_d_pct"]
-    out["loss_pct"] = out["ft_l_pct"]
+        # ── Corners / Cards (우리 팀)
+        corners = stats_map.get((fx, team_id, "Corner Kicks"), 0)
+        yellow = stats_map.get((fx, team_id, "Yellow Cards"), 0)
+        red = stats_map.get((fx, team_id, "Red Cards"), 0)
 
-    out["btts_yes_pct"] = fmt_pct(btts_t, eff_tot)
-    out["btts_no_pct"] = fmt_pct(nbtts_t, eff_tot)
+        corners_sum_t += corners
+        yellow_sum_t += yellow
+        red_sum_t += red
+        if is_home:
+            corners_sum_h += corners
+            yellow_sum_h += yellow
+            red_sum_h += red
+        else:
+            corners_sum_a += corners
+            yellow_sum_a += yellow
+            red_sum_a += red
 
-    out["over15_pct"] = fmt_pct(o15_t, eff_tot)
-    out["over25_pct"] = fmt_pct(o25_t, eff_tot)
+        # ── Events 기반(First Goal/Concede, Pen, Red 이후 득/실점)
+        evs = events_by_fixture.get(fx, [])
+        goals = [e for e in evs if str(e.get("type") or "").lower() == "goal"]
+        cards = [
+            e for e in evs
+            if str(e.get("type") or "").lower() == "card" and str(e.get("detail") or "") == "Red Card"
+        ]
 
-    out["win_over25_pct"] = fmt_pct(win_o25_t, eff_tot)
-    out["lose_btts_pct"] = fmt_pct(lose_btts_t, eff_tot)
-    out["win_btts_pct"] = fmt_pct(win_btts_t, eff_tot)
-    out["draw_btts_pct"] = fmt_pct(draw_btts_t, eff_tot)
+        # First Goal / First Concede (분모는 전체 경기)
+        if goals:
+            first = goals[0]
+            try:
+                first_team = int(first.get("team_id")) if first.get("team_id") is not None else None
+            except Exception:
+                first_team = None
 
-    out["cs_pct"] = fmt_pct(cs_t, eff_tot)
-    out["ng_pct"] = fmt_pct(ng_t, eff_tot)
+            if first_team == team_id:
+                fg_t += 1
+                if is_home:
+                    fg_h += 1
+                else:
+                    fg_a += 1
+            elif first_team in (home_id, away_id):
+                fc_t += 1
+                if is_home:
+                    fc_h += 1
+                else:
+                    fc_a += 1
+            # team_id가 비정상(None 등)이면 그냥 무시(분모는 유지)
 
-    out["goals_for_avg"] = fmt_avg(gf_sum_t, eff_tot, 2)
-    out["goals_against_avg"] = fmt_avg(ga_sum_t, eff_tot, 2)
+        # Pen Won / Pen Conv% (PK 시도/성공: goal detail 기반)
+        pen_attempts = 0
+        pen_scored = 0
+        for g in goals:
+            if g.get("team_id") is None:
+                continue
+            try:
+                g_tid = int(g.get("team_id"))
+            except Exception:
+                continue
+            if g_tid != team_id:
+                continue
+            det = str(g.get("detail") or "")
+            if det == "Penalty":
+                pen_attempts += 1
+                pen_scored += 1
+            elif det == "Missed Penalty":
+                pen_attempts += 1
 
-    # 홈/원정도 같이 제공 (기존 UI에서 쓰면 유지됨)
-    out["home_games"] = mt_h
-    out["away_games"] = mt_a
+        pen_att_t += pen_attempts
+        pen_sc_t += pen_scored
+        if is_home:
+            pen_att_h += pen_attempts
+            pen_sc_h += pen_scored
+        else:
+            pen_att_a += pen_attempts
+            pen_sc_a += pen_scored
 
-    out["home_win_pct"] = fmt_pct(w_h, mt_h) if mt_h else 0
-    out["home_draw_pct"] = fmt_pct(d_h, mt_h) if mt_h else 0
-    out["home_loss_pct"] = fmt_pct(l_h, mt_h) if mt_h else 0
+        # Opp Red Card → Score
+        opp_reds = [c for c in cards if c.get("team_id") is not None and int(c.get("team_id")) == opp_team_id]
+        if opp_reds:
+            # 가장 이른 상대 레드(정렬되어 있으므로 0번)
+            first_red = opp_reds[0]
+            ref = (int(first_red.get("minute") or 0), int(first_red.get("extra") or 0), int(first_red.get("id") or 0))
 
-    out["away_win_pct"] = fmt_pct(w_a, mt_a) if mt_a else 0
-    out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
-    out["away_loss_pct"] = fmt_pct(l_a, mt_a) if mt_a else 0
+            opp_red_den_t += 1
+            if is_home:
+                opp_red_den_h += 1
+            else:
+                opp_red_den_a += 1
+
+            scored_after = any(
+                (g.get("team_id") is not None and int(g.get("team_id")) == team_id and _is_after(g, ref))
+                for g in goals
+            )
+            if scored_after:
+                opp_red_num_t += 1
+                if is_home:
+                    opp_red_num_h += 1
+                else:
+                    opp_red_num_a += 1
+
+        # Own Red Card → Concede
+        own_reds = [c for c in cards if c.get("team_id") is not None and int(c.get("team_id")) == team_id]
+        if own_reds:
+            first_red = own_reds[0]
+            ref = (int(first_red.get("minute") or 0), int(first_red.get("extra") or 0), int(first_red.get("id") or 0))
+
+            own_red_den_t += 1
+            if is_home:
+                own_red_den_h += 1
+            else:
+                own_red_den_a += 1
+
+            conceded_after = any(
+                (g.get("team_id") is not None and int(g.get("team_id")) == opp_team_id and _is_after(g, ref))
+                for g in goals
+            )
+            if conceded_after:
+                own_red_num_t += 1
+                if is_home:
+                    own_red_num_h += 1
+                else:
+                    own_red_num_a += 1
 
     # ─────────────────────────────────────
-    # ✅ (원본 구조 복구) 앱이 기대하는 {total, home, away} 형태로 내려준다
-    #   - 기존 services/insights/insights_overall_outcome_totals.py 와 동일한 키/구조
+    # 5) insights 키(앱이 쓰는 구조)로 세팅
     # ─────────────────────────────────────
+    insights["win_pct"] = {"total": fmt_pct(w_t, eff_tot), "home": fmt_pct(w_h, eff_home), "away": fmt_pct(w_a, eff_away)}
+    insights["draw_pct"] = {"total": fmt_pct(d_t, eff_tot), "home": fmt_pct(d_h, eff_home), "away": fmt_pct(d_a, eff_away)}
+    insights["loss_pct"] = {"total": fmt_pct(l_t, eff_tot), "home": fmt_pct(l_h, eff_home), "away": fmt_pct(l_a, eff_away)}
 
-    # eff_tot / eff_home / eff_away 는 원본과 동일한 방식
-    eff_home = mt_h or eff_tot
-    eff_away = mt_a or eff_tot
+    insights["clean_sheet_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
+    insights["btts_pct"] = {"total": fmt_pct(btts_t, eff_tot), "home": fmt_pct(btts_h, eff_home), "away": fmt_pct(btts_a, eff_away)}
 
-    # events_sample: 원본처럼 "없으면 세팅" (이미 있으면 유지)
-    try:
-        current_events_sample = insights.get("events_sample")
-    except Exception:
-        current_events_sample = None
+    insights["win_and_btts_pct"] = {"total": fmt_pct(w_btts_t, eff_tot), "home": fmt_pct(w_btts_h, eff_home), "away": fmt_pct(w_btts_a, eff_away)}
 
-    if not isinstance(current_events_sample, int) or current_events_sample <= 0:
-        try:
-            insights["events_sample"] = int(eff_tot)
-        except (TypeError, ValueError):
-            pass
+    insights["team_over05_pct"] = {"total": fmt_pct(tg05_t, eff_tot), "home": fmt_pct(tg05_h, eff_home), "away": fmt_pct(tg05_a, eff_away)}
+    insights["team_over15_pct"] = {"total": fmt_pct(tg15_t, eff_tot), "home": fmt_pct(tg15_h, eff_home), "away": fmt_pct(tg15_a, eff_away)}
+    insights["team_over25_pct"] = {"total": fmt_pct(tg25_t, eff_tot), "home": fmt_pct(tg25_h, eff_home), "away": fmt_pct(tg25_a, eff_away)}
 
-    # W/D/L
-    insights["win_pct"] = {
-        "total": fmt_pct(w_t, eff_tot),
-        "home": fmt_pct(w_h, eff_home),
-        "away": fmt_pct(w_a, eff_away),
-    }
-    insights["draw_pct"] = {
-        "total": fmt_pct(d_t, eff_tot),
-        "home": fmt_pct(d_h, eff_home),
-        "away": fmt_pct(d_a, eff_away),
-    }
-    # 원본엔 loss_pct가 없었지만, 앱에서 필요할 수 있으니 동일 구조로 제공(무해)
-    insights["loss_pct"] = {
-        "total": fmt_pct(l_t, eff_tot),
-        "home": fmt_pct(l_h, eff_home),
-        "away": fmt_pct(l_a, eff_away),
-    }
+    insights["over15_pct"] = {"total": fmt_pct(tot15_t, eff_tot), "home": fmt_pct(tot15_h, eff_home), "away": fmt_pct(tot15_a, eff_away)}
+    insights["over25_pct"] = {"total": fmt_pct(tot25_t, eff_tot), "home": fmt_pct(tot25_h, eff_home), "away": fmt_pct(tot25_a, eff_away)}
 
-    # BTTS / Team Over / Totals
-    insights["btts_pct"] = {
-        "total": fmt_pct(btts_t, eff_tot),
-        "home": fmt_pct(btts_h, eff_home),
-        "away": fmt_pct(btts_a, eff_away),
-    }
-    insights["team_over05_pct"] = {
-        "total": fmt_pct(team_o05_t, eff_tot),
-        "home": fmt_pct(team_o05_h, eff_home),
-        "away": fmt_pct(team_o05_a, eff_away),
-    }
-    insights["team_over15_pct"] = {
-        "total": fmt_pct(team_o15_t, eff_tot),
-        "home": fmt_pct(team_o15_h, eff_home),
-        "away": fmt_pct(team_o15_a, eff_away),
-    }
-    insights["over15_pct"] = {
-        "total": fmt_pct(o15_t, eff_tot),
-        "home": fmt_pct(o15_h, eff_home),
-        "away": fmt_pct(o15_a, eff_away),
-    }
-    insights["over25_pct"] = {
-        "total": fmt_pct(o25_t, eff_tot),
-        "home": fmt_pct(o25_h, eff_home),
-        "away": fmt_pct(o25_a, eff_away),
+    insights["win_and_over15_pct"] = {"total": fmt_pct(w_tot15_t, eff_tot), "home": fmt_pct(w_tot15_h, eff_home), "away": fmt_pct(w_tot15_a, eff_away)}
+    insights["win_and_over25_pct"] = {"total": fmt_pct(w_tot25_t, eff_tot), "home": fmt_pct(w_tot25_h, eff_home), "away": fmt_pct(w_tot25_a, eff_away)}
+
+    insights["first_goal_pct"] = {"total": fmt_pct(fg_t, eff_tot), "home": fmt_pct(fg_h, eff_home), "away": fmt_pct(fg_a, eff_away)}
+    insights["first_concede_pct"] = {"total": fmt_pct(fc_t, eff_tot), "home": fmt_pct(fc_h, eff_home), "away": fmt_pct(fc_a, eff_away)}
+
+    insights["corners_avg"] = {"total": fmt_avg(corners_sum_t, eff_tot, 2), "home": fmt_avg(corners_sum_h, eff_home, 2), "away": fmt_avg(corners_sum_a, eff_away, 2)}
+    insights["yellow_avg"] = {"total": fmt_avg(yellow_sum_t, eff_tot, 2), "home": fmt_avg(yellow_sum_h, eff_home, 2), "away": fmt_avg(yellow_sum_a, eff_away, 2)}
+    insights["red_avg"] = {"total": fmt_avg(red_sum_t, eff_tot, 2), "home": fmt_avg(red_sum_h, eff_home, 2), "away": fmt_avg(red_sum_a, eff_away, 2)}
+
+    insights["pen_won_avg"] = {"total": fmt_avg(pen_att_t, eff_tot, 2), "home": fmt_avg(pen_att_h, eff_home, 2), "away": fmt_avg(pen_att_a, eff_away, 2)}
+    insights["pen_conv_pct"] = {"total": fmt_pct(pen_sc_t, pen_att_t), "home": fmt_pct(pen_sc_h, pen_att_h), "away": fmt_pct(pen_sc_a, pen_att_a)}
+
+    insights["opp_red_to_score_pct"] = {"total": fmt_pct(opp_red_num_t, opp_red_den_t), "home": fmt_pct(opp_red_num_h, opp_red_den_h), "away": fmt_pct(opp_red_num_a, opp_red_den_a)}
+    insights["own_red_to_concede_pct"] = {"total": fmt_pct(own_red_num_t, own_red_den_t), "home": fmt_pct(own_red_num_h, own_red_den_h), "away": fmt_pct(own_red_num_a, own_red_den_a)}
+
+    # 하위 호환용 nested
+    insights["outcome_totals"] = {
+        "win_pct": fmt_pct(w_t, eff_tot),
+        "draw_pct": fmt_pct(d_t, eff_tot),
+        "loss_pct": fmt_pct(l_t, eff_tot),
+        "clean_sheet_pct": fmt_pct(cs_t, eff_tot),
+        "btts_pct": fmt_pct(btts_t, eff_tot),
+        "win_and_btts_pct": fmt_pct(w_btts_t, eff_tot),
+        "team_over05_pct": fmt_pct(tg05_t, eff_tot),
+        "team_over15_pct": fmt_pct(tg15_t, eff_tot),
+        "team_over25_pct": fmt_pct(tg25_t, eff_tot),
+        "over15_pct": fmt_pct(tot15_t, eff_tot),
+        "over25_pct": fmt_pct(tot25_t, eff_tot),
+        "win_and_over15_pct": fmt_pct(w_tot15_t, eff_tot),
+        "win_and_over25_pct": fmt_pct(w_tot25_t, eff_tot),
+        "first_goal_pct": fmt_pct(fg_t, eff_tot),
+        "first_concede_pct": fmt_pct(fc_t, eff_tot),
+        "corners_avg": fmt_avg(corners_sum_t, eff_tot, 2),
+        "yellow_avg": fmt_avg(yellow_sum_t, eff_tot, 2),
+        "red_avg": fmt_avg(red_sum_t, eff_tot, 2),
+        "pen_won_avg": fmt_avg(pen_att_t, eff_tot, 2),
+        "pen_conv_pct": fmt_pct(pen_sc_t, pen_att_t),
+        "opp_red_to_score_pct": fmt_pct(opp_red_num_t, opp_red_den_t),
+        "own_red_to_concede_pct": fmt_pct(own_red_num_t, own_red_den_t),
     }
 
-    # Clean sheet / No goals
-    insights["clean_sheet_pct"] = {
-        "total": fmt_pct(cs_t, eff_tot),
-        "home": fmt_pct(cs_h, eff_home),
-        "away": fmt_pct(cs_a, eff_away),
-    }
-    insights["no_goals_pct"] = {
-        "total": fmt_pct(ng_t, eff_tot),
-        "home": fmt_pct(ng_h, eff_home),
-        "away": fmt_pct(ng_a, eff_away),
-    }
 
-    # AVG GF / AVG GA / Goal Diff (원본 구조)
-    gf_avg_t = fmt_avg(gf_sum_t, eff_tot, 2)
-    ga_avg_t = fmt_avg(ga_sum_t, eff_tot, 2)
-    gf_avg_h = fmt_avg(gf_sum_h, eff_home, 2)
-    ga_avg_h = fmt_avg(ga_sum_h, eff_home, 2)
-    gf_avg_a = fmt_avg(gf_sum_a, eff_away, 2)
-    ga_avg_a = fmt_avg(ga_sum_a, eff_away, 2)
-
-    insights["avg_gf"] = {"total": gf_avg_t, "home": gf_avg_h, "away": gf_avg_a}
-    insights["avg_ga"] = {"total": ga_avg_t, "home": ga_avg_h, "away": ga_avg_a}
-
-    insights["goal_diff_avg"] = {
-        "total": round(gf_avg_t - ga_avg_t, 2),
-        "home": round(gf_avg_h - ga_avg_h, 2),
-        "away": round(gf_avg_a - ga_avg_a, 2),
-    }
-
-    # 콤보 지표
-    insights["win_and_over25_pct"] = {
-        "total": fmt_pct(win_o25_t, eff_tot),
-        "home": fmt_pct(win_o25_h, eff_home),
-        "away": fmt_pct(win_o25_a, eff_away),
-    }
-    insights["lose_and_btts_pct"] = {
-        "total": fmt_pct(lose_btts_t, eff_tot),
-        "home": fmt_pct(lose_btts_h, eff_home),
-        "away": fmt_pct(lose_btts_a, eff_away),
-    }
-    insights["win_and_btts_pct"] = {
-        "total": fmt_pct(win_btts_t, eff_tot),
-        "home": fmt_pct(win_btts_h, eff_home),
-        "away": fmt_pct(win_btts_a, eff_away),
-    }
-    insights["draw_and_btts_pct"] = {
-        "total": fmt_pct(draw_btts_t, eff_tot),
-        "home": fmt_pct(draw_btts_h, eff_home),
-        "away": fmt_pct(draw_btts_a, eff_away),
-    }
-
-    # (선택) 기존 nested 구조는 유지해도 됨
-    insights["outcome_totals"] = out
 
 
 
@@ -588,74 +673,126 @@ def enrich_overall_outcome_totals(
 # ─────────────────────────────────────
 
 
-def _beneficiary_team_id_for_goal(
-    *,
-    goal_team_id: Optional[int],
-    home_id: int,
-    away_id: int,
-    detail: str,
-) -> Optional[int]:
+# ─────────────────────────────────────
+#  ✅ 추가: 1H / 2H Performance (HT/2H 지표)
+# ─────────────────────────────────────
+
+def _parse_events_raw_to_list(data_json: str) -> List[Dict[str, Any]]:
+    """match_events_raw.data_json을 최대한 관대하게 파싱해서 '이벤트 리스트'만 뽑는다."""
+    if not data_json:
+        return []
+    try:
+        obj = json.loads(data_json)
+    except Exception:
+        return []
+
+    # API-Sports 형태: {"response":[...]} / {"events":[...]} / 혹은 바로 [...]
+    if isinstance(obj, list):
+        return [e for e in obj if isinstance(e, dict)]
+    if isinstance(obj, dict):
+        if isinstance(obj.get("response"), list):
+            return [e for e in obj.get("response") if isinstance(e, dict)]
+        if isinstance(obj.get("events"), list):
+            return [e for e in obj.get("events") if isinstance(e, dict)]
+    return []
+
+
+def _load_corner_counts_by_half(fixture_ids: List[int]) -> Dict[tuple, Dict[str, int]]:
     """
-    match_events Goal 이벤트의 team_id 해석:
-    - Normal Goal / Penalty: team_id = 득점 팀
-    - Own Goal: team_id = 자책골을 넣은 팀(=실점 팀) → 득점(beneficiary)은 반대 팀
+    코너는 match_team_stats에 '전/후반 분리'가 없으니, 가능하면 match_events_raw에서 코너 이벤트를 찾아서
+    1H/2H 코너 수를 계산한다.
+
+    반환:
+      {(fixture_id, team_id): {"h1": int, "h2": int}}
     """
-    if goal_team_id is None:
-        return None
+    if not fixture_ids:
+        return {}
 
-    d = (detail or "").strip().lower()
-    if d == "own goal":
-        if goal_team_id == home_id:
-            return away_id
-        if goal_team_id == away_id:
-            return home_id
-        return goal_team_id
+    in_fix = ",".join(["%s"] * len(fixture_ids))
+    raw_sql = f"""
+        SELECT fixture_id, data_json
+        FROM match_events_raw
+        WHERE fixture_id IN ({in_fix})
+    """
+    raw_rows = fetch_all(raw_sql, tuple(fixture_ids)) or []
 
-    return goal_team_id
+    out: Dict[tuple, Dict[str, int]] = {}
+
+    for r in raw_rows:
+        try:
+            fx = int(r.get("fixture_id"))
+        except Exception:
+            continue
+
+        events = _parse_events_raw_to_list(r.get("data_json") or "")
+        for ev in events:
+            typ = str(ev.get("type") or ev.get("Type") or "").strip().lower()
+            det = str(ev.get("detail") or ev.get("Detail") or "").strip().lower()
+
+            # 코너 판정(가능한 폭넓게)
+            is_corner = (typ == "corner") or (det.startswith("corner")) or ("corner kick" in det)
+            if not is_corner:
+                continue
+
+            team_obj = ev.get("team") if isinstance(ev.get("team"), dict) else {}
+            team_id = team_obj.get("id") if isinstance(team_obj, dict) else None
+            if team_id is None:
+                continue
+            try:
+                tid = int(team_id)
+            except Exception:
+                continue
+
+            time_obj = ev.get("time") if isinstance(ev.get("time"), dict) else {}
+            elapsed = None
+            if isinstance(time_obj, dict):
+                elapsed = time_obj.get("elapsed")
+            if elapsed is None:
+                elapsed = ev.get("elapsed")
+
+            try:
+                minute = int(elapsed)
+            except Exception:
+                continue
+
+            # 1H: <=45 (45+extra 포함), 2H: 46~90
+            if minute <= 45:
+                half = "h1"
+            elif 46 <= minute <= 90:
+                half = "h2"
+            else:
+                continue
+
+            k = (fx, tid)
+            if k not in out:
+                out[k] = {"h1": 0, "h2": 0}
+            out[k][half] += 1
+
+    return out
 
 
-def enrich_overall_first_half_performance(
+def enrich_overall_1h_performance(
     stats: Dict[str, Any],
-    insights: Dict[str, Any],
-    *,
-    league_id: int,
-    season_int: Optional[int],
     team_id: int,
-    last_n: int = 0,
+    league_id: int,
+    season_int: int,
+    last_n: Optional[int] = None,
 ) -> None:
-    """
-    1H Performance 섹션 생성.
+    """1H Performance 섹션(HT 스코어/전반 이벤트 기반)"""
+    insights = stats.setdefault("insights_overall", {})
 
-    현재 DB 스키마/적재 기준:
-    - matches 테이블에 HT 스코어 컬럼이 없음
-    - match_team_stats에도 1H/2H 코너 통계가 없음
-    - match_events에도 코너 이벤트가 없음
-
-    따라서 1H 관련 지표는 match_events(Goal/Card)로 계산한다.
-    - 1H = minute < 46 (45+ 추가시간 포함)
-    - 연장/PK 제외: minute > 90 제외
-    - Missed Penalty는 득점이 아니므로 골 집계에서 제외
-    """
-    if not season_int:
-        return
-
-    league_ids_for_query = build_league_ids_for_query(stats, league_id)
-    if not league_ids_for_query:
-        return
-
-    placeholders = ",".join(["%s"] * len(league_ids_for_query))
-
-    base_sql = f"""
+    # FINISHED + FT 스코어 존재 경기만 (outcome과 동일 원칙)
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
-            m.status_group,
-            m.date_utc,
             m.home_ft,
-            m.away_ft
+            m.away_ft,
+            m.status_group,
+            m.date_utc
         FROM matches m
-        WHERE m.league_id IN ({placeholders})
+        WHERE m.league_id = %s
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND lower(m.status_group) = 'finished'
@@ -663,29 +800,56 @@ def enrich_overall_first_half_performance(
           AND m.away_ft IS NOT NULL
         ORDER BY m.date_utc DESC
     """
-
-    params: List[Any] = []
-    params.extend(league_ids_for_query)
-    params.extend([season_int, team_id, team_id])
-
-    rows = fetch_all(base_sql, tuple(params))
+    rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
     if not rows:
         return
-
     if last_n and last_n > 0:
         rows = rows[:last_n]
+
+    fixture_ids = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+    if not fixture_ids:
+        return
+
+    # goal/card 이벤트(FT 범위: minute<=90) 로 HT/전반 카드/전반 선제 산출
+    in_fix = ",".join(["%s"] * len(fixture_ids))
+    ev_sql = f"""
+        SELECT
+            e.id,
+            e.fixture_id,
+            e.team_id,
+            e.type,
+            e.detail,
+            e.minute,
+            COALESCE(e.extra, 0) AS extra
+        FROM match_events e
+        WHERE e.fixture_id IN ({in_fix})
+          AND lower(e.type) IN ('goal','card')
+          AND e.minute <= 90
+        ORDER BY e.fixture_id, e.minute, COALESCE(e.extra,0), e.id
+    """
+    ev_rows = fetch_all(ev_sql, tuple(fixture_ids)) or []
+    events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
+    for ev in ev_rows:
+        try:
+            fx = int(ev.get("fixture_id"))
+        except Exception:
+            continue
+        events_by_fixture.setdefault(fx, []).append(ev)
+
+    # 코너(전/후반) — 가능하면 raw에서
+    corner_counts = _load_corner_counts_by_half(fixture_ids)
 
     eff_tot = len(rows)
     eff_home = 0
     eff_away = 0
 
-    w_t = w_h = w_a = 0
-    d_t = d_h = d_a = 0
-    l_t = l_h = l_a = 0
+    w_t = d_t = l_t = 0
+    w_h = d_h = l_h = 0
+    w_a = d_a = l_a = 0
 
     cs_t = cs_h = cs_a = 0
     btts_t = btts_h = btts_a = 0
-    win_btts_t = win_btts_h = win_btts_a = 0
+    w_btts_t = w_btts_h = w_btts_a = 0
 
     tg05_t = tg05_h = tg05_a = 0
     tg15_t = tg15_h = tg15_a = 0
@@ -693,116 +857,95 @@ def enrich_overall_first_half_performance(
     tot05_t = tot05_h = tot05_a = 0
     tot15_t = tot15_h = tot15_a = 0
 
-    win_tot15_t = win_tot15_h = win_tot15_a = 0
+    w_tot15_t = w_tot15_h = w_tot15_a = 0
 
     fg_t = fg_h = fg_a = 0
     fc_t = fc_h = fc_a = 0
 
-    yellow_sum_t = yellow_sum_h = yellow_sum_a = 0
-    red_sum_t = red_sum_h = red_sum_a = 0
+    c_sum_t = c_sum_h = c_sum_a = 0
+    y_sum_t = y_sum_h = y_sum_a = 0
+    r_sum_t = r_sum_h = r_sum_a = 0
 
-    fixture_ids: List[int] = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+    for row in rows:
+        fx = int(row["fixture_id"])
+        home_id = int(row["home_id"])
+        away_id = int(row["away_id"])
 
-    events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
-    if fixture_ids:
-        in_fix = ",".join(["%s"] * len(fixture_ids))
-        ev_sql = f"""
-            SELECT fixture_id, team_id, minute, extra, type, detail, id
-            FROM match_events
-            WHERE fixture_id IN ({in_fix})
-              AND lower(type) IN ('goal','card')
-              AND minute <= 90
-            ORDER BY fixture_id, minute, COALESCE(extra,0), id
-        """
-        ev_rows = fetch_all(ev_sql, tuple(fixture_ids))
-        for ev in ev_rows or []:
-            try:
-                fx = int(ev.get("fixture_id"))
-            except Exception:
-                continue
-            events_by_fixture.setdefault(fx, []).append(ev)
-
-    for r in rows:
-        fx = int(r["fixture_id"])
-        home_id = int(r["home_id"])
-        away_id = int(r["away_id"])
         is_home = (home_id == team_id)
         if is_home:
             eff_home += 1
-            opp_id = away_id
         else:
             eff_away += 1
-            opp_id = home_id
 
-        evs = events_by_fixture.get(fx, []) or []
+        # 1H 스코어: goal 이벤트 중 minute<=45 합
+        h1_home = 0
+        h1_away = 0
 
-        our_1h = 0
-        opp_1h = 0
+        # 1H 카드(우리팀 기준): minute<=45
+        h1_y = 0
+        h1_r = 0
 
-        our_y_1h = 0
-        our_r_1h = 0
-
+        # 1H 첫 골(존재하면): minute<=45 중 earliest
         first_goal_team: Optional[int] = None
 
+        evs = events_by_fixture.get(fx, [])
         for ev in evs:
-            try:
-                minute = int(ev.get("minute") or 0)
-            except Exception:
-                minute = 0
+            typ = str(ev.get("type") or "").strip().lower()
+            det = str(ev.get("detail") or "").strip().lower()
+            minute = int(ev.get("minute") or 0)
 
-            if minute >= 46:
+            if minute > 45:
                 continue
 
-            typ = (ev.get("type") or "").strip().lower()
-            detail = (ev.get("detail") or "").strip()
-
             if typ == "goal":
-                if detail.lower() == "missed penalty":
+                tid = ev.get("team_id")
+                if tid is None:
+                    continue
+                try:
+                    tid = int(tid)
+                except Exception:
                     continue
 
-                try:
-                    goal_team_id = int(ev.get("team_id")) if ev.get("team_id") is not None else None
-                except Exception:
-                    goal_team_id = None
+                if tid == home_id:
+                    h1_home += 1
+                elif tid == away_id:
+                    h1_away += 1
 
-                beneficiary = _beneficiary_team_id_for_goal(
-                    goal_team_id=goal_team_id,
-                    home_id=home_id,
-                    away_id=away_id,
-                    detail=detail,
-                )
-
-                if beneficiary == team_id:
-                    our_1h += 1
-                elif beneficiary == opp_id:
-                    opp_1h += 1
-
-                if first_goal_team is None and beneficiary in (team_id, opp_id):
-                    first_goal_team = beneficiary
+                if first_goal_team is None:
+                    first_goal_team = tid
 
             elif typ == "card":
+                tid = ev.get("team_id")
+                if tid is None:
+                    continue
                 try:
-                    card_team = int(ev.get("team_id")) if ev.get("team_id") is not None else None
+                    tid = int(tid)
                 except Exception:
-                    card_team = None
-
-                if card_team != team_id:
+                    continue
+                if tid != team_id:
                     continue
 
-                d = detail.lower()
-                if d == "yellow card":
-                    our_y_1h += 1
-                elif d == "red card":
-                    our_r_1h += 1
+                if det == "yellow card":
+                    h1_y += 1
+                elif det == "red card":
+                    h1_r += 1
 
-        # 1H 결과(W/D/L)
-        if our_1h > opp_1h:
+        # 우리/상대 매핑
+        if is_home:
+            gf = h1_home
+            ga = h1_away
+        else:
+            gf = h1_away
+            ga = h1_home
+
+        # 1H 결과 W/D/L
+        if gf > ga:
             w_t += 1
             if is_home:
                 w_h += 1
             else:
                 w_a += 1
-        elif our_1h == opp_1h:
+        elif gf == ga:
             d_t += 1
             if is_home:
                 d_h += 1
@@ -816,140 +959,140 @@ def enrich_overall_first_half_performance(
                 l_a += 1
 
         # Clean Sheet / BTTS
-        if opp_1h == 0:
+        if ga == 0:
             cs_t += 1
             if is_home:
                 cs_h += 1
             else:
                 cs_a += 1
 
-        if our_1h >= 1 and opp_1h >= 1:
+        if gf >= 1 and ga >= 1:
             btts_t += 1
             if is_home:
                 btts_h += 1
             else:
                 btts_a += 1
 
-        if our_1h > opp_1h and our_1h >= 1 and opp_1h >= 1:
-            win_btts_t += 1
+        if (gf > ga) and (gf >= 1 and ga >= 1):
+            w_btts_t += 1
             if is_home:
-                win_btts_h += 1
+                w_btts_h += 1
             else:
-                win_btts_a += 1
+                w_btts_a += 1
 
-        if our_1h >= 1:
+        # TG / Total
+        if gf >= 1:
             tg05_t += 1
             if is_home:
                 tg05_h += 1
             else:
                 tg05_a += 1
-        if our_1h >= 2:
+        if gf >= 2:
             tg15_t += 1
             if is_home:
                 tg15_h += 1
             else:
                 tg15_a += 1
 
-        total_1h = our_1h + opp_1h
-        if total_1h >= 1:
+        total_goals = gf + ga
+        if total_goals >= 1:
             tot05_t += 1
             if is_home:
                 tot05_h += 1
             else:
                 tot05_a += 1
-        if total_1h >= 2:
+        if total_goals >= 2:
             tot15_t += 1
             if is_home:
                 tot15_h += 1
             else:
                 tot15_a += 1
 
-        if our_1h > opp_1h and total_1h >= 2:
-            win_tot15_t += 1
+        if (gf > ga) and (total_goals >= 2):
+            w_tot15_t += 1
             if is_home:
-                win_tot15_h += 1
+                w_tot15_h += 1
             else:
-                win_tot15_a += 1
+                w_tot15_a += 1
 
-        if first_goal_team == team_id:
-            fg_t += 1
-            if is_home:
-                fg_h += 1
+        # First Goal / First Concede (분모=전체 경기, 전반 득점 없는 경기는 분자 제외)
+        if first_goal_team is not None:
+            if first_goal_team == team_id:
+                fg_t += 1
+                if is_home:
+                    fg_h += 1
+                else:
+                    fg_a += 1
             else:
-                fg_a += 1
-        elif first_goal_team == opp_id:
-            fc_t += 1
-            if is_home:
-                fc_h += 1
-            else:
-                fc_a += 1
+                fc_t += 1
+                if is_home:
+                    fc_h += 1
+                else:
+                    fc_a += 1
 
-        yellow_sum_t += our_y_1h
-        red_sum_t += our_r_1h
+        # Corners(AVG) — raw에서 가능한 만큼
+        c = corner_counts.get((fx, team_id), {}).get("h1", 0)
+        c_sum_t += c
         if is_home:
-            yellow_sum_h += our_y_1h
-            red_sum_h += our_r_1h
+            c_sum_h += c
         else:
-            yellow_sum_a += our_y_1h
-            red_sum_a += our_r_1h
+            c_sum_a += c
+
+        # Cards(AVG)
+        y_sum_t += h1_y
+        r_sum_t += h1_r
+        if is_home:
+            y_sum_h += h1_y
+            r_sum_h += h1_r
+        else:
+            y_sum_a += h1_y
+            r_sum_a += h1_r
 
     insights["h1_win_pct"] = {"total": fmt_pct(w_t, eff_tot), "home": fmt_pct(w_h, eff_home), "away": fmt_pct(w_a, eff_away)}
     insights["h1_draw_pct"] = {"total": fmt_pct(d_t, eff_tot), "home": fmt_pct(d_h, eff_home), "away": fmt_pct(d_a, eff_away)}
     insights["h1_loss_pct"] = {"total": fmt_pct(l_t, eff_tot), "home": fmt_pct(l_h, eff_home), "away": fmt_pct(l_a, eff_away)}
 
-    insights["h1_cs_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
+    insights["h1_clean_sheet_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
     insights["h1_btts_pct"] = {"total": fmt_pct(btts_t, eff_tot), "home": fmt_pct(btts_h, eff_home), "away": fmt_pct(btts_a, eff_away)}
-    insights["h1_win_btts_pct"] = {"total": fmt_pct(win_btts_t, eff_tot), "home": fmt_pct(win_btts_h, eff_home), "away": fmt_pct(win_btts_a, eff_away)}
+    insights["h1_win_and_btts_pct"] = {"total": fmt_pct(w_btts_t, eff_tot), "home": fmt_pct(w_btts_h, eff_home), "away": fmt_pct(w_btts_a, eff_away)}
 
-    insights["h1_tg05_pct"] = {"total": fmt_pct(tg05_t, eff_tot), "home": fmt_pct(tg05_h, eff_home), "away": fmt_pct(tg05_a, eff_away)}
-    insights["h1_tg15_pct"] = {"total": fmt_pct(tg15_t, eff_tot), "home": fmt_pct(tg15_h, eff_home), "away": fmt_pct(tg15_a, eff_away)}
+    insights["h1_team_over05_pct"] = {"total": fmt_pct(tg05_t, eff_tot), "home": fmt_pct(tg05_h, eff_home), "away": fmt_pct(tg05_a, eff_away)}
+    insights["h1_team_over15_pct"] = {"total": fmt_pct(tg15_t, eff_tot), "home": fmt_pct(tg15_h, eff_home), "away": fmt_pct(tg15_a, eff_away)}
 
-    insights["h1_total05_pct"] = {"total": fmt_pct(tot05_t, eff_tot), "home": fmt_pct(tot05_h, eff_home), "away": fmt_pct(tot05_a, eff_away)}
-    insights["h1_total15_pct"] = {"total": fmt_pct(tot15_t, eff_tot), "home": fmt_pct(tot15_h, eff_home), "away": fmt_pct(tot15_a, eff_away)}
+    insights["h1_total_over05_pct"] = {"total": fmt_pct(tot05_t, eff_tot), "home": fmt_pct(tot05_h, eff_home), "away": fmt_pct(tot05_a, eff_away)}
+    insights["h1_total_over15_pct"] = {"total": fmt_pct(tot15_t, eff_tot), "home": fmt_pct(tot15_h, eff_home), "away": fmt_pct(tot15_a, eff_away)}
 
-    insights["h1_win_total15_pct"] = {"total": fmt_pct(win_tot15_t, eff_tot), "home": fmt_pct(win_tot15_h, eff_home), "away": fmt_pct(win_tot15_a, eff_away)}
+    insights["h1_win_and_total_over15_pct"] = {"total": fmt_pct(w_tot15_t, eff_tot), "home": fmt_pct(w_tot15_h, eff_home), "away": fmt_pct(w_tot15_a, eff_away)}
 
     insights["h1_first_goal_pct"] = {"total": fmt_pct(fg_t, eff_tot), "home": fmt_pct(fg_h, eff_home), "away": fmt_pct(fg_a, eff_away)}
     insights["h1_first_concede_pct"] = {"total": fmt_pct(fc_t, eff_tot), "home": fmt_pct(fc_h, eff_home), "away": fmt_pct(fc_a, eff_away)}
 
-    insights["h1_yellow_avg"] = {"total": fmt_avg(yellow_sum_t, eff_tot), "home": fmt_avg(yellow_sum_h, eff_home), "away": fmt_avg(yellow_sum_a, eff_away)}
-    insights["h1_red_avg"] = {"total": fmt_avg(red_sum_t, eff_tot), "home": fmt_avg(red_sum_h, eff_home), "away": fmt_avg(red_sum_a, eff_away)}
+    insights["h1_corners_avg"] = {"total": fmt_avg(c_sum_t, eff_tot), "home": fmt_avg(c_sum_h, eff_home), "away": fmt_avg(c_sum_a, eff_away)}
+    insights["h1_yellow_avg"] = {"total": fmt_avg(y_sum_t, eff_tot), "home": fmt_avg(y_sum_h, eff_home), "away": fmt_avg(y_sum_a, eff_away)}
+    insights["h1_red_avg"] = {"total": fmt_avg(r_sum_t, eff_tot), "home": fmt_avg(r_sum_h, eff_home), "away": fmt_avg(r_sum_a, eff_away)}
 
 
-def enrich_overall_second_half_performance(
+def enrich_overall_2h_performance(
     stats: Dict[str, Any],
-    insights: Dict[str, Any],
-    *,
-    league_id: int,
-    season_int: Optional[int],
     team_id: int,
-    last_n: int = 0,
+    league_id: int,
+    season_int: int,
+    last_n: Optional[int] = None,
 ) -> None:
-    """
-    2H Performance 섹션 생성.
-    - 2H 득점 = match_events를 46~90분 구간으로 집계하여 계산
-    - 2H First Goal / First Concede: "후반 첫 득점" 기준(경기 첫 득점 아님)
-    """
-    if not season_int:
-        return
+    """2H Performance 섹션(후반 득점 = FT - HT)"""
+    insights = stats.setdefault("insights_overall", {})
 
-    league_ids_for_query = build_league_ids_for_query(stats, league_id)
-    if not league_ids_for_query:
-        return
-
-    placeholders = ",".join(["%s"] * len(league_ids_for_query))
-
-    base_sql = f"""
+    base_sql = """
         SELECT
             m.fixture_id,
             m.home_id,
             m.away_id,
-            m.status_group,
-            m.date_utc,
             m.home_ft,
-            m.away_ft
+            m.away_ft,
+            m.status_group,
+            m.date_utc
         FROM matches m
-        WHERE m.league_id IN ({placeholders})
+        WHERE m.league_id = %s
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND lower(m.status_group) = 'finished'
@@ -957,29 +1100,54 @@ def enrich_overall_second_half_performance(
           AND m.away_ft IS NOT NULL
         ORDER BY m.date_utc DESC
     """
-
-    params: List[Any] = []
-    params.extend(league_ids_for_query)
-    params.extend([season_int, team_id, team_id])
-
-    rows = fetch_all(base_sql, tuple(params))
+    rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
     if not rows:
         return
-
     if last_n and last_n > 0:
         rows = rows[:last_n]
+
+    fixture_ids = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+    if not fixture_ids:
+        return
+
+    in_fix = ",".join(["%s"] * len(fixture_ids))
+    ev_sql = f"""
+        SELECT
+            e.id,
+            e.fixture_id,
+            e.team_id,
+            e.type,
+            e.detail,
+            e.minute,
+            COALESCE(e.extra, 0) AS extra
+        FROM match_events e
+        WHERE e.fixture_id IN ({in_fix})
+          AND lower(e.type) IN ('goal','card')
+          AND e.minute <= 90
+        ORDER BY e.fixture_id, e.minute, COALESCE(e.extra,0), e.id
+    """
+    ev_rows = fetch_all(ev_sql, tuple(fixture_ids)) or []
+    events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
+    for ev in ev_rows:
+        try:
+            fx = int(ev.get("fixture_id"))
+        except Exception:
+            continue
+        events_by_fixture.setdefault(fx, []).append(ev)
+
+    corner_counts = _load_corner_counts_by_half(fixture_ids)
 
     eff_tot = len(rows)
     eff_home = 0
     eff_away = 0
 
-    w_t = w_h = w_a = 0
-    d_t = d_h = d_a = 0
-    l_t = l_h = l_a = 0
+    w_t = d_t = l_t = 0
+    w_h = d_h = l_h = 0
+    w_a = d_a = l_a = 0
 
     cs_t = cs_h = cs_a = 0
     btts_t = btts_h = btts_a = 0
-    win_btts_t = win_btts_h = win_btts_a = 0
+    w_btts_t = w_btts_h = w_btts_a = 0
 
     tg05_t = tg05_h = tg05_a = 0
     tg15_t = tg15_h = tg15_a = 0
@@ -987,116 +1155,104 @@ def enrich_overall_second_half_performance(
     tot05_t = tot05_h = tot05_a = 0
     tot15_t = tot15_h = tot15_a = 0
 
-    win_tot15_t = win_tot15_h = win_tot15_a = 0
+    w_tot15_t = w_tot15_h = w_tot15_a = 0
 
     fg_t = fg_h = fg_a = 0
     fc_t = fc_h = fc_a = 0
 
-    yellow_sum_t = yellow_sum_h = yellow_sum_a = 0
-    red_sum_t = red_sum_h = red_sum_a = 0
+    c_sum_t = c_sum_h = c_sum_a = 0
+    y_sum_t = y_sum_h = y_sum_a = 0
+    r_sum_t = r_sum_h = r_sum_a = 0
 
-    fixture_ids: List[int] = [int(r["fixture_id"]) for r in rows if r.get("fixture_id") is not None]
+    for row in rows:
+        fx = int(row["fixture_id"])
+        home_id = int(row["home_id"])
+        away_id = int(row["away_id"])
 
-    events_by_fixture: Dict[int, List[Dict[str, Any]]] = {}
-    if fixture_ids:
-        in_fix = ",".join(["%s"] * len(fixture_ids))
-        ev_sql = f"""
-            SELECT fixture_id, team_id, minute, extra, type, detail, id
-            FROM match_events
-            WHERE fixture_id IN ({in_fix})
-              AND lower(type) IN ('goal','card')
-              AND minute <= 90
-            ORDER BY fixture_id, minute, COALESCE(extra,0), id
-        """
-        ev_rows = fetch_all(ev_sql, tuple(fixture_ids))
-        for ev in ev_rows or []:
-            try:
-                fx = int(ev.get("fixture_id"))
-            except Exception:
-                continue
-            events_by_fixture.setdefault(fx, []).append(ev)
-
-    for r in rows:
-        fx = int(r["fixture_id"])
-        home_id = int(r["home_id"])
-        away_id = int(r["away_id"])
         is_home = (home_id == team_id)
         if is_home:
             eff_home += 1
-            opp_id = away_id
         else:
             eff_away += 1
-            opp_id = home_id
 
-        evs = events_by_fixture.get(fx, []) or []
+        home_ft = int(row.get("home_ft") or 0)
+        away_ft = int(row.get("away_ft") or 0)
 
-        our_2h = 0
-        opp_2h = 0
+        # HT 스코어(1H) — goal 이벤트 중 minute<=45 합
+        h1_home = 0
+        h1_away = 0
 
-        our_y_2h = 0
-        our_r_2h = 0
+        # 2H 카드(우리팀 기준): minute>=46
+        h2_y = 0
+        h2_r = 0
 
+        # 2H 첫 골: minute>=46 중 earliest
         first_goal_team: Optional[int] = None
 
+        evs = events_by_fixture.get(fx, [])
         for ev in evs:
-            try:
-                minute = int(ev.get("minute") or 0)
-            except Exception:
-                minute = 0
-
-            if minute < 46 or minute > 90:
-                continue
-
-            typ = (ev.get("type") or "").strip().lower()
-            detail = (ev.get("detail") or "").strip()
+            typ = str(ev.get("type") or "").strip().lower()
+            det = str(ev.get("detail") or "").strip().lower()
+            minute = int(ev.get("minute") or 0)
 
             if typ == "goal":
-                if detail.lower() == "missed penalty":
+                tid = ev.get("team_id")
+                if tid is None:
+                    continue
+                try:
+                    tid = int(tid)
+                except Exception:
                     continue
 
-                try:
-                    goal_team_id = int(ev.get("team_id")) if ev.get("team_id") is not None else None
-                except Exception:
-                    goal_team_id = None
-
-                beneficiary = _beneficiary_team_id_for_goal(
-                    goal_team_id=goal_team_id,
-                    home_id=home_id,
-                    away_id=away_id,
-                    detail=detail,
-                )
-
-                if beneficiary == team_id:
-                    our_2h += 1
-                elif beneficiary == opp_id:
-                    opp_2h += 1
-
-                if first_goal_team is None and beneficiary in (team_id, opp_id):
-                    first_goal_team = beneficiary
+                if minute <= 45:
+                    if tid == home_id:
+                        h1_home += 1
+                    elif tid == away_id:
+                        h1_away += 1
+                elif 46 <= minute <= 90:
+                    if first_goal_team is None:
+                        first_goal_team = tid
 
             elif typ == "card":
+                if minute < 46:
+                    continue
+                tid = ev.get("team_id")
+                if tid is None:
+                    continue
                 try:
-                    card_team = int(ev.get("team_id")) if ev.get("team_id") is not None else None
+                    tid = int(tid)
                 except Exception:
-                    card_team = None
-
-                if card_team != team_id:
+                    continue
+                if tid != team_id:
                     continue
 
-                d = detail.lower()
-                if d == "yellow card":
-                    our_y_2h += 1
-                elif d == "red card":
-                    our_r_2h += 1
+                if det == "yellow card":
+                    h2_y += 1
+                elif det == "red card":
+                    h2_r += 1
 
-        # 2H 결과(W/D/L)
-        if our_2h > opp_2h:
+        # 2H 득점 = FT - HT
+        if is_home:
+            gf_ft = home_ft
+            ga_ft = away_ft
+            gf_h1 = h1_home
+            ga_h1 = h1_away
+        else:
+            gf_ft = away_ft
+            ga_ft = home_ft
+            gf_h1 = h1_away
+            ga_h1 = h1_home
+
+        gf = max(gf_ft - gf_h1, 0)
+        ga = max(ga_ft - ga_h1, 0)
+
+        if gf > ga:
             w_t += 1
             if is_home:
                 w_h += 1
             else:
                 w_a += 1
-        elif our_2h == opp_2h:
+        elif gf == ga:
             d_t += 1
             if is_home:
                 d_h += 1
@@ -1109,104 +1265,114 @@ def enrich_overall_second_half_performance(
             else:
                 l_a += 1
 
-        if opp_2h == 0:
+        if ga == 0:
             cs_t += 1
             if is_home:
                 cs_h += 1
             else:
                 cs_a += 1
 
-        if our_2h >= 1 and opp_2h >= 1:
+        if gf >= 1 and ga >= 1:
             btts_t += 1
             if is_home:
                 btts_h += 1
             else:
                 btts_a += 1
 
-        if our_2h > opp_2h and our_2h >= 1 and opp_2h >= 1:
-            win_btts_t += 1
+        if (gf > ga) and (gf >= 1 and ga >= 1):
+            w_btts_t += 1
             if is_home:
-                win_btts_h += 1
+                w_btts_h += 1
             else:
-                win_btts_a += 1
+                w_btts_a += 1
 
-        if our_2h >= 1:
+        if gf >= 1:
             tg05_t += 1
             if is_home:
                 tg05_h += 1
             else:
                 tg05_a += 1
-        if our_2h >= 2:
+        if gf >= 2:
             tg15_t += 1
             if is_home:
                 tg15_h += 1
             else:
                 tg15_a += 1
 
-        total_2h = our_2h + opp_2h
-        if total_2h >= 1:
+        total_goals = gf + ga
+        if total_goals >= 1:
             tot05_t += 1
             if is_home:
                 tot05_h += 1
             else:
                 tot05_a += 1
-        if total_2h >= 2:
+        if total_goals >= 2:
             tot15_t += 1
             if is_home:
                 tot15_h += 1
             else:
                 tot15_a += 1
 
-        if our_2h > opp_2h and total_2h >= 2:
-            win_tot15_t += 1
+        if (gf > ga) and (total_goals >= 2):
+            w_tot15_t += 1
             if is_home:
-                win_tot15_h += 1
+                w_tot15_h += 1
             else:
-                win_tot15_a += 1
+                w_tot15_a += 1
 
-        if first_goal_team == team_id:
-            fg_t += 1
-            if is_home:
-                fg_h += 1
+        if first_goal_team is not None:
+            if first_goal_team == team_id:
+                fg_t += 1
+                if is_home:
+                    fg_h += 1
+                else:
+                    fg_a += 1
             else:
-                fg_a += 1
-        elif first_goal_team == opp_id:
-            fc_t += 1
-            if is_home:
-                fc_h += 1
-            else:
-                fc_a += 1
+                fc_t += 1
+                if is_home:
+                    fc_h += 1
+                else:
+                    fc_a += 1
 
-        yellow_sum_t += our_y_2h
-        red_sum_t += our_r_2h
+        c = corner_counts.get((fx, team_id), {}).get("h2", 0)
+        c_sum_t += c
         if is_home:
-            yellow_sum_h += our_y_2h
-            red_sum_h += our_r_2h
+            c_sum_h += c
         else:
-            yellow_sum_a += our_y_2h
-            red_sum_a += our_r_2h
+            c_sum_a += c
+
+        y_sum_t += h2_y
+        r_sum_t += h2_r
+        if is_home:
+            y_sum_h += h2_y
+            r_sum_h += h2_r
+        else:
+            y_sum_a += h2_y
+            r_sum_a += h2_r
 
     insights["h2_win_pct"] = {"total": fmt_pct(w_t, eff_tot), "home": fmt_pct(w_h, eff_home), "away": fmt_pct(w_a, eff_away)}
     insights["h2_draw_pct"] = {"total": fmt_pct(d_t, eff_tot), "home": fmt_pct(d_h, eff_home), "away": fmt_pct(d_a, eff_away)}
     insights["h2_loss_pct"] = {"total": fmt_pct(l_t, eff_tot), "home": fmt_pct(l_h, eff_home), "away": fmt_pct(l_a, eff_away)}
 
-    insights["h2_cs_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
+    insights["h2_clean_sheet_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
     insights["h2_btts_pct"] = {"total": fmt_pct(btts_t, eff_tot), "home": fmt_pct(btts_h, eff_home), "away": fmt_pct(btts_a, eff_away)}
-    insights["h2_win_btts_pct"] = {"total": fmt_pct(win_btts_t, eff_tot), "home": fmt_pct(win_btts_h, eff_home), "away": fmt_pct(win_btts_a, eff_away)}
+    insights["h2_win_and_btts_pct"] = {"total": fmt_pct(w_btts_t, eff_tot), "home": fmt_pct(w_btts_h, eff_home), "away": fmt_pct(w_btts_a, eff_away)}
 
-    insights["h2_tg05_pct"] = {"total": fmt_pct(tg05_t, eff_tot), "home": fmt_pct(tg05_h, eff_home), "away": fmt_pct(tg05_a, eff_away)}
-    insights["h2_tg15_pct"] = {"total": fmt_pct(tg15_t, eff_tot), "home": fmt_pct(tg15_h, eff_home), "away": fmt_pct(tg15_a, eff_away)}
+    insights["h2_team_over05_pct"] = {"total": fmt_pct(tg05_t, eff_tot), "home": fmt_pct(tg05_h, eff_home), "away": fmt_pct(tg05_a, eff_away)}
+    insights["h2_team_over15_pct"] = {"total": fmt_pct(tg15_t, eff_tot), "home": fmt_pct(tg15_h, eff_home), "away": fmt_pct(tg15_a, eff_away)}
 
-    insights["h2_total05_pct"] = {"total": fmt_pct(tot05_t, eff_tot), "home": fmt_pct(tot05_h, eff_home), "away": fmt_pct(tot05_a, eff_away)}
-    insights["h2_total15_pct"] = {"total": fmt_pct(tot15_t, eff_tot), "home": fmt_pct(tot15_h, eff_home), "away": fmt_pct(tot15_a, eff_away)}
+    insights["h2_total_over05_pct"] = {"total": fmt_pct(tot05_t, eff_tot), "home": fmt_pct(tot05_h, eff_home), "away": fmt_pct(tot05_a, eff_away)}
+    insights["h2_total_over15_pct"] = {"total": fmt_pct(tot15_t, eff_tot), "home": fmt_pct(tot15_h, eff_home), "away": fmt_pct(tot15_a, eff_away)}
 
-    insights["h2_win_total15_pct"] = {"total": fmt_pct(win_tot15_t, eff_tot), "home": fmt_pct(win_tot15_h, eff_home), "away": fmt_pct(win_tot15_a, eff_away)}
+    insights["h2_win_and_total_over15_pct"] = {"total": fmt_pct(w_tot15_t, eff_tot), "home": fmt_pct(w_tot15_h, eff_home), "away": fmt_pct(w_tot15_a, eff_away)}
 
     insights["h2_first_goal_pct"] = {"total": fmt_pct(fg_t, eff_tot), "home": fmt_pct(fg_h, eff_home), "away": fmt_pct(fg_a, eff_away)}
     insights["h2_first_concede_pct"] = {"total": fmt_pct(fc_t, eff_tot), "home": fmt_pct(fc_h, eff_home), "away": fmt_pct(fc_a, eff_away)}
 
-    insights["h2_yellow_avg"] = {"total": fmt_avg(yellow_sum_t, eff_tot), "home": fmt_avg(yellow_sum_h, eff_home), "away": fmt_avg(yellow_sum_a, eff_away)}
-    insights["h2_red_avg"] = {"total": fmt_avg(red_sum_t, eff_tot), "home": fmt_avg(red_sum_h, eff_home), "away": fmt_avg(red_sum_a, eff_away)}
+    insights["h2_corners_avg"] = {"total": fmt_avg(c_sum_t, eff_tot), "home": fmt_avg(c_sum_h, eff_home), "away": fmt_avg(c_sum_a, eff_away)}
+    insights["h2_yellow_avg"] = {"total": fmt_avg(y_sum_t, eff_tot), "home": fmt_avg(y_sum_h, eff_home), "away": fmt_avg(y_sum_a, eff_away)}
+    insights["h2_red_avg"] = {"total": fmt_avg(r_sum_t, eff_tot), "home": fmt_avg(r_sum_h, eff_home), "away": fmt_avg(r_sum_a, eff_away)}
+
 
 
 def enrich_overall_goals_by_time(
@@ -1702,23 +1868,20 @@ def _build_side_insights(
         last_n=last_n,
     )
 
-    # ✅ NEW: 1H Performance
-    enrich_overall_first_half_performance(
+
+    # ✅ 추가: 1H / 2H Performance
+    enrich_overall_1h_performance(
         stats,
-        insights,
+        team_id=team_id,
         league_id=league_id,
         season_int=season_int,
-        team_id=team_id,
         last_n=last_n,
     )
-
-    # ✅ NEW: 2H Performance
-    enrich_overall_second_half_performance(
+    enrich_overall_2h_performance(
         stats,
-        insights,
+        team_id=team_id,
         league_id=league_id,
         season_int=season_int,
-        team_id=team_id,
         last_n=last_n,
     )
 
@@ -1948,92 +2111,101 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
     - 앱은 sections를 보고 어떤 섹션을 어떤 렌더러로 그릴지 결정
     """
     return [
-        {
-            "id": "outcome_totals",
-            "title": "Outcome + Totals",
-            "renderer": "metrics_table",
-            # metrics: 기존 insights dict에 이미 존재하는 키들만 참조
-            "metrics": [
-                {"key": "win_pct", "label": "FT W", "format": "pct_hoa"},
-                {"key": "draw_pct", "label": "FT D", "format": "pct_hoa"},
-                {"key": "loss_pct", "label": "FT L", "format": "pct_hoa"},
-
-                {"key": "over15_pct", "label": "Total 1.5+", "format": "pct_hoa"},
-                {"key": "over25_pct", "label": "Total 2.5+", "format": "pct_hoa"},
-
-                {"key": "btts_pct", "label": "BTTS", "format": "pct_hoa"},
-                {"key": "clean_sheet_pct", "label": "CS", "format": "pct_hoa"},
-                {"key": "no_goals_pct", "label": "NG", "format": "pct_hoa"},
-
-                {"key": "team_over05_pct", "label": "Team 0.5+", "format": "pct_hoa"},
-                {"key": "team_over15_pct", "label": "Team 1.5+", "format": "pct_hoa"},
-
-                {"key": "avg_gf", "label": "AVG GF", "format": "avg_hoa"},
-                {"key": "avg_ga", "label": "AVG GA", "format": "avg_hoa"},
-                {"key": "goal_diff_avg", "label": "GD", "format": "avg_hoa"},
-
-                {"key": "win_and_over25_pct", "label": "W & Total 2.5+", "format": "pct_hoa"},
-                {"key": "lose_and_btts_pct", "label": "L & BTTS", "format": "pct_hoa"},
-                {"key": "win_and_btts_pct", "label": "W & BTTS", "format": "pct_hoa"},
-                {"key": "draw_and_btts_pct", "label": "D & BTTS", "format": "pct_hoa"},
-            ],
         
-},
 {
-    "id": "first_half_performance",
-    "title": "1H Performance",
+    "id": "outcome_totals",
+    "title": "FT Results",
     "renderer": "metrics_table",
     "metrics": [
-        {"key": "h1_win_pct", "label": "1H W", "format": "pct_hoa"},
-        {"key": "h1_draw_pct", "label": "1H D", "format": "pct_hoa"},
-        {"key": "h1_loss_pct", "label": "1H L", "format": "pct_hoa"},
-        {"key": "h1_cs_pct", "label": "1H Clean Sheet", "format": "pct_hoa"},
-        {"key": "h1_btts_pct", "label": "1H BTTS", "format": "pct_hoa"},
-        {"key": "h1_win_btts_pct", "label": "1H W & BTTS", "format": "pct_hoa"},
+        {"key": "win_pct", "label": "FT W", "format": "pct_hoa"},
+        {"key": "draw_pct", "label": "FT D", "format": "pct_hoa"},
+        {"key": "loss_pct", "label": "FT L", "format": "pct_hoa"},
+        {"key": "clean_sheet_pct", "label": "FT Clean Sheet", "format": "pct_hoa"},
+        {"key": "btts_pct", "label": "FT BTTS", "format": "pct_hoa"},
+        {"key": "win_and_btts_pct", "label": "FT W & BTTS", "format": "pct_hoa"},
 
-        {"key": "h1_tg05_pct", "label": "1H TG 0.5+", "format": "pct_hoa"},
-        {"key": "h1_tg15_pct", "label": "1H TG 1.5+", "format": "pct_hoa"},
+        {"key": "team_over05_pct", "label": "FT TG 0.5+", "format": "pct_hoa"},
+        {"key": "team_over15_pct", "label": "FT TG 1.5+", "format": "pct_hoa"},
+        {"key": "team_over25_pct", "label": "FT TG 2.5+", "format": "pct_hoa"},
 
-        {"key": "h1_total05_pct", "label": "1H Total 0.5+", "format": "pct_hoa"},
-        {"key": "h1_total15_pct", "label": "1H Total 1.5+", "format": "pct_hoa"},
+        {"key": "over15_pct", "label": "FT Total 1.5+", "format": "pct_hoa"},
+        {"key": "over25_pct", "label": "FT Total 2.5+", "format": "pct_hoa"},
 
-        {"key": "h1_win_total15_pct", "label": "1H W & Total 1.5+", "format": "pct_hoa"},
+        {"key": "win_and_over15_pct", "label": "FT W & Total 1.5+", "format": "pct_hoa"},
+        {"key": "win_and_over25_pct", "label": "FT W & Total 2.5+", "format": "pct_hoa"},
 
-        {"key": "h1_first_goal_pct", "label": "1H First Goal", "format": "pct_hoa"},
-        {"key": "h1_first_concede_pct", "label": "1H First Concede", "format": "pct_hoa"},
+        {"key": "first_goal_pct", "label": "FT First Goal", "format": "pct_hoa"},
+        {"key": "first_concede_pct", "label": "FT First Concede", "format": "pct_hoa"},
 
-        {"key": "h1_yellow_avg", "label": "1H Yellow Card (AVG)", "format": "avg_hoa"},
-        {"key": "h1_red_avg", "label": "1H Red Card (AVG)", "format": "avg_hoa"},
+        {"key": "corners_avg", "label": "FT Corners (AVG)", "format": "avg_hoa"},
+        {"key": "yellow_avg", "label": "FT Yellow Card (AVG)", "format": "avg_hoa"},
+        {"key": "red_avg", "label": "FT Red Card (AVG)", "format": "avg_hoa"},
+
+        {"key": "pen_won_avg", "label": "FT Pen Won (AVG)", "format": "avg_hoa"},
+        {"key": "pen_conv_pct", "label": "FT Pen Conv%", "format": "pct_hoa"},
+
+        {"key": "opp_red_to_score_pct", "label": "FT Opp Red Card → Score", "format": "pct_hoa"},
+        {"key": "own_red_to_concede_pct", "label": "FT Own Red Card → Concede", "format": "pct_hoa"},
     ]
 },
-{
-    "id": "second_half_performance",
-    "title": "2H Performance",
-    "renderer": "metrics_table",
-    "metrics": [
-        {"key": "h2_win_pct", "label": "2H W", "format": "pct_hoa"},
-        {"key": "h2_draw_pct", "label": "2H D", "format": "pct_hoa"},
-        {"key": "h2_loss_pct", "label": "2H L", "format": "pct_hoa"},
-        {"key": "h2_cs_pct", "label": "2H Clean Sheet", "format": "pct_hoa"},
-        {"key": "h2_btts_pct", "label": "2H BTTS", "format": "pct_hoa"},
-        {"key": "h2_win_btts_pct", "label": "2H W & BTTS", "format": "pct_hoa"},
 
-        {"key": "h2_tg05_pct", "label": "2H TG 0.5+", "format": "pct_hoa"},
-        {"key": "h2_tg15_pct", "label": "2H TG 1.5+", "format": "pct_hoa"},
+        {
+            "id": "h1_performance",
+            "title": "1H Performance",
+            "renderer": "metrics_table",
+            "metrics": [
+                {"key": "h1_win_pct", "label": "1H W", "format": "pct_hoa"},
+                {"key": "h1_draw_pct", "label": "1H D", "format": "pct_hoa"},
+                {"key": "h1_loss_pct", "label": "1H L", "format": "pct_hoa"},
+                {"key": "h1_clean_sheet_pct", "label": "1H Clean Sheet", "format": "pct_hoa"},
+                {"key": "h1_btts_pct", "label": "1H BTTS", "format": "pct_hoa"},
+                {"key": "h1_win_and_btts_pct", "label": "1H W & BTTS", "format": "pct_hoa"},
 
-        {"key": "h2_total05_pct", "label": "2H Total 0.5+", "format": "pct_hoa"},
-        {"key": "h2_total15_pct", "label": "2H Total 1.5+", "format": "pct_hoa"},
+                {"key": "h1_team_over05_pct", "label": "1H TG 0.5+", "format": "pct_hoa"},
+                {"key": "h1_team_over15_pct", "label": "1H TG 1.5+", "format": "pct_hoa"},
 
-        {"key": "h2_win_total15_pct", "label": "2H W & Total 1.5+", "format": "pct_hoa"},
+                {"key": "h1_total_over05_pct", "label": "1H Total 0.5+", "format": "pct_hoa"},
+                {"key": "h1_total_over15_pct", "label": "1H Total 1.5+", "format": "pct_hoa"},
 
-        {"key": "h2_first_goal_pct", "label": "2H First Goal", "format": "pct_hoa"},
-        {"key": "h2_first_concede_pct", "label": "2H First Concede", "format": "pct_hoa"},
+                {"key": "h1_win_and_total_over15_pct", "label": "1H W & Total 1.5+", "format": "pct_hoa"},
 
-        {"key": "h2_yellow_avg", "label": "2H Yellow Card (AVG)", "format": "avg_hoa"},
-        {"key": "h2_red_avg", "label": "2H Red Card (AVG)", "format": "avg_hoa"},
-    ]
+                {"key": "h1_first_goal_pct", "label": "1H First Goal", "format": "pct_hoa"},
+                {"key": "h1_first_concede_pct", "label": "1H First Concede", "format": "pct_hoa"},
 
-},
+                {"key": "h1_corners_avg", "label": "1H Corners (AVG)", "format": "avg_hoa"},
+                {"key": "h1_yellow_avg", "label": "1H Yellow Card (AVG)", "format": "avg_hoa"},
+                {"key": "h1_red_avg", "label": "1H Red Card (AVG)", "format": "avg_hoa"},
+            ]
+        },
+
+        {
+            "id": "h2_performance",
+            "title": "2H Performance",
+            "renderer": "metrics_table",
+            "metrics": [
+                {"key": "h2_win_pct", "label": "2H W", "format": "pct_hoa"},
+                {"key": "h2_draw_pct", "label": "2H D", "format": "pct_hoa"},
+                {"key": "h2_loss_pct", "label": "2H L", "format": "pct_hoa"},
+                {"key": "h2_clean_sheet_pct", "label": "2H Clean Sheet", "format": "pct_hoa"},
+                {"key": "h2_btts_pct", "label": "2H BTTS", "format": "pct_hoa"},
+                {"key": "h2_win_and_btts_pct", "label": "2H W & BTTS", "format": "pct_hoa"},
+
+                {"key": "h2_team_over05_pct", "label": "2H TG 0.5+", "format": "pct_hoa"},
+                {"key": "h2_team_over15_pct", "label": "2H TG 1.5+", "format": "pct_hoa"},
+
+                {"key": "h2_total_over05_pct", "label": "2H Total 0.5+", "format": "pct_hoa"},
+                {"key": "h2_total_over15_pct", "label": "2H Total 1.5+", "format": "pct_hoa"},
+
+                {"key": "h2_win_and_total_over15_pct", "label": "2H W & Total 1.5+", "format": "pct_hoa"},
+
+                {"key": "h2_first_goal_pct", "label": "2H First Goal", "format": "pct_hoa"},
+                {"key": "h2_first_concede_pct", "label": "2H First Concede", "format": "pct_hoa"},
+
+                {"key": "h2_corners_avg", "label": "2H Corners (AVG)", "format": "avg_hoa"},
+                {"key": "h2_yellow_avg", "label": "2H Yellow Card (AVG)", "format": "avg_hoa"},
+                {"key": "h2_red_avg", "label": "2H Red Card (AVG)", "format": "avg_hoa"},
+            ]
+        },
         {
             "id": "goals_by_time",
             "title": "Goals by Time",
