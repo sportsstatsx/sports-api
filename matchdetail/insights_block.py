@@ -770,6 +770,129 @@ def _load_corner_counts_by_half(fixture_ids: List[int]) -> Dict[tuple, Dict[str,
 
     return out
 
+def _load_cards_and_first_goal_by_half(fixture_ids: List[int]) -> Dict[str, Any]:
+    """
+    match_events_raw에서 1H/2H 기준으로:
+      - 팀별 카드(옐/레) 카운트
+      - 1H 첫 골 팀 / 2H 첫 골 팀 (fixture 단위)
+    를 만든다.
+
+    반환:
+      {
+        "cards": {(fixture_id, team_id): {"y1":int,"r1":int,"y2":int,"r2":int}},
+        "first_goal": {fixture_id: {"h1": team_id|None, "h2": team_id|None}}
+      }
+    """
+    if not fixture_ids:
+        return {"cards": {}, "first_goal": {}}
+
+    in_fix = ",".join(["%s"] * len(fixture_ids))
+    raw_sql = f"""
+        SELECT fixture_id, data_json
+        FROM match_events_raw
+        WHERE fixture_id IN ({in_fix})
+    """
+    raw_rows = fetch_all(raw_sql, tuple(fixture_ids)) or []
+
+    cards_map: Dict[tuple, Dict[str, int]] = {}
+    first_goal_map: Dict[int, Dict[str, Optional[int]]] = {}
+
+    def _get_time(ev: Dict[str, Any]) -> tuple:
+        time_obj = ev.get("time") if isinstance(ev.get("time"), dict) else {}
+        elapsed = None
+        extra = None
+
+        if isinstance(time_obj, dict):
+            elapsed = time_obj.get("elapsed")
+            extra = time_obj.get("extra")
+
+        if elapsed is None:
+            elapsed = ev.get("elapsed")
+        if extra is None:
+            extra = ev.get("extra")
+
+        try:
+            m = int(elapsed)
+        except Exception:
+            m = 999999
+        try:
+            x = int(extra) if extra is not None else 0
+        except Exception:
+            x = 0
+
+        return (m, x)
+
+    def _half_from_elapsed(minute: int) -> Optional[str]:
+        # raw elapsed 기준: 1H=1~45(+extra), 2H=46~90(+extra)
+        if 0 <= minute <= 45:
+            return "h1"
+        if 46 <= minute <= 90:
+            return "h2"
+        return None
+
+    for r in raw_rows:
+        try:
+            fx = int(r.get("fixture_id"))
+        except Exception:
+            continue
+
+        events = _parse_events_raw_to_list(r.get("data_json") or "")
+        if fx not in first_goal_map:
+            first_goal_map[fx] = {"h1": None, "h2": None}
+
+        # goal/card만 시간순으로 정렬해서 처리
+        filtered: List[Dict[str, Any]] = []
+        for ev in events:
+            typ = str(ev.get("type") or ev.get("Type") or "").strip().lower()
+            if typ in ("goal", "card"):
+                filtered.append(ev)
+
+        filtered.sort(key=_get_time)
+
+        for ev in filtered:
+            typ = str(ev.get("type") or ev.get("Type") or "").strip().lower()
+            det = str(ev.get("detail") or ev.get("Detail") or "").strip().lower()
+
+            minute, extra = _get_time(ev)
+            half = _half_from_elapsed(minute)
+            if half is None:
+                continue
+
+            # team id
+            team_obj = ev.get("team") if isinstance(ev.get("team"), dict) else {}
+            team_id = team_obj.get("id") if isinstance(team_obj, dict) else None
+            if team_id is None:
+                continue
+            try:
+                tid = int(team_id)
+            except Exception:
+                continue
+
+            if typ == "goal":
+                # 1H/2H 첫 골 팀 기록
+                if first_goal_map[fx].get(half) is None:
+                    first_goal_map[fx][half] = tid
+
+            elif typ == "card":
+                # 옐/레만 카운트
+                k = (fx, tid)
+                if k not in cards_map:
+                    cards_map[k] = {"y1": 0, "r1": 0, "y2": 0, "r2": 0}
+
+                if "yellow" in det:
+                    if half == "h1":
+                        cards_map[k]["y1"] += 1
+                    else:
+                        cards_map[k]["y2"] += 1
+                elif "red" in det:
+                    if half == "h1":
+                        cards_map[k]["r1"] += 1
+                    else:
+                        cards_map[k]["r2"] += 1
+
+    return {"cards": cards_map, "first_goal": first_goal_map}
+
+
 
 def enrich_overall_1h_performance(
     stats: Dict[str, Any],
@@ -787,6 +910,8 @@ def enrich_overall_1h_performance(
             m.fixture_id,
             m.home_id,
             m.away_id,
+            m.home_ht,
+            m.away_ht,
             m.home_ft,
             m.away_ft,
             m.status_group,
@@ -798,8 +923,11 @@ def enrich_overall_1h_performance(
           AND lower(m.status_group) = 'finished'
           AND m.home_ft IS NOT NULL
           AND m.away_ft IS NOT NULL
+          AND m.home_ht IS NOT NULL
+          AND m.away_ht IS NOT NULL
         ORDER BY m.date_utc DESC
     """
+
     rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
     if not rows:
         return
@@ -839,6 +967,12 @@ def enrich_overall_1h_performance(
     # 코너(전/후반) — 가능하면 raw에서
     corner_counts = _load_corner_counts_by_half(fixture_ids)
 
+    # 카드 + 1H/2H 첫 골 팀 — raw에서 (match_events 시간컷 오류 방지)
+    raw_pack = _load_cards_and_first_goal_by_half(fixture_ids)
+    cards_by_fx_team = raw_pack.get("cards", {}) or {}
+    first_goal_by_fx = raw_pack.get("first_goal", {}) or {}
+
+
     eff_tot = len(rows)
     eff_home = 0
     eff_away = 0
@@ -877,58 +1011,19 @@ def enrich_overall_1h_performance(
         else:
             eff_away += 1
 
-        # 1H 스코어: goal 이벤트 중 minute<=45 합
-        h1_home = 0
-        h1_away = 0
+        # 1H 스코어: ✅ matches.home_ht/away_ht 사용 (시간컷 오류/누락 방지)
+        h1_home = int(row.get("home_ht") or 0)
+        h1_away = int(row.get("away_ht") or 0)
 
-        # 1H 카드(우리팀 기준): minute<=45
-        h1_y = 0
-        h1_r = 0
+        # 1H 카드(우리팀 기준): ✅ raw 기반
+        cpack = cards_by_fx_team.get((fx, team_id), {}) or {}
+        h1_y = int(cpack.get("y1") or 0)
+        h1_r = int(cpack.get("r1") or 0)
 
-        # 1H 첫 골(존재하면): minute<=45 중 earliest
-        first_goal_team: Optional[int] = None
+        # 1H 첫 골 팀(존재하면): ✅ raw 기반
+        fg_map = first_goal_by_fx.get(fx, {}) or {}
+        first_goal_team: Optional[int] = fg_map.get("h1")
 
-        evs = events_by_fixture.get(fx, [])
-        for ev in evs:
-            typ = str(ev.get("type") or "").strip().lower()
-            det = str(ev.get("detail") or "").strip().lower()
-            minute = int(ev.get("minute") or 0)
-
-            if minute > 45:
-                continue
-
-            if typ == "goal":
-                tid = ev.get("team_id")
-                if tid is None:
-                    continue
-                try:
-                    tid = int(tid)
-                except Exception:
-                    continue
-
-                if tid == home_id:
-                    h1_home += 1
-                elif tid == away_id:
-                    h1_away += 1
-
-                if first_goal_team is None:
-                    first_goal_team = tid
-
-            elif typ == "card":
-                tid = ev.get("team_id")
-                if tid is None:
-                    continue
-                try:
-                    tid = int(tid)
-                except Exception:
-                    continue
-                if tid != team_id:
-                    continue
-
-                if det == "yellow card":
-                    h1_y += 1
-                elif det == "red card":
-                    h1_r += 1
 
         # 우리/상대 매핑
         if is_home:
@@ -1087,6 +1182,8 @@ def enrich_overall_2h_performance(
             m.fixture_id,
             m.home_id,
             m.away_id,
+            m.home_ht,
+            m.away_ht,
             m.home_ft,
             m.away_ft,
             m.status_group,
@@ -1098,8 +1195,11 @@ def enrich_overall_2h_performance(
           AND lower(m.status_group) = 'finished'
           AND m.home_ft IS NOT NULL
           AND m.away_ft IS NOT NULL
+          AND m.home_ht IS NOT NULL
+          AND m.away_ht IS NOT NULL
         ORDER BY m.date_utc DESC
     """
+
     rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
     if not rows:
         return
@@ -1136,6 +1236,12 @@ def enrich_overall_2h_performance(
         events_by_fixture.setdefault(fx, []).append(ev)
 
     corner_counts = _load_corner_counts_by_half(fixture_ids)
+
+    # 카드 + 1H/2H 첫 골 팀 — raw에서 (match_events 시간컷 오류 방지)
+    raw_pack = _load_cards_and_first_goal_by_half(fixture_ids)
+    cards_by_fx_team = raw_pack.get("cards", {}) or {}
+    first_goal_by_fx = raw_pack.get("first_goal", {}) or {}
+
 
     eff_tot = len(rows)
     eff_home = 0
@@ -1178,58 +1284,19 @@ def enrich_overall_2h_performance(
         home_ft = int(row.get("home_ft") or 0)
         away_ft = int(row.get("away_ft") or 0)
 
-        # HT 스코어(1H) — goal 이벤트 중 minute<=45 합
-        h1_home = 0
-        h1_away = 0
+        # HT 스코어(1H): ✅ matches.home_ht/away_ht 사용
+        h1_home = int(row.get("home_ht") or 0)
+        h1_away = int(row.get("away_ht") or 0)
 
-        # 2H 카드(우리팀 기준): minute>=46
-        h2_y = 0
-        h2_r = 0
+        # 2H 카드(우리팀 기준): ✅ raw 기반
+        cpack = cards_by_fx_team.get((fx, team_id), {}) or {}
+        h2_y = int(cpack.get("y2") or 0)
+        h2_r = int(cpack.get("r2") or 0)
 
-        # 2H 첫 골: minute>=46 중 earliest
-        first_goal_team: Optional[int] = None
+        # 2H 첫 골 팀(존재하면): ✅ raw 기반
+        fg_map = first_goal_by_fx.get(fx, {}) or {}
+        first_goal_team: Optional[int] = fg_map.get("h2")
 
-        evs = events_by_fixture.get(fx, [])
-        for ev in evs:
-            typ = str(ev.get("type") or "").strip().lower()
-            det = str(ev.get("detail") or "").strip().lower()
-            minute = int(ev.get("minute") or 0)
-
-            if typ == "goal":
-                tid = ev.get("team_id")
-                if tid is None:
-                    continue
-                try:
-                    tid = int(tid)
-                except Exception:
-                    continue
-
-                if minute <= 45:
-                    if tid == home_id:
-                        h1_home += 1
-                    elif tid == away_id:
-                        h1_away += 1
-                elif 46 <= minute <= 90:
-                    if first_goal_team is None:
-                        first_goal_team = tid
-
-            elif typ == "card":
-                if minute < 46:
-                    continue
-                tid = ev.get("team_id")
-                if tid is None:
-                    continue
-                try:
-                    tid = int(tid)
-                except Exception:
-                    continue
-                if tid != team_id:
-                    continue
-
-                if det == "yellow card":
-                    h2_y += 1
-                elif det == "red card":
-                    h2_r += 1
 
         # 2H 득점 = FT - HT
         if is_home:
