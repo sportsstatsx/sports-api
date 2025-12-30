@@ -263,6 +263,10 @@ def enrich_overall_outcome_totals(
     gf_sum_t = gf_sum_h = gf_sum_a = 0
     ga_sum_t = ga_sum_h = ga_sum_a = 0
 
+    team_o05_t = team_o05_h = team_o05_a = 0
+    team_o15_t = team_o15_h = team_o15_a = 0
+
+
     for r in rows:
         try:
             home_id = int(r.get("home_id"))
@@ -396,6 +400,22 @@ def enrich_overall_outcome_totals(
             else:
                 ng_a += 1
 
+            # Team Goals Over (팀 득점 기준)
+        if gf >= 1:
+            team_o05_t += 1
+            if is_home:
+                team_o05_h += 1
+            else:
+                team_o05_a += 1
+
+        if gf >= 2:
+            team_o15_t += 1
+            if is_home:
+                team_o15_h += 1
+            else:
+                team_o15_a += 1
+
+
     # 분모는 실제 집계 경기 수 우선
     eff_tot = mt_t if mt_t > 0 else int(matches_total_api or 0)
     if eff_tot <= 0:
@@ -437,10 +457,47 @@ def enrich_overall_outcome_totals(
     out["home_loss_pct"] = fmt_pct(l_h, mt_h) if mt_h else 0
 
     out["away_win_pct"] = fmt_pct(w_a, mt_a) if mt_a else 0
-    out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
+        out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
     out["away_loss_pct"] = fmt_pct(l_a, mt_a) if mt_a else 0
 
+    # ─────────────────────────────────────
+    # ✅ UI 호환(top-level) + GameSample 키 보장
+    #   - 기존 앱이 읽는 키들(win_pct, avg_gf, btts_pct, events_sample...)을
+    #     insights 루트에 같이 내려준다.
+    # ─────────────────────────────────────
+    sample_n = mt_t  # last_n 적용된 실제 경기 수(= 샘플)
+    insights["events_sample"] = sample_n
+    insights["first_goal_sample"] = sample_n  # 지금 단계에서는 동일하게 둠(추후 first goal 로직 분리 가능)
+
+    avg_gf = fmt_avg(gf_sum_t, sample_n, 2) if sample_n else 0.0
+    avg_ga = fmt_avg(ga_sum_t, sample_n, 2) if sample_n else 0.0
+
+    insights["avg_gf"] = avg_gf
+    insights["avg_ga"] = avg_ga
+    insights["goal_diff_avg"] = round(float(avg_gf - avg_ga), 2) if sample_n else 0.0
+
+    insights["win_pct"] = fmt_pct(w_t, sample_n)
+    insights["draw_pct"] = fmt_pct(d_t, sample_n)
+    insights["loss_pct"] = fmt_pct(l_t, sample_n)
+
+    insights["btts_pct"] = fmt_pct(btts_t, sample_n)
+    insights["clean_sheet_pct"] = fmt_pct(cs_t, sample_n)
+    insights["no_goals_pct"] = fmt_pct(ng_t, sample_n)
+
+    insights["over15_pct"] = fmt_pct(o15_t, sample_n)
+    insights["over25_pct"] = fmt_pct(o25_t, sample_n)
+
+    insights["team_over05_pct"] = fmt_pct(team_o05_t, sample_n)
+    insights["team_over15_pct"] = fmt_pct(team_o15_t, sample_n)
+
+    insights["win_and_over25_pct"] = fmt_pct(win_o25_t, sample_n)
+    insights["lose_and_btts_pct"] = fmt_pct(lose_btts_t, sample_n)
+    insights["win_and_btts_pct"] = fmt_pct(win_btts_t, sample_n)
+    insights["draw_and_btts_pct"] = fmt_pct(draw_btts_t, sample_n)
+
+    # 기존 nested 구조도 유지(디버그/확장용)
     insights["outcome_totals"] = out
+
 
 
 # ─────────────────────────────────────
