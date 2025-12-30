@@ -83,11 +83,10 @@ def normalize_comp(raw: Any) -> str:
     if "uefa" in lower or "europe" in lower:
         return "UEFA"
 
-    # ACL
-    if "acl" in lower or "afc champions" in lower:
+    # ACL (Continental 포함)
+    if "acl" in lower or "afc champions" in lower or "continental" in lower:
         return "ACL"
 
-    return s
 
 
 def parse_last_n(raw: Any) -> int:
@@ -219,8 +218,12 @@ def enrich_overall_outcome_totals(
     # ─────────────────────────────────────
     # 1) Finished(FT 계산 가능) 경기만 기준으로 matches 가져오기
     # ─────────────────────────────────────
-    league_ids_for_query = [league_id]
+    league_ids_for_query = build_league_ids_for_query(stats, league_id)
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
 
     base_sql = f"""
         SELECT
@@ -911,7 +914,12 @@ def enrich_overall_1h_performance(
     insights = stats.setdefault("insights_overall", {})
 
     # FINISHED + FT 스코어 존재 경기만 (outcome과 동일 원칙)
-    base_sql = """
+    league_ids_for_query = build_league_ids_for_query(stats, league_id)
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    base_sql = f"""
         SELECT
             m.fixture_id,
             m.home_id,
@@ -923,7 +931,7 @@ def enrich_overall_1h_performance(
             m.status_group,
             m.date_utc
         FROM matches m
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND lower(m.status_group) = 'finished'
@@ -934,7 +942,12 @@ def enrich_overall_1h_performance(
         ORDER BY m.date_utc DESC
     """
 
-    rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
+    params: List[Any] = []
+    params.extend(league_ids_for_query)
+    params.extend([season_int, team_id, team_id])
+
+    rows = fetch_all(base_sql, tuple(params)) or []
+
     if not rows:
         return
     if last_n and last_n > 0:
@@ -1183,7 +1196,12 @@ def enrich_overall_2h_performance(
     """2H Performance 섹션(후반 득점 = FT - HT)"""
     insights = stats.setdefault("insights_overall", {})
 
-    base_sql = """
+    league_ids_for_query = build_league_ids_for_query(stats, league_id)
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    base_sql = f"""
         SELECT
             m.fixture_id,
             m.home_id,
@@ -1195,7 +1213,7 @@ def enrich_overall_2h_performance(
             m.status_group,
             m.date_utc
         FROM matches m
-        WHERE m.league_id = %s
+        WHERE m.league_id IN ({placeholders})
           AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND lower(m.status_group) = 'finished'
@@ -1206,7 +1224,12 @@ def enrich_overall_2h_performance(
         ORDER BY m.date_utc DESC
     """
 
-    rows = fetch_all(base_sql, (league_id, season_int, team_id, team_id)) or []
+    params: List[Any] = []
+    params.extend(league_ids_for_query)
+    params.extend([season_int, team_id, team_id])
+
+    rows = fetch_all(base_sql, tuple(params)) or []
+
     if not rows:
         return
     if last_n and last_n > 0:
