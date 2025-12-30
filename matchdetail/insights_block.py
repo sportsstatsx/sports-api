@@ -4,9 +4,593 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 
 from db import fetch_all
-from services.insights.insights_overall_outcome_totals import enrich_overall_outcome_totals
-from services.insights.insights_overall_goalsbytime import enrich_overall_goals_by_time
-from services.insights.utils import parse_last_n, normalize_comp
+
+
+# ─────────────────────────────────────
+#  ✅ 통합: services/insights/utils.py
+# ─────────────────────────────────────
+
+def safe_div(num: Any, den: Any) -> float:
+    """
+    0 나누기, 타입 오류 등을 모두 0.0 으로 처리하는 안전한 나눗셈.
+    """
+    try:
+        num_f = float(num)
+    except (TypeError, ValueError):
+        return 0.0
+
+    try:
+        den_f = float(den)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if den_f == 0.0:
+        return 0.0
+
+    return num_f / den_f
+
+
+def fmt_pct(num: Any, den: Any) -> int:
+    """
+    분자/분모에서 퍼센트(int, 0~100) 를 만들어 준다.
+    분모가 0 이면 0 리턴.
+    """
+    v = safe_div(num, den) * 100.0
+    return int(round(v)) if v > 0.0 else 0
+
+
+def fmt_avg(num: Any, den: Any, decimals: int = 2) -> float:
+    """
+    분자/분모에서 평균(float) 을 만들어 준다.
+    분모가 0 이면 0.0 리턴.
+    """
+    v = safe_div(num, den)
+    try:
+        return round(float(v), decimals)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def normalize_comp(raw: Any) -> str:
+    """
+    UI에서 내려오는 competition 필터 값을
+    서버 내부에서 사용하는 표준 문자열로 정규화.
+    """
+    if raw is None:
+        return "All"
+
+    s = str(raw).strip()
+    if not s:
+        return "All"
+
+    lower = s.lower()
+
+    # All
+    if lower in ("all", "전체"):
+        return "All"
+
+    # League
+    if lower in ("league", "리그"):
+        return "League"
+
+    # Cup
+    if lower in ("cup", "domestic cup", "국내컵"):
+        return "Cup"
+
+    # UEFA
+    if "uefa" in lower or "europe" in lower:
+        return "UEFA"
+
+    # ACL
+    if "acl" in lower or "afc champions" in lower:
+        return "ACL"
+
+    return s
+
+
+def parse_last_n(raw: Any) -> int:
+    """
+    UI에서 내려오는 lastN 값을 안전하게 정수 N 으로 변환.
+    """
+    if raw is None:
+        return 0
+
+    # 이미 숫자면 그대로
+    if isinstance(raw, int):
+        return raw if raw > 0 else 0
+    if isinstance(raw, float):
+        try:
+            n = int(raw)
+            return n if n > 0 else 0
+        except (TypeError, ValueError):
+            return 0
+
+    s = str(raw).strip()
+    if not s:
+        return 0
+
+    lower = s.lower()
+    if lower in ("season", "all", "full season"):
+        return 0
+
+    # "Last 5", "Last 10" 등에서 숫자만 추출
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            n = int(digits)
+            return n if n > 0 else 0
+        except ValueError:
+            return 0
+
+    # 마지막 fallback: 전체 문자열이 숫자일 때
+    if s.isdigit():
+        n = int(s)
+        return n if n > 0 else 0
+
+    return 0
+
+
+def build_league_ids_for_query(
+    stats: Any,
+    fallback_league_id: Optional[int],
+) -> List[int]:
+    """
+    stats["insights_filters"]["target_league_ids_last_n"] 가 있으면 그걸 사용.
+    없거나 비어있으면 fallback_league_id 한 개로 폴백.
+    """
+    league_ids: List[int] = []
+    filters = {}
+
+    try:
+        filters = (stats or {}).get("insights_filters", {}) or {}
+    except Exception:
+        filters = {}
+
+    raw_list = filters.get("target_league_ids_last_n")
+
+    # 1) 우선: target_league_ids_last_n 사용
+    if isinstance(raw_list, list):
+        for v in raw_list:
+            try:
+                league_ids.append(int(v))
+            except (TypeError, ValueError):
+                continue
+
+        # 중복 제거
+        if league_ids:
+            seen = set()
+            deduped = []
+            for lid in league_ids:
+                if lid in seen:
+                    continue
+                seen.add(lid)
+                deduped.append(lid)
+            league_ids = deduped
+
+    # 2) 폴백: 기본 league_id 한 개
+    if not league_ids and fallback_league_id is not None:
+        try:
+            league_ids = [int(fallback_league_id)]
+        except (TypeError, ValueError):
+            league_ids = []
+
+    return league_ids
+
+
+# ─────────────────────────────────────
+#  ✅ 통합: services/insights/insights_overall_outcome_totals.py
+# ─────────────────────────────────────
+
+def enrich_overall_outcome_totals(
+    stats: Dict[str, Any],
+    insights: Dict[str, Any],
+    *,
+    league_id: int,
+    season_int: Optional[int],
+    team_id: int,
+    matches_total_api: int = 0,
+    last_n: int = 0,
+) -> None:
+    """
+    Outcome + Totals 섹션 생성.
+    """
+    if not season_int:
+        return
+
+    # ─────────────────────────────────────
+    # 1) Competition + Last N 기준 league_id 집합 생성
+    # ─────────────────────────────────────
+    league_ids_for_query = build_league_ids_for_query(stats, league_id)
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    # ─────────────────────────────────────
+    # 2) Finished 경기만 기준으로 집계할 matches 가져오기
+    # ─────────────────────────────────────
+    base_sql = f"""
+        SELECT
+            m.home_id,
+            m.away_id,
+            m.home_ft,
+            m.away_ft,
+            m.status_group,
+            m.date_utc
+        FROM matches m
+        WHERE m.league_id IN ({placeholders})
+          AND m.season    = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
+        ORDER BY m.date_utc DESC
+    """
+
+    params: List[Any] = []
+    params.extend(league_ids_for_query)
+    params.extend([season_int, team_id, team_id])
+
+    rows = fetch_all(base_sql, tuple(params))
+    if not rows:
+        return
+
+    # Last N 적용 (0이면 시즌 전체)
+    if last_n and last_n > 0:
+        rows = rows[:last_n]
+
+    # ─────────────────────────────────────
+    # 3) 집계
+    # ─────────────────────────────────────
+    mt_t = mt_h = mt_a = 0
+
+    w_t = w_h = w_a = 0
+    d_t = d_h = d_a = 0
+    l_t = l_h = l_a = 0
+
+    btts_t = btts_h = btts_a = 0
+    nbtts_t = nbtts_h = nbtts_a = 0
+
+    o15_t = o15_h = o15_a = 0
+    o25_t = o25_h = o25_a = 0
+
+    win_o25_t = win_o25_h = win_o25_a = 0
+    lose_btts_t = lose_btts_h = lose_btts_a = 0
+    win_btts_t = win_btts_h = win_btts_a = 0
+    draw_btts_t = draw_btts_h = draw_btts_a = 0
+
+    cs_t = cs_h = cs_a = 0
+    ng_t = ng_h = ng_a = 0
+
+    gf_sum_t = gf_sum_h = gf_sum_a = 0
+    ga_sum_t = ga_sum_h = ga_sum_a = 0
+
+    for r in rows:
+        try:
+            home_id = int(r.get("home_id"))
+            away_id = int(r.get("away_id"))
+        except Exception:
+            continue
+
+        try:
+            home_ft = int(r.get("home_ft") or 0)
+            away_ft = int(r.get("away_ft") or 0)
+        except Exception:
+            home_ft = 0
+            away_ft = 0
+
+        is_home = (home_id == team_id)
+        is_away = (away_id == team_id)
+        if not (is_home or is_away):
+            continue
+
+        mt_t += 1
+        if is_home:
+            mt_h += 1
+        else:
+            mt_a += 1
+
+        # 팀 기준 gf/ga
+        gf = home_ft if is_home else away_ft
+        ga = away_ft if is_home else home_ft
+
+        gf_sum_t += gf
+        ga_sum_t += ga
+        if is_home:
+            gf_sum_h += gf
+            ga_sum_h += ga
+        else:
+            gf_sum_a += gf
+            ga_sum_a += ga
+
+        # W/D/L
+        if gf > ga:
+            w_t += 1
+            if is_home:
+                w_h += 1
+            else:
+                w_a += 1
+        elif gf == ga:
+            d_t += 1
+            if is_home:
+                d_h += 1
+            else:
+                d_a += 1
+        else:
+            l_t += 1
+            if is_home:
+                l_h += 1
+            else:
+                l_a += 1
+
+        # BTTS / No BTTS
+        if home_ft > 0 and away_ft > 0:
+            btts_t += 1
+            if is_home:
+                btts_h += 1
+            else:
+                btts_a += 1
+        else:
+            nbtts_t += 1
+            if is_home:
+                nbtts_h += 1
+            else:
+                nbtts_a += 1
+
+        # Over 1.5 / 2.5 (Total Goals)
+        tg = home_ft + away_ft
+        if tg >= 2:
+            o15_t += 1
+            if is_home:
+                o15_h += 1
+            else:
+                o15_a += 1
+        if tg >= 3:
+            o25_t += 1
+            if is_home:
+                o25_h += 1
+            else:
+                o25_a += 1
+
+        # Win & Over2.5
+        if (gf > ga) and (tg >= 3):
+            win_o25_t += 1
+            if is_home:
+                win_o25_h += 1
+            else:
+                win_o25_a += 1
+
+        # Lose & BTTS
+        if (gf < ga) and (home_ft > 0 and away_ft > 0):
+            lose_btts_t += 1
+            if is_home:
+                lose_btts_h += 1
+            else:
+                lose_btts_a += 1
+
+        # Win & BTTS
+        if (gf > ga) and (home_ft > 0 and away_ft > 0):
+            win_btts_t += 1
+            if is_home:
+                win_btts_h += 1
+            else:
+                win_btts_a += 1
+
+        # Draw & BTTS (0-0 제외)
+        if (gf == ga) and (gf > 0):
+            draw_btts_t += 1
+            if is_home:
+                draw_btts_h += 1
+            else:
+                draw_btts_a += 1
+
+        # Clean Sheet / No Goals
+        if ga == 0:
+            cs_t += 1
+            if is_home:
+                cs_h += 1
+            else:
+                cs_a += 1
+        if gf == 0:
+            ng_t += 1
+            if is_home:
+                ng_h += 1
+            else:
+                ng_a += 1
+
+    # 분모는 실제 집계 경기 수 우선
+    eff_tot = mt_t if mt_t > 0 else int(matches_total_api or 0)
+    if eff_tot <= 0:
+        return
+
+    out: Dict[str, Any] = {}
+
+    out["ft_w_pct"] = fmt_pct(w_t, eff_tot)
+    out["ft_d_pct"] = fmt_pct(d_t, eff_tot)
+    out["ft_l_pct"] = fmt_pct(l_t, eff_tot)
+
+    out["win_pct"] = out["ft_w_pct"]
+    out["draw_pct"] = out["ft_d_pct"]
+    out["loss_pct"] = out["ft_l_pct"]
+
+    out["btts_yes_pct"] = fmt_pct(btts_t, eff_tot)
+    out["btts_no_pct"] = fmt_pct(nbtts_t, eff_tot)
+
+    out["over15_pct"] = fmt_pct(o15_t, eff_tot)
+    out["over25_pct"] = fmt_pct(o25_t, eff_tot)
+
+    out["win_over25_pct"] = fmt_pct(win_o25_t, eff_tot)
+    out["lose_btts_pct"] = fmt_pct(lose_btts_t, eff_tot)
+    out["win_btts_pct"] = fmt_pct(win_btts_t, eff_tot)
+    out["draw_btts_pct"] = fmt_pct(draw_btts_t, eff_tot)
+
+    out["cs_pct"] = fmt_pct(cs_t, eff_tot)
+    out["ng_pct"] = fmt_pct(ng_t, eff_tot)
+
+    out["goals_for_avg"] = fmt_avg(gf_sum_t, eff_tot, 2)
+    out["goals_against_avg"] = fmt_avg(ga_sum_t, eff_tot, 2)
+
+    # 홈/원정도 같이 제공 (기존 UI에서 쓰면 유지됨)
+    out["home_games"] = mt_h
+    out["away_games"] = mt_a
+
+    out["home_win_pct"] = fmt_pct(w_h, mt_h) if mt_h else 0
+    out["home_draw_pct"] = fmt_pct(d_h, mt_h) if mt_h else 0
+    out["home_loss_pct"] = fmt_pct(l_h, mt_h) if mt_h else 0
+
+    out["away_win_pct"] = fmt_pct(w_a, mt_a) if mt_a else 0
+    out["away_draw_pct"] = fmt_pct(d_a, mt_a) if mt_a else 0
+    out["away_loss_pct"] = fmt_pct(l_a, mt_a) if mt_a else 0
+
+    insights["outcome_totals"] = out
+
+
+# ─────────────────────────────────────
+#  ✅ 통합: services/insights/insights_overall_goalsbytime.py
+# ─────────────────────────────────────
+
+def enrich_overall_goals_by_time(
+    stats: Dict[str, Any],
+    insights: Dict[str, Any],
+    *,
+    league_id: int,
+    season_int: Optional[int],
+    team_id: int,
+    last_n: Optional[int] = None,  # Last N (없으면 시즌 전체)
+) -> None:
+    """
+    Goals by Time 섹션.
+    """
+    if not season_int:
+        return
+
+    # ─────────────────────────────────────
+    # 0) Competition + Last N 기준 league_id 집합 생성
+    # ─────────────────────────────────────
+    league_ids_for_query: List[int] = []
+    try:
+        filters = (stats or {}).get("insights_filters", {}) or {}
+        target = filters.get("target_league_ids_last_n") or []
+    except Exception:
+        target = []
+
+    if isinstance(target, list):
+        for v in target:
+            try:
+                league_ids_for_query.append(int(v))
+            except (TypeError, ValueError):
+                continue
+
+    if not league_ids_for_query:
+        league_ids_for_query = [league_id]
+
+    # ─────────────────────────────────────
+    # 1) fixture_id 뽑기
+    # ─────────────────────────────────────
+    placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    matches_sql = f"""
+        SELECT
+            m.fixture_id,
+            m.home_id,
+            m.away_id,
+            m.date_utc
+        FROM matches m
+        WHERE m.league_id IN ({placeholders})
+          AND m.season = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+          AND lower(m.status_group) IN ('finished','ft','fulltime')
+        ORDER BY m.date_utc DESC
+    """
+
+    params: List[Any] = []
+    params.extend(league_ids_for_query)
+    params.extend([season_int, team_id, team_id])
+
+    rows = fetch_all(matches_sql, tuple(params))
+    if not rows:
+        return
+
+    if last_n and last_n > 0:
+        rows = rows[:last_n]
+
+    fixture_ids: List[int] = []
+    for r in rows:
+        try:
+            fixture_ids.append(int(r.get("fixture_id")))
+        except Exception:
+            continue
+
+    if not fixture_ids:
+        return
+
+    # ─────────────────────────────────────
+    # 2) goal 이벤트 뽑기
+    # ─────────────────────────────────────
+    placeholders2 = ",".join(["%s"] * len(fixture_ids))
+
+    events_sql = f"""
+        SELECT
+            e.fixture_id,
+            e.team_id,
+            e.type,
+            e.detail,
+            e.elapsed
+        FROM match_events e
+        WHERE e.fixture_id IN ({placeholders2})
+          AND lower(e.type) = 'goal'
+    """
+
+    ev_rows = fetch_all(events_sql, tuple(fixture_ids))
+    if not ev_rows:
+        return
+
+    # ─────────────────────────────────────
+    # 3) 버킷 집계
+    # ─────────────────────────────────────
+    for_buckets = [0, 0, 0, 0, 0, 0]
+    against_buckets = [0, 0, 0, 0, 0, 0]
+
+    def bucket_idx(minute: int) -> int:
+        if minute <= 15:
+            return 0
+        if minute <= 30:
+            return 1
+        if minute <= 45:
+            return 2
+        if minute <= 60:
+            return 3
+        if minute <= 75:
+            return 4
+        return 5
+
+    for ev in ev_rows:
+        try:
+            elapsed = ev.get("elapsed")
+            if elapsed is None:
+                continue
+            minute = int(elapsed)
+        except Exception:
+            continue
+
+        idx = bucket_idx(minute)
+
+        try:
+            ev_team_id = ev.get("team_id")
+            if ev_team_id is None:
+                continue
+            ev_team_id = int(ev_team_id)
+        except Exception:
+            continue
+
+        is_for = (ev_team_id == team_id)
+
+        if is_for:
+            for_buckets[idx] += 1
+        else:
+            against_buckets[idx] += 1
+
+    insights["goals_by_time_for"] = for_buckets
+    insights["goals_by_time_against"] = against_buckets
+
 
 
 # ─────────────────────────────────────
