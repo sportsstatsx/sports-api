@@ -523,7 +523,7 @@ def enrich_overall_goals_by_time(
         return
 
     # ─────────────────────────────────────
-    # 2) goal 이벤트 뽑기
+    # 2) goal 이벤트 뽑기  ✅ elapsed → minute
     # ─────────────────────────────────────
     placeholders2 = ",".join(["%s"] * len(fixture_ids))
 
@@ -533,7 +533,7 @@ def enrich_overall_goals_by_time(
             e.team_id,
             e.type,
             e.detail,
-            e.elapsed
+            e.minute
         FROM match_events e
         WHERE e.fixture_id IN ({placeholders2})
           AND lower(e.type) = 'goal'
@@ -564,10 +564,10 @@ def enrich_overall_goals_by_time(
 
     for ev in ev_rows:
         try:
-            elapsed = ev.get("elapsed")
-            if elapsed is None:
+            m = ev.get("minute")
+            if m is None:
                 continue
-            minute = int(elapsed)
+            minute = int(m)
         except Exception:
             continue
 
@@ -590,6 +590,7 @@ def enrich_overall_goals_by_time(
 
     insights["goals_by_time_for"] = for_buckets
     insights["goals_by_time_against"] = against_buckets
+
 
 
 
