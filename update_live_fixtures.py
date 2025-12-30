@@ -19,11 +19,13 @@ from live_fixtures_a_group import (
     fetch_events_from_api,
     upsert_match_events,
     upsert_match_events_raw,
+    upsert_match_fixtures_raw,
     fetch_team_stats_from_api,
     upsert_match_team_stats,
     fetch_lineups_from_api,
     upsert_match_lineups,
 )
+
 
 # ───────────────────────────────
 # 스탯 라이브 호출 쿨다운 (초 단위)
