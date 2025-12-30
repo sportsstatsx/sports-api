@@ -262,17 +262,23 @@ def main() -> None:
                 date_utc = basic["date_utc"]
                 elapsed = basic.get("elapsed")
 
-                # ✅ raw fixtures 저장 (항상 1번)
-                upsert_match_fixtures_raw(fixture_id, fx)
+                # ✅ NEW: /fixtures 원문(JSON)을 통째로 저장 (HT 점수 등 포함)
+                try:
+                    upsert_match_fixtures_raw(fixture_id, fx)
+                except Exception as raw_err:
+                    print(
+                        f"      [fixtures_raw] fixture_id={fixture_id} 저장 실패: {raw_err}",
+                        file=sys.stderr,
+                    )
 
                 # 3) matches row 상태/스코어/elapsed 갱신 (NS / INPLAY / FINISHED 공통)
                 upsert_match_row(fx, lid, None)
-
 
                 # 4) FINISHED 경기는 여기서 라이브 처리만 스킵
                 #    (라인업 / 이벤트 / 스탯 같은 추가 작업만 막고, matches 갱신은 이미 위에서 한 번 수행)
                 if status_group == "FINISHED":
                     continue
+
 
                 # 5) 라인업: 프리매치/직후 정책
 
