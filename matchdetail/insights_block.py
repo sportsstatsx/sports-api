@@ -1298,6 +1298,64 @@ def _merge_options(*lists: List[str]) -> List[str]:
             merged.append(v)
     return merged
 
+def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
+    """
+    앱이 동적으로 Insights 탭을 렌더링할 수 있게
+    섹션 정의(메타)만 내려준다.
+    - 기존 수치 키(win_pct, goals_by_time_for 등)는 그대로 유지
+    - 앱은 sections를 보고 어떤 섹션을 어떤 렌더러로 그릴지 결정
+    """
+    return [
+        {
+            "id": "outcome_totals",
+            "title": "Outcome + Totals",
+            "renderer": "metrics_table",
+            # metrics: 기존 insights dict에 이미 존재하는 키들만 참조
+            "metrics": [
+                {"key": "win_pct", "label": "FT W", "format": "pct_hoa"},
+                {"key": "draw_pct", "label": "FT D", "format": "pct_hoa"},
+                {"key": "loss_pct", "label": "FT L", "format": "pct_hoa"},
+
+                {"key": "over15_pct", "label": "Total 1.5+", "format": "pct_hoa"},
+                {"key": "over25_pct", "label": "Total 2.5+", "format": "pct_hoa"},
+
+                {"key": "btts_pct", "label": "BTTS", "format": "pct_hoa"},
+                {"key": "clean_sheet_pct", "label": "CS", "format": "pct_hoa"},
+                {"key": "no_goals_pct", "label": "NG", "format": "pct_hoa"},
+
+                {"key": "team_over05_pct", "label": "Team 0.5+", "format": "pct_hoa"},
+                {"key": "team_over15_pct", "label": "Team 1.5+", "format": "pct_hoa"},
+
+                {"key": "avg_gf", "label": "AVG GF", "format": "avg_hoa"},
+                {"key": "avg_ga", "label": "AVG GA", "format": "avg_hoa"},
+                {"key": "goal_diff_avg", "label": "GD", "format": "avg_hoa"},
+
+                {"key": "win_and_over25_pct", "label": "W & Total 2.5+", "format": "pct_hoa"},
+                {"key": "lose_and_btts_pct", "label": "L & BTTS", "format": "pct_hoa"},
+                {"key": "win_and_btts_pct", "label": "W & BTTS", "format": "pct_hoa"},
+                {"key": "draw_and_btts_pct", "label": "D & BTTS", "format": "pct_hoa"},
+            ],
+        },
+        {
+            "id": "goals_by_time",
+            "title": "Goals by Time",
+            "renderer": "goals_by_time",
+            # 이 섹션은 배열 두 개를 사용
+            "for_key": "goals_by_time_for",
+            "against_key": "goals_by_time_against",
+            # 버킷 정의(앱에서 라벨 만들 때 사용)
+            "buckets": [
+                {"from": 0, "to": 15},
+                {"from": 16, "to": 30},
+                {"from": 31, "to": 45},
+                {"from": 46, "to": 60},
+                {"from": 61, "to": 75},
+                {"from": 76, "to": 90},
+            ],
+        },
+    ]
+
+
 
 # ─────────────────────────────────────
 #  전체 insights 블록 생성
@@ -1430,13 +1488,17 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
 
     return {
         "league_id": league_id,
-        # 🔥 실제 계산에 사용된 시즌 / last_n 을 내려준다.
         "season": season_for_calc,
         "last_n": last_n_for_calc,
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
         "filters": filters_for_client,
+
+        # ✅ NEW: 동적 렌더링용 섹션 정의
+        "sections": _build_insights_overall_sections_meta(),
+
         "home": home_ins,
         "away": away_ins,
     }
+
 
