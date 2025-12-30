@@ -263,10 +263,15 @@ def list_fixtures():
             m.status_group,
             m.status,
             m.elapsed,
+            m.status_long,
             m.home_id,
             m.away_id,
             m.home_ft,
             m.away_ft,
+            m.home_ht,
+            m.away_ht,
+            m.venue_name,
+            m.league_round,
             th.name AS home_name,
             ta.name AS away_name,
             th.logo AS home_logo,
@@ -296,6 +301,7 @@ def list_fixtures():
         ORDER BY m.date_utc ASC
     """
 
+
     rows = fetch_all(sql, tuple(params))
 
     fixtures = []
@@ -308,14 +314,18 @@ def list_fixtures():
             "status_group": r["status_group"],
             "status": r["status"],
             "elapsed": r["elapsed"],
+            "status_long": r["status_long"],   # ✅ 추가
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
+            "league_round": r["league_round"], # ✅ 추가
+            "venue_name": r["venue_name"],     # ✅ 추가
             "home": {
                 "id": r["home_id"],
                 "name": r["home_name"],
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
+                "ht": r["home_ht"],            # ✅ 추가
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -323,9 +333,11 @@ def list_fixtures():
                 "name": r["away_name"],
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
+                "ht": r["away_ht"],            # ✅ 추가
                 "red_cards": r["away_red_cards"],
             },
         })
+
 
     return jsonify({"ok": True, "rows": fixtures})
 
@@ -335,6 +347,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
