@@ -461,42 +461,125 @@ def enrich_overall_outcome_totals(
     out["away_loss_pct"] = fmt_pct(l_a, mt_a) if mt_a else 0
 
     # ─────────────────────────────────────
-    # ✅ UI 호환(top-level) + GameSample 키 보장
-    #   - 기존 앱이 읽는 키들(win_pct, avg_gf, btts_pct, events_sample...)을
-    #     insights 루트에 같이 내려준다.
+    # ✅ (원본 구조 복구) 앱이 기대하는 {total, home, away} 형태로 내려준다
+    #   - 기존 services/insights/insights_overall_outcome_totals.py 와 동일한 키/구조
     # ─────────────────────────────────────
-    sample_n = mt_t  # last_n 적용된 실제 경기 수(= 샘플)
-    insights["events_sample"] = sample_n
-    insights["first_goal_sample"] = sample_n  # 지금 단계에서는 동일하게 둠(추후 first goal 로직 분리 가능)
 
-    avg_gf = fmt_avg(gf_sum_t, sample_n, 2) if sample_n else 0.0
-    avg_ga = fmt_avg(ga_sum_t, sample_n, 2) if sample_n else 0.0
+    # eff_tot / eff_home / eff_away 는 원본과 동일한 방식
+    eff_home = mt_h or eff_tot
+    eff_away = mt_a or eff_tot
 
-    insights["avg_gf"] = avg_gf
-    insights["avg_ga"] = avg_ga
-    insights["goal_diff_avg"] = round(float(avg_gf - avg_ga), 2) if sample_n else 0.0
+    # events_sample: 원본처럼 "없으면 세팅" (이미 있으면 유지)
+    try:
+        current_events_sample = insights.get("events_sample")
+    except Exception:
+        current_events_sample = None
 
-    insights["win_pct"] = fmt_pct(w_t, sample_n)
-    insights["draw_pct"] = fmt_pct(d_t, sample_n)
-    insights["loss_pct"] = fmt_pct(l_t, sample_n)
+    if not isinstance(current_events_sample, int) or current_events_sample <= 0:
+        try:
+            insights["events_sample"] = int(eff_tot)
+        except (TypeError, ValueError):
+            pass
 
-    insights["btts_pct"] = fmt_pct(btts_t, sample_n)
-    insights["clean_sheet_pct"] = fmt_pct(cs_t, sample_n)
-    insights["no_goals_pct"] = fmt_pct(ng_t, sample_n)
+    # W/D/L
+    insights["win_pct"] = {
+        "total": fmt_pct(w_t, eff_tot),
+        "home": fmt_pct(w_h, eff_home),
+        "away": fmt_pct(w_a, eff_away),
+    }
+    insights["draw_pct"] = {
+        "total": fmt_pct(d_t, eff_tot),
+        "home": fmt_pct(d_h, eff_home),
+        "away": fmt_pct(d_a, eff_away),
+    }
+    # 원본엔 loss_pct가 없었지만, 앱에서 필요할 수 있으니 동일 구조로 제공(무해)
+    insights["loss_pct"] = {
+        "total": fmt_pct(l_t, eff_tot),
+        "home": fmt_pct(l_h, eff_home),
+        "away": fmt_pct(l_a, eff_away),
+    }
 
-    insights["over15_pct"] = fmt_pct(o15_t, sample_n)
-    insights["over25_pct"] = fmt_pct(o25_t, sample_n)
+    # BTTS / Team Over / Totals
+    insights["btts_pct"] = {
+        "total": fmt_pct(btts_t, eff_tot),
+        "home": fmt_pct(btts_h, eff_home),
+        "away": fmt_pct(btts_a, eff_away),
+    }
+    insights["team_over05_pct"] = {
+        "total": fmt_pct(team_o05_t, eff_tot),
+        "home": fmt_pct(team_o05_h, eff_home),
+        "away": fmt_pct(team_o05_a, eff_away),
+    }
+    insights["team_over15_pct"] = {
+        "total": fmt_pct(team_o15_t, eff_tot),
+        "home": fmt_pct(team_o15_h, eff_home),
+        "away": fmt_pct(team_o15_a, eff_away),
+    }
+    insights["over15_pct"] = {
+        "total": fmt_pct(o15_t, eff_tot),
+        "home": fmt_pct(o15_h, eff_home),
+        "away": fmt_pct(o15_a, eff_away),
+    }
+    insights["over25_pct"] = {
+        "total": fmt_pct(o25_t, eff_tot),
+        "home": fmt_pct(o25_h, eff_home),
+        "away": fmt_pct(o25_a, eff_away),
+    }
 
-    insights["team_over05_pct"] = fmt_pct(team_o05_t, sample_n)
-    insights["team_over15_pct"] = fmt_pct(team_o15_t, sample_n)
+    # Clean sheet / No goals
+    insights["clean_sheet_pct"] = {
+        "total": fmt_pct(cs_t, eff_tot),
+        "home": fmt_pct(cs_h, eff_home),
+        "away": fmt_pct(cs_a, eff_away),
+    }
+    insights["no_goals_pct"] = {
+        "total": fmt_pct(ng_t, eff_tot),
+        "home": fmt_pct(ng_h, eff_home),
+        "away": fmt_pct(ng_a, eff_away),
+    }
 
-    insights["win_and_over25_pct"] = fmt_pct(win_o25_t, sample_n)
-    insights["lose_and_btts_pct"] = fmt_pct(lose_btts_t, sample_n)
-    insights["win_and_btts_pct"] = fmt_pct(win_btts_t, sample_n)
-    insights["draw_and_btts_pct"] = fmt_pct(draw_btts_t, sample_n)
+    # AVG GF / AVG GA / Goal Diff (원본 구조)
+    gf_avg_t = fmt_avg(gf_sum_t, eff_tot, 2)
+    ga_avg_t = fmt_avg(ga_sum_t, eff_tot, 2)
+    gf_avg_h = fmt_avg(gf_sum_h, eff_home, 2)
+    ga_avg_h = fmt_avg(ga_sum_h, eff_home, 2)
+    gf_avg_a = fmt_avg(gf_sum_a, eff_away, 2)
+    ga_avg_a = fmt_avg(ga_sum_a, eff_away, 2)
 
-    # 기존 nested 구조도 유지(디버그/확장용)
+    insights["avg_gf"] = {"total": gf_avg_t, "home": gf_avg_h, "away": gf_avg_a}
+    insights["avg_ga"] = {"total": ga_avg_t, "home": ga_avg_h, "away": ga_avg_a}
+
+    insights["goal_diff_avg"] = {
+        "total": round(gf_avg_t - ga_avg_t, 2),
+        "home": round(gf_avg_h - ga_avg_h, 2),
+        "away": round(gf_avg_a - ga_avg_a, 2),
+    }
+
+    # 콤보 지표
+    insights["win_and_over25_pct"] = {
+        "total": fmt_pct(win_o25_t, eff_tot),
+        "home": fmt_pct(win_o25_h, eff_home),
+        "away": fmt_pct(win_o25_a, eff_away),
+    }
+    insights["lose_and_btts_pct"] = {
+        "total": fmt_pct(lose_btts_t, eff_tot),
+        "home": fmt_pct(lose_btts_h, eff_home),
+        "away": fmt_pct(lose_btts_a, eff_away),
+    }
+    insights["win_and_btts_pct"] = {
+        "total": fmt_pct(win_btts_t, eff_tot),
+        "home": fmt_pct(win_btts_h, eff_home),
+        "away": fmt_pct(win_btts_a, eff_away),
+    }
+    insights["draw_and_btts_pct"] = {
+        "total": fmt_pct(draw_btts_t, eff_tot),
+        "home": fmt_pct(draw_btts_h, eff_home),
+        "away": fmt_pct(draw_btts_a, eff_away),
+    }
+
+    # (선택) 기존 nested 구조는 유지해도 됨
     insights["outcome_totals"] = out
+
 
 
 
