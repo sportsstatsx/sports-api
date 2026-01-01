@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, List, Tuple
 import math
+from datetime import datetime, timezone
+
 
 from db import fetch_all
 from .ai_predictions_engine import (
@@ -401,6 +403,570 @@ def _shrink_share(team_share: Optional[float], league_share: float, n: int, k: f
     share = (n * float(team_share) + k * float(league_share)) / (n + k)
     return _clamp(share, 0.35, 0.65)
 
+# ─────────────────────────────────────────────────────────────
+# ✅ 추가 요인: 요일/시간대 + 피로/휴식 + 대회 동기 + 상대 강도
+#   - 모두 "factor(곱셈)"로 λ(기대득점)에 반영
+#   - 데이터/컬럼/테이블이 없으면 항상 1.0(중립)로 폴백
+# ─────────────────────────────────────────────────────────────
+
+def _try_fetch_all(sql: str, params: Tuple[Any, ...]) -> List[Dict[str, Any]]:
+    try:
+        rows = fetch_all(sql, params)
+        return rows or []
+    except Exception:
+        return []
+
+
+def _dow_hour_pg(ts: int) -> Tuple[int, int]:
+    """
+    Postgres EXTRACT(DOW) 기준(일=0..토=6)에 맞춘 (dow, hour).
+    """
+    dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    # python weekday: 월=0..일=6 → pg dow: 일=0..토=6
+    dow_pg = (dt.weekday() + 1) % 7
+    return dow_pg, int(dt.hour)
+
+
+def _hour_bucket(hour: int) -> Tuple[int, int]:
+    """
+    시간대 버킷(단순 4분할):
+      0-5 / 6-11 / 12-17 / 18-23
+    """
+    h = max(0, min(23, int(hour)))
+    if h <= 5:
+        return 0, 5
+    if h <= 11:
+        return 6, 11
+    if h <= 17:
+        return 12, 17
+    return 18, 23
+
+
+def _shrink_factor(raw: Optional[float], n: int, k: float = 10.0) -> float:
+    """
+    표본 수가 적으면 1.0으로 shrink.
+      f = (n*raw + k*1.0) / (n+k)
+    """
+    if raw is None:
+        return 1.0
+    try:
+        r = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    f = (n * r + k * 1.0) / (n + k)
+    return float(_clamp(f, 0.85, 1.15))
+
+
+def _rest_factor(rest_days: Optional[float]) -> float:
+    """
+    휴식일수 → 득점 기대 factor.
+    (너무 과격하지 않게, 보수적으로)
+    """
+    if rest_days is None:
+        return 1.0
+    d = float(rest_days)
+    if d < 2.0:
+        return 0.93
+    if d < 3.0:
+        return 0.96
+    if d < 5.0:
+        return 1.00
+    if d < 7.0:
+        return 1.02
+    return 1.03
+
+
+def _fetch_last_game_ts_any_comp(team_id: int, before_ts: int) -> Optional[int]:
+    rows = _try_fetch_all(
+        """
+        SELECT MAX(fixture_timestamp)::int AS last_ts
+        FROM matches
+        WHERE status_group IN ('FINISHED','AET','PEN')
+          AND fixture_timestamp < %s
+          AND (home_id=%s OR away_id=%s)
+        """,
+        (before_ts, team_id, team_id),
+    )
+    if not rows:
+        return None
+    v = rows[0].get("last_ts")
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_team_gf_ga_overall(
+    team_ids: List[int], league_id: int, season: int, before_ts: int
+) -> Dict[int, Dict[str, Any]]:
+    """
+    해당 리그/시즌/현재경기 이전 기준으로 팀별 overall avg_gf/avg_ga + n
+    """
+    if not team_ids:
+        return {}
+
+    # IN 파라미터 안전 구성
+    placeholders = ",".join(["%s"] * len(team_ids))
+    params: List[Any] = [league_id, season, before_ts] + team_ids
+
+    rows = _try_fetch_all(
+        f"""
+        WITH m AS (
+          SELECT fixture_timestamp, home_id AS team_id, home_ft::float AS gf, away_ft::float AS ga
+          FROM matches
+          WHERE league_id=%s AND season=%s
+            AND status_group IN ('FINISHED','AET','PEN')
+            AND fixture_timestamp < %s
+            AND home_ft IS NOT NULL AND away_ft IS NOT NULL
+          UNION ALL
+          SELECT fixture_timestamp, away_id AS team_id, away_ft::float AS gf, home_ft::float AS ga
+          FROM matches
+          WHERE league_id=%s AND season=%s
+            AND status_group IN ('FINISHED','AET','PEN')
+            AND fixture_timestamp < %s
+            AND home_ft IS NOT NULL AND away_ft IS NOT NULL
+        )
+        SELECT team_id,
+               AVG(gf)::float AS avg_gf,
+               AVG(ga)::float AS avg_ga,
+               COUNT(*)::int AS n
+        FROM m
+        WHERE team_id IN ({placeholders})
+        GROUP BY team_id
+        """,
+        (league_id, season, before_ts, league_id, season, before_ts, *team_ids),
+    )
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        tid = _safe_int(r.get("team_id"))
+        if tid is None:
+            continue
+        out[tid] = {
+            "avg_gf": _safe_float(r.get("avg_gf")),
+            "avg_ga": _safe_float(r.get("avg_ga")),
+            "n": _safe_int(r.get("n")) or 0,
+        }
+    return out
+
+
+def _fetch_team_gf_ga_slot(
+    team_ids: List[int],
+    league_id: int,
+    season: int,
+    before_ts: int,
+    dow_pg: int,
+    h0: int,
+    h1: int,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    요일/시간대 슬롯 기준 팀별 avg_gf/avg_ga + n
+    """
+    if not team_ids:
+        return {}
+
+    placeholders = ",".join(["%s"] * len(team_ids))
+
+    rows = _try_fetch_all(
+        f"""
+        WITH m AS (
+          SELECT fixture_timestamp, home_id AS team_id, home_ft::float AS gf, away_ft::float AS ga
+          FROM matches
+          WHERE league_id=%s AND season=%s
+            AND status_group IN ('FINISHED','AET','PEN')
+            AND fixture_timestamp < %s
+            AND home_ft IS NOT NULL AND away_ft IS NOT NULL
+          UNION ALL
+          SELECT fixture_timestamp, away_id AS team_id, away_ft::float AS gf, home_ft::float AS ga
+          FROM matches
+          WHERE league_id=%s AND season=%s
+            AND status_group IN ('FINISHED','AET','PEN')
+            AND fixture_timestamp < %s
+            AND home_ft IS NOT NULL AND away_ft IS NOT NULL
+        )
+        SELECT team_id,
+               AVG(gf)::float AS avg_gf,
+               AVG(ga)::float AS avg_ga,
+               COUNT(*)::int AS n
+        FROM m
+        WHERE team_id IN ({placeholders})
+          AND EXTRACT(DOW FROM to_timestamp(fixture_timestamp))::int = %s
+          AND EXTRACT(HOUR FROM to_timestamp(fixture_timestamp))::int BETWEEN %s AND %s
+        GROUP BY team_id
+        """,
+        (league_id, season, before_ts, league_id, season, before_ts, *team_ids, dow_pg, h0, h1),
+    )
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        tid = _safe_int(r.get("team_id"))
+        if tid is None:
+            continue
+        out[tid] = {
+            "avg_gf": _safe_float(r.get("avg_gf")),
+            "avg_ga": _safe_float(r.get("avg_ga")),
+            "n": _safe_int(r.get("n")) or 0,
+        }
+    return out
+
+
+def _fetch_league_slot_mu_per_team(
+    league_id: int,
+    season: int,
+    dow_pg: int,
+    h0: int,
+    h1: int,
+) -> Tuple[Optional[float], int]:
+    """
+    리그 평균(팀당) 득점: 요일/시간대 슬롯 기준
+    """
+    rows = _try_fetch_all(
+        """
+        SELECT
+          SUM(COALESCE(home_ft,0)+COALESCE(away_ft,0))::float AS goals_total,
+          COUNT(*)::int AS n_games
+        FROM matches
+        WHERE league_id=%s AND season=%s
+          AND status_group IN ('FINISHED','AET','PEN')
+          AND home_ft IS NOT NULL AND away_ft IS NOT NULL
+          AND EXTRACT(DOW FROM to_timestamp(fixture_timestamp))::int = %s
+          AND EXTRACT(HOUR FROM to_timestamp(fixture_timestamp))::int BETWEEN %s AND %s
+        """,
+        (league_id, season, dow_pg, h0, h1),
+    )
+    if not rows:
+        return None, 0
+
+    goals_total = _safe_float(rows[0].get("goals_total")) or 0.0
+    n_games = _safe_int(rows[0].get("n_games")) or 0
+    if n_games <= 0:
+        return None, 0
+
+    mu_per_team = goals_total / (n_games * 2.0)
+    return float(mu_per_team), n_games
+
+
+def _fetch_standings_rows(league_id: int, season: int) -> List[Dict[str, Any]]:
+    """
+    standings 테이블 스키마가 환경마다 조금 다를 수 있어서 여러 패턴을 시도.
+    없으면 빈 리스트.
+    """
+    candidates = [
+        # (table, goalsdiff_col)
+        ("standings", "goals_diff"),
+        ("standings", "goalsDiff"),
+        ("league_standings", "goals_diff"),
+        ("league_standings", "goalsDiff"),
+    ]
+
+    for table, gdcol in candidates:
+        rows = _try_fetch_all(
+            f"""
+            SELECT
+              team_id,
+              rank,
+              points,
+              {gdcol} AS goals_diff,
+              "group" AS group_name,
+              stage
+            FROM {table}
+            WHERE league_id=%s AND season=%s
+            """,
+            (league_id, season),
+        )
+        if rows:
+            return rows
+
+    # 마지막 폴백: group/stage 컬럼이 없을 수도
+    for table, gdcol in candidates:
+        rows = _try_fetch_all(
+            f"""
+            SELECT
+              team_id,
+              rank,
+              points,
+              {gdcol} AS goals_diff
+            FROM {table}
+            WHERE league_id=%s AND season=%s
+            """,
+            (league_id, season),
+        )
+        if rows:
+            return rows
+
+    return []
+
+
+def _compute_opponent_strength_factor(
+    league_id: int,
+    season: int,
+    home_id: int,
+    away_id: int,
+) -> Tuple[float, float]:
+    """
+    상대 강도(상대 rank + GD) → 득점 기대 factor.
+    strong opponent → factor < 1
+    weak opponent   → factor > 1
+    """
+    rows = _fetch_standings_rows(league_id, season)
+    if not rows:
+        return 1.0, 1.0
+
+    by_team: Dict[int, Dict[str, Any]] = {}
+    ranks: List[int] = []
+    gds: List[float] = []
+
+    for r in rows:
+        tid = _safe_int(r.get("team_id"))
+        if tid is None:
+            continue
+        rk = _safe_int(r.get("rank"))
+        pt = _safe_int(r.get("points"))
+        gd = _safe_float(r.get("goals_diff"))
+        by_team[tid] = {
+            "rank": rk,
+            "points": pt,
+            "gd": gd,
+            "group": r.get("group_name"),
+            "stage": r.get("stage"),
+        }
+        if rk is not None:
+            ranks.append(rk)
+        if gd is not None:
+            gds.append(gd)
+
+    opp_h = by_team.get(away_id)  # home 기준 상대는 away
+    opp_a = by_team.get(home_id)  # away 기준 상대는 home
+    if not opp_h or not opp_a or not ranks:
+        return 1.0, 1.0
+
+    avg_rank = (sum(ranks) / len(ranks)) if ranks else 10.0
+    avg_rank = max(2.0, float(avg_rank))
+
+    def _z(xs: List[float], x: float) -> float:
+        if not xs:
+            return 0.0
+        mu = sum(xs) / len(xs)
+        var = sum((v - mu) ** 2 for v in xs) / max(1, (len(xs) - 1))
+        sd = math.sqrt(max(1e-6, var))
+        return (x - mu) / sd
+
+    def _factor_from_opp(opp: Dict[str, Any]) -> float:
+        rk = opp.get("rank")
+        gd = opp.get("gd")
+        if rk is None:
+            return 1.0
+
+        # rank가 낮을수록 강팀 → 감점
+        rank_strength = (avg_rank - float(rk)) / avg_rank  # 강팀이면 +
+        gd_strength = _z(gds, float(gd)) if gd is not None else 0.0
+
+        # 보수적으로 합산
+        idx = 0.9 * rank_strength + 0.35 * gd_strength
+
+        # 강팀(+idx)일수록 exp(-k*idx) < 1
+        f = math.exp(-0.18 * idx)
+        return float(_clamp(f, 0.88, 1.12))
+
+    return _factor_from_opp(opp_h), _factor_from_opp(opp_a)
+
+
+def _compute_motivation_factor(
+    league_id: int,
+    season: int,
+    fixture_ts: int,
+    team_id: int,
+) -> float:
+    """
+    대회 동기 factor (조별/16강 진출 여부 + 마지막 경기 중요도).
+    standings가 없으면 1.0.
+    """
+    rows = _fetch_standings_rows(league_id, season)
+    if not rows:
+        return 1.0
+
+    # 팀 row 찾기
+    trow: Optional[Dict[str, Any]] = None
+    for r in rows:
+        if _safe_int(r.get("team_id")) == team_id:
+            trow = r
+            break
+    if not trow:
+        return 1.0
+
+    rank = _safe_int(trow.get("rank"))
+    points = _safe_int(trow.get("points"))
+    group_name = trow.get("group_name") or trow.get("group")  # 호환
+    stage = trow.get("stage")
+
+    # 남은 경기 수(해당 리그/시즌 내)
+    rem_rows = _try_fetch_all(
+        """
+        SELECT COUNT(*)::int AS n_rem
+        FROM matches
+        WHERE league_id=%s AND season=%s
+          AND fixture_timestamp > %s
+          AND (home_id=%s OR away_id=%s)
+          AND (status_group IS NULL OR status_group NOT IN ('FINISHED','AET','PEN'))
+        """,
+        (league_id, season, fixture_ts, team_id, team_id),
+    )
+    n_rem = 0
+    if rem_rows:
+        n_rem = _safe_int(rem_rows[0].get("n_rem")) or 0
+
+    is_last_games = (n_rem <= 1)
+
+    # 16강/토너먼트(대략): stage/round 문자열이 있으면 가중
+    stage_s = (str(stage).lower() if stage is not None else "")
+    is_knockout = any(x in stage_s for x in ["round of 16", "quarter", "semi", "final", "knockout", "playoff", "16강", "8강", "4강", "결승"])
+
+    # 조별: group_name이 Group/조 같은 텍스트면 조별로 간주
+    g_s = (str(group_name).lower() if group_name is not None else "")
+    is_group_stage = any(x in g_s for x in ["group", "조"])
+
+    # 기본
+    f = 1.0
+
+    if is_knockout:
+        # 토너먼트는 기본적으로 동기 높음
+        f *= 1.03
+        if is_last_games:
+            f *= 1.01
+        return float(_clamp(f, 0.95, 1.08))
+
+    if is_group_stage and rank is not None and points is not None:
+        # "조별/16강 진출 여부"를 단순히 "조 1~2위 = 진출권"으로 가정(데이터 없으면 보수적으로)
+        # 같은 group의 2위/3위 포인트를 찾아 "경합"이면 가중
+        same_group = []
+        for r in rows:
+            if (r.get("group_name") or r.get("group")) == group_name:
+                same_group.append(r)
+
+        def _points_of_rank(rrank: int) -> Optional[int]:
+            cand = [x for x in same_group if _safe_int(x.get("rank")) == rrank]
+            if not cand:
+                return None
+            return _safe_int(cand[0].get("points"))
+
+        p2 = _points_of_rank(2)
+        p3 = _points_of_rank(3)
+
+        qualified = (rank <= 2)
+        chasing = False
+
+        # 3위인데 2위와 3점 이내면 동기 ↑
+        if (rank == 3) and (p2 is not None) and (p2 - points <= 3):
+            chasing = True
+
+        # 2위인데 3위와 3점 이내면 방어 동기 ↑
+        if (rank == 2) and (p3 is not None) and (points - p3 <= 3):
+            chasing = True
+
+        if is_last_games and chasing:
+            f *= 1.06
+        elif is_last_games and (not qualified):
+            f *= 1.05
+        elif is_last_games and qualified:
+            # 이미 진출 확정이면 약간 다운
+            f *= 0.99
+        else:
+            if chasing:
+                f *= 1.03
+
+    return float(_clamp(f, 0.94, 1.08))
+
+
+def _compute_time_weekday_factor(
+    league_id: int,
+    season: int,
+    home_id: int,
+    away_id: int,
+    fixture_ts: int,
+    mu_for_per_team: float,
+) -> Tuple[float, float]:
+    """
+    요일/시간대 효과 = (리그 평균 슬롯/전체) × (팀 슬롯/팀 전체) [shrink]
+    → 득점 기대 factor로 반환 (home_factor, away_factor)
+    """
+    dow_pg, hour = _dow_hour_pg(fixture_ts)
+    h0, h1 = _hour_bucket(hour)
+
+    slot_mu, n_games = _fetch_league_slot_mu_per_team(league_id, season, dow_pg, h0, h1)
+    if slot_mu is None or mu_for_per_team <= 0:
+        league_factor = 1.0
+    else:
+        league_factor = float(_clamp(slot_mu / max(0.25, mu_for_per_team), 0.92, 1.08))
+
+    overall = _fetch_team_gf_ga_overall([home_id, away_id], league_id, season, fixture_ts)
+    slot = _fetch_team_gf_ga_slot([home_id, away_id], league_id, season, fixture_ts, dow_pg, h0, h1)
+
+    def _team_factor(tid: int) -> float:
+        o = overall.get(tid) or {}
+        s = slot.get(tid) or {}
+
+        ogf = _safe_float(o.get("avg_gf"))
+        sgf = _safe_float(s.get("avg_gf"))
+        on = int(o.get("n") or 0)
+        sn = int(s.get("n") or 0)
+
+        if ogf is None or ogf <= 0 or sgf is None:
+            raw = None
+        else:
+            raw = sgf / max(0.05, ogf)
+
+        # 팀 슬롯 표본 적으면 1.0으로 shrink
+        tf = _shrink_factor(raw, n=sn, k=10.0)
+
+        # 리그 효과(공통) + 팀 편차(개별) 섞기(과하지 않게)
+        # league 60%, team 40% 정도
+        f = (league_factor ** 0.60) * (tf ** 0.40)
+        return float(_clamp(f, 0.90, 1.10))
+
+    return _team_factor(home_id), _team_factor(away_id)
+
+
+def _compute_context_goal_factors(
+    league_id: int,
+    season: int,
+    home_id: int,
+    away_id: int,
+    fixture_ts: int,
+    mu_for_per_team: float,
+) -> Tuple[float, float]:
+    """
+    최종 득점 기대 factor(home, away):
+      요일/시간대 × 휴식 × 동기 × 상대강도
+    """
+    # 1) 요일/시간대
+    f_time_h, f_time_a = _compute_time_weekday_factor(
+        league_id, season, home_id, away_id, fixture_ts, mu_for_per_team
+    )
+
+    # 2) 휴식(대회 구분 없이)
+    last_h = _fetch_last_game_ts_any_comp(home_id, fixture_ts)
+    last_a = _fetch_last_game_ts_any_comp(away_id, fixture_ts)
+
+    rest_h = (fixture_ts - last_h) / 86400.0 if last_h else None
+    rest_a = (fixture_ts - last_a) / 86400.0 if last_a else None
+
+    f_rest_h = _rest_factor(rest_h)
+    f_rest_a = _rest_factor(rest_a)
+
+    # 3) 대회 동기(조별/16강/마지막 경기 중요도)
+    f_mot_h = _compute_motivation_factor(league_id, season, fixture_ts, home_id)
+    f_mot_a = _compute_motivation_factor(league_id, season, fixture_ts, away_id)
+
+    # 4) 상대 강도(상대 스탠딩/골득실 가중)
+    f_opp_h, f_opp_a = _compute_opponent_strength_factor(league_id, season, home_id, away_id)
+
+    # 합성(과격 방지)
+    home_factor = f_time_h * f_rest_h * f_mot_h * f_opp_h
+    away_factor = f_time_a * f_rest_a * f_mot_a * f_opp_a
+
+    return float(_clamp(home_factor, 0.85, 1.15)), float(_clamp(away_factor, 0.85, 1.15))
+
+
 
 def _compute_lambdas_from_db(
     meta: Dict[str, Any],
@@ -460,8 +1026,28 @@ def _compute_lambdas_from_db(
     lam_home_ft = mu_home * (h_atk / denom) * (a_def / denom)
     lam_away_ft = mu_away * (a_atk / denom) * (h_def / denom)
 
+    # ─────────────────────────────────────────
+    # ✅ 추가 요인 반영 (요일/시간대, 휴식, 동기, 상대강도)
+    # ─────────────────────────────────────────
+    try:
+        f_goal_home, f_goal_away = _compute_context_goal_factors(
+            league_id=league_id,
+            season=season,
+            home_id=home_id,
+            away_id=away_id,
+            fixture_ts=before_ts,
+            mu_for_per_team=mu_for_per_team,
+        )
+    except Exception:
+        f_goal_home, f_goal_away = 1.0, 1.0
+
+    lam_home_ft *= f_goal_home
+    lam_away_ft *= f_goal_away
+
+    # 최종 clamp
     lam_home_ft = max(0.05, float(lam_home_ft))
     lam_away_ft = max(0.05, float(lam_away_ft))
+
 
     # 1H 비중(팀 득점 기준 share를 리그 평균으로 shrink)
     h_share = _shrink_share(h_share10, league_share_1h, n=len(h10), k=8.0)
