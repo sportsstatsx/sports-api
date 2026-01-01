@@ -290,6 +290,11 @@ def enrich_overall_outcome_totals(
     yellow_sum_t = yellow_sum_h = yellow_sum_a = 0
     red_sum_t = red_sum_h = red_sum_a = 0
 
+    # ✅ Goals For/Against (AVG)  ← AI Predictions 필수
+    gf_sum_t = gf_sum_h = gf_sum_a = 0
+    ga_sum_t = ga_sum_h = ga_sum_a = 0
+
+
     # Pen Won (AVG) / Pen Conv%
     pen_att_t = pen_att_h = pen_att_a = 0
     pen_sc_t = pen_sc_h = pen_sc_a = 0
@@ -392,7 +397,18 @@ def enrich_overall_outcome_totals(
             ga = home_ft
             opp_team_id = home_id
 
+        # ✅ Goals For/Against 누적 (avg_gf/avg_ga 생성용)
+        gf_sum_t += gf
+        ga_sum_t += ga
+        if is_home:
+            gf_sum_h += gf
+            ga_sum_h += ga
+        else:
+            gf_sum_a += gf
+            ga_sum_a += ga
+
         tg = gf + ga
+
 
         # ── W/D/L
         if gf > ga:
@@ -620,6 +636,11 @@ def enrich_overall_outcome_totals(
     insights["draw_pct"] = {"total": fmt_pct(d_t, eff_tot), "home": fmt_pct(d_h, eff_home), "away": fmt_pct(d_a, eff_away)}
     insights["loss_pct"] = {"total": fmt_pct(l_t, eff_tot), "home": fmt_pct(l_h, eff_home), "away": fmt_pct(l_a, eff_away)}
 
+    # ✅ AI Predictions 필수: 평균 득점/실점
+    insights["avg_gf"] = {"total": fmt_avg(gf_sum_t, eff_tot, 2), "home": fmt_avg(gf_sum_h, eff_home, 2), "away": fmt_avg(gf_sum_a, eff_away, 2)}
+    insights["avg_ga"] = {"total": fmt_avg(ga_sum_t, eff_tot, 2), "home": fmt_avg(ga_sum_h, eff_home, 2), "away": fmt_avg(ga_sum_a, eff_away, 2)}
+
+
     insights["clean_sheet_pct"] = {"total": fmt_pct(cs_t, eff_tot), "home": fmt_pct(cs_h, eff_home), "away": fmt_pct(cs_a, eff_away)}
     insights["btts_pct"] = {"total": fmt_pct(btts_t, eff_tot), "home": fmt_pct(btts_h, eff_home), "away": fmt_pct(btts_a, eff_away)}
 
@@ -641,6 +662,12 @@ def enrich_overall_outcome_totals(
     insights["corners_avg"] = {"total": fmt_avg(corners_sum_t, eff_tot, 2), "home": fmt_avg(corners_sum_h, eff_home, 2), "away": fmt_avg(corners_sum_a, eff_away, 2)}
     insights["yellow_avg"] = {"total": fmt_avg(yellow_sum_t, eff_tot, 2), "home": fmt_avg(yellow_sum_h, eff_home, 2), "away": fmt_avg(yellow_sum_a, eff_away, 2)}
     insights["red_avg"] = {"total": fmt_avg(red_sum_t, eff_tot, 2), "home": fmt_avg(red_sum_h, eff_home, 2), "away": fmt_avg(red_sum_a, eff_away, 2)}
+
+    # ✅ AI Predictions 호환(스칼라 기대)
+    insights["corners_per_match"] = fmt_avg(corners_sum_t, eff_tot, 2)
+    insights["yellow_per_match"] = fmt_avg(yellow_sum_t, eff_tot, 2)
+    insights["red_per_match"] = fmt_avg(red_sum_t, eff_tot, 2)
+
 
     insights["pen_won_avg"] = {"total": fmt_avg(pen_att_t, eff_tot, 2), "home": fmt_avg(pen_att_h, eff_home, 2), "away": fmt_avg(pen_att_a, eff_away, 2)}
     insights["pen_conv_pct"] = {"total": fmt_pct(pen_sc_t, pen_att_t), "home": fmt_pct(pen_sc_h, pen_att_h), "away": fmt_pct(pen_sc_a, pen_att_a)}
