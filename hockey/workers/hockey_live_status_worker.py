@@ -107,6 +107,315 @@ def _float_env(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _select_latest_league_season_pairs(leagues: List[int]) -> List[Tuple[int, int]]:
+    """
+    standings 갱신 대상 (league_id, season) 추출:
+    - hockey_games에 존재하는 시즌 중 league별 최신 season 1개
+    """
+    if not leagues:
+        return []
+
+    rows = hockey_fetch_all(
+        """
+        SELECT league_id, season, max(updated_at) AS last_u
+        FROM hockey_games
+        WHERE league_id = ANY(%s)
+        GROUP BY league_id, season
+        ORDER BY league_id ASC, season DESC
+        """,
+        (leagues,),
+    )
+
+    latest_by_league: Dict[int, int] = {}
+    for r in rows:
+        lid = int(r.get("league_id") or 0)
+        season = int(r.get("season") or 0)
+        if lid <= 0 or season <= 0:
+            continue
+        if lid not in latest_by_league:
+            latest_by_league[lid] = season  # season DESC 정렬이므로 첫값이 최신
+
+    return [(lid, latest_by_league[lid]) for lid in sorted(latest_by_league.keys())]
+
+
+def _api_get_league_meta_by_id(league_id: int) -> Optional[Dict[str, Any]]:
+    payload = _get("/leagues", {"id": league_id})
+    resp = payload.get("response") if isinstance(payload, dict) else None
+    if isinstance(resp, list) and resp and isinstance(resp[0], dict):
+        return resp[0]
+    return None
+
+
+def _api_get_standings_payload(league_id: int, season: int) -> Dict[str, Any]:
+    return _get("/standings", {"league": league_id, "season": season})
+
+
+def _upsert_country(country: Dict[str, Any]) -> None:
+    # schema: hockey_countries(id, name, code, flag, updated_at...)
+    cid = _safe_int(country.get("id")) or 0
+    if cid <= 0:
+        return
+    hockey_execute(
+        """
+        INSERT INTO hockey_countries (id, name, code, flag)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          code = EXCLUDED.code,
+          flag = EXCLUDED.flag
+        """,
+        (
+            cid,
+            _safe_text(country.get("name")),
+            _safe_text(country.get("code")),
+            _safe_text(country.get("flag")),
+        ),
+    )
+
+
+def _upsert_league(league: Dict[str, Any], country_id: Optional[int]) -> None:
+    # schema: hockey_leagues(id, name, type, logo, country_id, updated_at...)
+    lid = _safe_int(league.get("id")) or 0
+    if lid <= 0:
+        return
+    hockey_execute(
+        """
+        INSERT INTO hockey_leagues (id, name, type, logo, country_id)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          type = EXCLUDED.type,
+          logo = EXCLUDED.logo,
+          country_id = EXCLUDED.country_id
+        """,
+        (
+            lid,
+            _safe_text(league.get("name")),
+            _safe_text(league.get("type")),
+            _safe_text(league.get("logo")),
+            country_id,
+        ),
+    )
+
+
+def _upsert_league_season(league_id: int, season_item: Dict[str, Any]) -> None:
+    # schema: hockey_league_seasons(league_id, season, start, end, current, coverage_json, updated_at...)
+    season = _safe_int(season_item.get("season")) or 0
+    if league_id <= 0 or season <= 0:
+        return
+    hockey_execute(
+        """
+        INSERT INTO hockey_league_seasons (league_id, season, start_date, end_date, is_current, coverage_json)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (league_id, season) DO UPDATE SET
+          start_date = EXCLUDED.start_date,
+          end_date = EXCLUDED.end_date,
+          is_current = EXCLUDED.is_current,
+          coverage_json = EXCLUDED.coverage_json
+        """,
+        (
+            league_id,
+            season,
+            _safe_text(season_item.get("start")),
+            _safe_text(season_item.get("end")),
+            bool(season_item.get("current")) if season_item.get("current") is not None else None,
+            _jdump(season_item.get("coverage") or {}),
+        ),
+    )
+
+
+def _upsert_team(team: Dict[str, Any]) -> None:
+    # schema: hockey_teams(id, name, logo, updated_at...)
+    tid = _safe_int(team.get("id")) or 0
+    if tid <= 0:
+        return
+    hockey_execute(
+        """
+        INSERT INTO hockey_teams (id, name, logo)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          logo = EXCLUDED.logo
+        """,
+        (
+            tid,
+            _safe_text(team.get("name")),
+            _safe_text(team.get("logo")),
+        ),
+    )
+
+
+def _iter_standing_rows(obj: Any):
+    # standings 응답이 list/list-of-list/dict 섞여서 오는 경우 방어적으로 flatten
+    if isinstance(obj, list):
+        for x in obj:
+            yield from _iter_standing_rows(x)
+    elif isinstance(obj, dict):
+        if "standings" in obj:
+            yield from _iter_standing_rows(obj.get("standings"))
+        elif "team" in obj:
+            yield obj
+
+
+def _upsert_standings(league_id: int, season: int, payload: Dict[str, Any]) -> int:
+    resp = payload.get("response") if isinstance(payload, dict) else None
+    if not isinstance(resp, list) or not resp:
+        return 0
+
+    saved = 0
+
+    # API는 response[0]에 league+standings가 들어있는 형태가 흔함
+    for item in resp:
+        if not isinstance(item, dict):
+            continue
+
+        league_obj = item.get("league") if isinstance(item.get("league"), dict) else {}
+        stage = _safe_text(league_obj.get("stage")) or "REG"
+
+        standings_obj = item.get("standings")
+        for row in _iter_standing_rows(standings_obj):
+            team = row.get("team") if isinstance(row.get("team"), dict) else {}
+            _upsert_team(team)
+
+            group_name = _safe_text(row.get("group")) or _safe_text(row.get("group_name")) or "overall"
+
+            games = row.get("games") if isinstance(row.get("games"), dict) else {}
+            win = row.get("win") if isinstance(row.get("win"), dict) else {}
+            lose = row.get("lose") if isinstance(row.get("lose"), dict) else {}
+            goals = row.get("goals") if isinstance(row.get("goals"), dict) else {}
+
+            hockey_execute(
+                """
+                INSERT INTO hockey_standings (
+                  league_id, season, stage, group_name,
+                  position, team_id, team_name,
+                  games_played,
+                  win_total, win_pct, win_ot_total, win_ot_pct,
+                  lose_total, lose_pct, lose_ot_total, lose_ot_pct,
+                  goals_for, goals_against,
+                  points, form, description,
+                  raw_json
+                )
+                VALUES (
+                  %s,%s,%s,%s,
+                  %s,%s,%s,
+                  %s,
+                  %s,%s,%s,%s,
+                  %s,%s,%s,%s,
+                  %s,%s,
+                  %s,%s,%s,
+                  %s::jsonb
+                )
+                ON CONFLICT (league_id, season, stage, group_name, team_id)
+                DO UPDATE SET
+                  position = EXCLUDED.position,
+                  team_name = EXCLUDED.team_name,
+                  games_played = EXCLUDED.games_played,
+                  win_total = EXCLUDED.win_total,
+                  win_pct = EXCLUDED.win_pct,
+                  win_ot_total = EXCLUDED.win_ot_total,
+                  win_ot_pct = EXCLUDED.win_ot_pct,
+                  lose_total = EXCLUDED.lose_total,
+                  lose_pct = EXCLUDED.lose_pct,
+                  lose_ot_total = EXCLUDED.lose_ot_total,
+                  lose_ot_pct = EXCLUDED.lose_ot_pct,
+                  goals_for = EXCLUDED.goals_for,
+                  goals_against = EXCLUDED.goals_against,
+                  points = EXCLUDED.points,
+                  form = EXCLUDED.form,
+                  description = EXCLUDED.description,
+                  raw_json = EXCLUDED.raw_json
+                """,
+                (
+                    league_id,
+                    season,
+                    stage,
+                    group_name,
+
+                    _safe_int(row.get("position")) or 0,
+                    _safe_int(team.get("id")) or 0,
+                    _safe_text(team.get("name")),
+
+                    _safe_int(games.get("played")),
+
+                    _safe_int(win.get("total")),
+                    _safe_float(win.get("percentage")),
+                    _safe_int(win.get("overtime")),
+                    _safe_float(win.get("overtime_percentage")),
+
+                    _safe_int(lose.get("total")),
+                    _safe_float(lose.get("percentage")),
+                    _safe_int(lose.get("overtime")),
+                    _safe_float(lose.get("overtime_percentage")),
+
+                    _safe_int(goals.get("for")),
+                    _safe_int(goals.get("against")),
+
+                    _safe_int(row.get("points")),
+                    _safe_text(row.get("form")),
+                    _safe_text(row.get("description")),
+                    _jdump(row),
+                ),
+            )
+            saved += 1
+
+    return saved
+
+
+def _refresh_meta_for_leagues(leagues: List[int], sleep_sec: float) -> None:
+    for lid in leagues:
+        try:
+            item = _api_get_league_meta_by_id(int(lid))
+            if not item:
+                continue
+
+            country = item.get("country") if isinstance(item.get("country"), dict) else {}
+            league = item.get("league") if isinstance(item.get("league"), dict) else {}
+            seasons = item.get("seasons") if isinstance(item.get("seasons"), list) else []
+
+            # country -> league -> seasons
+            _upsert_country(country)
+            cid = _safe_int(country.get("id"))
+            _upsert_league(league, cid)
+
+            league_id = _safe_int(league.get("id")) or int(lid)
+            for s in seasons:
+                if isinstance(s, dict):
+                    _upsert_league_season(league_id, s)
+
+        except Exception as e:
+            log.warning("meta refresh failed: league=%s err=%s", lid, e)
+
+        if sleep_sec > 0:
+            time.sleep(float(sleep_sec))
+
+
+def _refresh_standings_for_latest_seasons(leagues: List[int], sleep_sec: float) -> None:
+    pairs = _select_latest_league_season_pairs(leagues)
+    if not pairs:
+        return
+
+    for (lid, season) in pairs:
+        try:
+            payload = _api_get_standings_payload(lid, season)
+            saved = _upsert_standings(lid, season, payload)
+            log.info("standings refreshed: league=%s season=%s rows=%s", lid, season, saved)
+        except Exception as e:
+            log.warning("standings refresh failed: league=%s season=%s err=%s", lid, season, e)
+
+        if sleep_sec > 0:
+            time.sleep(float(sleep_sec))
+
+
 
 def _int_set_env(name: str) -> set[int]:
     raw = (os.getenv(name) or "").strip()
@@ -1027,18 +1336,46 @@ def main() -> None:
         slow_interval, idle_interval
     )
 
-    # 리그별 다음 실행 시각(UTC timestamp)
-    next_run_by_league: Dict[int, float] = {}
+# 리그별 다음 실행 시각(UTC timestamp)
+next_run_by_league: Dict[int, float] = {}
 
-    while True:
-        try:
-            # 1) 윈도우 후보 한 번만 로드
-            all_rows = _load_live_window_game_rows()
+# ✅ meta/standings 저빈도 갱신용 타이머
+meta_refresh_sec = _float_env("HOCKEY_META_REFRESH_SEC", 86400.0)          # 기본 24h
+standings_refresh_sec = _float_env("HOCKEY_STANDINGS_REFRESH_SEC", 21600.0) # 기본 6h
+meta_sleep = _float_env("HOCKEY_META_REFRESH_SLEEP_SEC", 0.5)
+standings_sleep = _float_env("HOCKEY_STANDINGS_REFRESH_SLEEP_SEC", 0.5)
 
-            if not all_rows:
-                # 후보 없으면 idle
-                time.sleep(idle_interval)
-                continue
+next_meta_refresh_ts = 0.0
+next_standings_refresh_ts = 0.0
+
+while True:
+    try:
+        now0 = time.time()
+
+        # ✅ (A) 메타 테이블 갱신: countries/leagues/league_seasons
+        if now0 >= next_meta_refresh_ts:
+            try:
+                _refresh_meta_for_leagues(leagues, sleep_sec=meta_sleep)
+            except Exception as e:
+                log.exception("meta refresh tick failed: %s", e)
+            next_meta_refresh_ts = now0 + float(meta_refresh_sec)
+
+        # ✅ (B) 스탠딩+팀 갱신: standings + teams
+        if now0 >= next_standings_refresh_ts:
+            try:
+                _refresh_standings_for_latest_seasons(leagues, sleep_sec=standings_sleep)
+            except Exception as e:
+                log.exception("standings refresh tick failed: %s", e)
+            next_standings_refresh_ts = now0 + float(standings_refresh_sec)
+
+        # 1) 윈도우 후보 한 번만 로드
+        all_rows = _load_live_window_game_rows()
+
+        if not all_rows:
+            # 후보 없으면 idle
+            time.sleep(idle_interval)
+            continue
+
 
             # 2) 리그별로 rows 그룹핑
             rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
