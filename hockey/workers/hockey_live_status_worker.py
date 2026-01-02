@@ -206,31 +206,115 @@ def _upsert_league(league: Dict[str, Any], country_id: Optional[int]) -> None:
         ),
     )
 
+# ✅ hockey_league_seasons 컬럼명 자동 감지(스키마 차이 대응)
+_LEAGUE_SEASONS_COLMAP: Optional[Dict[str, Optional[str]]] = None
+
+def _detect_league_seasons_colmap() -> Dict[str, Optional[str]]:
+    """
+    DB의 hockey_league_seasons 컬럼명을 조회해서
+    start/end/current 컬럼이 어떤 이름인지 매핑해준다.
+
+    지원:
+      - start_date or start
+      - end_date or end
+      - is_current or current
+    """
+    global _LEAGUE_SEASONS_COLMAP
+    if _LEAGUE_SEASONS_COLMAP is not None:
+        return _LEAGUE_SEASONS_COLMAP
+
+    cols = set()
+    try:
+        rows = hockey_fetch_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name='hockey_league_seasons'
+            """,
+            (),
+        )
+        for r in rows:
+            cn = (r.get("column_name") or "").strip()
+            if cn:
+                cols.add(cn)
+    except Exception:
+        # 조회 실패 시에는 코드 기본값을 우선 시도
+        cols = {"start_date", "end_date", "is_current", "coverage_json"}
+
+    start_col = "start_date" if "start_date" in cols else ("start" if "start" in cols else None)
+    end_col = "end_date" if "end_date" in cols else ("end" if "end" in cols else None)
+    current_col = "is_current" if "is_current" in cols else ("current" if "current" in cols else None)
+
+    _LEAGUE_SEASONS_COLMAP = {
+        "start": start_col,
+        "end": end_col,
+        "current": current_col,
+    }
+    return _LEAGUE_SEASONS_COLMAP
+
+
 
 def _upsert_league_season(league_id: int, season_item: Dict[str, Any]) -> None:
-    # schema: hockey_league_seasons(league_id, season, start, end, current, coverage_json, updated_at...)
+    # schema: hockey_league_seasons(league_id, season, start/start_date, end/end_date, current/is_current, coverage_json, updated_at...)
     season = _safe_int(season_item.get("season")) or 0
     if league_id <= 0 or season <= 0:
         return
-    hockey_execute(
-        """
-        INSERT INTO hockey_league_seasons (league_id, season, start_date, end_date, is_current, coverage_json)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-        ON CONFLICT (league_id, season) DO UPDATE SET
-          start_date = EXCLUDED.start_date,
-          end_date = EXCLUDED.end_date,
-          is_current = EXCLUDED.is_current,
-          coverage_json = EXCLUDED.coverage_json
-        """,
-        (
-            league_id,
-            season,
-            _safe_text(season_item.get("start")),
-            _safe_text(season_item.get("end")),
-            bool(season_item.get("current")) if season_item.get("current") is not None else None,
-            _jdump(season_item.get("coverage") or {}),
-        ),
+
+    colmap = _detect_league_seasons_colmap()
+    start_col = colmap.get("start")
+    end_col = colmap.get("end")
+    current_col = colmap.get("current")
+
+    start_val = _safe_text(season_item.get("start"))
+    end_val = _safe_text(season_item.get("end"))
+    current_val = (
+        bool(season_item.get("current"))
+        if season_item.get("current") is not None
+        else None
     )
+    coverage_json = _jdump(season_item.get("coverage") or {})
+
+    # start/end 컬럼이 아예 없으면 최소 upsert만 하고 종료
+    # (coverage_json만이라도 넣게)
+    cols = ["league_id", "season"]
+    vals = ["%s", "%s"]
+    upd = []
+
+    params: List[Any] = [league_id, season]
+
+    if start_col:
+        cols.append(start_col)
+        vals.append("%s")
+        upd.append(f"{start_col} = EXCLUDED.{start_col}")
+        params.append(start_val)
+
+    if end_col:
+        cols.append(end_col)
+        vals.append("%s")
+        upd.append(f"{end_col} = EXCLUDED.{end_col}")
+        params.append(end_val)
+
+    if current_col:
+        cols.append(current_col)
+        vals.append("%s")
+        upd.append(f"{current_col} = EXCLUDED.{current_col}")
+        params.append(current_val)
+
+    cols.append("coverage_json")
+    vals.append("%s::jsonb")
+    upd.append("coverage_json = EXCLUDED.coverage_json")
+    params.append(coverage_json)
+
+    sql = f"""
+    INSERT INTO hockey_league_seasons ({", ".join(cols)})
+    VALUES ({", ".join(vals)})
+    ON CONFLICT (league_id, season) DO UPDATE SET
+      {", ".join(upd)}
+    """
+
+    hockey_execute(sql, tuple(params))
+
 
 
 def _upsert_team(team: Dict[str, Any]) -> None:
