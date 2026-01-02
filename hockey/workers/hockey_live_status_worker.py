@@ -1336,46 +1336,43 @@ def main() -> None:
         slow_interval, idle_interval
     )
 
-# 리그별 다음 실행 시각(UTC timestamp)
-next_run_by_league: Dict[int, float] = {}
+    # 리그별 다음 실행 시각(UTC timestamp)
+    next_run_by_league: Dict[int, float] = {}
 
-# ✅ meta/standings 저빈도 갱신용 타이머
-meta_refresh_sec = _float_env("HOCKEY_META_REFRESH_SEC", 86400.0)          # 기본 24h
-standings_refresh_sec = _float_env("HOCKEY_STANDINGS_REFRESH_SEC", 21600.0) # 기본 6h
-meta_sleep = _float_env("HOCKEY_META_REFRESH_SLEEP_SEC", 0.5)
-standings_sleep = _float_env("HOCKEY_STANDINGS_REFRESH_SLEEP_SEC", 0.5)
+    # ✅ meta/standings 저빈도 갱신용 타이머
+    meta_refresh_sec = _float_env("HOCKEY_META_REFRESH_SEC", 86400.0)           # 기본 24h
+    standings_refresh_sec = _float_env("HOCKEY_STANDINGS_REFRESH_SEC", 21600.0) # 기본 6h
+    meta_sleep = _float_env("HOCKEY_META_REFRESH_SLEEP_SEC", 0.5)
+    standings_sleep = _float_env("HOCKEY_STANDINGS_REFRESH_SLEEP_SEC", 0.5)
 
-next_meta_refresh_ts = 0.0
-next_standings_refresh_ts = 0.0
+    next_meta_refresh_ts = 0.0
+    next_standings_refresh_ts = 0.0
 
-while True:
-    try:
-        now0 = time.time()
+    while True:
+        try:
+            now0 = time.time()
 
-        # ✅ (A) 메타 테이블 갱신: countries/leagues/league_seasons
-        if now0 >= next_meta_refresh_ts:
-            try:
-                _refresh_meta_for_leagues(leagues, sleep_sec=meta_sleep)
-            except Exception as e:
-                log.exception("meta refresh tick failed: %s", e)
-            next_meta_refresh_ts = now0 + float(meta_refresh_sec)
+            # ✅ (A) 메타 테이블 갱신: countries/leagues/league_seasons
+            if now0 >= next_meta_refresh_ts:
+                try:
+                    _refresh_meta_for_leagues(leagues, sleep_sec=meta_sleep)
+                except Exception as e:
+                    log.exception("meta refresh tick failed: %s", e)
+                next_meta_refresh_ts = now0 + float(meta_refresh_sec)
 
-        # ✅ (B) 스탠딩+팀 갱신: standings + teams
-        if now0 >= next_standings_refresh_ts:
-            try:
-                _refresh_standings_for_latest_seasons(leagues, sleep_sec=standings_sleep)
-            except Exception as e:
-                log.exception("standings refresh tick failed: %s", e)
-            next_standings_refresh_ts = now0 + float(standings_refresh_sec)
+            # ✅ (B) 스탠딩+팀 갱신: standings + teams
+            if now0 >= next_standings_refresh_ts:
+                try:
+                    _refresh_standings_for_latest_seasons(leagues, sleep_sec=standings_sleep)
+                except Exception as e:
+                    log.exception("standings refresh tick failed: %s", e)
+                next_standings_refresh_ts = now0 + float(standings_refresh_sec)
 
-        # 1) 윈도우 후보 한 번만 로드
-        all_rows = _load_live_window_game_rows()
-
-        if not all_rows:
-            # 후보 없으면 idle
-            time.sleep(idle_interval)
-            continue
-
+            # 1) 윈도우 후보 한 번만 로드
+            all_rows = _load_live_window_game_rows()
+            if not all_rows:
+                time.sleep(idle_interval)
+                continue
 
             # 2) 리그별로 rows 그룹핑
             rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
@@ -1409,9 +1406,8 @@ while True:
 
                 nxt = next_run_by_league.get(lid, 0.0)
                 if now_ts < nxt:
-                    continue  # 아직 시간 안 됨
+                    continue
 
-                # due → 실행
                 g_up, e_up, cand = tick_once_windowed(
                     rows,
                     super_fast_leagues=super_fast_leagues,
@@ -1427,7 +1423,6 @@ while True:
                 total_candidates += cand
                 processed_leagues.append(lid)
 
-                # 다음 실행 시각 갱신
                 next_run_by_league[lid] = now_ts + max(1.0, float(interval))
 
             log.info(
@@ -1435,11 +1430,10 @@ while True:
                 processed_leagues, total_candidates, total_games_upserted, total_events_upserted
             )
 
-            # 4) 다음 sleep 계산: "가장 가까운 next_run" 까지
-            # (너무 길게 자면 딜레이 생김 → 최소 0.2s, 최대 1.0s로 clamp)
+            # 4) 다음 sleep 계산
             soonest = None
             for lid, tnext in next_run_by_league.items():
-                if lid in rows_by_league:  # 현재 윈도우에 존재하는 리그만 고려
+                if lid in rows_by_league:
                     if soonest is None or tnext < soonest:
                         soonest = tnext
 
@@ -1447,13 +1441,13 @@ while True:
                 time.sleep(1.0)
             else:
                 wait = max(0.0, soonest - time.time())
-                # 너무 미세하게 돌면 CPU 부담 → 0.2~1.0로 제한
                 wait = min(1.0, max(0.2, wait))
                 time.sleep(wait)
 
         except Exception as e:
             log.exception("tick failed: %s", e)
             time.sleep(idle_interval)
+
 
 
 
