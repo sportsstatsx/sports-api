@@ -212,12 +212,13 @@ _LEAGUE_SEASONS_COLMAP: Optional[Dict[str, Optional[str]]] = None
 def _detect_league_seasons_colmap() -> Dict[str, Optional[str]]:
     """
     DB의 hockey_league_seasons 컬럼명을 조회해서
-    start/end/current 컬럼이 어떤 이름인지 매핑해준다.
+    start/end/current/coverage 컬럼이 어떤 이름인지 매핑해준다.
 
     지원:
       - start_date or start
       - end_date or end
       - is_current or current
+      - coverage_json (있으면만 사용)
     """
     global _LEAGUE_SEASONS_COLMAP
     if _LEAGUE_SEASONS_COLMAP is not None:
@@ -239,19 +240,22 @@ def _detect_league_seasons_colmap() -> Dict[str, Optional[str]]:
             if cn:
                 cols.add(cn)
     except Exception:
-        # 조회 실패 시에는 코드 기본값을 우선 시도
-        cols = {"start_date", "end_date", "is_current", "coverage_json"}
+        # 조회 실패 시에는 최소 컬럼만 가정(coverage는 가정하지 않음)
+        cols = {"start_date", "end_date", "is_current"}
 
     start_col = "start_date" if "start_date" in cols else ("start" if "start" in cols else None)
     end_col = "end_date" if "end_date" in cols else ("end" if "end" in cols else None)
     current_col = "is_current" if "is_current" in cols else ("current" if "current" in cols else None)
+    coverage_col = "coverage_json" if "coverage_json" in cols else None
 
     _LEAGUE_SEASONS_COLMAP = {
         "start": start_col,
         "end": end_col,
         "current": current_col,
+        "coverage": coverage_col,
     }
     return _LEAGUE_SEASONS_COLMAP
+
 
 
 
@@ -301,10 +305,13 @@ def _upsert_league_season(league_id: int, season_item: Dict[str, Any]) -> None:
         upd.append(f"{current_col} = EXCLUDED.{current_col}")
         params.append(current_val)
 
-    cols.append("coverage_json")
-    vals.append("%s::jsonb")
-    upd.append("coverage_json = EXCLUDED.coverage_json")
-    params.append(coverage_json)
+    coverage_col = colmap.get("coverage")
+    if coverage_col:
+        cols.append(coverage_col)
+        vals.append("%s::jsonb")
+        upd.append(f"{coverage_col} = EXCLUDED.{coverage_col}")
+        params.append(coverage_json)
+
 
     sql = f"""
     INSERT INTO hockey_league_seasons ({", ".join(cols)})
