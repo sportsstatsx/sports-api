@@ -623,7 +623,7 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     - 시작 전(pre): now ~ now+pre_min
     - 진행중(in-play): game_date가 now - inplay_max_min 이후이고, status가 '종료'가 아닌 경기
 
-    ✅ 추가 보정(중요):
+    추가 보정(중요):
     - start_called_at(=킥오프 감지)이 찍힌 경기는,
       DB status가 NS/TBD로 남아있더라도 in-play 후보에서 절대 빠지지 않게 유지한다.
       (API가 NS를 오래 주는 케이스에서 윈도우 탈락 → 영구 NS 고착 방지)
