@@ -425,32 +425,39 @@ def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
     except Exception as e:
         log.warning("resolve standings season(current) failed: %s", e)
 
-    # (2) 시즌 기간(start/end)이 오늘을 포함하는 시즌 (컬럼/캐스팅 실패 시 그냥 스킵)
+    # (2) 시즌 기간(start/end)이 오늘을 포함하는 시즌
+    #     ✅ start/end 컬럼이 실제로 있을 때만 시도 (로그 스팸 방지)
     missing = [int(x) for x in leagues if int(x) not in out]
     if missing:
-        try:
-            rows2 = hockey_fetch_all(
-                """
-                SELECT league_id, MAX(season) AS season
-                FROM hockey_league_seasons
-                WHERE league_id = ANY(%s)
-                  AND start IS NOT NULL AND start <> ''
-                  AND "end" IS NOT NULL AND "end" <> ''
-                  AND (start::date) <= ((now() AT TIME ZONE 'utc')::date)
-                  AND ("end"::date) >= ((now() AT TIME ZONE 'utc')::date)
-                GROUP BY league_id
-                """,
-                (missing,),
-            )
-            for r in rows2 or []:
-                lid = r.get("league_id")
-                ss = r.get("season")
-                if lid is None or ss is None:
-                    continue
-                out[int(lid)] = int(ss)
-        except Exception as e:
-            # start/end 컬럼이 없거나 date cast 불가한 스키마/데이터면 여기로 옴
-            log.info("resolve standings season(date-range) skipped: %s", e)
+        seasons_cols = _table_columns("hockey_league_seasons")
+        if ("start" in seasons_cols) and ("end" in seasons_cols):
+            try:
+                rows2 = hockey_fetch_all(
+                    """
+                    SELECT league_id, MAX(season) AS season
+                    FROM hockey_league_seasons
+                    WHERE league_id = ANY(%s)
+                      AND start IS NOT NULL AND start <> ''
+                      AND "end" IS NOT NULL AND "end" <> ''
+                      AND (start::date) <= ((now() AT TIME ZONE 'utc')::date)
+                      AND ("end"::date) >= ((now() AT TIME ZONE 'utc')::date)
+                    GROUP BY league_id
+                    """,
+                    (missing,),
+                )
+                for r in rows2 or []:
+                    lid = r.get("league_id")
+                    ss = r.get("season")
+                    if lid is None or ss is None:
+                        continue
+                    out[int(lid)] = int(ss)
+            except Exception as e:
+                # start/end가 있어도 date cast 불가한 데이터면 스킵
+                log.info("resolve standings season(date-range) skipped: %s", e)
+        else:
+            # 컬럼이 없으면 애초에 시도하지 않음
+            log.info("resolve standings season(date-range) skipped: start/end columns not present")
+
 
     # (3) 미래가 멀어도 잡히게: '지금 기준 가장 가까운 경기' 시즌 선택
     missing = [int(x) for x in leagues if int(x) not in out]
