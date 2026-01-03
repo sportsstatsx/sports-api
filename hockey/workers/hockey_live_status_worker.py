@@ -391,11 +391,13 @@ def _meta_refresh_teams_for_leagues(leagues: List[int]) -> None:
 
 def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
     """
-    standings 시즌의 '정답 원천'을 고정한다.
+    standings 시즌의 '정답 원천'을 최대한 안정적으로 고정한다.
 
     우선순위:
-    1) hockey_league_seasons.current = true 인 시즌
-    2) fallback: hockey_games에서 "최근/근처 날짜" 범위 내 시즌 (미래 시즌 튀는 것 방지)
+    1) hockey_league_seasons.current = true
+    2) (가능하면) hockey_league_seasons.start/end 범위가 '오늘'을 포함하는 시즌
+    3) hockey_games에서 '지금 기준 가장 가까운(game_date 기준)' 경기의 시즌  ← 미래 일정이 멀어도 여기서 잡힘
+    4) 마지막 fallback: MAX(season) (seasons 테이블 → games 테이블 순)
     """
     if not leagues:
         return {}
@@ -423,17 +425,19 @@ def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
     except Exception as e:
         log.warning("resolve standings season(current) failed: %s", e)
 
-    # (2) fallback: games에서 "근처 날짜" 범위만
+    # (2) 시즌 기간(start/end)이 오늘을 포함하는 시즌 (컬럼/캐스팅 실패 시 그냥 스킵)
     missing = [int(x) for x in leagues if int(x) not in out]
     if missing:
         try:
             rows2 = hockey_fetch_all(
                 """
                 SELECT league_id, MAX(season) AS season
-                FROM hockey_games
+                FROM hockey_league_seasons
                 WHERE league_id = ANY(%s)
-                  AND game_date >= (now() AT TIME ZONE 'utc') - interval '120 days'
-                  AND game_date <= (now() AT TIME ZONE 'utc') + interval '30 days'
+                  AND start IS NOT NULL AND start <> ''
+                  AND "end" IS NOT NULL AND "end" <> ''
+                  AND (start::date) <= ((now() AT TIME ZONE 'utc')::date)
+                  AND ("end"::date) >= ((now() AT TIME ZONE 'utc')::date)
                 GROUP BY league_id
                 """,
                 (missing,),
@@ -445,9 +449,84 @@ def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
                     continue
                 out[int(lid)] = int(ss)
         except Exception as e:
-            log.warning("resolve standings season(fallback games window) failed: %s", e)
+            # start/end 컬럼이 없거나 date cast 불가한 스키마/데이터면 여기로 옴
+            log.info("resolve standings season(date-range) skipped: %s", e)
+
+    # (3) 미래가 멀어도 잡히게: '지금 기준 가장 가까운 경기' 시즌 선택
+    missing = [int(x) for x in leagues if int(x) not in out]
+    if missing:
+        try:
+            rows3 = hockey_fetch_all(
+                """
+                SELECT DISTINCT ON (league_id)
+                  league_id,
+                  season
+                FROM hockey_games
+                WHERE league_id = ANY(%s)
+                  AND game_date IS NOT NULL
+                ORDER BY
+                  league_id,
+                  abs(extract(epoch from (game_date - (now() AT TIME ZONE 'utc')))) ASC,
+                  season DESC
+                """,
+                (missing,),
+            )
+            for r in rows3 or []:
+                lid = r.get("league_id")
+                ss = r.get("season")
+                if lid is None or ss is None:
+                    continue
+                out[int(lid)] = int(ss)
+        except Exception as e:
+            log.warning("resolve standings season(nearest game_date) failed: %s", e)
+
+    # (4) 최후 fallback: MAX(season)
+    missing = [int(x) for x in leagues if int(x) not in out]
+    if missing:
+        # 4-1) seasons 테이블 MAX(season)
+        try:
+            rows4 = hockey_fetch_all(
+                """
+                SELECT league_id, MAX(season) AS season
+                FROM hockey_league_seasons
+                WHERE league_id = ANY(%s)
+                GROUP BY league_id
+                """,
+                (missing,),
+            )
+            for r in rows4 or []:
+                lid = r.get("league_id")
+                ss = r.get("season")
+                if lid is None or ss is None:
+                    continue
+                out[int(lid)] = int(ss)
+        except Exception as e:
+            log.warning("resolve standings season(max seasons) failed: %s", e)
+
+    missing = [int(x) for x in leagues if int(x) not in out]
+    if missing:
+        # 4-2) games 테이블 MAX(season)
+        try:
+            rows5 = hockey_fetch_all(
+                """
+                SELECT league_id, MAX(season) AS season
+                FROM hockey_games
+                WHERE league_id = ANY(%s)
+                GROUP BY league_id
+                """,
+                (missing,),
+            )
+            for r in rows5 or []:
+                lid = r.get("league_id")
+                ss = r.get("season")
+                if lid is None or ss is None:
+                    continue
+                out[int(lid)] = int(ss)
+        except Exception as e:
+            log.warning("resolve standings season(max games) failed: %s", e)
 
     return out
+
 
 
 def _normalize_standings_blocks(payload: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
