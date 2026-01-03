@@ -450,6 +450,37 @@ def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
     return out
 
 
+def _normalize_standings_blocks(payload: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """
+    standings 응답 형태가 케이스가 여러개라 통일:
+    - case A: response = [ { league: { standings: [[...], [...]] } } ]
+    - case B: response = [[...],[...]]
+    """
+    resp = payload.get("response") if isinstance(payload, dict) else None
+    if not isinstance(resp, list) or not resp:
+        return []
+
+    # A
+    if isinstance(resp[0], dict):
+        league = resp[0].get("league")
+        if isinstance(league, dict):
+            st = league.get("standings")
+            if isinstance(st, list):
+                # st가 [[{...}]] 형태
+                if st and isinstance(st[0], list):
+                    return st  # type: ignore
+                # st가 [{...}] 형태면 1블록으로 래핑
+                if st and isinstance(st[0], dict):
+                    return [st]  # type: ignore
+
+    # B
+    if isinstance(resp[0], list):
+        return resp  # type: ignore
+
+    return []
+
+
+
 
 
 def _refresh_standings_for_leagues(leagues: List[int]) -> None:
@@ -480,37 +511,31 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             log.warning("standings fetch failed: league=%s season=%s err=%s", lid, season, e)
             continue
 
-        resp = payload.get("response") if isinstance(payload, dict) else None
-        if not isinstance(resp, list) or not resp:
-            continue
-
-        root = resp[0] if isinstance(resp[0], dict) else {}
-        league_block = root.get("league") if isinstance(root.get("league"), dict) else {}
-
-        # API-Sports가 보통 league.standings 형태로 줌 (리그마다 shape 다를 수 있어 방어)
-        standings = league_block.get("standings")
-        if standings is None:
-            standings = root.get("standings")
-
-        if not isinstance(standings, list):
+        blocks = _normalize_standings_blocks(payload)
+        if not blocks:
+            resp = payload.get("response") if isinstance(payload, dict) else None
+            t0 = None
+            if isinstance(resp, list) and resp:
+                t0 = type(resp[0]).__name__
             log.warning(
-                "standings shape unexpected: league=%s season=%s type=%s keys_root=%s keys_league=%s",
-                lid, season, type(standings).__name__,
-                list(root.keys()) if isinstance(root, dict) else None,
-                list(league_block.keys()) if isinstance(league_block, dict) else None,
+                "standings shape unexpected(normalize empty): league=%s season=%s resp0_type=%s",
+                lid, season, t0
             )
             continue
 
         # stage 기본값(없어도 NOT NULL 만족 위해 fallback)
-        default_stage = _safe_text(league_block.get("stage")) or "Regular Season"
+        # case A에서는 league_block에서 stage를 얻을 수도 있지만, blocks만으로도 충분히 동작하게 기본값만 둔다.
+        default_stage = "Regular Season"
 
-        # standings는 보통 "그룹 리스트들의 리스트" 형태 (ex: [ [..team..], [..team..] ])
+        # blocks는 항상 [ [row,row..], [row,row..] ] 형태로 통일됨
         groups: List[List[Dict[str, Any]]] = []
-        if standings and all(isinstance(x, list) for x in standings):
-            for g in standings:
-                groups.append([t for t in g if isinstance(t, dict)])
-        else:
-            groups = [[t for t in standings if isinstance(t, dict)]]
+        for b in blocks:
+            if isinstance(b, list):
+                groups.append([t for t in b if isinstance(t, dict)])
+
+        if not groups:
+            continue
+
 
         upserted = 0
         skipped = 0
@@ -528,7 +553,15 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                 position = _safe_int(row.get("rank")) or _safe_int(row.get("position")) or 0
 
                 stage = _safe_text(row.get("stage")) or default_stage
-                group_name = _safe_text(row.get("group")) or _safe_text(row.get("group_name")) or group_name_fallback
+                g = row.get("group")
+                group_name = None
+                if isinstance(g, dict):
+                    group_name = _safe_text(g.get("name"))
+                else:
+                    group_name = _safe_text(g)
+
+                group_name = group_name or _safe_text(row.get("group_name")) or group_name_fallback
+
 
                 insert_cols: List[str] = []
                 insert_vals: List[Any] = []
