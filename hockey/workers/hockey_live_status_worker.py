@@ -41,6 +41,67 @@ def _table_columns(table: str) -> set[str]:
 def _jsonb_dump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
+def _upsert_no_unique(
+    table: str,
+    table_cols: set[str],
+    insert_cols: List[str],
+    insert_vals: List[Any],
+    key_cols: List[str],
+) -> None:
+    """
+    ✅ UNIQUE/PK가 없어도 동작하는 upsert:
+    1) key_cols로 UPDATE 먼저 시도(UPDATE ... RETURNING 1)
+    2) 업데이트된 row가 없으면 INSERT
+
+    - 단점: key가 유니크가 아니면 UPDATE가 여러 행에 적용될 수 있음(그래도 "갱신"은 됨)
+    - 장점: ON CONFLICT 제약 없어도 절대 에러 안 남
+    """
+    col_to_val = {c: v for c, v in zip(insert_cols, insert_vals)}
+
+    # key가 실제 컬럼에 없으면 아무것도 못함
+    real_keys = [k for k in key_cols if k in insert_cols]
+    if not real_keys:
+        log.warning("upsert skip(no key cols in insert): table=%s key_cols=%s insert_cols=%s", table, key_cols, insert_cols)
+        return
+
+    # UPDATE
+    set_cols = [c for c in insert_cols if (c not in real_keys and c != "updated_at")]
+    if not set_cols and "updated_at" not in table_cols:
+        # 업데이트할 게 없으면 UPDATE는 의미가 없음 → 존재 확인 후 INSERT만
+        exists = hockey_fetch_one(
+            f"SELECT 1 FROM {table} WHERE " + " AND ".join([f"{k}=%s" for k in real_keys]) + " LIMIT 1",
+            tuple(col_to_val[k] for k in real_keys),
+        )
+        if exists:
+            return
+        ph = ", ".join(["%s"] * len(insert_cols))
+        hockey_execute(
+            f"INSERT INTO {table} ({', '.join(insert_cols)}) VALUES ({ph})",
+            tuple(insert_vals),
+        )
+        return
+
+    set_parts = [f"{c}=%s" for c in set_cols]
+    if "updated_at" in table_cols:
+        set_parts.append("updated_at=now()")
+
+    where_sql = " AND ".join([f"{k}=%s" for k in real_keys])
+    sql = f"UPDATE {table} SET {', '.join(set_parts)} WHERE {where_sql} RETURNING 1"
+
+    update_vals = [col_to_val[c] for c in set_cols] + [col_to_val[k] for k in real_keys]
+    updated = hockey_fetch_one(sql, tuple(update_vals))
+
+    if updated:
+        return
+
+    # INSERT
+    ph = ", ".join(["%s"] * len(insert_cols))
+    hockey_execute(
+        f"INSERT INTO {table} ({', '.join(insert_cols)}) VALUES ({ph})",
+        tuple(insert_vals),
+    )
+
+
 
 def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
     """
@@ -114,13 +175,15 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
             upd_sql = ", ".join(upd_parts) if upd_parts else ""
             hockey_execute(
                 f"""
-                INSERT INTO hockey_leagues ({cols_sql})
-                VALUES ({ph_sql})
-                ON CONFLICT (id) DO UPDATE SET
-                {upd_sql}
-                """,
-                tuple(insert_vals),
+            # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
+            _upsert_no_unique(
+                "hockey_leagues",
+                leagues_cols,
+                insert_cols,
+                insert_vals,
+                ["id"],
             )
+
 
         # ── hockey_league_seasons upsert
         # seasons 응답 형태가 바뀔 수 있으니 최대한 안전 처리
@@ -162,16 +225,15 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
                 if "updated_at" in seasons_cols:
                     upd_parts.append("updated_at=now()")
 
-                upd_sql = ", ".join(upd_parts) if upd_parts else ""
-                hockey_execute(
-                    f"""
-                    INSERT INTO hockey_league_seasons ({cols_sql})
-                    VALUES ({ph_sql})
-                    ON CONFLICT (league_id, season) DO UPDATE SET
-                    {upd_sql}
-                    """,
-                    tuple(svals),
+                # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
+                _upsert_no_unique(
+                    "hockey_league_seasons",
+                    seasons_cols,
+                    scols,
+                    svals,
+                    ["league_id", "season"],
                 )
+
 
 
 def _meta_refresh_countries() -> None:
@@ -224,16 +286,15 @@ def _meta_refresh_countries() -> None:
         if "updated_at" in cols:
             upd_parts.append("updated_at=now()")
 
-        upd_sql = ", ".join(upd_parts) if upd_parts else ""
-        hockey_execute(
-            f"""
-            INSERT INTO hockey_countries ({cols_sql})
-            VALUES ({ph_sql})
-            ON CONFLICT (code) DO UPDATE SET
-            {upd_sql}
-            """,
-            tuple(insert_vals),
+        # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
+        _upsert_no_unique(
+            "hockey_countries",
+            cols,
+            insert_cols,
+            insert_vals,
+            ["code"],
         )
+
 
 
 def _meta_refresh_teams_for_leagues(leagues: List[int]) -> None:
@@ -314,16 +375,15 @@ def _meta_refresh_teams_for_leagues(leagues: List[int]) -> None:
             if "updated_at" in cols:
                 upd_parts.append("updated_at=now()")
 
-            upd_sql = ", ".join(upd_parts) if upd_parts else ""
-            hockey_execute(
-                f"""
-                INSERT INTO hockey_teams ({cols_sql})
-                VALUES ({ph_sql})
-                ON CONFLICT (id) DO UPDATE SET
-                {upd_sql}
-                """,
-                tuple(insert_vals),
+            # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
+            _upsert_no_unique(
+                "hockey_teams",
+                cols,
+                insert_cols,
+                insert_vals,
+                ["id"],
             )
+
 
 
 def _refresh_standings_for_leagues(leagues: List[int]) -> None:
@@ -391,16 +451,15 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
         if "updated_at" in cols:
             upd_parts.append("updated_at=now()")
 
-        upd_sql = ", ".join(upd_parts) if upd_parts else ""
-        hockey_execute(
-            f"""
-            INSERT INTO hockey_standings ({cols_sql})
-            VALUES ({ph_sql})
-            ON CONFLICT (league_id, season) DO UPDATE SET
-            {upd_sql}
-            """,
-            tuple(insert_vals),
+        # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
+        _upsert_no_unique(
+            "hockey_standings",
+            cols,
+            insert_cols,
+            insert_vals,
+            ["league_id", "season"],
         )
+
 
 
 def _run_meta_and_standings_refresh(leagues: List[int]) -> None:
@@ -1482,6 +1541,8 @@ def main() -> None:
                     log.info("meta refresh done")
             except Exception as e:
                 log.warning("meta refresh failed: %s", e)
+                _last_meta_ts = now_ts  # ✅ 실패해도 스팸 방지
+
 
             try:
                 if _last_standings_ts == 0.0 or (now_ts - _last_standings_ts) >= float(standings_refresh_sec):
@@ -1491,6 +1552,8 @@ def main() -> None:
                     log.info("standings refresh done")
             except Exception as e:
                 log.warning("standings refresh failed: %s", e)
+                _last_standings_ts = now_ts  # ✅ 실패해도 스팸 방지
+
 
 
             # 3) due 된 리그만 처리
