@@ -466,14 +466,13 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
 
     cols = _table_columns("hockey_standings")
 
-season_by_league = _resolve_standings_season_by_league(leagues)
+    season_by_league = _resolve_standings_season_by_league(leagues)
 
-for lid in leagues:
-    season = season_by_league.get(int(lid))
-    if not season:
-        log.info("standings skip(no season resolved): league=%s", lid)
-        continue
-
+    for lid in leagues:
+        season = season_by_league.get(int(lid))
+        if not season:
+            log.info("standings skip(no season resolved): league=%s", lid)
+            continue
 
         try:
             payload = _get("/standings", {"league": int(lid), "season": int(season)})
@@ -581,6 +580,7 @@ for lid in leagues:
             "standings refreshed: league=%s season=%s groups=%s upserted=%s skipped=%s",
             lid, season, len(groups), upserted, skipped
         )
+
 
 
 
@@ -1628,54 +1628,22 @@ def main() -> None:
     _last_meta_ts = 0.0
     _last_standings_ts = 0.0
 
-while True:
-    try:
-        now_ts = time.time()
-
-        # ✅ (0) meta/standings refresh는 후보 경기 없어도 항상 주기적으로 실행
+    while True:
         try:
-            if _last_meta_ts == 0.0 or (now_ts - _last_meta_ts) >= float(meta_refresh_sec):
-                log.info("meta refresh start (interval=%ss)", meta_refresh_sec)
-                _meta_refresh_leagues_and_seasons(leagues)
-                _meta_refresh_countries()
-                _meta_refresh_teams_for_leagues(leagues)
-                _last_meta_ts = now_ts
-                log.info("meta refresh done")
-        except Exception as e:
-            log.warning("meta refresh failed: %s", e)
-            _last_meta_ts = now_ts  # ✅ 실패해도 스팸 방지
+            now_ts = time.time()
 
-        try:
-            if _last_standings_ts == 0.0 or (now_ts - _last_standings_ts) >= float(standings_refresh_sec):
-                log.info("standings refresh start (interval=%ss)", standings_refresh_sec)
-                _refresh_standings_for_leagues(leagues)
-                _last_standings_ts = now_ts
-                log.info("standings refresh done")
-        except Exception as e:
-            log.warning("standings refresh failed: %s", e)
-            _last_standings_ts = now_ts  # ✅ 실패해도 스팸 방지
-
-        # (1) 윈도우 후보 한 번만 로드 (라이브 파이프라인)
-        all_rows = _load_live_window_game_rows()
-
-        if not all_rows:
-            # 후보 없으면 라이브만 idle (메타/스탠딩은 이미 위에서 처리됨)
-            time.sleep(idle_interval)
-            continue
-
-        # (2) 리그별로 rows 그룹핑
-        rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
-        for r in all_rows:
-            lid = int(r.get("league_id") or 0)
-            if lid <= 0:
-                continue
-            rows_by_league.setdefault(lid, []).append(r)
-
-        if not rows_by_league:
-            time.sleep(idle_interval)
-            continue
-
-
+            # ✅ (0) meta/standings refresh는 후보 경기 없어도 항상 주기적으로 실행
+            try:
+                if _last_meta_ts == 0.0 or (now_ts - _last_meta_ts) >= float(meta_refresh_sec):
+                    log.info("meta refresh start (interval=%ss)", meta_refresh_sec)
+                    _meta_refresh_leagues_and_seasons(leagues)
+                    _meta_refresh_countries()
+                    _meta_refresh_teams_for_leagues(leagues)
+                    _last_meta_ts = now_ts
+                    log.info("meta refresh done")
+            except Exception as e:
+                log.warning("meta refresh failed: %s", e)
+                _last_meta_ts = now_ts  # ✅ 실패해도 스팸 방지
 
             try:
                 if _last_standings_ts == 0.0 or (now_ts - _last_standings_ts) >= float(standings_refresh_sec):
@@ -1687,7 +1655,25 @@ while True:
                 log.warning("standings refresh failed: %s", e)
                 _last_standings_ts = now_ts  # ✅ 실패해도 스팸 방지
 
+            # (1) 윈도우 후보 한 번만 로드 (라이브 파이프라인)
+            all_rows = _load_live_window_game_rows()
 
+            if not all_rows:
+                # 후보 없으면 라이브만 idle (메타/스탠딩은 이미 위에서 처리됨)
+                time.sleep(idle_interval)
+                continue
+
+            # (2) 리그별로 rows 그룹핑
+            rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
+            for r in all_rows:
+                lid = int(r.get("league_id") or 0)
+                if lid <= 0:
+                    continue
+                rows_by_league.setdefault(lid, []).append(r)
+
+            if not rows_by_league:
+                time.sleep(idle_interval)
+                continue
 
             # 3) due 된 리그만 처리
             total_games_upserted = 0
@@ -1752,6 +1738,7 @@ while True:
         except Exception as e:
             log.exception("tick failed: %s", e)
             time.sleep(idle_interval)
+
 
 
 
