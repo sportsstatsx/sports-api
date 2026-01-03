@@ -440,6 +440,12 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             standings = root.get("standings")
 
         if not isinstance(standings, list):
+            log.warning(
+                "standings shape unexpected: league=%s season=%s type=%s keys_root=%s keys_league=%s",
+                lid, season, type(standings).__name__,
+                list(root.keys()) if isinstance(root, dict) else None,
+                list(league_block.keys()) if isinstance(league_block, dict) else None,
+            )
             continue
 
         # stage 기본값(없어도 NOT NULL 만족 위해 fallback)
@@ -453,23 +459,24 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
         else:
             groups = [[t for t in standings if isinstance(t, dict)]]
 
+        upserted = 0
+        skipped = 0
+
         for gi, group_rows in enumerate(groups):
-            # group_name 기본값(없어도 NOT NULL 만족 위해 fallback)
             group_name_fallback = f"Group {gi+1}" if len(groups) > 1 else "Overall"
 
             for row in group_rows:
                 team = row.get("team") if isinstance(row.get("team"), dict) else {}
                 team_id = _safe_int(team.get("id"))
                 if team_id is None:
+                    skipped += 1
                     continue
 
-                # position/rank (NOT NULL)
                 position = _safe_int(row.get("rank")) or _safe_int(row.get("position")) or 0
 
                 stage = _safe_text(row.get("stage")) or default_stage
                 group_name = _safe_text(row.get("group")) or _safe_text(row.get("group_name")) or group_name_fallback
 
-                # 필요한 컬럼만 안전하게 넣기
                 insert_cols: List[str] = []
                 insert_vals: List[Any] = []
 
@@ -486,25 +493,22 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                 _add("position", int(position))
                 _add("raw_json", _jsonb_dump(row))
 
-                # raw_json이 없으면 의미 없음(트리거도 못 탐)
                 if "raw_json" not in insert_cols:
+                    skipped += 1
                     continue
 
                 cols_sql = ", ".join(insert_cols)
-                # raw_json만 jsonb cast
                 ph_parts = []
                 for c in insert_cols:
                     ph_parts.append("%s::jsonb" if c == "raw_json" else "%s")
                 ph_sql = ", ".join(ph_parts)
 
-                # 업데이트는 position/raw_json만 확실히 갱신
                 upd_parts = []
                 if "position" in cols:
                     upd_parts.append("position=EXCLUDED.position")
                 upd_parts.append("raw_json=EXCLUDED.raw_json")
                 if "updated_at" in cols:
                     upd_parts.append("updated_at=now()")
-
                 upd_sql = ", ".join(upd_parts)
 
                 hockey_execute(
@@ -517,6 +521,13 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                     """,
                     tuple(insert_vals),
                 )
+                upserted += 1
+
+        log.info(
+            "standings refreshed: league=%s season=%s groups=%s upserted=%s skipped=%s",
+            lid, season, len(groups), upserted, skipped
+        )
+
 
 
 
