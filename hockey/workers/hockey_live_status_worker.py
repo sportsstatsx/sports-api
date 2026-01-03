@@ -389,6 +389,67 @@ def _meta_refresh_teams_for_leagues(leagues: List[int]) -> None:
                 ["id"],
             )
 
+def _resolve_standings_season_by_league(leagues: List[int]) -> Dict[int, int]:
+    """
+    standings 시즌의 '정답 원천'을 고정한다.
+
+    우선순위:
+    1) hockey_league_seasons.current = true 인 시즌
+    2) fallback: hockey_games에서 "최근/근처 날짜" 범위 내 시즌 (미래 시즌 튀는 것 방지)
+    """
+    if not leagues:
+        return {}
+
+    out: Dict[int, int] = {}
+
+    # (1) current season 우선
+    try:
+        rows = hockey_fetch_all(
+            """
+            SELECT league_id, MAX(season) AS season
+            FROM hockey_league_seasons
+            WHERE league_id = ANY(%s)
+              AND current IS TRUE
+            GROUP BY league_id
+            """,
+            (leagues,),
+        )
+        for r in rows or []:
+            lid = r.get("league_id")
+            ss = r.get("season")
+            if lid is None or ss is None:
+                continue
+            out[int(lid)] = int(ss)
+    except Exception as e:
+        log.warning("resolve standings season(current) failed: %s", e)
+
+    # (2) fallback: games에서 "근처 날짜" 범위만
+    missing = [int(x) for x in leagues if int(x) not in out]
+    if missing:
+        try:
+            rows2 = hockey_fetch_all(
+                """
+                SELECT league_id, MAX(season) AS season
+                FROM hockey_games
+                WHERE league_id = ANY(%s)
+                  AND game_date >= (now() AT TIME ZONE 'utc') - interval '120 days'
+                  AND game_date <= (now() AT TIME ZONE 'utc') + interval '30 days'
+                GROUP BY league_id
+                """,
+                (missing,),
+            )
+            for r in rows2 or []:
+                lid = r.get("league_id")
+                ss = r.get("season")
+                if lid is None or ss is None:
+                    continue
+                out[int(lid)] = int(ss)
+        except Exception as e:
+            log.warning("resolve standings season(fallback games window) failed: %s", e)
+
+    return out
+
+
 
 
 def _refresh_standings_for_leagues(leagues: List[int]) -> None:
@@ -405,21 +466,14 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
 
     cols = _table_columns("hockey_standings")
 
-    rows = hockey_fetch_all(
-        """
-        SELECT league_id, MAX(season) AS season
-        FROM hockey_games
-        WHERE league_id = ANY(%s)
-        GROUP BY league_id
-        """,
-        (leagues,),
-    )
-    latest_by_league = {int(r["league_id"]): int(r["season"]) for r in rows if r.get("season") is not None}
+season_by_league = _resolve_standings_season_by_league(leagues)
 
-    for lid in leagues:
-        season = latest_by_league.get(int(lid))
-        if not season:
-            continue
+for lid in leagues:
+    season = season_by_league.get(int(lid))
+    if not season:
+        log.info("standings skip(no season resolved): league=%s", lid)
+        continue
+
 
         try:
             payload = _get("/standings", {"league": int(lid), "season": int(season)})
@@ -1574,44 +1628,53 @@ def main() -> None:
     _last_meta_ts = 0.0
     _last_standings_ts = 0.0
 
-    while True:
+while True:
+    try:
+        now_ts = time.time()
+
+        # ✅ (0) meta/standings refresh는 후보 경기 없어도 항상 주기적으로 실행
         try:
-            # 1) 윈도우 후보 한 번만 로드
-            all_rows = _load_live_window_game_rows()
+            if _last_meta_ts == 0.0 or (now_ts - _last_meta_ts) >= float(meta_refresh_sec):
+                log.info("meta refresh start (interval=%ss)", meta_refresh_sec)
+                _meta_refresh_leagues_and_seasons(leagues)
+                _meta_refresh_countries()
+                _meta_refresh_teams_for_leagues(leagues)
+                _last_meta_ts = now_ts
+                log.info("meta refresh done")
+        except Exception as e:
+            log.warning("meta refresh failed: %s", e)
+            _last_meta_ts = now_ts  # ✅ 실패해도 스팸 방지
 
+        try:
+            if _last_standings_ts == 0.0 or (now_ts - _last_standings_ts) >= float(standings_refresh_sec):
+                log.info("standings refresh start (interval=%ss)", standings_refresh_sec)
+                _refresh_standings_for_leagues(leagues)
+                _last_standings_ts = now_ts
+                log.info("standings refresh done")
+        except Exception as e:
+            log.warning("standings refresh failed: %s", e)
+            _last_standings_ts = now_ts  # ✅ 실패해도 스팸 방지
 
-            if not all_rows:
-                # 후보 없으면 idle
-                time.sleep(idle_interval)
+        # (1) 윈도우 후보 한 번만 로드 (라이브 파이프라인)
+        all_rows = _load_live_window_game_rows()
+
+        if not all_rows:
+            # 후보 없으면 라이브만 idle (메타/스탠딩은 이미 위에서 처리됨)
+            time.sleep(idle_interval)
+            continue
+
+        # (2) 리그별로 rows 그룹핑
+        rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
+        for r in all_rows:
+            lid = int(r.get("league_id") or 0)
+            if lid <= 0:
                 continue
+            rows_by_league.setdefault(lid, []).append(r)
 
-            # 2) 리그별로 rows 그룹핑
-            rows_by_league: Dict[int, List[Dict[str, Any]]] = {}
-            for r in all_rows:
-                lid = int(r.get("league_id") or 0)
-                if lid <= 0:
-                    continue
-                rows_by_league.setdefault(lid, []).append(r)
+        if not rows_by_league:
+            time.sleep(idle_interval)
+            continue
 
-            if not rows_by_league:
-                time.sleep(idle_interval)
-                continue
-
-            now_ts = time.time()
-
-            # ✅ meta/standings refresh (ADD ONLY) - 라이브 파이프라인과 독립
-            # - rows가 없어도 갱신은 돌릴 수 있으니, leagues 기준으로 실행
-            try:
-                if _last_meta_ts == 0.0 or (now_ts - _last_meta_ts) >= float(meta_refresh_sec):
-                    log.info("meta refresh start (interval=%ss)", meta_refresh_sec)
-                    _meta_refresh_leagues_and_seasons(leagues)
-                    _meta_refresh_countries()
-                    _meta_refresh_teams_for_leagues(leagues)
-                    _last_meta_ts = now_ts
-                    log.info("meta refresh done")
-            except Exception as e:
-                log.warning("meta refresh failed: %s", e)
-                _last_meta_ts = now_ts  # ✅ 실패해도 스팸 방지
 
 
             try:
