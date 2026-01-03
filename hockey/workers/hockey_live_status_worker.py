@@ -175,14 +175,14 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
             upd_sql = ", ".join(upd_parts) if upd_parts else ""
             hockey_execute(
                 f"""
-            # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
-            _upsert_no_unique(
-                "hockey_leagues",
-                leagues_cols,
-                insert_cols,
-                insert_vals,
-                ["id"],
+                INSERT INTO hockey_leagues ({cols_sql})
+                VALUES ({ph_sql})
+                ON CONFLICT (id) DO UPDATE SET
+                {upd_sql}
+                """,
+                tuple(insert_vals),
             )
+
 
 
         # ── hockey_league_seasons upsert
@@ -251,13 +251,15 @@ def _meta_refresh_countries() -> None:
         if not isinstance(c, dict):
             continue
 
-        code = _safe_text(c.get("code"))
+        cid = _safe_int(c.get("id"))
         name = _safe_text(c.get("name"))
+        code = _safe_text(c.get("code"))
         flag = _safe_text(c.get("flag"))
 
-        # PK가 code라고 가정(대부분 그렇게 설계)
-        if code is None:
+        # ✅ 너 DB 스키마: hockey_countries PK는 id (NOT NULL)
+        if cid is None:
             continue
+
 
         insert_cols: List[str] = []
         insert_vals: List[Any] = []
@@ -267,10 +269,12 @@ def _meta_refresh_countries() -> None:
                 insert_cols.append(col)
                 insert_vals.append(val)
 
-        _add("code", code)
+        _add("id", cid)
         _add("name", name)
+        _add("code", code)
         _add("flag", flag)
         _add("raw_json", _jsonb_dump(c))
+
 
         if not insert_cols:
             continue
@@ -292,8 +296,9 @@ def _meta_refresh_countries() -> None:
             cols,
             insert_cols,
             insert_vals,
-            ["code"],
+            ["id"],
         )
+
 
 
 
@@ -389,8 +394,11 @@ def _meta_refresh_teams_for_leagues(leagues: List[int]) -> None:
 def _refresh_standings_for_leagues(leagues: List[int]) -> None:
     """
     /standings?league=&season= 를 받아 hockey_standings 갱신.
-    - standings는 스키마 차이가 큰 편이라 raw_json 저장 위주로 안전 처리
-    - UNIQUE가 (league_id, season) 라고 가정. (없으면 너 스키마에 맞게 조정 필요)
+
+    ✅ 너 DB 스키마 기준:
+    - PK: (league_id, season, stage, group_name, team_id)
+    - NOT NULL: league_id, season, stage, group_name, team_id, position, raw_json
+    - trg_hockey_standings_fill_derived 가 raw_json 기반으로 파생 컬럼을 채움
     """
     if not leagues:
         return
@@ -420,45 +428,96 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             continue
 
         resp = payload.get("response") if isinstance(payload, dict) else None
-        if resp is None:
+        if not isinstance(resp, list) or not resp:
             continue
 
-        # ✅ 가장 안전: league_id+season 단위로 raw_json 통으로 저장
-        insert_cols: List[str] = []
-        insert_vals: List[Any] = []
+        root = resp[0] if isinstance(resp[0], dict) else {}
+        league_block = root.get("league") if isinstance(root.get("league"), dict) else {}
 
-        def _add(col: str, val: Any) -> None:
-            if col in cols:
-                insert_cols.append(col)
-                insert_vals.append(val)
+        # API-Sports가 보통 league.standings 형태로 줌 (리그마다 shape 다를 수 있어 방어)
+        standings = league_block.get("standings")
+        if standings is None:
+            standings = root.get("standings")
 
-        _add("league_id", int(lid))
-        _add("season", int(season))
-        _add("raw_json", _jsonb_dump(resp))
-        _add("standings_json", _jsonb_dump(resp))
-
-        if not insert_cols:
+        if not isinstance(standings, list):
             continue
 
-        cols_sql = ", ".join(insert_cols)
-        ph_sql = ", ".join(["%s"] * len(insert_cols))
+        # stage 기본값(없어도 NOT NULL 만족 위해 fallback)
+        default_stage = _safe_text(league_block.get("stage")) or "Regular Season"
 
-        upd_parts = []
-        for col in insert_cols:
-            if col in ("league_id", "season"):
-                continue
-            upd_parts.append(f"{col}=EXCLUDED.{col}")
-        if "updated_at" in cols:
-            upd_parts.append("updated_at=now()")
+        # standings는 보통 "그룹 리스트들의 리스트" 형태 (ex: [ [..team..], [..team..] ])
+        groups: List[List[Dict[str, Any]]] = []
+        if standings and all(isinstance(x, list) for x in standings):
+            for g in standings:
+                groups.append([t for t in g if isinstance(t, dict)])
+        else:
+            groups = [[t for t in standings if isinstance(t, dict)]]
 
-        # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
-        _upsert_no_unique(
-            "hockey_standings",
-            cols,
-            insert_cols,
-            insert_vals,
-            ["league_id", "season"],
-        )
+        for gi, group_rows in enumerate(groups):
+            # group_name 기본값(없어도 NOT NULL 만족 위해 fallback)
+            group_name_fallback = f"Group {gi+1}" if len(groups) > 1 else "Overall"
+
+            for row in group_rows:
+                team = row.get("team") if isinstance(row.get("team"), dict) else {}
+                team_id = _safe_int(team.get("id"))
+                if team_id is None:
+                    continue
+
+                # position/rank (NOT NULL)
+                position = _safe_int(row.get("rank")) or _safe_int(row.get("position")) or 0
+
+                stage = _safe_text(row.get("stage")) or default_stage
+                group_name = _safe_text(row.get("group")) or _safe_text(row.get("group_name")) or group_name_fallback
+
+                # 필요한 컬럼만 안전하게 넣기
+                insert_cols: List[str] = []
+                insert_vals: List[Any] = []
+
+                def _add(col: str, val: Any) -> None:
+                    if col in cols:
+                        insert_cols.append(col)
+                        insert_vals.append(val)
+
+                _add("league_id", int(lid))
+                _add("season", int(season))
+                _add("stage", stage)
+                _add("group_name", group_name)
+                _add("team_id", int(team_id))
+                _add("position", int(position))
+                _add("raw_json", _jsonb_dump(row))
+
+                # raw_json이 없으면 의미 없음(트리거도 못 탐)
+                if "raw_json" not in insert_cols:
+                    continue
+
+                cols_sql = ", ".join(insert_cols)
+                # raw_json만 jsonb cast
+                ph_parts = []
+                for c in insert_cols:
+                    ph_parts.append("%s::jsonb" if c == "raw_json" else "%s")
+                ph_sql = ", ".join(ph_parts)
+
+                # 업데이트는 position/raw_json만 확실히 갱신
+                upd_parts = []
+                if "position" in cols:
+                    upd_parts.append("position=EXCLUDED.position")
+                upd_parts.append("raw_json=EXCLUDED.raw_json")
+                if "updated_at" in cols:
+                    upd_parts.append("updated_at=now()")
+
+                upd_sql = ", ".join(upd_parts)
+
+                hockey_execute(
+                    f"""
+                    INSERT INTO hockey_standings ({cols_sql})
+                    VALUES ({ph_sql})
+                    ON CONFLICT (league_id, season, stage, group_name, team_id)
+                    DO UPDATE SET
+                      {upd_sql}
+                    """,
+                    tuple(insert_vals),
+                )
+
 
 
 
