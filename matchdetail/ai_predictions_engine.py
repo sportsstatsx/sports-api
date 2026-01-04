@@ -349,3 +349,190 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
         total_gbt = None
 
     return compute_ai_predictions_from_lambdas(lam_home, lam_away, total_gbt)
+
+# ─────────────────────────────────────────────────────────────
+#  ✅ v2 Engine (FT/1H/2H + 35-45+, 80-90+)
+# ─────────────────────────────────────────────────────────────
+
+from math import exp
+from typing import List, Tuple
+
+
+def _v2_clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _poisson_pmf_list_v2(lam: float, gmax: int) -> List[float]:
+    lam = max(0.0, float(lam))
+    p0 = exp(-lam)
+    out = [p0]
+    for k in range(1, gmax + 1):
+        out.append(out[-1] * lam / k)
+    return out
+
+
+def _prob_team_ge_v2(lam: float, k: int, gmax: int) -> float:
+    pmf = _poisson_pmf_list_v2(lam, gmax)
+    if k <= 0:
+        return 1.0
+    if k > gmax:
+        return 0.0
+    return _v2_clamp(1.0 - sum(pmf[:k]), 0.0, 1.0)
+
+
+def _prob_total_ge_v2(lam_h: float, lam_a: float, k: int, gmax: int) -> float:
+    return _prob_team_ge_v2(lam_h + lam_a, k, gmax)
+
+
+def _prob_btts_yes_v2(lam_h: float, lam_a: float) -> float:
+    return _v2_clamp((1.0 - exp(-lam_h)) * (1.0 - exp(-lam_a)), 0.0, 1.0)
+
+
+def _prob_1x2_v2(lam_h: float, lam_a: float, gmax: int) -> Tuple[float, float, float]:
+    ph = _poisson_pmf_list_v2(lam_h, gmax)
+    pa = _poisson_pmf_list_v2(lam_a, gmax)
+
+    p_home = 0.0
+    p_draw = 0.0
+    p_away = 0.0
+
+    for i in range(gmax + 1):
+        for j in range(gmax + 1):
+            p = ph[i] * pa[j]
+            if i > j:
+                p_home += p
+            elif i == j:
+                p_draw += p
+            else:
+                p_away += p
+
+    s = p_home + p_draw + p_away
+    if s <= 0.0:
+        return 1 / 3, 1 / 3, 1 / 3
+    return p_home / s, p_draw / s, p_away / s
+
+
+def _normalize_pct3_v2(ph: float, pd: float, pa: float) -> Tuple[int, int, int]:
+    ph = _v2_clamp(ph, 0.0, 1.0)
+    pd = _v2_clamp(pd, 0.0, 1.0)
+    pa = _v2_clamp(pa, 0.0, 1.0)
+    s = ph + pd + pa
+    if s <= 0.0:
+        return 33, 33, 34
+
+    ph /= s
+    pd /= s
+    pa /= s
+
+    raw = [ph * 100.0, pd * 100.0, pa * 100.0]
+    flo = [int(x) for x in raw]
+    rem = 100 - sum(flo)
+    frac = [raw[i] - flo[i] for i in range(3)]
+    order = sorted(range(3), key=lambda i: frac[i], reverse=True)
+    for i in range(rem):
+        flo[order[i % 3]] += 1
+    return flo[0], flo[1], flo[2]
+
+
+def compute_ai_predictions_v2(
+    *,
+    lam_h_ft: float,
+    lam_a_ft: float,
+    lam_h_1h: float,
+    lam_a_1h: float,
+    lam_h_2h: float,
+    lam_a_2h: float,
+    lam_w35_45: float,
+    lam_w80_90: float,
+    gmax: int = 10,
+):
+    # clamp lambdas
+    lam_h_ft = _v2_clamp(float(lam_h_ft), 0.05, 6.0)
+    lam_a_ft = _v2_clamp(float(lam_a_ft), 0.05, 6.0)
+    lam_h_1h = _v2_clamp(float(lam_h_1h), 0.01, 4.0)
+    lam_a_1h = _v2_clamp(float(lam_a_1h), 0.01, 4.0)
+    lam_h_2h = _v2_clamp(float(lam_h_2h), 0.01, 4.0)
+    lam_a_2h = _v2_clamp(float(lam_a_2h), 0.01, 4.0)
+    lam_w35_45 = _v2_clamp(float(lam_w35_45), 0.0, 3.0)
+    lam_w80_90 = _v2_clamp(float(lam_w80_90), 0.0, 3.0)
+
+    def build_1x2(prefix: str, lh: float, la: float):
+        ph, pd, pa = _prob_1x2_v2(lh, la, gmax=gmax)
+        hw, dr, aw = _normalize_pct3_v2(ph, pd, pa)
+        return [
+            {"key": f"{prefix}_home_win", "name": "Home Win", "pct": hw},
+            {"key": f"{prefix}_draw", "name": "Draw", "pct": dr},
+            {"key": f"{prefix}_away_win", "name": "Away Win", "pct": aw},
+            {"key": f"{prefix}_home_or_draw", "name": "Home or draw(1x)", "pct": int(_v2_clamp(hw + dr, 0, 100))},
+            {"key": f"{prefix}_home_or_away", "name": "Home or Away(12)", "pct": int(_v2_clamp(hw + aw, 0, 100))},
+            {"key": f"{prefix}_draw_or_away", "name": "Draw or Away(x2)", "pct": int(_v2_clamp(dr + aw, 0, 100))},
+        ]
+
+    def build_totals(prefix: str, lh: float, la: float, lines):
+        out = []
+        for key_suffix, k in lines:
+            p = _prob_total_ge_v2(lh, la, k, gmax=gmax)
+            out.append({"key": f"{prefix}_total_over_{key_suffix}", "name": f"Total over {key_suffix}", "pct": int(round(p * 100))})
+        return out
+
+    def build_team_totals(prefix: str, lh: float, la: float, lines):
+        out = []
+        for key_suffix, k in lines:
+            ph = _prob_team_ge_v2(lh, k, gmax=gmax)
+            pa = _prob_team_ge_v2(la, k, gmax=gmax)
+            out.append({"key": f"{prefix}_home_over_{key_suffix}", "name": f"Home Team Over {key_suffix}", "pct": int(round(ph * 100))})
+            out.append({"key": f"{prefix}_away_over_{key_suffix}", "name": f"Away Team Over {key_suffix}", "pct": int(round(pa * 100))})
+        return out
+
+    def build_btts(prefix: str, lh: float, la: float):
+        p = _prob_btts_yes_v2(lh, la)
+        return [{"key": f"{prefix}_btts_yes", "name": "BTTS Yes", "pct": int(round(p * 100))}]
+
+    ft_items = []
+    ft_items += build_1x2("ft", lam_h_ft, lam_a_ft)
+    ft_items += build_totals("ft", lam_h_ft, lam_a_ft, [("0_5", 1), ("1_5", 2), ("2_5", 3)])
+    ft_items += build_team_totals("ft", lam_h_ft, lam_a_ft, [("0_5", 1), ("1_5", 2)])
+    ft_items += build_btts("ft", lam_h_ft, lam_a_ft)
+    ft_items.append({"key": "ft_goal_35_45_plus", "name": "Goal in 35-45+", "pct": int(round((1.0 - exp(-lam_w35_45)) * 100))})
+    ft_items.append({"key": "ft_goal_80_90_plus", "name": "Goal in 80-90+", "pct": int(round((1.0 - exp(-lam_w80_90)) * 100))})
+
+    h1_items = []
+    h1_items += build_1x2("h1", lam_h_1h, lam_a_1h)
+    h1_items += build_totals("h1", lam_h_1h, lam_a_1h, [("0_5", 1), ("1_5", 2)])
+    h1_items += build_team_totals("h1", lam_h_1h, lam_a_1h, [("0_5", 1), ("1_5", 2)])
+    h1_items += build_btts("h1", lam_h_1h, lam_a_1h)
+
+    h2_items = []
+    h2_items += build_1x2("h2", lam_h_2h, lam_a_2h)
+    h2_items += build_totals("h2", lam_h_2h, lam_a_2h, [("0_5", 1), ("1_5", 2)])
+    h2_items += build_team_totals("h2", lam_h_2h, lam_a_2h, [("0_5", 1), ("1_5", 2)])
+    h2_items += build_btts("h2", lam_h_2h, lam_a_2h)
+
+    # clamp pct
+    for sec in (ft_items, h1_items, h2_items):
+        for it in sec:
+            if it.get("pct") is None:
+                continue
+            it["pct"] = int(_v2_clamp(float(it["pct"]), 0.0, 100.0))
+
+    return {
+        "version": 2,
+        "sections": [
+            {"key": "FT", "title": "Full Time", "items": ft_items},
+            {"key": "1H", "title": "1st Half", "items": h1_items},
+            {"key": "2H", "title": "2nd Half", "items": h2_items},
+        ],
+        "debug": {
+            "lambdas": {
+                "lam_h_ft": lam_h_ft,
+                "lam_a_ft": lam_a_ft,
+                "lam_h_1h": lam_h_1h,
+                "lam_a_1h": lam_a_1h,
+                "lam_h_2h": lam_h_2h,
+                "lam_a_2h": lam_a_2h,
+                "lam_w35_45": lam_w35_45,
+                "lam_w80_90": lam_w80_90,
+            }
+        }
+    }
+
