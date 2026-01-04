@@ -1,31 +1,18 @@
+# ai_predictions_engine.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple, Optional
-import math
+from dataclasses import dataclass
+from math import exp, factorial
+from typing import Any, Dict, List, Tuple
 
 
-# ============================================================
-#  AI Predictions Engine
-#  - Outputs ONLY requested markets:
-#    FT / 1H / 2H 1X2, Double chance, Totals Over,
-#    Team Totals, BTTS, Clean Sheets,
-#    First goal (H/A), Goal 0-15, Goal 80-90+
-# ============================================================
-
-
-# -----------------------------
-# Small helpers
-# -----------------------------
-def _to_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
+# ─────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────
 
 def _clamp01(x: float) -> float:
+    if x != x:  # NaN
+        return 0.0
     if x < 0.0:
         return 0.0
     if x > 1.0:
@@ -33,319 +20,290 @@ def _clamp01(x: float) -> float:
     return x
 
 
-def _pct(p: Optional[float]) -> int:
-    if p is None:
-        return 0
-    return int(round(_clamp01(float(p)) * 100.0))
+def _round_pct(p01: float) -> int:
+    return int(round(_clamp01(p01) * 100.0))
 
 
-def _poisson_pmf(k: int, lam: float) -> float:
-    if lam <= 0.0:
-        return 1.0 if k == 0 else 0.0
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-
-def _poisson_cdf(k: int, lam: float) -> float:
-    return sum(_poisson_pmf(i, lam) for i in range(0, k + 1))
-
-
-def _result_probs_1x2(lam_home: float, lam_away: float, max_goals: int = 10) -> Tuple[float, float, float]:
-    """
-    Returns (P(Home Win), P(Draw), P(Away Win)) using truncated Poisson score grid.
-    """
-    ph = [_poisson_pmf(i, lam_home) for i in range(0, max_goals + 1)]
-    pa = [_poisson_pmf(i, lam_away) for i in range(0, max_goals + 1)]
-
-    # truncate correction
-    sh = sum(ph)
-    sa = sum(pa)
-    if sh > 0:
-        ph = [x / sh for x in ph]
-    if sa > 0:
-        pa = [x / sa for x in pa]
-
-    p_home = 0.0
-    p_draw = 0.0
-    p_away = 0.0
-    for i in range(0, max_goals + 1):
-        for j in range(0, max_goals + 1):
-            p = ph[i] * pa[j]
-            if i > j:
-                p_home += p
-            elif i == j:
-                p_draw += p
-            else:
-                p_away += p
-
-    s = p_home + p_draw + p_away
-    if s > 0:
-        p_home /= s
-        p_draw /= s
-        p_away /= s
-
-    return p_home, p_draw, p_away
-
-
-def _core_markets(lam_home: float, lam_away: float) -> Dict[str, float]:
-    """
-    Core Poisson markets for a given (lam_home, lam_away).
-    All values are probabilities in [0, 1].
-    """
-    lam_home = max(0.0, float(lam_home))
-    lam_away = max(0.0, float(lam_away))
-    lam_tot = lam_home + lam_away
-
-    # 1X2
-    p_home, p_draw, p_away = _result_probs_1x2(lam_home, lam_away, max_goals=10)
-
-    # Double chance
-    p_1x = p_home + p_draw
-    p_12 = p_home + p_away
-    p_x2 = p_draw + p_away
-
-    # Totals (Poisson sum)
-    p_tot_over_0_5 = 1.0 - _poisson_cdf(0, lam_tot)  # >=1
-    p_tot_over_1_5 = 1.0 - _poisson_cdf(1, lam_tot)  # >=2
-    p_tot_over_2_5 = 1.0 - _poisson_cdf(2, lam_tot)  # >=3
-
-    # Team totals
-    p_h_over_0_5 = 1.0 - _poisson_cdf(0, lam_home)
-    p_h_over_1_5 = 1.0 - _poisson_cdf(1, lam_home)
-    p_a_over_0_5 = 1.0 - _poisson_cdf(0, lam_away)
-    p_a_over_1_5 = 1.0 - _poisson_cdf(1, lam_away)
-
-    # BTTS
-    p_h0 = _poisson_pmf(0, lam_home)
-    p_a0 = _poisson_pmf(0, lam_away)
-    p_btts_yes = 1.0 - p_h0 - p_a0 + (p_h0 * p_a0)
-    p_btts_no = 1.0 - p_btts_yes
-
-    # Clean sheets (concede 0)
-    p_home_cs = p_a0  # away scores 0
-    p_away_cs = p_h0  # home scores 0
-
-    return {
-        "home_win": p_home,
-        "draw": p_draw,
-        "away_win": p_away,
-        "home_or_draw": p_1x,
-        "home_or_away": p_12,
-        "draw_or_away": p_x2,
-        "total_over_0_5": p_tot_over_0_5,
-        "total_over_1_5": p_tot_over_1_5,
-        "total_over_2_5": p_tot_over_2_5,
-        "home_team_over_0_5": p_h_over_0_5,
-        "home_team_over_1_5": p_h_over_1_5,
-        "away_team_over_0_5": p_a_over_0_5,
-        "away_team_over_1_5": p_a_over_1_5,
-        "btts_yes": p_btts_yes,
-        "btts_no": p_btts_no,
-        "home_clean_sheet": p_home_cs,
-        "away_clean_sheet": p_away_cs,
-    }
-
-
-def _goals_by_time_ratio(total_goals_by_time: Optional[List[float]]) -> Tuple[float, float, float, float]:
-    """
-    Returns:
-      ratio_1h, ratio_2h, ratio_0_15, ratio_80_90
-    total_goals_by_time is expected to be length 10 (index 0 => 0-15, index 9 => 80-90+).
-    If missing/invalid, falls back to reasonable defaults.
-    """
-    ratio_1h = 0.45
-    ratio_2h = 0.55
-    ratio_0_15 = 15.0 / 90.0
-    ratio_80_90 = 10.0 / 90.0
-
-    if isinstance(total_goals_by_time, list) and len(total_goals_by_time) >= 10:
-        vals = []
-        for x in total_goals_by_time[:10]:
-            xf = _to_float(x)
-            vals.append(max(0.0, xf) if xf is not None else 0.0)
-        s = sum(vals)
-        if s > 0.0:
-            s1 = sum(vals[0:5])
-            s2 = sum(vals[5:10])
-            ratio_1h = s1 / s
-            ratio_2h = s2 / s
-            ratio_0_15 = vals[0] / s
-            ratio_80_90 = vals[9] / s
-
-    ratio_1h = _clamp01(ratio_1h)
-    ratio_2h = _clamp01(ratio_2h)
-    if ratio_1h + ratio_2h > 0:
-        s = ratio_1h + ratio_2h
-        ratio_1h /= s
-        ratio_2h /= s
-
-    ratio_0_15 = _clamp01(ratio_0_15)
-    ratio_80_90 = _clamp01(ratio_80_90)
-    return ratio_1h, ratio_2h, ratio_0_15, ratio_80_90
-
-
-def compute_ai_predictions_from_lambdas(
-    lam_home: float,
-    lam_away: float,
-    total_goals_by_time: Optional[List[float]] = None,
-) -> Dict[str, int]:
-    """
-    Lambda 기반(순수 Poisson) AI Predictions.
-    - history blend 없음
-    - goals_by_time 가 있으면 1H/2H ratio 및 0-15 / 80-90+ ratio 계산에 반영
-    """
-    lam_home = max(0.0, float(lam_home))
-    lam_away = max(0.0, float(lam_away))
-    lam_tot = lam_home + lam_away
-
-    ratio_1h, ratio_2h, ratio_0_15, ratio_80_90 = _goals_by_time_ratio(total_goals_by_time)
-
-    # FT markets
-    ft = _core_markets(lam_home, lam_away)
-
-    # 1H / 2H markets (goals only inside each half)
-    lam_home_1h = lam_home * ratio_1h
-    lam_away_1h = lam_away * ratio_1h
-    lam_home_2h = lam_home * ratio_2h
-    lam_away_2h = lam_away * ratio_2h
-
-    h1 = _core_markets(lam_home_1h, lam_away_1h)
-    h2 = _core_markets(lam_home_2h, lam_away_2h)
-
-    # First goal (unconditional; 0-0 case excluded automatically)
-    if lam_tot <= 0.0:
-        p_first_home = 0.0
-        p_first_away = 0.0
-    else:
-        p_any_goal = 1.0 - math.exp(-lam_tot)
-        share_home = lam_home / lam_tot
-        share_away = lam_away / lam_tot
-        p_first_home = p_any_goal * share_home
-        p_first_away = p_any_goal * share_away
-
-    # Goal in minute buckets (at least one goal occurs in the bucket)
-    p_goal_0_15 = 1.0 - math.exp(-lam_tot * ratio_0_15)
-    p_goal_80_90 = 1.0 - math.exp(-lam_tot * ratio_80_90)
-
-    out: Dict[str, int] = {}
-
-    # FT
-    out["home_win_pct"] = _pct(ft["home_win"])
-    out["draw_pct"] = _pct(ft["draw"])
-    out["away_win_pct"] = _pct(ft["away_win"])
-
-    out["home_or_draw_pct"] = _pct(ft["home_or_draw"])
-    out["home_or_away_pct"] = _pct(ft["home_or_away"])
-    out["draw_or_away_pct"] = _pct(ft["draw_or_away"])
-
-    out["total_over_0_5_pct"] = _pct(ft["total_over_0_5"])
-    out["total_over_1_5_pct"] = _pct(ft["total_over_1_5"])
-    out["total_over_2_5_pct"] = _pct(ft["total_over_2_5"])
-
-    out["home_team_over_0_5_pct"] = _pct(ft["home_team_over_0_5"])
-    out["home_team_over_1_5_pct"] = _pct(ft["home_team_over_1_5"])
-    out["away_team_over_0_5_pct"] = _pct(ft["away_team_over_0_5"])
-    out["away_team_over_1_5_pct"] = _pct(ft["away_team_over_1_5"])
-
-    out["btts_yes_pct"] = _pct(ft["btts_yes"])
-    out["btts_no_pct"] = _pct(ft["btts_no"])
-    out["home_clean_sheet_pct"] = _pct(ft["home_clean_sheet"])
-    out["away_clean_sheet_pct"] = _pct(ft["away_clean_sheet"])
-
-    # 1H
-    out["h1_home_win_pct"] = _pct(h1["home_win"])
-    out["h1_draw_pct"] = _pct(h1["draw"])
-    out["h1_away_win_pct"] = _pct(h1["away_win"])
-
-    out["h1_home_or_draw_pct"] = _pct(h1["home_or_draw"])
-    out["h1_home_or_away_pct"] = _pct(h1["home_or_away"])
-    out["h1_draw_or_away_pct"] = _pct(h1["draw_or_away"])
-
-    out["h1_total_over_0_5_pct"] = _pct(h1["total_over_0_5"])
-    out["h1_total_over_1_5_pct"] = _pct(h1["total_over_1_5"])
-
-    out["h1_home_team_over_0_5_pct"] = _pct(h1["home_team_over_0_5"])
-    out["h1_home_team_over_1_5_pct"] = _pct(h1["home_team_over_1_5"])
-    out["h1_away_team_over_0_5_pct"] = _pct(h1["away_team_over_0_5"])
-    out["h1_away_team_over_1_5_pct"] = _pct(h1["away_team_over_1_5"])
-
-    out["h1_btts_yes_pct"] = _pct(h1["btts_yes"])
-    out["h1_btts_no_pct"] = _pct(h1["btts_no"])
-    out["h1_home_clean_sheet_pct"] = _pct(h1["home_clean_sheet"])
-    out["h1_away_clean_sheet_pct"] = _pct(h1["away_clean_sheet"])
-
-    # 2H
-    out["h2_home_win_pct"] = _pct(h2["home_win"])
-    out["h2_draw_pct"] = _pct(h2["draw"])
-    out["h2_away_win_pct"] = _pct(h2["away_win"])
-
-    out["h2_home_or_draw_pct"] = _pct(h2["home_or_draw"])
-    out["h2_home_or_away_pct"] = _pct(h2["home_or_away"])
-    out["h2_draw_or_away_pct"] = _pct(h2["draw_or_away"])
-
-    out["h2_total_over_0_5_pct"] = _pct(h2["total_over_0_5"])
-    out["h2_total_over_1_5_pct"] = _pct(h2["total_over_1_5"])
-
-    out["h2_home_team_over_0_5_pct"] = _pct(h2["home_team_over_0_5"])
-    out["h2_home_team_over_1_5_pct"] = _pct(h2["home_team_over_1_5"])
-    out["h2_away_team_over_0_5_pct"] = _pct(h2["away_team_over_0_5"])
-    out["h2_away_team_over_1_5_pct"] = _pct(h2["away_team_over_1_5"])
-
-    out["h2_btts_yes_pct"] = _pct(h2["btts_yes"])
-    out["h2_btts_no_pct"] = _pct(h2["btts_no"])
-    out["h2_home_clean_sheet_pct"] = _pct(h2["home_clean_sheet"])
-    out["h2_away_clean_sheet_pct"] = _pct(h2["away_clean_sheet"])
-
-    # Specials
-    out["first_goal_home_pct"] = _pct(p_first_home)
-    out["first_goal_away_pct"] = _pct(p_first_away)
-    out["goal_0_15_pct"] = _pct(p_goal_0_15)
-    out["goal_80_90_pct"] = _pct(p_goal_80_90)
-
+def _poisson_pmf_list(lam: float, gmax: int) -> List[float]:
+    lam = max(0.0, float(lam))
+    out = []
+    for k in range(gmax + 1):
+        out.append(exp(-lam) * (lam ** k) / factorial(k))
+    # tail correction: keep total == 1.0 by pushing remainder into last bin
+    s = sum(out)
+    if s > 0.0:
+        out[-1] += max(0.0, 1.0 - s)
     return out
 
 
-def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dict[str, int]:
+def _poisson_tail_prob(lam: float, k: int) -> float:
     """
-    insights_overall(홈/원정 팀 최근 성적 요약)로부터 lam_home / lam_away 구성 후 확률 계산.
+    P(X >= k) for X~Pois(lam), k>=0.
     """
-    if not isinstance(insights_overall, dict):
-        return compute_ai_predictions_from_lambdas(0.0, 0.0, None)
+    lam = max(0.0, float(lam))
+    if k <= 0:
+        return 1.0
+    # 1 - CDF(k-1)
+    cdf = 0.0
+    for i in range(k):
+        cdf += exp(-lam) * (lam ** i) / factorial(i)
+    return _clamp01(1.0 - cdf)
 
-    home = insights_overall.get("home") or {}
-    away = insights_overall.get("away") or {}
-    league = insights_overall.get("league") or {}
 
-    # 공격/수비 강도 (없으면 1.0)
-    h_attack = _to_float(home.get("attack_strength")) or 1.0
-    h_def = _to_float(home.get("defense_strength")) or 1.0
-    a_attack = _to_float(away.get("attack_strength")) or 1.0
-    a_def = _to_float(away.get("defense_strength")) or 1.0
+def _btts_yes(lh: float, la: float) -> float:
+    lh = max(0.0, float(lh))
+    la = max(0.0, float(la))
+    # 1 - P(H=0) - P(A=0) + P(H=0,A=0)
+    return _clamp01(1.0 - exp(-lh) - exp(-la) + exp(-(lh + la)))
 
-    # 리그 평균 득점 (없으면 기본값)
-    league_home_gf = _to_float(league.get("avg_home_goals_for")) or 1.35
-    league_away_gf = _to_float(league.get("avg_away_goals_for")) or 1.10
 
-    # expected goals (lambdas)
-    lam_home = max(0.0, league_home_gf * h_attack * a_def)
-    lam_away = max(0.0, league_away_gf * a_attack * h_def)
+def _normalize_1x2_pcts(hw: float, d: float, aw: float) -> Tuple[int, int, int]:
+    """
+    Convert float probs (sum≈1) to int % that sum exactly to 100.
+    """
+    hw = _clamp01(hw)
+    d = _clamp01(d)
+    aw = _clamp01(aw)
+    s = hw + d + aw
+    if s <= 0.0:
+        return (33, 34, 33)
+    hw *= 100.0 / s
+    d *= 100.0 / s
+    aw *= 100.0 / s
 
-    # goals_by_time 기반 ratio
-    h_gbt_for = home.get("goals_by_time_for") or []
-    h_gbt_against = home.get("goals_by_time_against") or []
-    a_gbt_for = away.get("goals_by_time_for") or []
-    a_gbt_against = away.get("goals_by_time_against") or []
+    hw_i = int(round(hw))
+    d_i = int(round(d))
+    aw_i = int(round(aw))
 
-    total_gbt: Optional[List[float]] = None
-    try:
-        total_gbt = []
+    # fix rounding drift
+    drift = 100 - (hw_i + d_i + aw_i)
+    if drift != 0:
+        # add/subtract to the largest bucket (most stable)
+        arr = [("hw", hw_i, hw), ("d", d_i, d), ("aw", aw_i, aw)]
+        arr.sort(key=lambda x: x[2], reverse=True)
+        name, val_i, _ = arr[0]
+        val_i += drift
+        if name == "hw":
+            hw_i = val_i
+        elif name == "d":
+            d_i = val_i
+        else:
+            aw_i = val_i
+
+    # final clamp
+    hw_i = max(0, min(100, hw_i))
+    d_i = max(0, min(100, d_i))
+    aw_i = max(0, min(100, aw_i))
+    # re-fix if clamp broke sum (rare)
+    s2 = hw_i + d_i + aw_i
+    if s2 != 100:
+        hw_i = max(0, min(100, hw_i + (100 - s2)))
+    return (hw_i, d_i, aw_i)
+
+
+def _scorelines_top3(lh: float, la: float, gmax: int = 10) -> Tuple[str, List[str]]:
+    ph = _poisson_pmf_list(lh, gmax)
+    pa = _poisson_pmf_list(la, gmax)
+
+    pairs: List[Tuple[float, int, int]] = []
+    for i in range(gmax + 1):
+        for j in range(gmax + 1):
+            pairs.append((ph[i] * pa[j], i, j))
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    top = pairs[:3]
+    fmt = [f"{i}-{j}" for _, i, j in top]
+    most = fmt[0] if fmt else "0-0"
+    return most, fmt
+
+
+@dataclass
+class SectionInputs:
+    lam_home: float
+    lam_away: float
+
+
+def _section_core_1x2(inp: SectionInputs, gmax: int = 10) -> Tuple[float, float, float]:
+    """
+    Return (P(HW), P(D), P(AW)) from independent Pois(lh),Pois(la).
+    """
+    ph = _poisson_pmf_list(inp.lam_home, gmax)
+    pa = _poisson_pmf_list(inp.lam_away, gmax)
+
+    hw = 0.0
+    d = 0.0
+    aw = 0.0
+    for i in range(gmax + 1):
+        for j in range(gmax + 1):
+            p = ph[i] * pa[j]
+            if i > j:
+                hw += p
+            elif i == j:
+                d += p
+            else:
+                aw += p
+
+    s = hw + d + aw
+    if s > 0.0:
+        hw /= s
+        d /= s
+        aw /= s
+    return (_clamp01(hw), _clamp01(d), _clamp01(aw))
+
+
+def _derive_half_lambdas(
+    lam_h_ft: float,
+    lam_a_ft: float,
+    total_goals_by_time: List[float] | None,
+    *,
+    fallback_share_1h: float = 0.45,
+) -> Tuple[SectionInputs, SectionInputs]:
+    """
+    Return (1H lambdas, 2H lambdas).
+    total_goals_by_time expected length 10 with first 5 = 1H, last 5 = 2H.
+    """
+    share_1h = fallback_share_1h
+    share_2h = 1.0 - share_1h
+
+    if total_goals_by_time and len(total_goals_by_time) >= 10:
+        s1 = sum(float(x or 0.0) for x in total_goals_by_time[:5])
+        s2 = sum(float(x or 0.0) for x in total_goals_by_time[5:10])
+        st = s1 + s2
+        if st > 0.0:
+            share_1h = _clamp01(s1 / st)
+            share_2h = 1.0 - share_1h
+
+    h1 = SectionInputs(lam_home=lam_h_ft * share_1h, lam_away=lam_a_ft * share_1h)
+    h2 = SectionInputs(lam_home=lam_h_ft * share_2h, lam_away=lam_a_ft * share_2h)
+    return h1, h2
+
+
+def _derive_window_lambda(
+    section_total_lambda: float,
+    total_goals_by_time: List[float] | None,
+    *,
+    section: str,  # "1H" or "2H"
+    fallback_ratio_in_section: float = 0.20,
+) -> float:
+    """
+    We assume total_goals_by_time length 10:
+      - 1H window 35-45+ is bucket index 4 (last of first 5)
+      - 2H window 80-90+ is bucket index 9 (last overall)
+    """
+    if not total_goals_by_time or len(total_goals_by_time) < 10:
+        return max(0.0, float(section_total_lambda)) * fallback_ratio_in_section
+
+    vals = [float(x or 0.0) for x in total_goals_by_time[:10]]
+
+    if section == "1H":
+        denom = sum(vals[:5])
+        numer = vals[4]
+    else:  # "2H"
+        denom = sum(vals[5:10])
+        numer = vals[9]
+
+    if denom <= 0.0:
+        ratio = fallback_ratio_in_section
+    else:
+        ratio = _clamp01(numer / denom)
+
+    return max(0.0, float(section_total_lambda)) * ratio
+
+
+def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dict[str, Any]:
+    lam_h_ft = float(insights_overall.get("expected_goals_for") or 0.0)
+    lam_a_ft = float(insights_overall.get("expected_goals_against") or 0.0)
+
+    gbt_for = insights_overall.get("goals_by_time_for") or []
+    gbt_against = insights_overall.get("goals_by_time_against") or []
+    total_goals_by_time: List[float] | None = None
+    if isinstance(gbt_for, list) and isinstance(gbt_against, list) and len(gbt_for) >= 10 and len(gbt_against) >= 10:
+        total_goals_by_time = []
         for i in range(10):
-            total_gbt.append(
-                float(h_gbt_for[i] or 0)
-                + float(h_gbt_against[i] or 0)
-                + float(a_gbt_for[i] or 0)
-                + float(a_gbt_against[i] or 0)
-            )
-    except Exception:
-        total_gbt = None
+            try:
+                total_goals_by_time.append(float(gbt_for[i] or 0.0) + float(gbt_against[i] or 0.0))
+            except Exception:
+                total_goals_by_time.append(0.0)
 
-    return compute_ai_predictions_from_lambdas(lam_home, lam_away, total_gbt)
+    ft = SectionInputs(lam_home=lam_h_ft, lam_away=lam_a_ft)
+    h1, h2 = _derive_half_lambdas(lam_h_ft, lam_a_ft, total_goals_by_time)
+
+    lam_t1 = h1.lam_home + h1.lam_away
+    lam_t2 = h2.lam_home + h2.lam_away
+
+    lam_w35_45 = _derive_window_lambda(lam_t1, total_goals_by_time, section="1H", fallback_ratio_in_section=0.20)
+    lam_w80_90 = _derive_window_lambda(lam_t2, total_goals_by_time, section="2H", fallback_ratio_in_section=0.20)
+
+    out: Dict[str, Any] = {}
+
+    out["expected_goals_home"] = round(lam_h_ft, 2)
+    out["expected_goals_away"] = round(lam_a_ft, 2)
+    most, top3 = _scorelines_top3(lam_h_ft, lam_a_ft, gmax=10)
+    out["most_likely_score"] = most
+    out["top3_scorelines"] = top3
+
+    # ── FT
+    hw, d, aw = _section_core_1x2(ft, gmax=10)
+    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
+    out["ft_home_win"] = hw_i
+    out["ft_draw"] = d_i
+    out["ft_away_win"] = aw_i
+    out["ft_1x"] = max(0, min(100, hw_i + d_i))
+    out["ft_12"] = max(0, min(100, hw_i + aw_i))
+    out["ft_x2"] = max(0, min(100, d_i + aw_i))
+
+    lam_t_ft = lam_h_ft + lam_a_ft
+    out["ft_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 1))
+    out["ft_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 2))
+    out["ft_total_over_2_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 3))
+
+    out["ft_btts_yes"] = _round_pct(_btts_yes(lam_h_ft, lam_a_ft))
+
+    out["ft_home_over_0_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 1))
+    out["ft_home_over_1_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 2))
+    out["ft_away_over_0_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 1))
+    out["ft_away_over_1_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 2))
+
+    # ── 1H
+    hw, d, aw = _section_core_1x2(h1, gmax=10)
+    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
+    out["1h_home_win"] = hw_i
+    out["1h_draw"] = d_i
+    out["1h_away_win"] = aw_i
+    out["1h_1x"] = max(0, min(100, hw_i + d_i))
+    out["1h_12"] = max(0, min(100, hw_i + aw_i))
+    out["1h_x2"] = max(0, min(100, d_i + aw_i))
+
+    out["1h_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t1, 1))
+    out["1h_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t1, 2))
+    out["1h_btts_yes"] = _round_pct(_btts_yes(h1.lam_home, h1.lam_away))
+
+    out["1h_home_over_0_5"] = _round_pct(_poisson_tail_prob(h1.lam_home, 1))
+    out["1h_home_over_1_5"] = _round_pct(_poisson_tail_prob(h1.lam_home, 2))
+    out["1h_away_over_0_5"] = _round_pct(_poisson_tail_prob(h1.lam_away, 1))
+    out["1h_away_over_1_5"] = _round_pct(_poisson_tail_prob(h1.lam_away, 2))
+
+    out["1h_goal_35_45_plus"] = _round_pct(1.0 - exp(-max(0.0, lam_w35_45)))
+
+    # ── 2H
+    hw, d, aw = _section_core_1x2(h2, gmax=10)
+    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
+    out["2h_home_win"] = hw_i
+    out["2h_draw"] = d_i
+    out["2h_away_win"] = aw_i
+    out["2h_1x"] = max(0, min(100, hw_i + d_i))
+    out["2h_12"] = max(0, min(100, hw_i + aw_i))
+    out["2h_x2"] = max(0, min(100, d_i + aw_i))
+
+    out["2h_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t2, 1))
+    out["2h_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t2, 2))
+    out["2h_btts_yes"] = _round_pct(_btts_yes(h2.lam_home, h2.lam_away))
+
+    out["2h_home_over_0_5"] = _round_pct(_poisson_tail_prob(h2.lam_home, 1))
+    out["2h_home_over_1_5"] = _round_pct(_poisson_tail_prob(h2.lam_home, 2))
+    out["2h_away_over_0_5"] = _round_pct(_poisson_tail_prob(h2.lam_away, 1))
+    out["2h_away_over_1_5"] = _round_pct(_poisson_tail_prob(h2.lam_away, 2))
+
+    out["2h_goal_80_90_plus"] = _round_pct(1.0 - exp(-max(0.0, lam_w80_90)))
+
+    return out
