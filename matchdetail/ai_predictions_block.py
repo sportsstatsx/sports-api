@@ -1,318 +1,188 @@
-# ai_predictions_block.py
+# matchdetail/ai_predictions_block.py
 
-from __future__ import annotations
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, List
 
 from db import fetch_all
-from ai_predictions_engine import compute_ai_predictions_v2
-
-GOAL_DETAILS_SCORED = ("Normal Goal", "Penalty", "Own Goal")
+from .ai_predictions_engine import compute_ai_predictions_from_overall
 
 
-def _fetch_one(sql: str, params: Tuple[Any, ...]) -> Optional[Dict[str, Any]]:
-    rows = fetch_all(sql, params)
-    return rows[0] if rows else None
-
-
-def _safe_float(x: Any, default: float = 0.0) -> float:
+def _is_continental_league(league_id: Any) -> bool:
+    """
+    현재 fixture 의 league_id 가 UEFA / ACL 같은 대륙컵 계열인지 간단히 판별.
+    - leagues.name 을 한 번 조회해서 문자열로 체크한다.
+    """
     try:
-        if x is None:
-            return default
-        return float(x)
+        lid = int(league_id)
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        rows = fetch_all(
+            """
+            SELECT name
+            FROM leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (lid,),
+        )
     except Exception:
-        return default
+        return False
+
+    if not rows:
+        return False
+
+    name = (rows[0].get("name") or "").strip().lower()
+    if not name:
+        return False
+
+    # UEFA / 유럽 대륙컵 계열
+    if (
+        "uefa" in name
+        or "champions league" in name
+        or "europa league" in name
+        or "conference league" in name
+    ):
+        return True
+
+    # 아시아 ACL 계열
+    if "afc" in name or "acl" in name or "afc champions league" in name:
+        return True
+
+    return False
 
 
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return lo if x < lo else hi if x > hi else x
-
-
-def _mix_weighted(
-    season_val: Optional[float],
-    l10_val: Optional[float],
-    l5_val: Optional[float],
+def _build_ai_comp_block(
     *,
-    w_season: float = 0.55,
-    w_l10: float = 0.35,
-    w_l5: float = 0.10,
-) -> float:
-    parts = []
-    if season_val is not None:
-        parts.append((w_season, season_val))
-    if l10_val is not None:
-        parts.append((w_l10, l10_val))
-    if l5_val is not None:
-        parts.append((w_l5, l5_val))
-    if not parts:
-        return 0.0
-    wsum = sum(w for w, _ in parts)
-    return sum((w / wsum) * v for w, v in parts)
+    header: Dict[str, Any],
+    insights_overall: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    insights_overall.filters.comp 를 기반으로
+    AI Predictions 전용 comp 블록을 만든다.
+
+    - 기본: insights_overall 과 동일한 options/selected
+    - 대륙컵 경기(UEFA / ACL 등)일 때:
+        → All + (컵/대륙컵 계열 이름)만 남기고, 각 리그 이름은 제거
+    """
+    filters_overall = insights_overall.get("filters") or {}
+    comp_block = filters_overall.get("comp") or {}
+
+    raw_options = list(comp_block.get("options") or [])
+    raw_selected = comp_block.get("selected") or "All"
+
+    league_id = header.get("league_id")
+    is_continental = _is_continental_league(league_id)
+
+    # 기본값: 그대로 복사
+    ai_options: List[str] = raw_options[:]
+    ai_selected: str = str(raw_selected) if raw_selected is not None else "All"
+
+    if is_continental and raw_options:
+        kept: List[str] = []
+
+        for opt in raw_options:
+            s = str(opt).strip()
+            if not s:
+                continue
+
+            # All 은 항상 유지
+            if s == "All":
+                kept.append(s)
+                continue
+
+            lower = s.lower()
+
+            # 컵 / 대륙컵 계열만 남긴다
+            is_cup = (
+                "cup" in lower
+                or "copa" in lower
+                or "컵" in lower
+                or "taça" in lower
+                or "杯" in lower
+            )
+            is_uefa = (
+                "uefa" in lower
+                or "champions league" in lower
+                or "europa league" in lower
+                or "conference league" in lower
+            )
+            is_acl = (
+                "afc" in lower
+                or "acl" in lower
+                or "afc champions league" in lower
+            )
+
+            if is_cup or is_uefa or is_acl:
+                if s not in kept:
+                    kept.append(s)
+
+        # 최소 한 개는 보장
+        ai_options = kept or ["All"]
+
+        # 선택 값이 빠졌으면 All 로 폴백
+        if ai_selected not in ai_options:
+            ai_selected = "All"
+
+    return {
+        "options": ai_options,
+        "selected": ai_selected,
+    }
 
 
-def _league_avgs(league_id: int, season: int) -> Tuple[float, float]:
-    row = _fetch_one(
-        """
-        select
-          avg(home_ft)::float as mu_home,
-          avg(away_ft)::float as mu_away
-        from matches
-        where league_id=%s and season=%s
-          and status_group='FINISHED'
-          and home_ft is not null and away_ft is not null
-        """,
-        (league_id, season),
-    )
-    mu_home = _safe_float(row["mu_home"] if row else None, 1.35)
-    mu_away = _safe_float(row["mu_away"] if row else None, 1.15)
-    return (_clamp(mu_home, 0.6, 2.4), _clamp(mu_away, 0.6, 2.4))
+def _build_ai_last_n_block(insights_overall: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    last_n 은 그냥 insights_overall 쪽 값을 그대로 복사해서 내려준다.
+    (나중에 필요하면 여기서만 별도로 커스터마이징 가능)
+    """
+    filters_overall = insights_overall.get("filters") or {}
+    last_n_block = filters_overall.get("last_n") or {}
+
+    options = list(last_n_block.get("options") or [])
+    selected = last_n_block.get("selected") or "Last 10"
+
+    return {
+        "options": options,
+        "selected": selected,
+    }
 
 
-def _team_home_context_stats(team_id: int, league_id: int, season: int):
-    row_s = _fetch_one(
-        """
-        select
-          avg(home_ft)::float as gf,
-          avg(away_ft)::float as ga,
-          count(*)::int as n
-        from matches
-        where league_id=%s and season=%s and status_group='FINISHED'
-          and home_id=%s
-          and home_ft is not null and away_ft is not null
-        """,
-        (league_id, season, team_id),
-    )
-    n_s = int(row_s["n"]) if row_s and row_s.get("n") is not None else 0
-    gf_s = _safe_float(row_s["gf"] if row_s else None, 0.0) if n_s > 0 else None
-    ga_s = _safe_float(row_s["ga"] if row_s else None, 0.0) if n_s > 0 else None
+def build_ai_predictions_block(
+    header: Dict[str, Any],
+    insights_overall: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    matchdetail/insights_block 에서 만든 insights_overall 블록을 기반으로
+    AI Predictions 블록(dict)을 생성한다.
 
-    row_10 = _fetch_one(
-        """
-        with last as (
-          select home_ft, away_ft
-          from matches
-          where league_id=%s and season=%s and status_group='FINISHED'
-            and home_id=%s
-            and home_ft is not null and away_ft is not null
-          order by (date_utc::timestamptz) desc
-          limit 10
-        )
-        select
-          avg(home_ft)::float as gf,
-          avg(away_ft)::float as ga,
-          count(*)::int as n
-        from last
-        """,
-        (league_id, season, team_id),
-    )
-    n_10 = int(row_10["n"]) if row_10 and row_10.get("n") is not None else 0
-    gf_10 = _safe_float(row_10["gf"] if row_10 else None, 0.0) if n_10 > 0 else None
-    ga_10 = _safe_float(row_10["ga"] if row_10 else None, 0.0) if n_10 > 0 else None
+    - 예측 계산 자체는 기존과 동일하게
+      compute_ai_predictions_from_overall(insights_overall) 만 사용.
+    - 추가로, AI Predictions 전용 filters(comp/last_n) 블록을 함께 내려준다.
+      → 나중에 앱에서 AI 탭은 이 filters 를 사용하면
+        다른 섹션과 독립적으로 comp 옵션을 제어할 수 있다.
+    """
+    if not insights_overall:
+        return None
 
-    row_5 = _fetch_one(
-        """
-        with last as (
-          select home_ft, away_ft
-          from matches
-          where league_id=%s and season=%s and status_group='FINISHED'
-            and home_id=%s
-            and home_ft is not null and away_ft is not null
-          order by (date_utc::timestamptz) desc
-          limit 5
-        )
-        select
-          avg(home_ft)::float as gf,
-          avg(away_ft)::float as ga,
-          count(*)::int as n
-        from last
-        """,
-        (league_id, season, team_id),
-    )
-    n_5 = int(row_5["n"]) if row_5 and row_5.get("n") is not None else 0
-    gf_5 = _safe_float(row_5["gf"] if row_5 else None, 0.0) if n_5 > 0 else None
-    ga_5 = _safe_float(row_5["ga"] if row_5 else None, 0.0) if n_5 > 0 else None
+    try:
+        predictions = compute_ai_predictions_from_overall(insights_overall)
+        if not isinstance(predictions, dict):
+            return None
 
-    return gf_s, ga_s, gf_10, ga_10, gf_5, ga_5
+        # 🔥 새로 추가: AI 전용 필터 블록
+        filters_block = {
+            "comp": _build_ai_comp_block(
+                header=header,
+                insights_overall=insights_overall,
+            ),
+            "last_n": _build_ai_last_n_block(insights_overall),
+        }
 
+        # 기존 필드는 그대로 두고, filters 만 추가
+        predictions["filters"] = filters_block
+        return predictions
 
-def _team_away_context_stats(team_id: int, league_id: int, season: int):
-    row_s = _fetch_one(
-        """
-        select
-          avg(away_ft)::float as gf,
-          avg(home_ft)::float as ga,
-          count(*)::int as n
-        from matches
-        where league_id=%s and season=%s and status_group='FINISHED'
-          and away_id=%s
-          and home_ft is not null and away_ft is not null
-        """,
-        (league_id, season, team_id),
-    )
-    n_s = int(row_s["n"]) if row_s and row_s.get("n") is not None else 0
-    gf_s = _safe_float(row_s["gf"] if row_s else None, 0.0) if n_s > 0 else None
-    ga_s = _safe_float(row_s["ga"] if row_s else None, 0.0) if n_s > 0 else None
-
-    row_10 = _fetch_one(
-        """
-        with last as (
-          select home_ft, away_ft
-          from matches
-          where league_id=%s and season=%s and status_group='FINISHED'
-            and away_id=%s
-            and home_ft is not null and away_ft is not null
-          order by (date_utc::timestamptz) desc
-          limit 10
-        )
-        select
-          avg(away_ft)::float as gf,
-          avg(home_ft)::float as ga,
-          count(*)::int as n
-        from last
-        """,
-        (league_id, season, team_id),
-    )
-    n_10 = int(row_10["n"]) if row_10 and row_10.get("n") is not None else 0
-    gf_10 = _safe_float(row_10["gf"] if row_10 else None, 0.0) if n_10 > 0 else None
-    ga_10 = _safe_float(row_10["ga"] if row_10 else None, 0.0) if n_10 > 0 else None
-
-    row_5 = _fetch_one(
-        """
-        with last as (
-          select home_ft, away_ft
-          from matches
-          where league_id=%s and season=%s and status_group='FINISHED'
-            and away_id=%s
-            and home_ft is not null and away_ft is not null
-          order by (date_utc::timestamptz) desc
-          limit 5
-        )
-        select
-          avg(away_ft)::float as gf,
-          avg(home_ft)::float as ga,
-          count(*)::int as n
-        from last
-        """,
-        (league_id, season, team_id),
-    )
-    n_5 = int(row_5["n"]) if row_5 and row_5.get("n") is not None else 0
-    gf_5 = _safe_float(row_5["gf"] if row_5 else None, 0.0) if n_5 > 0 else None
-    ga_5 = _safe_float(row_5["ga"] if row_5 else None, 0.0) if n_5 > 0 else None
-
-    return gf_s, ga_s, gf_10, ga_10, gf_5, ga_5
-
-
-def _league_goal_shares(league_id: int, season: int) -> Tuple[float, float, float]:
-    row = _fetch_one(
-        """
-        with finished as (
-          select fixture_id, (home_ft + away_ft) as ft_total
-          from matches
-          where league_id=%s and season=%s and status_group='FINISHED'
-            and home_ft is not null and away_ft is not null
-        )
-        select
-          sum(case when e.type='Goal' and e.detail in %s and e.minute <= 45 then 1 else 0 end)::float as goals_1h,
-          sum(case when e.type='Goal' and e.detail in %s and e.minute > 45 then 1 else 0 end)::float as goals_2h,
-          sum(case when e.type='Goal' and e.detail in %s and e.minute between 35 and 45 then 1 else 0 end)::float as goals_w35_45,
-          sum(case when e.type='Goal' and e.detail in %s and e.minute >= 80 then 1 else 0 end)::float as goals_w80_90,
-          sum(f.ft_total)::float as ft_total_sum
-        from finished f
-        left join match_events e on e.fixture_id=f.fixture_id
-        """,
-        (league_id, season, GOAL_DETAILS_SCORED, GOAL_DETAILS_SCORED, GOAL_DETAILS_SCORED, GOAL_DETAILS_SCORED),
-    )
-
-    goals_1h = _safe_float(row["goals_1h"] if row else None, 0.0)
-    goals_2h = _safe_float(row["goals_2h"] if row else None, 0.0)
-    goals_w35 = _safe_float(row["goals_w35_45"] if row else None, 0.0)
-    goals_w80 = _safe_float(row["goals_w80_90"] if row else None, 0.0)
-    ft_total_sum = _safe_float(row["ft_total_sum"] if row else None, 0.0)
-
-    if ft_total_sum <= 0.0:
-        share_1h = 0.45
-    else:
-        share_1h = goals_1h / ft_total_sum
-
-    share_1h = _clamp(share_1h, 0.20, 0.65)
-
-    if goals_1h <= 0.0:
-        w35 = 0.22
-    else:
-        w35 = goals_w35 / goals_1h
-
-    if goals_2h <= 0.0:
-        w80 = 0.22
-    else:
-        w80 = goals_w80 / goals_2h
-
-    w35 = _clamp(w35, 0.05, 0.55)
-    w80 = _clamp(w80, 0.05, 0.55)
-
-    return share_1h, w35, w80
-
-
-def build_ai_predictions_block(match_id: int, insights_overall: Dict[str, Any]) -> Dict[str, Any]:
-    match_row = _fetch_one(
-        """
-        select league_id, season, home_id, away_id
-        from matches
-        where fixture_id=%s
-        """,
-        (match_id,),
-    )
-    if not match_row:
-        return {"version": 2, "sections": []}
-
-    league_id = int(match_row["league_id"])
-    season = int(match_row["season"])
-    home_id = int(match_row["home_id"])
-    away_id = int(match_row["away_id"])
-
-    mu_home, mu_away = _league_avgs(league_id, season)
-
-    h_gf_s, h_ga_s, h_gf_10, h_ga_10, h_gf_5, h_ga_5 = _team_home_context_stats(home_id, league_id, season)
-    a_gf_s, a_ga_s, a_gf_10, a_ga_10, a_gf_5, a_ga_5 = _team_away_context_stats(away_id, league_id, season)
-
-    h_gf = _mix_weighted(h_gf_s, h_gf_10, h_gf_5)
-    h_ga = _mix_weighted(h_ga_s, h_ga_10, h_ga_5)
-    a_gf = _mix_weighted(a_gf_s, a_gf_10, a_gf_5)
-    a_ga = _mix_weighted(a_ga_s, a_ga_10, a_ga_5)
-
-    if h_gf <= 0.0:
-        h_gf = mu_home
-    if h_ga <= 0.0:
-        h_ga = mu_away
-    if a_gf <= 0.0:
-        a_gf = mu_away
-    if a_ga <= 0.0:
-        a_ga = mu_home
-
-    att_home = _clamp(h_gf / mu_home, 0.55, 1.70)
-    def_away = _clamp(a_ga / mu_home, 0.55, 1.70)
-    att_away = _clamp(a_gf / mu_away, 0.55, 1.70)
-    def_home = _clamp(h_ga / mu_away, 0.55, 1.70)
-
-    lam_h_ft = _clamp(mu_home * att_home * def_away, 0.05, 4.50)
-    lam_a_ft = _clamp(mu_away * att_away * def_home, 0.05, 4.50)
-
-    share_1h, winshare_35, winshare_80 = _league_goal_shares(league_id, season)
-
-    lam_h_1h = _clamp(lam_h_ft * share_1h, 0.01, 3.50)
-    lam_a_1h = _clamp(lam_a_ft * share_1h, 0.01, 3.50)
-    lam_h_2h = _clamp(lam_h_ft * (1.0 - share_1h), 0.01, 3.50)
-    lam_a_2h = _clamp(lam_a_ft * (1.0 - share_1h), 0.01, 3.50)
-
-    lam_w35_45 = _clamp((lam_h_1h + lam_a_1h) * winshare_35, 0.0, 3.0)
-    lam_w80_90 = _clamp((lam_h_2h + lam_a_2h) * winshare_80, 0.0, 3.0)
-
-    return compute_ai_predictions_v2(
-        lam_h_ft=lam_h_ft,
-        lam_a_ft=lam_a_ft,
-        lam_h_1h=lam_h_1h,
-        lam_a_1h=lam_a_1h,
-        lam_h_2h=lam_h_2h,
-        lam_a_2h=lam_a_2h,
-        lam_w35_45=lam_w35_45,
-        lam_w80_90=lam_w80_90,
-        gmax=10,
-    )
+    except Exception as e:
+        # 문제가 생겨도 번들 전체가 죽지 않도록 방어
+        print(f"[AI_PREDICTIONS] error while computing predictions: {e}")
+        return None
