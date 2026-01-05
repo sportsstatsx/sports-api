@@ -123,12 +123,12 @@ class SectionInputs:
     lam_away: float
 
 
-def _section_core_1x2(inp: SectionInputs, gmax: int = 10) -> Tuple[float, float, float]:
+def _section_core_1x2(lam_home: float, lam_away: float, gmax: int = 10) -> Tuple[float, float, float]:
     """
     Return (P(HW), P(D), P(AW)) from independent Pois(lh),Pois(la).
     """
-    ph = _poisson_pmf_list(inp.lam_home, gmax)
-    pa = _poisson_pmf_list(inp.lam_away, gmax)
+    ph = _poisson_pmf_list(lam_home, gmax)
+    pa = _poisson_pmf_list(lam_away, gmax)
 
     hw = 0.0
     d = 0.0
@@ -149,6 +149,7 @@ def _section_core_1x2(inp: SectionInputs, gmax: int = 10) -> Tuple[float, float,
         d /= s
         aw /= s
     return (_clamp01(hw), _clamp01(d), _clamp01(aw))
+
 
 
 def _derive_half_lambdas(
@@ -208,6 +209,66 @@ def _derive_window_lambda(
         ratio = _clamp01(numer / denom)
 
     return max(0.0, float(section_total_lambda)) * ratio
+
+def _derive_section_probs(
+    lam_home: float,
+    lam_away: float,
+    p_hw: float,
+    p_d: float,
+    p_aw: float,
+) -> Dict[str, int]:
+    # 1X2 -> 정수 퍼센트(합 100 보장)
+    hw_i, d_i, aw_i = _normalize_1x2_pcts(p_hw, p_d, p_aw)
+
+    # Double chance
+    home_or_draw = max(0, min(100, hw_i + d_i))
+    home_or_away = max(0, min(100, hw_i + aw_i))
+    draw_or_away = max(0, min(100, d_i + aw_i))
+
+    # Totals (Poisson total)
+    lam_t = max(0.0, float(lam_home)) + max(0.0, float(lam_away))
+    over_0_5 = _round_pct(_poisson_tail_prob(lam_t, 1))  # >=1
+    over_1_5 = _round_pct(_poisson_tail_prob(lam_t, 2))  # >=2
+    over_2_5 = _round_pct(_poisson_tail_prob(lam_t, 3))  # >=3
+
+    # Team totals
+    home_over_0_5 = _round_pct(_poisson_tail_prob(lam_home, 1))
+    home_over_1_5 = _round_pct(_poisson_tail_prob(lam_home, 2))
+    away_over_0_5 = _round_pct(_poisson_tail_prob(lam_away, 1))
+    away_over_1_5 = _round_pct(_poisson_tail_prob(lam_away, 2))
+
+    # BTTS / Clean sheet
+    btts_yes = _round_pct(_btts_yes(lam_home, lam_away))
+    btts_no = max(0, min(100, 100 - btts_yes))
+
+    home_clean_sheet = _round_pct(_clamp01(exp(-max(0.0, float(lam_away)))))  # P(A=0)
+    away_clean_sheet = _round_pct(_clamp01(exp(-max(0.0, float(lam_home)))))  # P(H=0)
+
+    return {
+        "home_win": hw_i,
+        "draw": d_i,
+        "away_win": aw_i,
+        "home_or_draw": home_or_draw,
+        "home_or_away": home_or_away,
+        "draw_or_away": draw_or_away,
+        "over_0_5": over_0_5,
+        "over_1_5": over_1_5,
+        "over_2_5": over_2_5,
+        "home_over_0_5": home_over_0_5,
+        "home_over_1_5": home_over_1_5,
+        "away_over_0_5": away_over_0_5,
+        "away_over_1_5": away_over_1_5,
+        "btts_yes": btts_yes,
+        "btts_no": btts_no,
+        "home_clean_sheet": home_clean_sheet,
+        "away_clean_sheet": away_clean_sheet,
+    }
+
+
+def _top_scorelines(lh: float, la: float, gmax: int = 10) -> Tuple[str, List[str]]:
+    # 너 파일에 이미 있는 _scorelines_top3를 그대로 사용
+    return _scorelines_top3(lh, la, gmax)
+
 
 
 def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,8 +423,8 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
     lam_w_35_45 = max(0.0, lam_h_1h * share_home_35_45 + lam_a_1h * share_away_35_45)
     lam_w_80_90 = max(0.0, lam_h_2h * share_home_80_90 + lam_a_2h * share_away_80_90)
 
-    p_35_45 = _clamp01(1.0 - math.exp(-lam_w_35_45))
-    p_80_90 = _clamp01(1.0 - math.exp(-lam_w_80_90))
+    p_35_45 = _clamp01(1.0 - exp(-lam_w_35_45))
+    p_80_90 = _clamp01(1.0 - exp(-lam_w_80_90))
 
     # ─────────────────────────────────────
     # 6) 섹션별 확률 파생
