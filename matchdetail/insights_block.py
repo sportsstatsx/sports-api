@@ -2247,6 +2247,70 @@ def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str
 
     return {"mu_home": mu_home, "mu_away": mu_away}
 
+def _compute_league_goals_by_time10_total(*, league_id: int, season_int: int) -> List[int]:
+    """
+    리그(league_id, season) 전체 기준: 정규시간(0~90) 득점 이벤트를 10버킷으로 집계한 분포(총합).
+    버킷:
+      0: 0-9
+      1: 10-19
+      2: 20-29
+      3: 30-34
+      4: 35-45
+      5: 46-55
+      6: 56-65
+      7: 66-75
+      8: 76-79
+      9: 80-90
+    """
+    try:
+        lid = int(league_id)
+        season = int(season_int)
+    except Exception:
+        return [0] * 10
+
+    # matches + match_events 조인으로 리그/시즌/finished 경기의 goal 이벤트만 집계
+    rows = fetch_all(
+        """
+        SELECT
+            SUM(CASE WHEN e.minute BETWEEN 0  AND 9  THEN 1 ELSE 0 END) AS b0,
+            SUM(CASE WHEN e.minute BETWEEN 10 AND 19 THEN 1 ELSE 0 END) AS b1,
+            SUM(CASE WHEN e.minute BETWEEN 20 AND 29 THEN 1 ELSE 0 END) AS b2,
+            SUM(CASE WHEN e.minute BETWEEN 30 AND 34 THEN 1 ELSE 0 END) AS b3,
+            SUM(CASE WHEN e.minute BETWEEN 35 AND 45 THEN 1 ELSE 0 END) AS b4,
+            SUM(CASE WHEN e.minute BETWEEN 46 AND 55 THEN 1 ELSE 0 END) AS b5,
+            SUM(CASE WHEN e.minute BETWEEN 56 AND 65 THEN 1 ELSE 0 END) AS b6,
+            SUM(CASE WHEN e.minute BETWEEN 66 AND 75 THEN 1 ELSE 0 END) AS b7,
+            SUM(CASE WHEN e.minute BETWEEN 76 AND 79 THEN 1 ELSE 0 END) AS b8,
+            SUM(CASE WHEN e.minute BETWEEN 80 AND 90 THEN 1 ELSE 0 END) AS b9
+        FROM match_events e
+        JOIN matches m ON m.fixture_id = e.fixture_id
+        WHERE m.league_id = %s
+          AND m.season = %s
+          AND lower(m.status_group) = 'finished'
+          AND lower(e.type) = 'goal'
+          AND e.minute IS NOT NULL
+          AND e.minute <= 90
+        """,
+        (lid, season),
+    ) or []
+
+    if not rows:
+        return [0] * 10
+
+    r0 = rows[0] or {}
+    out: List[int] = []
+    for k in ("b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9"):
+        try:
+            out.append(int(r0.get(k) or 0))
+        except Exception:
+            out.append(0)
+
+    # 길이 보정
+    if len(out) != 10:
+        out = (out + [0] * 10)[:10]
+    return out
+
+
 
 
 # ─────────────────────────────────────
@@ -3184,7 +3248,12 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         league_id=league_id,
         season_int=season_for_calc,
     )
-    
+
+    # ✅ AI Predictions 엔진용: 리그 득점 분포(10버킷, total)
+    league_goals_by_time10_total = _compute_league_goals_by_time10_total(
+        league_id=league_id,
+        season_int=season_for_calc,
+    )
 
     return {
         "league_id": league_id,
@@ -3197,6 +3266,8 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         # ✅ AI Predictions용 리그 평균(고정)
         "league_avgs": league_avgs,
 
+        # ✅ AI Predictions 엔진이 찾는 키 (matchdetail/ai_predictions_engine.py)
+        "league_goals_by_time10_total": league_goals_by_time10_total,
 
         # ✅ NEW: 동적 렌더링용 섹션 정의
         "sections": _build_insights_overall_sections_meta(),
@@ -3204,5 +3275,6 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "home": home_ins,
         "away": away_ins,
     }
+
 
 
