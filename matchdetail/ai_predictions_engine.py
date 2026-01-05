@@ -212,199 +212,235 @@ def _derive_window_lambda(
 
 def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dict[str, Any]:
     """
-    ✅ 기존(구형) insights_overall(평면 구조)과
-    ✅ 신규 insights_overall(home/away 중첩 구조) 모두 대응
-
-    신규 구조에서는:
-      - home.avg_gf.home / home.avg_ga.home
-      - away.avg_gf.away / away.avg_ga.away
-      - home.goals_by_time_for / away.goals_by_time_for
-    등을 사용해서 람다(기대득점)를 만든다.
+    ✅ 설계서 기반(현재 DB/insights 구조에서 가능한 범위)
+      - μ_home/μ_away(리그 평균 홈/원정 득점) + Att/Def 비율로 FT λ 산출
+      - 1H/2H 는 팀 득점 분포(goals_by_time10_for)로 FT λ를 분배
+      - 35-45+, 80-90+ 는 전/후반 내 구간 share로 λ_W 계산 → P=1-e^-λ_W
+      - 파생확률(1X2/DC/Over/TeamOver/BTTS/CleanSheet)은 기존 포아송 로직 그대로 사용
+    필요 키:
+      - insights_overall['league_avgs'] = {'mu_home': float, 'mu_away': float}
+      - insights_overall['home'|'away']['avg_gf'|'avg_ga'] = {'home'|'away': float ...}
+      - insights_overall['home'|'away']['goals_by_time10_for'] = [int]*10  (없으면 6버킷으로 폴백)
     """
+    overall = insights_overall or {}
+    home = overall.get("home") or {}
+    away = overall.get("away") or {}
 
-    # ─────────────────────────────
-    # 1) 람다(FT expected goals) 산출
-    # ─────────────────────────────
-
-    def _to_float(v: Any) -> float:
+    def clamp(x: float, lo: float, hi: float) -> float:
         try:
+            xf = float(x)
+        except Exception:
+            xf = 0.0
+        if xf < lo:
+            return lo
+        if xf > hi:
+            return hi
+        return xf
+
+    def safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            if v is None:
+                return float(default)
             return float(v)
         except Exception:
-            return 0.0
+            return float(default)
 
-    # (A) 구형 평면 구조 지원
-    if "expected_goals_for" in insights_overall or "expected_goals_against" in insights_overall:
-        lam_h_ft = _to_float(insights_overall.get("expected_goals_for") or 0.0)
-        lam_a_ft = _to_float(insights_overall.get("expected_goals_against") or 0.0)
+    # ─────────────────────────────────────
+    # 1) μ_home/μ_away (리그 평균 홈/원정 득점)
+    # ─────────────────────────────────────
+    league_avgs = overall.get("league_avgs") or {}
+    mu_home = max(0.2, safe_float(league_avgs.get("mu_home"), 1.0))
+    mu_away = max(0.2, safe_float(league_avgs.get("mu_away"), 1.0))
 
-        gbt_for = insights_overall.get("goals_by_time_for") or []
-        gbt_against = insights_overall.get("goals_by_time_against") or []
+    # ─────────────────────────────────────
+    # 2) Team GF/GA (홈팀=home컨텍스트, 원정팀=away컨텍스트)
+    # ─────────────────────────────────────
+    home_gf_home = safe_float((home.get("avg_gf") or {}).get("home"), 0.0)
+    home_ga_home = safe_float((home.get("avg_ga") or {}).get("home"), 0.0)
 
-    # (B) 신규 home/away 중첩 구조
-    else:
-        home = insights_overall.get("home") or {}
-        away = insights_overall.get("away") or {}
+    away_gf_away = safe_float((away.get("avg_gf") or {}).get("away"), 0.0)
+    away_ga_away = safe_float((away.get("avg_ga") or {}).get("away"), 0.0)
 
-        # 공격/수비(홈경기/원정경기 기준) 값 추출
-        home_avg_gf = (home.get("avg_gf") or {})
-        home_avg_ga = (home.get("avg_ga") or {})
-        away_avg_gf = (away.get("avg_gf") or {})
-        away_avg_ga = (away.get("avg_ga") or {})
+    # ─────────────────────────────────────
+    # 3) Att/Def 및 FT λ (설계서 핵심)
+    # ─────────────────────────────────────
+    att_home = (home_gf_home / mu_home) if mu_home > 0 else 0.0
+    def_home = (home_ga_home / mu_away) if mu_away > 0 else 0.0
 
-        home_attack_home = _to_float(home_avg_gf.get("home") or 0.0)
-        home_defense_home = _to_float(home_avg_ga.get("home") or 0.0)
+    att_away = (away_gf_away / mu_away) if mu_away > 0 else 0.0
+    def_away = (away_ga_away / mu_home) if mu_home > 0 else 0.0
 
-        away_attack_away = _to_float(away_avg_gf.get("away") or 0.0)
-        away_defense_away = _to_float(away_avg_ga.get("away") or 0.0)
+    lam_h_ft = mu_home * att_home * def_away
+    lam_a_ft = mu_away * att_away * def_home
 
-        # 매치업 람다(간단하고 안정적인 방식)
-        # 홈 득점 기대 = (홈 공격력 + 원정 수비력) / 2
-        # 원정 득점 기대 = (원정 공격력 + 홈 수비력) / 2
-        # 값이 하나만 있으면 있는 값만 사용 (0으로 떨어지는 걸 최대한 방지)
-        if home_attack_home > 0.0 and away_defense_away > 0.0:
-            lam_h_ft = (home_attack_home + away_defense_away) / 2.0
-        else:
-            lam_h_ft = max(home_attack_home, away_defense_away, 0.0)
+    # 안정화(clamp)
+    lam_h_ft = clamp(lam_h_ft, 0.05, 4.50)
+    lam_a_ft = clamp(lam_a_ft, 0.05, 4.50)
 
-        if away_attack_away > 0.0 and home_defense_home > 0.0:
-            lam_a_ft = (away_attack_away + home_defense_home) / 2.0
-        else:
-            lam_a_ft = max(away_attack_away, home_defense_home, 0.0)
+    # ─────────────────────────────────────
+    # 4) 1H/2H 분배 (팀 득점 분포 기반)
+    # ─────────────────────────────────────
+    def _get_goals10_for(team_block: Dict[str, Any]) -> List[int]:
+        arr = team_block.get("goals_by_time10_for")
+        if isinstance(arr, list) and len(arr) == 10:
+            out: List[int] = []
+            for x in arr:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    out.append(0)
+            return out
 
-        # goals_by_time은 현재 구조상 팀 하위에 있음
-        gbt_for = home.get("goals_by_time_for") or []
-        # 상대팀 득점 분포를 합치고 싶으면 away.goals_by_time_for도 참고 가능
-        # 여기서는 엔진 내부에서 len<10이면 폴백을 쓰므로 안전하게 최소만 연결
-        gbt_against = away.get("goals_by_time_for") or []
+        # 폴백: 기존 6버킷만 있는 경우(정밀도는 떨어짐)
+        arr6 = team_block.get("goals_by_time_for")
+        if isinstance(arr6, list) and len(arr6) == 6:
+            # [0-15,16-30,31-45,46-60,61-75,76-90] → 대략 10버킷으로 분배
+            # (30-34 / 35-45+, 76-79 / 80-90+ 를 50:50로 단순 분해)
+            a0, a1, a2, a3, a4, a5 = [int(x or 0) for x in arr6]
+            return [
+                int(round(a0 * 0.5)), int(round(a0 * 0.5)),  # 0-9 / 10-19
+                int(round(a1 * 0.5)), int(round(a1 * 0.5)),  # 20-29 / 30-34(대략)
+                a2,                                          # 35-45+ (대략)
+                int(round(a3 * 0.5)), int(round(a3 * 0.5)),  # 46-55 / 56-65
+                a4,                                          # 66-75 (대략)
+                int(round(a5 * 0.5)), int(round(a5 * 0.5)),  # 76-79 / 80-90+
+            ]
+        return [0] * 10
 
-    # ─────────────────────────────
-    # 2) total_goals_by_time 구성 (있으면 사용, 없으면 폴백)
-    # ─────────────────────────────
-    total_goals_by_time: List[float] | None = None
-    if isinstance(gbt_for, list) and isinstance(gbt_against, list) and len(gbt_for) >= 10 and len(gbt_against) >= 10:
-        total_goals_by_time = []
-        for i in range(10):
+    def _sum(xs: List[int]) -> int:
+        s = 0
+        for v in xs:
             try:
-                total_goals_by_time.append(_to_float(gbt_for[i] or 0.0) + _to_float(gbt_against[i] or 0.0))
+                s += int(v)
             except Exception:
-                total_goals_by_time.append(0.0)
+                pass
+        return s
 
-    ft = SectionInputs(lam_home=lam_h_ft, lam_away=lam_a_ft)
-    h1, h2 = _derive_half_lambdas(lam_h_ft, lam_a_ft, total_goals_by_time)
+    def _share(num: float, den: float, fallback: float) -> float:
+        try:
+            if den <= 0:
+                return fallback
+            return clamp(float(num) / float(den), 0.0, 1.0)
+        except Exception:
+            return fallback
 
-    lam_t1 = h1.lam_home + h1.lam_away
-    lam_t2 = h2.lam_home + h2.lam_away
+    home_g10 = _get_goals10_for(home)
+    away_g10 = _get_goals10_for(away)
 
-    lam_w35_45 = _derive_window_lambda(lam_t1, total_goals_by_time, section="1H", fallback_ratio_in_section=0.20)
-    lam_w80_90 = _derive_window_lambda(lam_t2, total_goals_by_time, section="2H", fallback_ratio_in_section=0.20)
+    home_total = _sum(home_g10)
+    away_total = _sum(away_g10)
 
-    out: Dict[str, Any] = {}
+    # 전반 득점 비중(팀 기준). 표본 부족 시 폴백 0.45
+    share_home_1h = _share(_sum(home_g10[0:5]), home_total, 0.45)
+    share_away_1h = _share(_sum(away_g10[0:5]), away_total, 0.45)
 
-    out["expected_goals_home"] = round(lam_h_ft, 2)
-    out["expected_goals_away"] = round(lam_a_ft, 2)
-    most, top3 = _scorelines_top3(lam_h_ft, lam_a_ft, gmax=10)
-    out["most_likely_score"] = most
-    out["top3_scorelines"] = top3
+    lam_h_1h = clamp(lam_h_ft * share_home_1h, 0.05, 4.50)
+    lam_a_1h = clamp(lam_a_ft * share_away_1h, 0.05, 4.50)
 
-    # ── FT
-    hw, d, aw = _section_core_1x2(ft, gmax=10)
-    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
-    out["ft_home_win"] = hw_i
-    out["ft_draw"] = d_i
-    out["ft_away_win"] = aw_i
-    out["ft_1x"] = max(0, min(100, hw_i + d_i))
-    out["ft_12"] = max(0, min(100, hw_i + aw_i))
-    out["ft_x2"] = max(0, min(100, d_i + aw_i))
+    lam_h_2h = clamp(lam_h_ft * (1.0 - share_home_1h), 0.05, 4.50)
+    lam_a_2h = clamp(lam_a_ft * (1.0 - share_away_1h), 0.05, 4.50)
 
-    lam_t_ft = lam_h_ft + lam_a_ft
-    out["ft_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 1))
-    out["ft_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 2))
-    out["ft_total_over_2_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 3))
+    lam_t_1h = lam_h_1h + lam_a_1h
+    lam_t_2h = lam_h_2h + lam_a_2h
 
-    out["ft_btts_yes"] = _round_pct(_btts_yes(lam_h_ft, lam_a_ft))
+    # ─────────────────────────────────────
+    # 5) 구간골 λ_W → 확률
+    # ─────────────────────────────────────
+    # 35-45+ share: bin4 / (1H bins0..4)
+    # 80-90+ share: bin9 / (2H bins5..9)
+    home_1h_total = _sum(home_g10[0:5])
+    away_1h_total = _sum(away_g10[0:5])
+    home_2h_total = _sum(home_g10[5:10])
+    away_2h_total = _sum(away_g10[5:10])
 
-    out["ft_home_over_0_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 1))
-    out["ft_home_over_1_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 2))
-    out["ft_away_over_0_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 1))
-    out["ft_away_over_1_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 2))
+    share_home_35_45 = _share(home_g10[4], home_1h_total, 0.20)
+    share_away_35_45 = _share(away_g10[4], away_1h_total, 0.20)
 
-    # (이 아래 기존 코드: 1H/2H 및 window 확률 계산 부분은 그대로 유지)
-    # out["1h_*"], out["2h_*"] 채우는 부분이 이어져야 함
+    share_home_80_90 = _share(home_g10[9], home_2h_total, 0.20)
+    share_away_80_90 = _share(away_g10[9], away_2h_total, 0.20)
 
-    # ⚠️ 주의: 이 함수 아래쪽(1H/2H 계산 로직)이 원본 파일에 이미 존재하므로
-    # 여기서 return out 하지 말고 원본대로 이어서 out에 계속 채워야 함.
+    lam_w_35_45 = max(0.0, lam_h_1h * share_home_35_45 + lam_a_1h * share_away_35_45)
+    lam_w_80_90 = max(0.0, lam_h_2h * share_home_80_90 + lam_a_2h * share_away_80_90)
 
+    p_35_45 = _clamp01(1.0 - math.exp(-lam_w_35_45))
+    p_80_90 = _clamp01(1.0 - math.exp(-lam_w_80_90))
 
-    out: Dict[str, Any] = {}
+    # ─────────────────────────────────────
+    # 6) 섹션별 확률 파생
+    # ─────────────────────────────────────
+    ft_hw, ft_d, ft_aw = _section_core_1x2(lam_h_ft, lam_a_ft)
+    h1_hw, h1_d, h1_aw = _section_core_1x2(lam_h_1h, lam_a_1h)
+    h2_hw, h2_d, h2_aw = _section_core_1x2(lam_h_2h, lam_a_2h)
 
-    out["expected_goals_home"] = round(lam_h_ft, 2)
-    out["expected_goals_away"] = round(lam_a_ft, 2)
-    most, top3 = _scorelines_top3(lam_h_ft, lam_a_ft, gmax=10)
-    out["most_likely_score"] = most
-    out["top3_scorelines"] = top3
+    ft = _derive_section_probs(lam_h_ft, lam_a_ft, ft_hw, ft_d, ft_aw)
+    h1 = _derive_section_probs(lam_h_1h, lam_a_1h, h1_hw, h1_d, h1_aw)
+    h2 = _derive_section_probs(lam_h_2h, lam_a_2h, h2_hw, h2_d, h2_aw)
 
-    # ── FT
-    hw, d, aw = _section_core_1x2(ft, gmax=10)
-    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
-    out["ft_home_win"] = hw_i
-    out["ft_draw"] = d_i
-    out["ft_away_win"] = aw_i
-    out["ft_1x"] = max(0, min(100, hw_i + d_i))
-    out["ft_12"] = max(0, min(100, hw_i + aw_i))
-    out["ft_x2"] = max(0, min(100, d_i + aw_i))
+    # 표시용 점수라인(FT)
+    most_likely, top3 = _top_scorelines(lam_h_ft, lam_a_ft)
 
-    lam_t_ft = lam_h_ft + lam_a_ft
-    out["ft_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 1))
-    out["ft_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 2))
-    out["ft_total_over_2_5"] = _round_pct(_poisson_tail_prob(lam_t_ft, 3))
+    out: Dict[str, Any] = {
+        "expected_goals_home": round(lam_h_ft, 3),
+        "expected_goals_away": round(lam_a_ft, 3),
+        "most_likely_score": most_likely,
+        "top3_scorelines": top3,
 
-    out["ft_btts_yes"] = _round_pct(_btts_yes(lam_h_ft, lam_a_ft))
+        # FT
+        "ft_home_win": ft["home_win"],
+        "ft_draw": ft["draw"],
+        "ft_away_win": ft["away_win"],
+        "ft_home_or_draw": ft["home_or_draw"],
+        "ft_home_or_away": ft["home_or_away"],
+        "ft_draw_or_away": ft["draw_or_away"],
+        "ft_total_over_0_5": ft["over_0_5"],
+        "ft_total_over_1_5": ft["over_1_5"],
+        "ft_total_over_2_5": ft["over_2_5"],
+        "ft_home_over_0_5": ft["home_over_0_5"],
+        "ft_home_over_1_5": ft["home_over_1_5"],
+        "ft_away_over_0_5": ft["away_over_0_5"],
+        "ft_away_over_1_5": ft["away_over_1_5"],
+        "ft_btts_yes": ft["btts_yes"],
+        "ft_btts_no": ft["btts_no"],
+        "ft_home_clean_sheet": ft["home_clean_sheet"],
+        "ft_away_clean_sheet": ft["away_clean_sheet"],
 
-    out["ft_home_over_0_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 1))
-    out["ft_home_over_1_5"] = _round_pct(_poisson_tail_prob(lam_h_ft, 2))
-    out["ft_away_over_0_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 1))
-    out["ft_away_over_1_5"] = _round_pct(_poisson_tail_prob(lam_a_ft, 2))
+        # 1H
+        "1h_home_win": h1["home_win"],
+        "1h_draw": h1["draw"],
+        "1h_away_win": h1["away_win"],
+        "1h_home_or_draw": h1["home_or_draw"],
+        "1h_home_or_away": h1["home_or_away"],
+        "1h_draw_or_away": h1["draw_or_away"],
+        "1h_total_over_0_5": h1["over_0_5"],
+        "1h_total_over_1_5": h1["over_1_5"],
+        "1h_home_over_0_5": h1["home_over_0_5"],
+        "1h_home_over_1_5": h1["home_over_1_5"],
+        "1h_away_over_0_5": h1["away_over_0_5"],
+        "1h_away_over_1_5": h1["away_over_1_5"],
+        "1h_btts_yes": h1["btts_yes"],
+        "1h_btts_no": h1["btts_no"],
+        "1h_home_clean_sheet": h1["home_clean_sheet"],
+        "1h_away_clean_sheet": h1["away_clean_sheet"],
+        "1h_goal_35_45_plus": _round_pct(p_35_45),
 
-    # ── 1H
-    hw, d, aw = _section_core_1x2(h1, gmax=10)
-    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
-    out["1h_home_win"] = hw_i
-    out["1h_draw"] = d_i
-    out["1h_away_win"] = aw_i
-    out["1h_1x"] = max(0, min(100, hw_i + d_i))
-    out["1h_12"] = max(0, min(100, hw_i + aw_i))
-    out["1h_x2"] = max(0, min(100, d_i + aw_i))
-
-    out["1h_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t1, 1))
-    out["1h_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t1, 2))
-    out["1h_btts_yes"] = _round_pct(_btts_yes(h1.lam_home, h1.lam_away))
-
-    out["1h_home_over_0_5"] = _round_pct(_poisson_tail_prob(h1.lam_home, 1))
-    out["1h_home_over_1_5"] = _round_pct(_poisson_tail_prob(h1.lam_home, 2))
-    out["1h_away_over_0_5"] = _round_pct(_poisson_tail_prob(h1.lam_away, 1))
-    out["1h_away_over_1_5"] = _round_pct(_poisson_tail_prob(h1.lam_away, 2))
-
-    out["1h_goal_35_45_plus"] = _round_pct(1.0 - exp(-max(0.0, lam_w35_45)))
-
-    # ── 2H
-    hw, d, aw = _section_core_1x2(h2, gmax=10)
-    hw_i, d_i, aw_i = _normalize_1x2_pcts(hw, d, aw)
-    out["2h_home_win"] = hw_i
-    out["2h_draw"] = d_i
-    out["2h_away_win"] = aw_i
-    out["2h_1x"] = max(0, min(100, hw_i + d_i))
-    out["2h_12"] = max(0, min(100, hw_i + aw_i))
-    out["2h_x2"] = max(0, min(100, d_i + aw_i))
-
-    out["2h_total_over_0_5"] = _round_pct(_poisson_tail_prob(lam_t2, 1))
-    out["2h_total_over_1_5"] = _round_pct(_poisson_tail_prob(lam_t2, 2))
-    out["2h_btts_yes"] = _round_pct(_btts_yes(h2.lam_home, h2.lam_away))
-
-    out["2h_home_over_0_5"] = _round_pct(_poisson_tail_prob(h2.lam_home, 1))
-    out["2h_home_over_1_5"] = _round_pct(_poisson_tail_prob(h2.lam_home, 2))
-    out["2h_away_over_0_5"] = _round_pct(_poisson_tail_prob(h2.lam_away, 1))
-    out["2h_away_over_1_5"] = _round_pct(_poisson_tail_prob(h2.lam_away, 2))
-
-    out["2h_goal_80_90_plus"] = _round_pct(1.0 - exp(-max(0.0, lam_w80_90)))
-
+        # 2H
+        "2h_home_win": h2["home_win"],
+        "2h_draw": h2["draw"],
+        "2h_away_win": h2["away_win"],
+        "2h_home_or_draw": h2["home_or_draw"],
+        "2h_home_or_away": h2["home_or_away"],
+        "2h_draw_or_away": h2["draw_or_away"],
+        "2h_total_over_0_5": h2["over_0_5"],
+        "2h_total_over_1_5": h2["over_1_5"],
+        "2h_home_over_0_5": h2["home_over_0_5"],
+        "2h_home_over_1_5": h2["home_over_1_5"],
+        "2h_away_over_0_5": h2["away_over_0_5"],
+        "2h_away_over_1_5": h2["away_over_1_5"],
+        "2h_btts_yes": h2["btts_yes"],
+        "2h_btts_no": h2["btts_no"],
+        "2h_home_clean_sheet": h2["home_clean_sheet"],
+        "2h_away_clean_sheet": h2["away_clean_sheet"],
+        "2h_goal_80_90_plus": _round_pct(p_80_90),
+    }
     return out
+
