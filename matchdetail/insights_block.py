@@ -2106,8 +2106,15 @@ def enrich_overall_goals_by_time(
     # ─────────────────────────────────────
     # 3) 버킷 집계
     # ─────────────────────────────────────
+    # ✅ UI(Goals by Time)용 6버킷은 기존 그대로 유지
     for_buckets = [0, 0, 0, 0, 0, 0]
     against_buckets = [0, 0, 0, 0, 0, 0]
+
+    # ✅ AI Predictions(전/후반/구간골)용 10버킷 추가
+    #   - 1H: [0-9],[10-19],[20-29],[30-34],[35-45(+)]
+    #   - 2H: [46-55],[56-65],[66-75],[76-79],[80-90(+)]
+    for_buckets10 = [0] * 10
+    against_buckets10 = [0] * 10
 
     def bucket_idx(minute: int) -> int:
         if minute <= 15:
@@ -2122,6 +2129,33 @@ def enrich_overall_goals_by_time(
             return 4
         return 5
 
+    def bucket_idx10(minute: int) -> Optional[int]:
+        # 연장(>90) 제외 (정규시간 기반)
+        if minute < 0:
+            return None
+        if minute > 90:
+            return None
+
+        if minute <= 9:
+            return 0
+        if minute <= 19:
+            return 1
+        if minute <= 29:
+            return 2
+        if minute <= 34:
+            return 3
+        if minute <= 45:
+            return 4
+        if minute <= 55:
+            return 5
+        if minute <= 65:
+            return 6
+        if minute <= 75:
+            return 7
+        if minute <= 79:
+            return 8
+        return 9
+
     for ev in ev_rows:
         try:
             m = ev.get("minute")
@@ -2131,7 +2165,10 @@ def enrich_overall_goals_by_time(
         except Exception:
             continue
 
-        idx = bucket_idx(minute)
+        idx6 = bucket_idx(minute)
+        idx10 = bucket_idx10(minute)
+        if idx10 is None:
+            continue
 
         try:
             ev_team_id = ev.get("team_id")
@@ -2144,13 +2181,71 @@ def enrich_overall_goals_by_time(
         is_for = (ev_team_id == team_id)
 
         if is_for:
-            for_buckets[idx] += 1
+            for_buckets[idx6] += 1
+            for_buckets10[idx10] += 1
         else:
-            against_buckets[idx] += 1
+            against_buckets[idx6] += 1
+            against_buckets10[idx10] += 1
 
     insights["goals_by_time_for"] = for_buckets
     insights["goals_by_time_against"] = against_buckets
 
+    # ✅ AI Predictions 전용(추가 키) — 기존 UI에는 영향 없음
+    insights["goals_by_time10_for"] = for_buckets10
+    insights["goals_by_time10_against"] = against_buckets10
+
+
+# ─────────────────────────────────────
+#  League 평균 홈/원정 득점(μ_home/μ_away)  ✅ AI Predictions용
+# ─────────────────────────────────────
+def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str, float]:
+    """
+    정책 고정:
+      - '리그(해당 시즌) 경기만' 기준 μ_home/μ_away 를 만든다.
+      - 여기서는 league_id를 '그대로' 사용한다. (comp 옵션과 무관하게 고정)
+      - FINISHED + FT 스코어 존재 경기만 포함
+    """
+    try:
+        lid = int(league_id)
+        season = int(season_int)
+    except Exception:
+        return {"mu_home": 1.0, "mu_away": 1.0}
+
+    rows = fetch_all(
+        """
+        SELECT
+            AVG(m.home_ft) AS mu_home,
+            AVG(m.away_ft) AS mu_away
+        FROM matches m
+        WHERE m.league_id = %s
+          AND m.season = %s
+          AND lower(m.status_group) = 'finished'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
+        """,
+        (lid, season),
+    )
+
+    if not rows:
+        return {"mu_home": 1.0, "mu_away": 1.0}
+
+    r0 = rows[0] or {}
+    try:
+        mu_home = float(r0.get("mu_home") or 0.0)
+    except Exception:
+        mu_home = 0.0
+    try:
+        mu_away = float(r0.get("mu_away") or 0.0)
+    except Exception:
+        mu_away = 0.0
+
+    # 최소값 방어 (엔진에서도 한 번 더 방어)
+    if mu_home <= 0.0:
+        mu_home = 1.0
+    if mu_away <= 0.0:
+        mu_away = 1.0
+
+    return {"mu_home": mu_home, "mu_away": mu_away}
 
 
 
@@ -3085,6 +3180,12 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         },
     }
 
+    league_avgs = _compute_league_mu_home_away(
+        league_id=league_id,
+        season_int=season_for_calc,
+    )
+    
+
     return {
         "league_id": league_id,
         "season": season_for_calc,
@@ -3092,6 +3193,10 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
         "filters": filters_for_client,
+
+        # ✅ AI Predictions용 리그 평균(고정)
+        "league_avgs": league_avgs,
+
 
         # ✅ NEW: 동적 렌더링용 섹션 정의
         "sections": _build_insights_overall_sections_meta(),
