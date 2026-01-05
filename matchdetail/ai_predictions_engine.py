@@ -397,15 +397,64 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
         except Exception:
             return fallback
 
+    # ─────────────────────────────────────
+    # ✅ (추가) 리그 전체 시간대 분포(10버킷) 읽기
+    #   - 서버에서 insights_overall["league_goals_by_time10_total"] 로 내려주면 사용
+    # ─────────────────────────────────────
+    def _get_league_goals10_total(overall_block: Dict[str, Any]) -> List[int]:
+        arr = overall_block.get("league_goals_by_time10_total")
+        if isinstance(arr, list) and len(arr) >= 10:
+            out: List[int] = []
+            for x in arr[:10]:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    out.append(0)
+            return out
+        return [0] * 10
+
+    # ─────────────────────────────────────
+    # ✅ (추가) 팀 비중과 리그 비중을 섞는 스무딩
+    #   - w = team_den / (team_den + k)
+    #   - team_den(표본)이 작으면 리그 비중 쪽으로 끌어당김
+    # ─────────────────────────────────────
+    def _mix_ratio(
+        team_num: float,
+        team_den: float,
+        league_num: float,
+        league_den: float,
+        fallback: float,
+        k: float,
+    ) -> float:
+        team_r = _share(team_num, team_den, fallback)
+        league_r = _share(league_num, league_den, fallback)
+        try:
+            w = clamp(float(team_den) / (float(team_den) + float(k)), 0.0, 1.0)
+        except Exception:
+            w = 0.0
+        return clamp(w * team_r + (1.0 - w) * league_r, 0.0, 1.0)
+
+
     home_g10 = _get_goals10_for(home)
     away_g10 = _get_goals10_for(away)
 
     home_total = _sum(home_g10)
     away_total = _sum(away_g10)
 
-    # 전반 득점 비중(팀 기준). 표본 부족 시 폴백 0.45
-    share_home_1h = _share(_sum(home_g10[0:5]), home_total, 0.45)
-    share_away_1h = _share(_sum(away_g10[0:5]), away_total, 0.45)
+    # ✅ 리그 전체 시간대 분포(있으면 스무딩에 사용)
+    league_g10 = _get_league_goals10_total(overall)
+    league_total = _sum(league_g10)
+    league_1h_total = _sum(league_g10[0:5])
+
+    home_1h_cnt = _sum(home_g10[0:5])
+    away_1h_cnt = _sum(away_g10[0:5])
+    league_1h_cnt = _sum(league_g10[0:5])
+
+    # 전반 비중: 팀 비중을 기본으로 하되 표본 적으면 리그 비중으로 스무딩
+    # k(스무딩 강도): 팀 total 골이 30 이하면 리그쪽 영향이 꽤 생김
+    share_home_1h = _mix_ratio(home_1h_cnt, home_total, league_1h_cnt, league_total, 0.45, k=30.0)
+    share_away_1h = _mix_ratio(away_1h_cnt, away_total, league_1h_cnt, league_total, 0.45, k=30.0)
+
 
     lam_h_1h = clamp(lam_h_ft * share_home_1h, 0.05, 4.50)
     lam_a_1h = clamp(lam_a_ft * share_away_1h, 0.05, 4.50)
@@ -426,11 +475,18 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
     home_2h_total = _sum(home_g10[5:10])
     away_2h_total = _sum(away_g10[5:10])
 
-    share_home_35_45 = _share(home_g10[4], home_1h_total, 0.20)
-    share_away_35_45 = _share(away_g10[4], away_1h_total, 0.20)
+    # ✅ 리그 half denom (구간 스무딩에 사용)
+    league_2h_total = _sum(league_g10[5:10])
 
-    share_home_80_90 = _share(home_g10[9], home_2h_total, 0.20)
-    share_away_80_90 = _share(away_g10[9], away_2h_total, 0.20)
+    # 35~45+ : 1H 내 마지막 버킷(인덱스 4)
+    # k=12 : 반쪽(half) 표본이 12골 미만이면 리그쪽으로 더 끌림
+    share_home_35_45 = _mix_ratio(home_g10[4], home_1h_total, league_g10[4], league_1h_total, 0.20, k=12.0)
+    share_away_35_45 = _mix_ratio(away_g10[4], away_1h_total, league_g10[4], league_1h_total, 0.20, k=12.0)
+
+    # 80~90+ : 2H 내 마지막 버킷(인덱스 9)
+    share_home_80_90 = _mix_ratio(home_g10[9], home_2h_total, league_g10[9], league_2h_total, 0.20, k=12.0)
+    share_away_80_90 = _mix_ratio(away_g10[9], away_2h_total, league_g10[9], league_2h_total, 0.20, k=12.0)
+
 
     lam_w_35_45 = max(0.0, lam_h_1h * share_home_35_45 + lam_a_1h * share_away_35_45)
     lam_w_80_90 = max(0.0, lam_h_2h * share_home_80_90 + lam_a_2h * share_away_80_90)
