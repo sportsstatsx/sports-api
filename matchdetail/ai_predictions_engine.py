@@ -221,9 +221,9 @@ def _derive_section_probs(
     hw_i, d_i, aw_i = _normalize_1x2_pcts(p_hw, p_d, p_aw)
 
     # Double chance
-    home_or_draw = max(0, min(100, hw_i + d_i))
-    home_or_away = max(0, min(100, hw_i + aw_i))
-    draw_or_away = max(0, min(100, d_i + aw_i))
+    home_or_draw = max(0, min(100, hw_i + d_i))  # 1X
+    home_or_away = max(0, min(100, hw_i + aw_i))  # 12
+    draw_or_away = max(0, min(100, d_i + aw_i))  # X2
 
     # Totals (Poisson total)
     lam_t = max(0.0, float(lam_home)) + max(0.0, float(lam_away))
@@ -248,9 +248,20 @@ def _derive_section_probs(
         "home_win": hw_i,
         "draw": d_i,
         "away_win": aw_i,
+
+        # ✅ 기존 키(유지)
         "home_or_draw": home_or_draw,
         "home_or_away": home_or_away,
         "draw_or_away": draw_or_away,
+
+        # ✅ 더블찬스 호환(alias) 키들 (앱이 뭘 읽든 잡히게)
+        "home_or_draw_1x": home_or_draw,
+        "home_or_away_12": home_or_away,
+        "draw_or_away_x2": draw_or_away,
+        "dc_1x": home_or_draw,
+        "dc_12": home_or_away,
+        "dc_x2": draw_or_away,
+
         "over_0_5": over_0_5,
         "over_1_5": over_1_5,
         "over_2_5": over_2_5,
@@ -263,6 +274,7 @@ def _derive_section_probs(
         "home_clean_sheet": home_clean_sheet,
         "away_clean_sheet": away_clean_sheet,
     }
+
 
 
 def _top_scorelines(lh: float, la: float, gmax: int = 10) -> Tuple[str, List[str]]:
@@ -453,6 +465,12 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
         "ft_home_or_draw": ft["home_or_draw"],
         "ft_home_or_away": ft["home_or_away"],
         "ft_draw_or_away": ft["draw_or_away"],
+
+        # ✅ 더블찬스 호환(짧은 키)
+        "ft_1x": ft["home_or_draw"],
+        "ft_12": ft["home_or_away"],
+        "ft_x2": ft["draw_or_away"],
+
         "ft_total_over_0_5": ft["over_0_5"],
         "ft_total_over_1_5": ft["over_1_5"],
         "ft_total_over_2_5": ft["over_2_5"],
@@ -472,6 +490,12 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
         "1h_home_or_draw": h1["home_or_draw"],
         "1h_home_or_away": h1["home_or_away"],
         "1h_draw_or_away": h1["draw_or_away"],
+
+        # ✅ 더블찬스 호환(짧은 키)
+        "1h_1x": h1["home_or_draw"],
+        "1h_12": h1["home_or_away"],
+        "1h_x2": h1["draw_or_away"],
+
         "1h_total_over_0_5": h1["over_0_5"],
         "1h_total_over_1_5": h1["over_1_5"],
         "1h_home_over_0_5": h1["home_over_0_5"],
@@ -491,6 +515,12 @@ def compute_ai_predictions_from_overall(insights_overall: Dict[str, Any]) -> Dic
         "2h_home_or_draw": h2["home_or_draw"],
         "2h_home_or_away": h2["home_or_away"],
         "2h_draw_or_away": h2["draw_or_away"],
+
+        # ✅ 더블찬스 호환(짧은 키)
+        "2h_1x": h2["home_or_draw"],
+        "2h_12": h2["home_or_away"],
+        "2h_x2": h2["draw_or_away"],
+
         "2h_total_over_0_5": h2["over_0_5"],
         "2h_total_over_1_5": h2["over_1_5"],
         "2h_home_over_0_5": h2["home_over_0_5"],
