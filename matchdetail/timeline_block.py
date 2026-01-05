@@ -289,7 +289,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     status_u = str(header.get("status") or "").upper()
     elapsed = int(header.get("elapsed") or 0)
-    has_et = (status_u in ("AET", "PEN")) or (elapsed >= 105)
+    has_et = (status_u in ("AET", "PEN", "ET")) or (elapsed >= 105)
 
 
     for idx, r in enumerate(rows):
@@ -414,20 +414,36 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         "PEN_MISSED": -1,  # 실축이 항상 골보다 먼저
     }
 
+    def _sort_time_key(e: Dict[str, Any]) -> tuple[int, int]:
+        """
+        minute_label 기준으로 시간 정렬되게 보정.
+        - H1: 45’+x 는 (45, x)
+        - H2: 90’+x 는 (90, x)
+        - 그 외: (minute, extra)
+        """
+        m = int(e.get("minute") or 0)
+        x = int(e.get("minute_extra") or 0)
+        p = e.get("period")
+
+        if p == "H1" and x > 0:
+            return 45, x
+        if p == "H2" and x > 0:
+            return 90, x
+        return m, x
+
     events.sort(
         key=lambda e: (
             # 1) 전/후반/연장/승부차기 순서
             order_map.get(e["period"], 9),
-            # 2) 분
-            e["minute"],
-            # 3) 추가시간
-            e.get("minute_extra") or 0,
-            # 4) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
+            # 2) 시간 정렬(표시 기준)
+            *_sort_time_key(e),
+            # 3) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
             type_order.get(e["type"], 0),
-            # 5) 마지막으로 id_stable 로 안정 정렬
+            # 4) 마지막으로 id_stable 로 안정 정렬
             e["id_stable"],
         )
     )
+
 
     return events
 
