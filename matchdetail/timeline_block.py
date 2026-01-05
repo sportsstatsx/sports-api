@@ -311,8 +311,6 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             side = "unknown"
 
-        period = _map_period(minute, has_et)
-
 
         period = _map_period(minute, has_et)
         label, minute_extra = _build_minute_label(
