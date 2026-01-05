@@ -173,29 +173,51 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     return "OTHER"
 
 
-def _map_period(minute: int) -> str:
+def _map_period(minute: int, has_et: bool) -> str:
     if minute <= 45:
         return "H1"
     if minute <= 90:
         return "H2"
-    if minute <= 120:
-        return "ET"
-    return "PEN"
+
+    # ✅ 연장이 "있는 경기"일 때만 91~120을 ET로 본다
+    if has_et:
+        if minute <= 120:
+            return "ET"
+        return "PEN"
+
+    # ✅ 연장이 "없는 경기"(리그 등): 90분 이후는 전부 후반 추가시간으로 취급
+    return "H2"
+
 
 
 def _build_minute_label(minute: int, extra_raw: Any, period: str) -> tuple[str, int | None]:
     """
-    Kotlin buildMinuteLabelAndExtra 와 동일한 규칙으로 minute_label / extra 계산
+    minute_label / extra 계산
+    - H1: 45’+x
+    - H2: 90’+x
+    - ET/PEN: minute’ 그대로 (기본)
+    - DB에 비정상 extra(예: 1062)가 존재할 수 있어 표기용 cap 적용
     """
-    extra = None
+    extra: int | None = None
     if isinstance(extra_raw, int):
         extra = extra_raw
 
+    # ✅ 1) raw extra 방어 (비정상 값 제거)
+    #    - 필요하면 cap 값은 조정 가능
+    RAW_EXTRA_CAP = 30
+    if extra is not None and extra > RAW_EXTRA_CAP:
+        extra = None
+
+    # ✅ 2) extra가 없으면 H1/H2에서만 추론
     if extra is None:
         if period == "H1":
-            extra = max(0, minute - 45) or None
+            inferred = max(0, minute - 45)
+            # H1 추가시간도 과하게 큰 값은 방어
+            extra = inferred if 0 < inferred <= 15 else None
         elif period == "H2":
-            extra = max(0, minute - 90) or None
+            inferred = max(0, minute - 90)
+            # 리그 추가시간은 보통 크지 않으니 방어 (원하면 20~25로)
+            extra = inferred if 0 < inferred <= 20 else None
 
     base = minute
     if period == "H1" and minute > 45:
@@ -209,6 +231,7 @@ def _build_minute_label(minute: int, extra_raw: Any, period: str) -> tuple[str, 
         label = f"{max(0, minute)}\u2019"
 
     return label, extra
+
 
 
 # ─────────────────────────────────────
@@ -277,12 +300,23 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             side = "unknown"
 
-        period = _map_period(minute)
+        # ✅ 연장 여부 판단: header.status 기반(1차) + 이벤트 minute 기반(2차)
+        status_u = str(header.get("status") or "").upper()
+        has_et = status_u in ("AET", "PEN", "ET")
+
+        if not has_et:
+            # 보조 힌트: 105 이상 이벤트가 존재하면 연장 가능성↑ (컵 등)
+            # (너무 공격적이면 minute>=105 조건을 빼고 status만 쓰면 됨)
+            if minute >= 105:
+                has_et = True
+
+        period = _map_period(minute, has_et)
         label, minute_extra = _build_minute_label(
             minute,
             r.get("extra") if "extra" in r else r.get("time_extra"),
             period,
         )
+
 
         player_id = r.get("player_id")
         assist_id = r.get("assist_player_id")
