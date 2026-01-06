@@ -73,8 +73,16 @@ def _build_team_form(
 
     # ✅ 이 팀이 참가한 "종료된 경기"들 중에서
     #    가장 최근 경기들을 기준으로 폼 계산
-    rows = fetch_all(
-        """
+    #
+    # ⚠️ 현재 보고 있는 경기(=header.fixture_id)는 폼에 포함되면 안 됨(데이터 누수).
+    #     또한 kickoff_utc(=현재 경기 date_utc) 이전 경기만 보도록 컷오프를 건다.
+    ref_date_utc = header.get("kickoff_utc") or header.get("date_utc") or header.get("utc_date")
+    this_fixture_id = _safe_int(header.get("fixture_id") or header.get("id"))
+
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc else ""
+    exclude_sql = " AND m.fixture_id <> %s" if this_fixture_id > 0 else ""
+
+    sql = f"""
         SELECT
             m.date_utc,
             m.home_id,
@@ -87,11 +95,21 @@ def _build_team_form(
           AND m.status_group = 'FINISHED'
           AND m.home_ft IS NOT NULL
           AND m.away_ft IS NOT NULL
+          {exclude_sql}
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
         LIMIT %s
-        """,
-        (team_id, team_id, limit * 2),
-    )
+    """
+
+    params = [team_id, team_id]
+    if this_fixture_id > 0:
+        params.append(this_fixture_id)
+    if ref_date_utc:
+        params.append(ref_date_utc)
+    params.append(limit * 2)
+
+    rows = fetch_all(sql, tuple(params))
+
 
     last_results: List[str] = []
     goals_for = 0
