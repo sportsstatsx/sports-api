@@ -2035,6 +2035,18 @@ def enrich_overall_game_state(
     # ─────────────────────────────
     # insights 키로 저장 (pct_hoa)
     # ─────────────────────────────
+
+    # ✅ NEW: 하위 섹션 타이틀에 표기할 "경우 수(분모)" 저장 (cnt_hoa)
+    insights["ft_first_score_sample"] = {"total": int(fs_den_t), "home": int(fs_den_h), "away": int(fs_den_a)}
+    insights["ft_first_concede_sample"] = {"total": int(fc_den_t), "home": int(fc_den_h), "away": int(fc_den_a)}
+
+    insights["ht_lead_sample"] = {"total": int(ht_lead_den_t), "home": int(ht_lead_den_h), "away": int(ht_lead_den_a)}
+    insights["ht_draw_sample"] = {"total": int(ht_draw_den_t), "home": int(ht_draw_den_h), "away": int(ht_draw_den_a)}
+    insights["ht_trail_sample"] = {"total": int(ht_trail_den_t), "home": int(ht_trail_den_h), "away": int(ht_trail_den_a)}
+    insights["ht_00_sample"] = {"total": int(ht_00_den_t), "home": int(ht_00_den_h), "away": int(ht_00_den_a)}
+
+    insights["clutch80_draw_sample"] = {"total": int(c80_draw_den_t), "home": int(c80_draw_den_h), "away": int(c80_draw_den_a)}
+
     insights["ft_first_score_to_win_pct"] = {"total": fmt_pct(fs_w_t, fs_den_t), "home": fmt_pct(fs_w_h, fs_den_h), "away": fmt_pct(fs_w_a, fs_den_a)}
     insights["ft_first_score_to_draw_pct"] = {"total": fmt_pct(fs_d_t, fs_den_t), "home": fmt_pct(fs_d_h, fs_den_h), "away": fmt_pct(fs_d_a, fs_den_a)}
     insights["ft_first_score_to_loss_pct"] = {"total": fmt_pct(fs_l_t, fs_den_t), "home": fmt_pct(fs_l_h, fs_den_h), "away": fmt_pct(fs_l_a, fs_den_a)}
@@ -2068,6 +2080,7 @@ def enrich_overall_game_state(
     insights["clutch80_total_goals_over05_pct"] = {"total": fmt_pct(total80_over05_t, eff_tot), "home": fmt_pct(total80_over05_h, eff_home), "away": fmt_pct(total80_over05_a, eff_away)}
 
     insights["clutch85_total_goals_over05_pct"] = {"total": fmt_pct(total85_over05_t, eff_tot), "home": fmt_pct(total85_over05_h, eff_home), "away": fmt_pct(total85_over05_a, eff_away)}
+
 
 
 
@@ -3215,37 +3228,48 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
             "collapsible": True,  # ✅ 큰 섹션만 접힘(앱에서 이 값으로 제어)
             # ✅ NEW: rows = subheader/metric 혼합 리스트 (앱은 rows 우선 렌더)
             "rows": [
-                {"type": "subheader", "title": "First Score"},
+                {"type": "subheader", "title": "First Score", "count_key": "ft_first_score_sample"},
                 {"type": "metric", "key": "ft_first_score_to_win_pct", "label": "FT First Score → W", "format": "pct_hoa"},
                 {"type": "metric", "key": "ft_first_score_to_draw_pct", "label": "FT First Score → D", "format": "pct_hoa"},
                 {"type": "metric", "key": "ft_first_score_to_loss_pct", "label": "FT First Score → L", "format": "pct_hoa"},
+
+                {"type": "subheader", "title": "First Concede", "count_key": "ft_first_concede_sample"},
                 {"type": "metric", "key": "ft_first_concede_to_win_pct", "label": "FT First Concede → W", "format": "pct_hoa"},
                 {"type": "metric", "key": "ft_first_concede_to_draw_pct", "label": "FT First Concede → D", "format": "pct_hoa"},
                 {"type": "metric", "key": "ft_first_concede_to_loss_pct", "label": "FT First Concede → L", "format": "pct_hoa"},
 
-                {"type": "subheader", "title": "HT State"},
-                {"type": "metric", "key": "ht_lead_to_win_pct", "label": "HT Lead → W", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_lead_to_draw_pct", "label": "HT Lead → D", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_lead_to_loss_pct", "label": "HT Lead → L", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_draw_to_win_pct", "label": "HT Draw → W", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_draw_to_draw_pct", "label": "HT Draw → D", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_draw_to_loss_pct", "label": "HT Draw → L", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_trail_to_win_pct", "label": "HT Trail → W", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_trail_to_draw_pct", "label": "HT Trail → D", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_trail_to_loss_pct", "label": "HT Trail → L", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_00_to_win_pct", "label": "HT 0-0 → W", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_00_to_draw_pct", "label": "HT 0-0 → D", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_00_to_loss_pct", "label": "HT 0-0 → L", "format": "pct_hoa"},
+                {"type": "subheader", "title": "HT Lead", "count_key": "ht_lead_sample"},
+                {"type": "metric", "key": "ht_lead_to_win_pct", "label": "FT HT Lead → W", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_lead_to_draw_pct", "label": "FT HT Lead → D", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_lead_to_loss_pct", "label": "FT HT Lead → L", "format": "pct_hoa"},
 
-                {"type": "subheader", "title": "Clutch"},
+                {"type": "subheader", "title": "HT Draw", "count_key": "ht_draw_sample"},
+                {"type": "metric", "key": "ht_draw_to_win_pct", "label": "FT HT Draw → W", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_draw_to_draw_pct", "label": "FT HT Draw → D", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_draw_to_loss_pct", "label": "FT HT Draw → L", "format": "pct_hoa"},
+
+                {"type": "subheader", "title": "HT Trail", "count_key": "ht_trail_sample"},
+                {"type": "metric", "key": "ht_trail_to_win_pct", "label": "FT HT Trail → W", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_trail_to_draw_pct", "label": "FT HT Trail → D", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_trail_to_loss_pct", "label": "FT HT Trail → L", "format": "pct_hoa"},
+
+                {"type": "subheader", "title": "HT 0-0", "count_key": "ht_00_sample"},
+                {"type": "metric", "key": "ht_00_to_win_pct", "label": "FT HT 0-0 → W", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_00_to_draw_pct", "label": "FT HT 0-0 → D", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_00_to_loss_pct", "label": "FT HT 0-0 → L", "format": "pct_hoa"},
+
+                {"type": "subheader", "title": "Draw & 80'+", "count_key": "clutch80_draw_sample"},
                 {"type": "metric", "key": "clutch80_draw_to_win_pct", "label": "Draw & 80'+ → W", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_draw_to_draw_pct", "label": "Draw & 80'+ → D", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_draw_to_loss_pct", "label": "Draw & 80'+ → L", "format": "pct_hoa"},
+
+                {"type": "subheader", "title": "Score 80'+"},
                 {"type": "metric", "key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch85_total_goals_over05_pct", "label": "Total Goals 85'+ 0.5+", "format": "pct_hoa"},
             ],
+
 
             # ✅ BACKWARD: 기존 앱이 metrics만 읽어도 대괄호 없이 깔끔하게 보이도록 유지
             "metrics": [
