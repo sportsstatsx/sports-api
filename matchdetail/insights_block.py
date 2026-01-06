@@ -193,7 +193,9 @@ def enrich_overall_outcome_totals(
     team_id: int,
     matches_total_api: int = 0,
     last_n: int = 0,
+    ref_date_utc: Any = None,   # ✅ NEW
 ) -> None:
+
     """
     FT Results(기존 Outcome + Totals) 섹션 생성.
 
@@ -227,6 +229,8 @@ def enrich_overall_outcome_totals(
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
 
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
+
     base_sql = f"""
         SELECT
             m.fixture_id,
@@ -243,14 +247,19 @@ def enrich_overall_outcome_totals(
           AND lower(m.status_group) = 'finished'
           AND m.home_ft IS NOT NULL
           AND m.away_ft IS NOT NULL
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
     """
+
 
     params: List[Any] = []
     params.extend(league_ids_for_query)
     params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
 
     rows = fetch_all(base_sql, tuple(params))
+
     if not rows:
         return
 
@@ -938,6 +947,7 @@ def enrich_overall_1h_performance(
     league_id: int,
     season_int: int,
     last_n: Optional[int] = None,
+    ref_date_utc: Any = None,   # ✅ NEW
 ) -> None:
     """1H Performance 섹션(HT 스코어/전반 이벤트 기반)"""
     insights = stats.setdefault("insights_overall", {})
@@ -947,6 +957,8 @@ def enrich_overall_1h_performance(
     if not league_ids_for_query:
         league_ids_for_query = [league_id]
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
 
     base_sql = f"""
         SELECT
@@ -968,12 +980,16 @@ def enrich_overall_1h_performance(
           AND m.away_ft IS NOT NULL
           AND m.home_ht IS NOT NULL
           AND m.away_ht IS NOT NULL
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
     """
+
 
     params: List[Any] = []
     params.extend(league_ids_for_query)
     params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
 
     rows = fetch_all(base_sql, tuple(params)) or []
 
@@ -1221,6 +1237,7 @@ def enrich_overall_2h_performance(
     league_id: int,
     season_int: int,
     last_n: Optional[int] = None,
+    ref_date_utc: Any = None,   # ✅ NEW
 ) -> None:
     """2H Performance 섹션(후반 득점 = FT - HT)"""
     insights = stats.setdefault("insights_overall", {})
@@ -1229,6 +1246,8 @@ def enrich_overall_2h_performance(
     if not league_ids_for_query:
         league_ids_for_query = [league_id]
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
 
     base_sql = f"""
         SELECT
@@ -1250,12 +1269,16 @@ def enrich_overall_2h_performance(
           AND m.away_ft IS NOT NULL
           AND m.home_ht IS NOT NULL
           AND m.away_ht IS NOT NULL
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
     """
+
 
     params: List[Any] = []
     params.extend(league_ids_for_query)
     params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
 
     rows = fetch_all(base_sql, tuple(params)) or []
 
@@ -1507,7 +1530,9 @@ def enrich_overall_game_state(
     season_int: Optional[int],
     team_id: int,
     last_n: Optional[int] = None,
+    ref_date_utc: Any = None,   # ✅ NEW
 ) -> None:
+
     """
     Game State 섹션:
       - First Score Impact (FT)
@@ -1521,6 +1546,8 @@ def enrich_overall_game_state(
     if not league_ids_for_query:
         league_ids_for_query = [league_id]
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
+
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
 
     base_sql = f"""
         SELECT
@@ -1542,12 +1569,16 @@ def enrich_overall_game_state(
           AND m.away_ft IS NOT NULL
           AND m.home_ht IS NOT NULL
           AND m.away_ht IS NOT NULL
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
     """
 
     params: List[Any] = []
     params.extend(league_ids_for_query)
     params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
+
 
     rows = fetch_all(base_sql, tuple(params)) or []
     if not rows:
@@ -1645,19 +1676,35 @@ def enrich_overall_game_state(
             return "D"
         return "L"
 
-    def _score_at_minute(goals: List[Dict[str, Any]], home_id: int, away_id: int, cut_min: int) -> tuple[int, int]:
+    def _score_at_minute(
+        goals: List[Dict[str, Any]],
+        home_id: int,
+        away_id: int,
+        cut_min: int
+    ) -> tuple[int, int]:
         """
-        cut_min 기준(<= cut_min)까지의 누적 스코어(홈,원정)
+        cut_min 기준까지의 누적 스코어(홈,원정).
+
+        ✅ minute만 보지 않고 (minute, extra)까지 포함해서
+           (cut_min, 0) 이하만 포함한다.
         """
         hs = 0
         a_s = 0
+
         for g in goals:
             try:
                 m = int(g.get("minute") or 0)
             except Exception:
                 continue
-            if m > cut_min:
+            try:
+                x = int(g.get("extra") or 0)
+            except Exception:
+                x = 0
+
+            # (cut_min, 0) 이하만 포함
+            if (m, x) > (cut_min, 0):
                 continue
+
             tid = g.get("team_id")
             if tid is None:
                 continue
@@ -1665,24 +1712,38 @@ def enrich_overall_game_state(
                 tid = int(tid)
             except Exception:
                 continue
+
             if tid == home_id:
                 hs += 1
             elif tid == away_id:
                 a_s += 1
+
         return hs, a_s
 
-    def _any_goal_in_window(goals: List[Dict[str, Any]], *, team: Optional[int], gt_min: int) -> bool:
+    def _any_goal_in_window(
+        goals: List[Dict[str, Any]],
+        *,
+        team: Optional[int],
+        gt_min: int
+    ) -> bool:
         """
-        minute > gt_min 인 구간에 goal 존재?
-        team=None이면 어떤 팀이든 상관없이 하나라도
+        ✅ (minute, extra) > (gt_min, 0) 인 구간에 goal 존재?
+        - team=None이면 어떤 팀이든 하나라도 있으면 True
+        - team이 있으면 해당 팀 골만 체크
         """
         for g in goals:
             try:
                 m = int(g.get("minute") or 0)
             except Exception:
                 continue
-            if m <= gt_min:
+            try:
+                x = int(g.get("extra") or 0)
+            except Exception:
+                x = 0
+
+            if (m, x) <= (gt_min, 0):
                 continue
+
             tid = g.get("team_id")
             if tid is None:
                 continue
@@ -1690,11 +1751,14 @@ def enrich_overall_game_state(
                 tid = int(tid)
             except Exception:
                 continue
+
             if team is None:
                 return True
             if tid == team:
                 return True
+
         return False
+
 
     # ─────────────────────────────
     # 경기별 집계
@@ -2015,7 +2079,9 @@ def enrich_overall_goals_by_time(
     season_int: Optional[int],
     team_id: int,
     last_n: Optional[int] = None,  # Last N (없으면 시즌 전체)
+    ref_date_utc: Any = None,      # ✅ NEW
 ) -> None:
+
     """
     Goals by Time 섹션.
     """
@@ -2047,6 +2113,8 @@ def enrich_overall_goals_by_time(
     # ─────────────────────────────────────
     placeholders = ",".join(["%s"] * len(league_ids_for_query))
 
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
+
     matches_sql = f"""
         SELECT
             m.fixture_id,
@@ -2057,13 +2125,20 @@ def enrich_overall_goals_by_time(
         WHERE m.league_id IN ({placeholders})
           AND m.season = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          AND lower(m.status_group) IN ('finished','ft','fulltime')
+          AND lower(m.status_group) = 'finished'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
+          {cutoff_sql}
         ORDER BY m.date_utc DESC
     """
+
 
     params: List[Any] = []
     params.extend(league_ids_for_query)
     params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
+
 
     rows = fetch_all(matches_sql, tuple(params))
     if not rows:
@@ -2198,7 +2273,8 @@ def enrich_overall_goals_by_time(
 # ─────────────────────────────────────
 #  League 평균 홈/원정 득점(μ_home/μ_away)  ✅ AI Predictions용
 # ─────────────────────────────────────
-def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str, float]:
+def _compute_league_mu_home_away(*, league_id: int, season_int: int, ref_date_utc: Any = None) -> Dict[str, float]:
+
     """
     정책 고정:
       - '리그(해당 시즌) 경기만' 기준 μ_home/μ_away 를 만든다.
@@ -2211,8 +2287,13 @@ def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str
     except Exception:
         return {"mu_home": 1.0, "mu_away": 1.0}
 
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
+    params: List[Any] = [lid, season]
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
+
     rows = fetch_all(
-        """
+        f"""
         SELECT
             AVG(m.home_ft) AS mu_home,
             AVG(m.away_ft) AS mu_away
@@ -2222,9 +2303,11 @@ def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str
           AND lower(m.status_group) = 'finished'
           AND m.home_ft IS NOT NULL
           AND m.away_ft IS NOT NULL
+          {cutoff_sql}
         """,
-        (lid, season),
+        tuple(params),
     )
+
 
     if not rows:
         return {"mu_home": 1.0, "mu_away": 1.0}
@@ -2247,7 +2330,8 @@ def _compute_league_mu_home_away(*, league_id: int, season_int: int) -> Dict[str
 
     return {"mu_home": mu_home, "mu_away": mu_away}
 
-def _compute_league_goals_by_time10_total(*, league_id: int, season_int: int) -> List[int]:
+def _compute_league_goals_by_time10_total(*, league_id: int, season_int: int, ref_date_utc: Any = None) -> List[int]:
+
     """
     리그(league_id, season) 전체 기준: 정규시간(0~90) 득점 이벤트를 10버킷으로 집계한 분포(총합).
     버킷:
@@ -2269,8 +2353,13 @@ def _compute_league_goals_by_time10_total(*, league_id: int, season_int: int) ->
         return [0] * 10
 
     # matches + match_events 조인으로 리그/시즌/finished 경기의 goal 이벤트만 집계
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
+    params: List[Any] = [lid, season]
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
+
     rows = fetch_all(
-        """
+        f"""
         SELECT
             SUM(CASE WHEN e.minute BETWEEN 0  AND 9  THEN 1 ELSE 0 END) AS b0,
             SUM(CASE WHEN e.minute BETWEEN 10 AND 19 THEN 1 ELSE 0 END) AS b1,
@@ -2290,9 +2379,11 @@ def _compute_league_goals_by_time10_total(*, league_id: int, season_int: int) ->
           AND lower(e.type) = 'goal'
           AND e.minute IS NOT NULL
           AND e.minute <= 90
+          {cutoff_sql}
         """,
-        (lid, season),
+        tuple(params),
     ) or []
+
 
     if not rows:
         return [0] * 10
@@ -2351,6 +2442,78 @@ def _get_meta_from_header(header: Dict[str, Any]) -> Dict[str, Optional[int]]:
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
     }
+
+def _extract_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _get_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
+    """
+    header에 fixture_id가 들어오는 경우가 많아서 우선 파싱.
+    (스키마가 다를 수 있으니 여러 키를 방어적으로 확인)
+    """
+    for k in ("fixture_id", "fixtureId", "id", "match_id", "matchId"):
+        v = header.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except Exception:
+            continue
+    return None
+
+
+def _load_match_date_utc_from_db(fixture_id: int) -> Any:
+    """
+    matches.date_utc 를 DB에서 가져온다. (timestamptz 그대로 사용)
+    """
+    try:
+        fx = int(fixture_id)
+    except Exception:
+        return None
+
+    rows = fetch_all(
+        """
+        SELECT m.date_utc
+        FROM matches m
+        WHERE m.fixture_id = %s
+        LIMIT 1
+        """,
+        (fx,),
+    ) or []
+
+    if not rows:
+        return None
+    return (rows[0] or {}).get("date_utc")
+
+
+def _get_ref_date_utc_for_this_match(header: Dict[str, Any]) -> Any:
+    """
+    ✅ 핵심: '현재 보고 있는 매치'의 kickoff(=matches.date_utc)를 ref_date_utc 로 사용.
+    가능하면 DB matches에서 fixture_id로 date_utc를 가져와 정확도를 보장한다.
+    """
+    fixture_id = _get_fixture_id_from_header(header)
+    if fixture_id is not None:
+        dt = _load_match_date_utc_from_db(fixture_id)
+        if dt is not None:
+            return dt
+
+    # DB 조회가 실패하면 header 안의 date 계열을 마지막으로 시도
+    for k in ("date_utc", "dateUTC", "date", "utc_date", "utcDate", "kickoff_utc"):
+        v = header.get(k)
+        if v is None:
+            continue
+        # 문자열/datetime 모두 그대로 파라미터로 넘겨도 psycopg2가 처리 가능(대부분)
+        return v
+
+    return None
+
 
 
 def _get_last_n_from_header(header: Dict[str, Any]) -> int:
@@ -2544,7 +2707,9 @@ def _compute_events_sample_home_away(
     league_id: Optional[int],
     filters: Dict[str, Any],
     events_sample: Optional[int],
+    ref_date_utc: Any = None,   # ✅ NEW
 ) -> Dict[str, Optional[int]]:
+
     """
     stats["insights_filters"]["target_league_ids_last_n"] 기준으로
     해당 팀의 시즌 경기들 중 홈/원정 개수를 세고,
@@ -2576,17 +2741,27 @@ def _compute_events_sample_home_away(
         return out
 
     placeholders = ", ".join(["%s"] * len(target_league_ids))
+    cutoff_sql = " AND date_utc < %s" if ref_date_utc is not None else ""
+
     sql = f"""
         SELECT home_id, away_id
         FROM matches
         WHERE season = %s
           AND league_id IN ({placeholders})
           AND (home_id = %s OR away_id = %s)
+          AND lower(status_group) = 'finished'
+          AND home_ft IS NOT NULL
+          AND away_ft IS NOT NULL
+          {cutoff_sql}
     """
+
+
 
     params: List[Any] = [season_int]
     params.extend(target_league_ids)
     params.extend([team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
 
     rows = fetch_all(sql, tuple(params))
 
@@ -2629,9 +2804,11 @@ def _build_side_insights(
     last_n: int,
     comp_raw: Any,
     header_filters: Dict[str, Any],
+    ref_date_utc: Any = None,   # ✅ NEW
 ):
     stats: Dict[str, Any] = {}
     insights: Dict[str, Any] = {}
+
 
     # Competition + Last N 기준 league_id 집합 생성
     side_filters = _build_insights_filters_for_team(
@@ -2657,7 +2834,9 @@ def _build_side_insights(
         team_id=team_id,
         matches_total_api=0,
         last_n=last_n,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
+
 
 
     # ✅ 추가: 1H / 2H Performance
@@ -2667,6 +2846,7 @@ def _build_side_insights(
         league_id=league_id,
         season_int=season_int,
         last_n=last_n,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
     enrich_overall_2h_performance(
         stats,
@@ -2674,7 +2854,9 @@ def _build_side_insights(
         league_id=league_id,
         season_int=season_int,
         last_n=last_n,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
+
 
     # ✅ 1H/2H 함수가 stats["insights_overall"]에 써둔 값을 insights로 병합
     for k, v in (stats.get("insights_overall") or {}).items():
@@ -2689,7 +2871,9 @@ def _build_side_insights(
         season_int=season_int,
         team_id=team_id,
         last_n=last_n,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
+
 
     # ✅ NEW: Game State (First Score Impact / HT State / Clutch)
     enrich_overall_game_state(
@@ -2699,7 +2883,9 @@ def _build_side_insights(
         season_int=season_int,
         team_id=team_id,
         last_n=last_n,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
+
 
 
 
@@ -2717,7 +2903,9 @@ def _build_side_insights(
             league_id=league_id,
             filters=stats.get("insights_filters", {}),
             events_sample=int(events_sample),
+            ref_date_utc=ref_date_utc,   # ✅ NEW
         )
+
         if "events_sample_home" not in insights and sample_split.get("events_sample_home") is not None:
             insights["events_sample_home"] = sample_split["events_sample_home"]
         if "events_sample_away" not in insights and sample_split.get("events_sample_away") is not None:
@@ -3129,6 +3317,10 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     home_team_id = meta["home_team_id"]
     away_team_id = meta["away_team_id"]
 
+    # ✅ NEW: 현재 보고 있는 매치 kickoff(UTC) = 컷오프 기준
+    ref_date_utc = _get_ref_date_utc_for_this_match(header)
+
+
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
@@ -3166,6 +3358,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         last_n=last_n_for_calc,
         comp_raw=comp_raw,
         header_filters=filters_block,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
     away_ins = _build_side_insights(
         league_id=league_id,
@@ -3174,7 +3367,9 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         last_n=last_n_for_calc,
         comp_raw=comp_raw,
         header_filters=filters_block,
+        ref_date_utc=ref_date_utc,   # ✅ NEW
     )
+
 
     # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
     # 1) 팀별 comp 옵션  → 시즌 기준은 season_for_calc 사용
