@@ -1615,6 +1615,82 @@ def enrich_overall_game_state(
             continue
         goals_by_fixture.setdefault(fx, []).append(g)
 
+    # ✅ NEW: match_events에 goal 이벤트가 비어있거나 team_id가 누락되는 리그/시즌이 있어서
+    #        match_events_raw를 "폴백"으로 사용한다.
+    #        - match_events에 정상 데이터가 있으면 그대로 사용
+    #        - fixture 단위로 goal 리스트가 비어있거나 team_id가 전부 None이면 raw로 채운다.
+
+    def _raw_goals_for_fixture(data_json: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        events = _parse_events_raw_to_list(data_json or "")
+        for ev in events:
+            typ = str(ev.get("type") or ev.get("Type") or "").strip().lower()
+            if typ != "goal":
+                continue
+
+            # team.id
+            team_obj = ev.get("team") if isinstance(ev.get("team"), dict) else {}
+            team_id_raw = team_obj.get("id") if isinstance(team_obj, dict) else None
+            if team_id_raw is None:
+                continue
+            try:
+                tid = int(team_id_raw)
+            except Exception:
+                continue
+
+            # time.elapsed / time.extra
+            time_obj = ev.get("time") if isinstance(ev.get("time"), dict) else {}
+            elapsed = time_obj.get("elapsed") if isinstance(time_obj, dict) else None
+            extra = time_obj.get("extra") if isinstance(time_obj, dict) else None
+            if elapsed is None:
+                elapsed = ev.get("elapsed")
+            if extra is None:
+                extra = ev.get("extra")
+
+            try:
+                m = int(elapsed)
+            except Exception:
+                continue
+            try:
+                x = int(extra) if extra is not None else 0
+            except Exception:
+                x = 0
+
+            # FT 범위: minute<=90 (90+추가시간은 minute=90, extra로 들어오므로 포함)
+            if m > 90:
+                continue
+
+            out.append({"team_id": tid, "minute": m, "extra": x})
+
+        # 시간순 정렬
+        out.sort(key=lambda g: (int(g.get("minute") or 0), int(g.get("extra") or 0)))
+        return out
+
+    # match_events_raw에서 fixture별 goal 로딩
+    raw_sql = f"""
+        SELECT fixture_id, data_json
+        FROM match_events_raw
+        WHERE fixture_id IN ({in_fix})
+    """
+    raw_rows = fetch_all(raw_sql, tuple(fixture_ids)) or []
+    raw_goals_by_fx: Dict[int, List[Dict[str, Any]]] = {}
+    for rr in raw_rows:
+        try:
+            fx = int(rr.get("fixture_id"))
+        except Exception:
+            continue
+        raw_goals_by_fx[fx] = _raw_goals_for_fixture(rr.get("data_json") or "")
+
+    # fixture 단위로 폴백 적용
+    for fx in fixture_ids:
+        cur = goals_by_fixture.get(fx) or []
+        has_valid_team = any(g.get("team_id") is not None for g in cur)
+
+        if (not cur) or (not has_valid_team):
+            if raw_goals_by_fx.get(fx):
+                goals_by_fixture[fx] = raw_goals_by_fx[fx]
+
+
     # ─────────────────────────────
     # 카운터들
     # ─────────────────────────────
