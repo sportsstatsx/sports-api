@@ -3442,13 +3442,16 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     league_avgs = _compute_league_mu_home_away(
         league_id=league_id,
         season_int=season_for_calc,
+        ref_date_utc=ref_date_utc,   # ✅ NEW: 경기 kickoff 이전까지만
     )
 
     # ✅ AI Predictions 엔진용: 리그 득점 분포(10버킷, total)
     league_goals_by_time10_total = _compute_league_goals_by_time10_total(
         league_id=league_id,
         season_int=season_for_calc,
+        ref_date_utc=ref_date_utc,   # ✅ NEW: 경기 kickoff 이전까지만
     )
+)
 
     return {
         "league_id": league_id,
