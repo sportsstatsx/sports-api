@@ -3193,6 +3193,157 @@ def _merge_options(*lists: List[str]) -> List[str]:
             merged.append(v)
     return merged
 
+def _infer_insight_desc(*, label: str, key: str, suffix: str) -> str:
+    """
+    Build an English, meaning-only help sentence for an Insights metric.
+    - No formulas.
+    - Uses label/key patterns to generate a specific explanation.
+    """
+    import re
+
+    l = (label or "").strip()
+    k = (key or "").strip().lower()
+
+    l_low = l.lower()
+
+    # ── Context (period) ─────────────────
+    if l_low.startswith("ft "):
+        period = "Full Time (FT)"
+        rest = l[3:].strip()
+    elif l_low.startswith("1h "):
+        period = "1st Half (1H)"
+        rest = l[3:].strip()
+    elif l_low.startswith("2h "):
+        period = "2nd Half (2H)"
+        rest = l[3:].strip()
+    elif l_low.startswith("ht "):
+        period = "Half-Time (HT)"
+        rest = l[3:].strip()
+    else:
+        period = ""
+        rest = l
+
+    ctx = f"{period}: " if period else ""
+
+    # ── Small helpers ────────────────────
+    def _outcome_phrase(token: str) -> str:
+        t = (token or "").strip().upper()
+        return {"W": "a win", "D": "a draw", "L": "a loss"}.get(t, t.lower())
+
+    def _goals_minute_phrase(min_str: str) -> str:
+        # "80'+", "85'+"
+        m = re.search(r"(\d+)", min_str)
+        if not m:
+            return "late in the match"
+        return f"from {m.group(1)}' to full time"
+
+    # ── Explicit key-based rules (most specific) ───────────────
+    # Conditional outcomes: first score / first concede
+    m = re.match(r"^ft_first_score_to_(win|draw|loss)_pct$", k)
+    if m:
+        return f"{ctx}Given the team scored the first goal, this is the {suffix} that finished as {_outcome_phrase(m.group(1)[0].upper())}."
+
+    m = re.match(r"^ft_first_concede_to_(win|draw|loss)_pct$", k)
+    if m:
+        return f"{ctx}Given the team conceded the first goal, this is the {suffix} that finished as {_outcome_phrase(m.group(1)[0].upper())}."
+
+    # Half-time state → full-time outcome
+    m = re.match(r"^ht_(lead|draw|trail)_to_(win|draw|loss)_pct$", k)
+    if m:
+        state = {"lead": "leading", "draw": "level", "trail": "trailing"}[m.group(1)]
+        return f"{ctx}Given the team was {state} at half-time, this is the {suffix} that finished as {_outcome_phrase(m.group(2)[0].upper())} at full time."
+
+    # Draw & 80'+ → W/D/L
+    m = re.match(r"^clutch80_draw_to_(win|draw|loss)_pct$", k)
+    if m:
+        return f"{ctx}Given the match was level at 80+ minutes, this is the {suffix} that finished as {_outcome_phrase(m.group(1)[0].upper())} at full time."
+
+    # Late goals (team/total)
+    if k in ("clutch80_team_score_pct", "clutch80_team_concede_pct"):
+        when = _goals_minute_phrase("80'+")
+        if k.endswith("_score_pct"):
+            return f"{ctx}This is the {suffix} where the team scored at least one goal {when}."
+        return f"{ctx}This is the {suffix} where the team conceded at least one goal {when}."
+
+    if k in ("clutch80_total_goals_over05_pct", "clutch85_total_goals_over05_pct"):
+        when = _goals_minute_phrase("85'+" if "85" in k else "80'+")
+        return f"{ctx}This is the {suffix} with at least one goal (either team) {when}."
+
+    # Red-card impact
+    if k == "opp_red_to_score_pct":
+        return f"{ctx}This is the {suffix} where the team scored at least once after the opponent received a red card."
+    if k == "own_red_to_concede_pct":
+        return f"{ctx}This is the {suffix} where the team conceded at least once after the team received a red card."
+
+    # Penalties
+    if k == "pen_won_avg":
+        return f"{ctx}This is the {suffix} for penalties awarded to the team."
+    if k == "pen_conv_pct":
+        return f"{ctx}This is the {suffix} for converting awarded penalties into goals."
+
+    # ── Label-based rules (general) ────────────────────────────
+    # W / D / L
+    if rest.upper() in ("W", "D", "L"):
+        return f"{ctx}This is the {suffix} of matches that ended as {_outcome_phrase(rest)}."
+
+    # Clean sheet / BTTS
+    if "clean sheet" in l_low:
+        return f"{ctx}This is the {suffix} where the team conceded 0 goals (a clean sheet)."
+    if "btts" in l_low:
+        return f"{ctx}This is the {suffix} where both teams scored at least one goal."
+
+    # First goal / first concede (note about 0–0)
+    if "first goal" in l_low:
+        return f"{ctx}This is the {suffix} where the team scored the first goal (0–0 matches count as 'no first goal')."
+    if "first concede" in l_low:
+        return f"{ctx}This is the {suffix} where the team conceded the first goal (0–0 matches count as 'no first concede')."
+
+    # Team goals (TG) thresholds
+    if " tg " in f" {l_low} ":
+        thr = re.search(r"(\d+(?:\.\d+)?)\+", l)
+        if thr:
+            # 0.5+ => 1+, 1.5+ => 2+, 2.5+ => 3+
+            n = float(thr.group(1))
+            min_goals = int(n + 0.5)
+            return f"{ctx}This is the {suffix} where the team scored at least {min_goals} goal(s)."
+        return f"{ctx}This is the {suffix} for the team-goals threshold condition."
+
+    # Total goals thresholds
+    if " total " in f" {l_low} ":
+        thr = re.search(r"(\d+(?:\.\d+)?)\+", l)
+        if thr:
+            n = float(thr.group(1))
+            min_goals = int(n + 0.5)
+            return f"{ctx}This is the {suffix} where the match had at least {min_goals} total goal(s)."
+        return f"{ctx}This is the {suffix} for the total-goals threshold condition."
+
+    # Win & combos
+    if "&" in l:
+        # Examples: "FT W & BTTS", "FT W & Total 2.5+"
+        if "w &" in l_low:
+            if "btts" in l_low:
+                return f"{ctx}This is the {suffix} where the team won and both teams scored."
+            if "total" in l_low:
+                thr = re.search(r"(\d+(?:\.\d+)?)\+", l)
+                if thr:
+                    min_goals = int(float(thr.group(1)) + 0.5)
+                    return f"{ctx}This is the {suffix} where the team won and the match had at least {min_goals} total goal(s)."
+                return f"{ctx}This is the {suffix} where the team won and the total-goals condition was met."
+
+    # Averages: corners / cards
+    if "corners" in l_low:
+        return f"{ctx}This is the {suffix} for corners taken by the team."
+    if "yellow card" in l_low:
+        return f"{ctx}This is the {suffix} for yellow cards received by the team."
+    if "red card" in l_low:
+        return f"{ctx}This is the {suffix} for red cards received by the team."
+
+    # Default fallback
+    if suffix:
+        return f"{ctx}This metric describes the '{label}' condition ({suffix})."
+    return f"{ctx}This metric describes the '{label}' condition."
+
+
 def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
     """
     앱이 동적으로 Insights 탭을 렌더링할 수 있게
@@ -3200,7 +3351,7 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
     - 기존 수치 키(win_pct, goals_by_time_for 등)는 그대로 유지
     - 앱은 sections를 보고 어떤 섹션을 어떤 렌더러로 그릴지 결정
     """
-    return [
+    sections = [
         
 {
     "id": "outcome_totals",
@@ -3231,14 +3382,16 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
         {"key": "yellow_avg", "label": "FT Yellow Card (AVG)", "format": "avg_hoa"},
         {"key": "red_avg", "label": "FT Red Card (AVG)", "format": "avg_hoa"},
 
-        {"key": "pen_won_avg", "label": "FT Pen Won (AVG)", "format": "avg_hoa"},
-        {"key": "pen_conv_pct", "label": "FT Pen Conv%", "format": "pct_hoa"},
-
         {"key": "opp_red_to_score_pct", "label": "FT Opp Red Card → Score", "format": "pct_hoa"},
         {"key": "own_red_to_concede_pct", "label": "FT Own Red Card → Concede", "format": "pct_hoa"},
+
+        {"key": "pen_won_avg", "label": "FT Pen Won (AVG)", "format": "avg_hoa"},
+        {"key": "pen_conv_pct", "label": "FT Pen Conv%", "format": "pct_hoa"},
     ]
 },
 
+
+        # ✅ 1H
         {
             "id": "h1_performance",
             "title": "1H Performance",
@@ -3247,9 +3400,6 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"key": "h1_win_pct", "label": "1H W", "format": "pct_hoa"},
                 {"key": "h1_draw_pct", "label": "1H D", "format": "pct_hoa"},
                 {"key": "h1_loss_pct", "label": "1H L", "format": "pct_hoa"},
-                {"key": "h1_clean_sheet_pct", "label": "1H Clean Sheet", "format": "pct_hoa"},
-                {"key": "h1_btts_pct", "label": "1H BTTS", "format": "pct_hoa"},
-                {"key": "h1_win_and_btts_pct", "label": "1H W & BTTS", "format": "pct_hoa"},
 
                 {"key": "h1_team_over05_pct", "label": "1H TG 0.5+", "format": "pct_hoa"},
                 {"key": "h1_team_over15_pct", "label": "1H TG 1.5+", "format": "pct_hoa"},
@@ -3268,6 +3418,8 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
             ]
         },
 
+
+        # ✅ 2H
         {
             "id": "h2_performance",
             "title": "2H Performance",
@@ -3276,9 +3428,6 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"key": "h2_win_pct", "label": "2H W", "format": "pct_hoa"},
                 {"key": "h2_draw_pct", "label": "2H D", "format": "pct_hoa"},
                 {"key": "h2_loss_pct", "label": "2H L", "format": "pct_hoa"},
-                {"key": "h2_clean_sheet_pct", "label": "2H Clean Sheet", "format": "pct_hoa"},
-                {"key": "h2_btts_pct", "label": "2H BTTS", "format": "pct_hoa"},
-                {"key": "h2_win_and_btts_pct", "label": "2H W & BTTS", "format": "pct_hoa"},
 
                 {"key": "h2_team_over05_pct", "label": "2H TG 0.5+", "format": "pct_hoa"},
                 {"key": "h2_team_over15_pct", "label": "2H TG 1.5+", "format": "pct_hoa"},
@@ -3296,6 +3445,8 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"key": "h2_red_avg", "label": "2H Red Card (AVG)", "format": "avg_hoa"},
             ]
         },
+
+
         # ✅ Game state (큰 섹션 1개 + 작은 서브섹션 헤더 rows)
         {
             "id": "game_state",
@@ -3329,53 +3480,18 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
                 {"type": "metric", "key": "ht_trail_to_draw_pct", "label": "FT HT Trail → D", "format": "pct_hoa"},
                 {"type": "metric", "key": "ht_trail_to_loss_pct", "label": "FT HT Trail → L", "format": "pct_hoa"},
 
-                {"type": "subheader", "title": "HT 0-0", "count_key": "ht_00_sample"},
-                {"type": "metric", "key": "ht_00_to_win_pct", "label": "FT HT 0-0 → W", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_00_to_draw_pct", "label": "FT HT 0-0 → D", "format": "pct_hoa"},
-                {"type": "metric", "key": "ht_00_to_loss_pct", "label": "FT HT 0-0 → L", "format": "pct_hoa"},
+                {"type": "subheader", "title": "HT 0–0", "count_key": "ht_00_sample"},
+                {"type": "metric", "key": "ht_00_to_win_pct", "label": "HT 0–0 → W", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_00_to_draw_pct", "label": "HT 0–0 → D", "format": "pct_hoa"},
+                {"type": "metric", "key": "ht_00_to_loss_pct", "label": "HT 0–0 → L", "format": "pct_hoa"},
 
-                {"type": "subheader", "title": "Draw & 80'+", "count_key": "clutch80_draw_sample"},
+                {"type": "subheader", "title": "Clutch (80'+)", "count_key": "clutch80_sample"},
+                {"type": "metric", "key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
+                {"type": "metric", "key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
+                {"type": "metric", "key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_draw_to_win_pct", "label": "Draw & 80'+ → W", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_draw_to_draw_pct", "label": "Draw & 80'+ → D", "format": "pct_hoa"},
                 {"type": "metric", "key": "clutch80_draw_to_loss_pct", "label": "Draw & 80'+ → L", "format": "pct_hoa"},
-
-                {"type": "subheader", "title": "Score 80'+"},
-                {"type": "metric", "key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
-                {"type": "metric", "key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
-                {"type": "metric", "key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
-                {"type": "metric", "key": "clutch85_total_goals_over05_pct", "label": "Total Goals 85'+ 0.5+", "format": "pct_hoa"},
-            ],
-
-
-            # ✅ BACKWARD: 기존 앱이 metrics만 읽어도 대괄호 없이 깔끔하게 보이도록 유지
-            "metrics": [
-                {"key": "ft_first_score_to_win_pct", "label": "FT First Score → W", "format": "pct_hoa"},
-                {"key": "ft_first_score_to_draw_pct", "label": "FT First Score → D", "format": "pct_hoa"},
-                {"key": "ft_first_score_to_loss_pct", "label": "FT First Score → L", "format": "pct_hoa"},
-                {"key": "ft_first_concede_to_win_pct", "label": "FT First Concede → W", "format": "pct_hoa"},
-                {"key": "ft_first_concede_to_draw_pct", "label": "FT First Concede → D", "format": "pct_hoa"},
-                {"key": "ft_first_concede_to_loss_pct", "label": "FT First Concede → L", "format": "pct_hoa"},
-
-                {"key": "ht_lead_to_win_pct", "label": "HT Lead → W", "format": "pct_hoa"},
-                {"key": "ht_lead_to_draw_pct", "label": "HT Lead → D", "format": "pct_hoa"},
-                {"key": "ht_lead_to_loss_pct", "label": "HT Lead → L", "format": "pct_hoa"},
-                {"key": "ht_draw_to_win_pct", "label": "HT Draw → W", "format": "pct_hoa"},
-                {"key": "ht_draw_to_draw_pct", "label": "HT Draw → D", "format": "pct_hoa"},
-                {"key": "ht_draw_to_loss_pct", "label": "HT Draw → L", "format": "pct_hoa"},
-                {"key": "ht_trail_to_win_pct", "label": "HT Trail → W", "format": "pct_hoa"},
-                {"key": "ht_trail_to_draw_pct", "label": "HT Trail → D", "format": "pct_hoa"},
-                {"key": "ht_trail_to_loss_pct", "label": "HT Trail → L", "format": "pct_hoa"},
-                {"key": "ht_00_to_win_pct", "label": "HT 0-0 → W", "format": "pct_hoa"},
-                {"key": "ht_00_to_draw_pct", "label": "HT 0-0 → D", "format": "pct_hoa"},
-                {"key": "ht_00_to_loss_pct", "label": "HT 0-0 → L", "format": "pct_hoa"},
-
-                {"key": "clutch80_draw_to_win_pct", "label": "Draw & 80'+ → W", "format": "pct_hoa"},
-                {"key": "clutch80_draw_to_draw_pct", "label": "Draw & 80'+ → D", "format": "pct_hoa"},
-                {"key": "clutch80_draw_to_loss_pct", "label": "Draw & 80'+ → L", "format": "pct_hoa"},
-                {"key": "clutch80_team_score_pct", "label": "Team Score 80'+", "format": "pct_hoa"},
-                {"key": "clutch80_team_concede_pct", "label": "Team Concede 80'+", "format": "pct_hoa"},
-                {"key": "clutch80_total_goals_over05_pct", "label": "Total Goals 80'+ 0.5+", "format": "pct_hoa"},
-                {"key": "clutch85_total_goals_over05_pct", "label": "Total Goals 85'+ 0.5+", "format": "pct_hoa"},
             ],
         },
 
@@ -3399,6 +3515,69 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
         },
 
     ]
+
+    # ─────────────────────────────────────
+    #  Auto-generate help texts (info_lines) for each section
+    #  - English only
+    #  - Meaning only (no formulas)
+    # ─────────────────────────────────────
+
+    def _suffix_for(fmt: str) -> str:
+        if (fmt or "").lower() == "avg_hoa":
+            return "average per match (Total / Home / Away)"
+        return "rate (Total / Home / Away)"
+
+    def _iter_metric_items(sec: Dict[str, Any]) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for m in (sec.get("metrics") or []):
+            if isinstance(m, dict) and m.get("key") and m.get("label"):
+                items.append(m)
+        for r in (sec.get("rows") or []):
+            if not isinstance(r, dict):
+                continue
+            if (r.get("type") or "").lower() != "metric":
+                continue
+            if r.get("key") and r.get("label"):
+                items.append(r)
+        return items
+
+    def _dedup_keep_order(lines: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for s in lines:
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    for sec in sections:
+        renderer = (sec.get("renderer") or "").lower()
+        info_lines: List[str] = []
+
+        if renderer == "goals_by_time":
+            info_lines = [
+                "Shows how goals are distributed across match minutes.",
+                "For each time interval: 'For' = goals scored by the team, 'Against' = goals conceded by the team.",
+            ]
+        else:
+            for item in _iter_metric_items(sec):
+                label = str(item.get("label") or "").strip()
+                key = str(item.get("key") or "").strip()
+                fmt = str(item.get("format") or "").strip()
+                suffix = _suffix_for(fmt)
+
+                if label and key:
+                    desc = _infer_insight_desc(label=label, key=key, suffix=suffix)
+                    info_lines.append(f"{label} — {desc}")
+
+        sec["info_lines"] = _dedup_keep_order(info_lines)
+
+    return sections
+
+
 
 
 
