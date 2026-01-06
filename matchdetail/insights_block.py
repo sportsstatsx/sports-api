@@ -3451,7 +3451,7 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         season_int=season_for_calc,
         ref_date_utc=ref_date_utc,   # ✅ NEW: 경기 kickoff 이전까지만
     )
-)
+
 
     return {
         "league_id": league_id,
