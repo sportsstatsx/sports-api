@@ -977,14 +977,30 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                         continue
 
 
-                    # 메시지 구성 (VAR는 "실제 스코어"를 보여줘야 함)
-                    # current는 단조 상태라서 골 무효로 인한 스코어 감소가 반영되지 않을 수 있음
-                    title, body = build_message("goal_disallowed", current_raw, extra_payload, labels)
+                    # 메시지 구성 (VAR는 "최신 실제 스코어"를 보여줘야 함)
+                    # - VAR 이벤트가 먼저 들어오고, 스코어 정정(home_ft/away_ft)이 다음 폴링/약간 뒤에 반영되는 케이스가 있음
+                    # - 그래서 알림 직전에 matches 스코어를 짧게 재조회/재시도해서 최신값으로 본문을 만든다.
+                    latest_raw = current_raw
+                    try:
+                        for _ in range(3):
+                            rr = load_current_match_state(match_id)
+                            if rr:
+                                # 스코어가 바뀌었거나(정정), 상태가 바뀌었으면 최신값 채택
+                                if (rr.home_goals != latest_raw.home_goals) or (rr.away_goals != latest_raw.away_goals) or (rr.status != latest_raw.status):
+                                    latest_raw = rr
+                                    break
+                                latest_raw = rr
+                            time.sleep(0.3)
+                    except Exception:
+                        log.exception("Failed to refresh latest score for goal_disallowed match %s", match_id)
+
+                    title, body = build_message("goal_disallowed", latest_raw, extra_payload, labels)
                     data: Dict[str, Any] = {
                         "match_id": match_id,
                         "event_type": "goal_disallowed",
                     }
                     data.update(extra_payload)
+
 
                     batch_size = 500
                     send_ok = True
