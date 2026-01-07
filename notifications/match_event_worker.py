@@ -319,17 +319,9 @@ def load_new_goal_disallowed_events(match_id: int, last_event_id: int) -> List[D
 def apply_monotonic_state(
     last: MatchState | None,
     current: MatchState,
+    *,
+    allow_goal_decrease: bool = False,
 ) -> MatchState:
-    """
-    match_notification_state 를 기준으로
-    - status 는 STATUS_ORDER 를 기준으로 뒤로 가지 않게
-    - 골 / 레드카드는 절대 감소하지 않게
-    만든 "유효 상태"를 만들어낸다.
-
-    이렇게 만들어진 상태를 기준으로 diff 를 계산하고,
-    같은 값을 match_notification_state 에 저장해서
-    이후에도 항상 단조롭게 유지한다.
-    """
     if last is None:
         return current
 
@@ -339,20 +331,27 @@ def apply_monotonic_state(
     old_rank = STATUS_ORDER.get(old_status, 0)
     new_rank = STATUS_ORDER.get(new_status, 0)
 
-    # 상태가 뒤로 가면(랭크가 작아지면) 이전 상태를 유지
     if new_rank < old_rank:
         effective_status = old_status
     else:
         effective_status = new_status
 
+    if allow_goal_decrease:
+        eff_home_goals = current.home_goals
+        eff_away_goals = current.away_goals
+    else:
+        eff_home_goals = max(last.home_goals, current.home_goals)
+        eff_away_goals = max(last.away_goals, current.away_goals)
+
     return MatchState(
         match_id=current.match_id,
         status=effective_status,
-        home_goals=max(last.home_goals, current.home_goals),
-        away_goals=max(last.away_goals, current.away_goals),
+        home_goals=eff_home_goals,
+        away_goals=eff_away_goals,
         home_red=max(last.home_red, current.home_red),
         away_red=max(last.away_red, current.away_red),
     )
+
 
 
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
@@ -775,8 +774,89 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
     last = load_last_state(match_id)
 
-    # match_notification_state 를 기준으로 단조 상태 강제
-    current = apply_monotonic_state(last, current_raw)
+    # ✅ state row 존재 여부(먼저 확인: last_goal_disallowed_event_id 조회 안정)
+    state_exists = fetch_one(
+        """
+        SELECT 1 AS ok
+        FROM match_notification_state
+        WHERE match_id = %s
+        """,
+        (match_id,),
+    )
+
+    # ✅ state row가 없으면 먼저 생성 + VAR 포인터 초기화(과거 이벤트 폭탄 방지)
+    if not state_exists:
+        # 첫 진입은 raw 기준으로 저장(기본값 컬럼들도 함께 생김)
+        save_state(current_raw)
+
+        mx = fetch_one(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Var'
+              AND detail ILIKE 'Goal Disallowed%%'
+            """,
+            (match_id,),
+        )
+        max_id = int(mx["max_id"] or 0) if mx else 0
+
+        execute(
+            """
+            UPDATE match_notification_state
+            SET last_goal_disallowed_event_id = %s,
+                updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (max_id, match_id),
+        )
+
+        # 첫 루프는 알림 없이 종료 (과거 이벤트 폭탄 방지)
+        return
+
+    # ✅ goal disallowed가 새로 들어온 poll이고, raw 스코어가 감소한 경우에만 감소 허용
+    allow_goal_decrease = False
+    try:
+        st0 = fetch_one(
+            """
+            SELECT last_goal_disallowed_event_id
+            FROM match_notification_state
+            WHERE match_id = %s
+            """,
+            (match_id,),
+        )
+        last_dis_id0 = int(st0["last_goal_disallowed_event_id"] or 0) if st0 else 0
+
+        raw_decreased = False
+        if last is not None:
+            raw_decreased = (
+                (current_raw.home_goals < last.home_goals) or
+                (current_raw.away_goals < last.away_goals)
+            )
+
+        has_new_dis = False
+        if raw_decreased:
+            chk = fetch_one(
+                """
+                SELECT 1 AS ok
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Var'
+                  AND detail ILIKE 'Goal Disallowed%%'
+                  AND id > %s
+                LIMIT 1
+                """,
+                (match_id, last_dis_id0),
+            )
+            has_new_dis = bool(chk)
+
+        allow_goal_decrease = raw_decreased and has_new_dis
+    except Exception:
+        log.exception("Failed to compute allow_goal_decrease for match %s", match_id)
+
+    # ✅ 단조 상태 강제(필요 시 골 감소 허용) — 여기 1번만!
+    current = apply_monotonic_state(last, current_raw, allow_goal_decrease=allow_goal_decrease)
+
 
     # ✅ state row가 없으면 먼저 생성 + VAR 포인터 초기화(과거 이벤트 폭탄 방지)
     state_exists = fetch_one(
