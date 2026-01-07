@@ -40,6 +40,11 @@ LAST_STATS_SYNC = {}                # fixture_id -> 마지막 스탯 갱신시�
 # 워커 프로세스 살아 있는 동안 fixture_id 를 기록해두고 중복 호출 방지.
 LINEUPS_FETCHED = set()
 
+# 프리매치(UPCOMING) 라인업은 정해진 시점에만 "딱 1번씩" 시도하기 위한 마킹
+LINEUPS_UPCOMING_TRIED_60 = set()   # 킥오프 60분 전 슬롯 1회
+LINEUPS_UPCOMING_TRIED_10 = set()   # 킥오프 10분 전 슬롯 1회
+
+
 
 def upsert_match_status_only(
     fixture,
@@ -128,69 +133,103 @@ def _maybe_fetch_lineups_once(
     """
     라인업 인입 정책:
 
-    - ❗ 경기당 1회만 호출 (LINEUPS_FETCHED 로 관리)
-    - 프리매치:
-        * status_group == 'NS' 이고
-        * 킥오프까지 남은 시간이 0~60분 사이면 (1시간 전~직전)
-          → 라인업 호출
-    - 킥오프 직후:
-        * status_group == 'INPLAY' 이고
-        * elapsed 가 5분 이하일 때
-          → 라인업 호출 (프리매치 타이밍을 놓쳤을 경우 대비)
-    - API 응답이 비어 있으면 (라인업 아직 안 풀린 상태)
-        → FETCHED 마킹 하지 않고 나중에 다시 시도
+    - ✅ 저장 성공한 경우에만 LINEUPS_FETCHED 마킹
+    - 프리매치(UPCOMING):
+        * 킥오프 60분 전 슬롯: 59~61분 사이에 딱 1회 시도
+        * 킥오프 10분 전 슬롯: 9~11분 사이에 딱 1회 시도
+        * 프리매치 슬롯은 "응답이 비어도" TRIED 마킹해서 반복 호출 방지
+    - 킥오프 직후(INPLAY):
+        * elapsed ≤ 5분 동안은 기존대로 시도 (프리매치 못 받았을 때 대비)
+        * 응답이 비어 있으면 LINEUPS_FETCHED 마킹하지 않아서, 5분 동안 재시도 가능
     """
     if fixture_id in LINEUPS_FETCHED:
         return
 
-    if not date_utc:
-        # 킥오프 시간을 모르면 프리매치 윈도우 계산 불가 → INPLAY fallback만 사용
-        pass
+    # now 를 UTC aware 로 정규화
+    now_utc_val = now
+    if now_utc_val.tzinfo is None:
+        now_utc_val = now_utc_val.replace(tzinfo=dt.timezone.utc)
+    else:
+        now_utc_val = now_utc_val.astimezone(dt.timezone.utc)
 
-    should_call = False
-
-    # 1) 프리매치 윈도우 (NS + 킥오프 0~60분 전)
-    if date_utc and status_group == "NS":
+    kickoff = None
+    if date_utc:
         try:
             kickoff = dt.datetime.fromisoformat(date_utc)
-            # now, kickoff 는 둘 다 timezone-aware(UTC) 라고 가정
-            minutes_to_kickoff = (kickoff - now).total_seconds() / 60.0
-            # 예: 60분 전 ~ 직후 5분(-5분) 정도까지 허용해도 됨
-            if -5.0 <= minutes_to_kickoff <= 60.0:
-                should_call = True
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
+            else:
+                kickoff = kickoff.astimezone(dt.timezone.utc)
         except Exception as e:
             print(
                 f"      [lineups] fixture_id={fixture_id} date_utc 파싱 에러: {e}",
                 file=sys.stderr,
             )
+            kickoff = None
+
+    # 1) 프리매치: UPCOMING 에서 -60, -10 슬롯만 딱 1번씩
+    if kickoff and status_group == "UPCOMING":
+        minutes_to_kickoff = (kickoff - now_utc_val).total_seconds() / 60.0
+
+        # 60분 전 슬롯 (±1분)
+        if 59.0 <= minutes_to_kickoff <= 61.0:
+            if fixture_id in LINEUPS_UPCOMING_TRIED_60:
+                return
+            LINEUPS_UPCOMING_TRIED_60.add(fixture_id)
+
+            try:
+                lineups = fetch_lineups_from_api(fixture_id)
+                if lineups:
+                    upsert_match_lineups(fixture_id, lineups)
+                    LINEUPS_FETCHED.add(fixture_id)
+                    print(f"      [lineups/pre60] fixture_id={fixture_id} fetched and saved")
+                else:
+                    print(f"      [lineups/pre60] fixture_id={fixture_id} response empty (no retry until INPLAY)")
+            except Exception as lu_err:
+                print(
+                    f"      [lineups/pre60] fixture_id={fixture_id} 처리 중 에러: {lu_err}",
+                    file=sys.stderr,
+                )
+            return
+
+        # 10분 전 슬롯 (±1분)
+        if 9.0 <= minutes_to_kickoff <= 11.0:
+            if fixture_id in LINEUPS_UPCOMING_TRIED_10:
+                return
+            LINEUPS_UPCOMING_TRIED_10.add(fixture_id)
+
+            try:
+                lineups = fetch_lineups_from_api(fixture_id)
+                if lineups:
+                    upsert_match_lineups(fixture_id, lineups)
+                    LINEUPS_FETCHED.add(fixture_id)
+                    print(f"      [lineups/pre10] fixture_id={fixture_id} fetched and saved")
+                else:
+                    print(f"      [lineups/pre10] fixture_id={fixture_id} response empty (no retry until INPLAY)")
+            except Exception as lu_err:
+                print(
+                    f"      [lineups/pre10] fixture_id={fixture_id} 처리 중 에러: {lu_err}",
+                    file=sys.stderr,
+                )
+            return
 
     # 2) 킥오프 직후 fallback (INPLAY + elapsed ≤ 5분)
     if status_group == "INPLAY":
         if elapsed is None or elapsed <= 5:
-            # elapsed 가 없으면, 그냥 초반으로 보고 한 번은 시도해준다
-            should_call = True
+            try:
+                lineups = fetch_lineups_from_api(fixture_id)
+                if lineups:
+                    upsert_match_lineups(fixture_id, lineups)
+                    LINEUPS_FETCHED.add(fixture_id)
+                    print(f"      [lineups/inplay] fixture_id={fixture_id} fetched and saved")
+                else:
+                    print(f"      [lineups/inplay] fixture_id={fixture_id} response empty, will retry later")
+            except Exception as lu_err:
+                print(
+                    f"      [lineups/inplay] fixture_id={fixture_id} 처리 중 에러: {lu_err}",
+                    file=sys.stderr,
+                )
 
-    if not should_call:
-        return
-
-    try:
-        lineups = fetch_lineups_from_api(fixture_id)
-        if lineups:
-            upsert_match_lineups(fixture_id, lineups)
-            LINEUPS_FETCHED.add(fixture_id)
-            print(
-                f"      [lineups] fixture_id={fixture_id} fetched and saved"
-            )
-        else:
-            # 응답 비어 있음 → 아직 라인업이 안 풀린 상태. 나중에 다시 시도.
-            print(
-                f"      [lineups] fixture_id={fixture_id} response empty, will retry later"
-            )
-    except Exception as lu_err:
-        print(
-            f"      [lineups] fixture_id={fixture_id} 처리 중 에러: {lu_err}",
-            file=sys.stderr,
-        )
 
 
 def main() -> None:
