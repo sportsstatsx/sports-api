@@ -1,7 +1,6 @@
-# hockey/routers/hockey_fixtures_router.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional
 
 import pytz
@@ -58,17 +57,18 @@ def hockey_list_fixtures():
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
     # local date range -> utc range
+    # ✅ 정식: [local_start, next_day_start) 로 잡아서 23:59:59.x 누락 방지
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_next_day_start = local_start + timedelta(days=1)
 
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end = local_end.astimezone(timezone.utc)
+    utc_end = local_next_day_start.astimezone(timezone.utc)
 
-    rows = hockey_get_fixtures_by_utc_range(
+    games = hockey_get_fixtures_by_utc_range(
         utc_start=utc_start,
         utc_end=utc_end,
         league_ids=league_ids,
         league_id=league_id,
     )
 
-    return jsonify({"ok": True, "rows": rows})
+    return jsonify({"ok": True, "games": games})

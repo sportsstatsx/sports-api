@@ -173,29 +173,55 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     return "OTHER"
 
 
-def _map_period(minute: int) -> str:
+def _map_period(minute: int, has_et: bool) -> str:
+    """
+    - 리그(연장 없음): 90분 넘어도 전부 H2(후반 추가시간)
+    - 컵/토너먼트(연장 있음): 91~104는 H2(후반 추가시간), 105~120은 ET, 이후는 PEN
+    """
     if minute <= 45:
         return "H1"
     if minute <= 90:
         return "H2"
+
+    if not has_et:
+        return "H2"
+
+    # has_et == True
+    if minute < 105:
+        return "H2"   # ✅ 90+X 구간
     if minute <= 120:
         return "ET"
     return "PEN"
 
 
+
+
 def _build_minute_label(minute: int, extra_raw: Any, period: str) -> tuple[str, int | None]:
     """
-    Kotlin buildMinuteLabelAndExtra 와 동일한 규칙으로 minute_label / extra 계산
+    minute_label / extra 계산
+    - 핵심: DB에 extra=0으로 저장된 케이스를 "없음(None)"으로 취급해서 추론 로직을 태운다.
     """
-    extra = None
+    extra: int | None = None
     if isinstance(extra_raw, int):
         extra = extra_raw
 
+    # ✅ 0(또는 음수)은 "없음" 처리 -> 추론 로직으로 넘긴다
+    if extra is not None and extra <= 0:
+        extra = None
+
+    # ✅ raw extra 방어 (비정상 값 제거)
+    RAW_EXTRA_CAP = 30
+    if extra is not None and extra > RAW_EXTRA_CAP:
+        extra = None
+
+    # ✅ extra가 없으면 H1/H2에서만 추론
     if extra is None:
         if period == "H1":
-            extra = max(0, minute - 45) or None
+            inferred = max(0, minute - 45)
+            extra = inferred if 0 < inferred <= 15 else None
         elif period == "H2":
-            extra = max(0, minute - 90) or None
+            inferred = max(0, minute - 90)
+            extra = inferred if 0 < inferred <= 20 else None
 
     base = minute
     if period == "H1" and minute > 45:
@@ -209,6 +235,8 @@ def _build_minute_label(minute: int, extra_raw: Any, period: str) -> tuple[str, 
         label = f"{max(0, minute)}\u2019"
 
     return label, extra
+
+
 
 
 # ─────────────────────────────────────
@@ -258,6 +286,12 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     home_score = 0
     away_score = 0
 
+
+    status_u = str(header.get("status") or "").upper()
+    elapsed = int(header.get("elapsed") or 0)
+    has_et = (status_u in ("AET", "PEN", "ET")) or (elapsed >= 105)
+
+
     for idx, r in enumerate(rows):
         minute = int(r.get("minute") or 0)
         detail = r.get("detail") or ""
@@ -277,12 +311,14 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             side = "unknown"
 
-        period = _map_period(minute)
+
+        period = _map_period(minute, has_et)
         label, minute_extra = _build_minute_label(
             minute,
             r.get("extra") if "extra" in r else r.get("time_extra"),
             period,
         )
+
 
         player_id = r.get("player_id")
         assist_id = r.get("assist_player_id")
@@ -378,20 +414,36 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         "PEN_MISSED": -1,  # 실축이 항상 골보다 먼저
     }
 
+    def _sort_time_key(e: Dict[str, Any]) -> tuple[int, int]:
+        """
+        minute_label 기준으로 시간 정렬되게 보정.
+        - H1: 45’+x 는 (45, x)
+        - H2: 90’+x 는 (90, x)
+        - 그 외: (minute, extra)
+        """
+        m = int(e.get("minute") or 0)
+        x = int(e.get("minute_extra") or 0)
+        p = e.get("period")
+
+        if p == "H1" and x > 0:
+            return 45, x
+        if p == "H2" and x > 0:
+            return 90, x
+        return m, x
+
     events.sort(
         key=lambda e: (
             # 1) 전/후반/연장/승부차기 순서
             order_map.get(e["period"], 9),
-            # 2) 분
-            e["minute"],
-            # 3) 추가시간
-            e.get("minute_extra") or 0,
-            # 4) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
+            # 2) 시간 정렬(표시 기준)
+            *_sort_time_key(e),
+            # 3) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
             type_order.get(e["type"], 0),
-            # 5) 마지막으로 id_stable 로 안정 정렬
+            # 4) 마지막으로 id_stable 로 안정 정렬
             e["id_stable"],
         )
     )
+
 
     return events
 

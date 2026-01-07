@@ -366,6 +366,34 @@ def upsert_match_row(
     goals_home = goals_block.get("home")
     goals_away = goals_block.get("away")
 
+    fixture_block = fixture.get("fixture") or {}
+    league_block = fixture.get("league") or {}
+    status_block = fixture_block.get("status") or {}
+    venue_block = fixture_block.get("venue") or {}
+    score_block = fixture.get("score") or {}
+    ht_block = score_block.get("halftime") or {}
+
+    referee = fixture_block.get("referee")
+    fixture_timezone = fixture_block.get("timezone")
+    fixture_timestamp = fixture_block.get("timestamp")
+
+    status_long = status_block.get("long")
+    status_elapsed = status_block.get("elapsed")
+    status_extra = status_block.get("extra")
+
+    home_ht = ht_block.get("home")
+    away_ht = ht_block.get("away")
+
+    venue_id = venue_block.get("id")
+    venue_name = venue_block.get("name")
+    venue_city = venue_block.get("city")
+
+    league_round = league_block.get("round")
+
+    # 안전장치 (팀 id 없으면 저장 스킵)
+    if home_team_id is None or away_team_id is None:
+        return
+
     execute(
         """
         INSERT INTO matches (
@@ -373,41 +401,111 @@ def upsert_match_row(
             league_id,
             season,
             date_utc,
+
             status,
             status_group,
             elapsed,
+
             home_id,
             away_id,
             home_ft,
-            away_ft
+            away_ft,
+
+            home_ht,
+            away_ht,
+
+            referee,
+            fixture_timezone,
+            fixture_timestamp,
+
+            status_short,
+            status_long,
+            status_elapsed,
+            status_extra,
+
+            venue_id,
+            venue_name,
+            venue_city,
+
+            league_round
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s
+        )
         ON CONFLICT (fixture_id) DO UPDATE SET
-            league_id    = EXCLUDED.league_id,
-            season       = EXCLUDED.season,
-            date_utc     = EXCLUDED.date_utc,
-            status       = EXCLUDED.status,
-            status_group = EXCLUDED.status_group,
-            elapsed      = EXCLUDED.elapsed,
-            home_id      = EXCLUDED.home_id,
-            away_id      = EXCLUDED.away_id,
-            home_ft      = EXCLUDED.home_ft,
-            away_ft      = EXCLUDED.away_ft
+            league_id         = EXCLUDED.league_id,
+            season            = EXCLUDED.season,
+            date_utc          = EXCLUDED.date_utc,
+
+            status            = EXCLUDED.status,
+            status_group      = EXCLUDED.status_group,
+            elapsed           = EXCLUDED.elapsed,
+
+            home_id           = EXCLUDED.home_id,
+            away_id           = EXCLUDED.away_id,
+            home_ft           = EXCLUDED.home_ft,
+            away_ft           = EXCLUDED.away_ft,
+
+            home_ht           = EXCLUDED.home_ht,
+            away_ht           = EXCLUDED.away_ht,
+
+            referee           = EXCLUDED.referee,
+            fixture_timezone  = EXCLUDED.fixture_timezone,
+            fixture_timestamp = EXCLUDED.fixture_timestamp,
+
+            status_short      = EXCLUDED.status_short,
+            status_long       = EXCLUDED.status_long,
+            status_elapsed    = EXCLUDED.status_elapsed,
+            status_extra      = EXCLUDED.status_extra,
+
+            venue_id          = EXCLUDED.venue_id,
+            venue_name        = EXCLUDED.venue_name,
+            venue_city        = EXCLUDED.venue_city,
+
+            league_round      = EXCLUDED.league_round
         """,
         (
             fixture_id,
             league_id,
             season,
             date_utc,
-            status_short,
+
+            status_short,      # matches.status (기존 유지)
             status_group,
             elapsed,
+
             home_team_id,
             away_team_id,
             goals_home,
             goals_away,
+
+            home_ht,
+            away_ht,
+
+            referee,
+            fixture_timezone,
+            fixture_timestamp,
+
+            status_short,      # matches.status_short (신규)
+            status_long,
+            status_elapsed,
+            status_extra,
+
+            venue_id,
+            venue_name,
+            venue_city,
+
+            league_round,
         ),
     )
+
 
 
 def upsert_match_events(
@@ -523,6 +621,29 @@ def upsert_match_events_raw(
             json.dumps(events),
         ),
     )
+
+def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: dict) -> None:
+    """
+    fixtures 원본(단일 fixture response object)을 match_fixtures_raw에 저장/갱신한다.
+    - B안: HT/기타 정보는 나중에 필요할 때 raw에서 꺼내 쓰거나, 별도 컬럼에 미러링할 수 있게 원본을 보관.
+    """
+    import json
+
+    # 최대한 그대로 저장(UTF-8 보존)
+    raw = json.dumps(fixture_obj, ensure_ascii=False)
+
+    execute(
+        """
+        INSERT INTO match_fixtures_raw (fixture_id, data_json, fetched_at, updated_at)
+        VALUES (%s, %s, now(), now())
+        ON CONFLICT (fixture_id) DO UPDATE
+        SET data_json = EXCLUDED.data_json,
+            fetched_at = now(),
+            updated_at = now()
+        """,
+        (fixture_id, raw),
+    )
+
 
 
 def upsert_match_lineups(
