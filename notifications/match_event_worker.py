@@ -858,43 +858,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     current = apply_monotonic_state(last, current_raw, allow_goal_decrease=allow_goal_decrease)
 
 
-    # ✅ state row가 없으면 먼저 생성 + VAR 포인터 초기화(과거 이벤트 폭탄 방지)
-    state_exists = fetch_one(
-        """
-        SELECT 1 AS ok
-        FROM match_notification_state
-        WHERE match_id = %s
-        """,
-        (match_id,),
-    )
-    if not state_exists:
-        # row 생성 (기본값 컬럼들도 함께 생김)
-        save_state(current)
-
-        # Goal Disallowed 포인터를 "현재까지 들어온 마지막 이벤트"로 올려서
-        # 다음 루프에서 과거 VAR 이벤트가 대량 발송되지 않게 한다.
-        mx = fetch_one(
-            """
-            SELECT COALESCE(MAX(id), 0) AS max_id
-            FROM match_events
-            WHERE fixture_id = %s
-              AND type = 'Var'
-              AND detail ILIKE 'Goal Disallowed%%'
-            """,
-            (match_id,),
-        )
-        max_id = int(mx["max_id"] or 0) if mx else 0
-
-        execute(
-            """
-            UPDATE match_notification_state
-            SET last_goal_disallowed_event_id = %s,
-                updated_at = NOW()
-            WHERE match_id = %s
-            """,
-            (max_id, match_id),
-        )
-
     # 🔹 킥오프 10분 전 알림 시도 (status 가 NS/TBD 인 경우에만 내부에서 처리)
     try:
         maybe_send_kickoff_10m(fcm, current)
