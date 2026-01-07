@@ -850,7 +850,28 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             )
             has_new_dis = bool(chk)
 
-        allow_goal_decrease = raw_decreased and has_new_dis
+        # ✅ 스코어 감소는 "새 VAR가 같은 폴링에 들어오는 경우" 뿐 아니라
+        #    "VAR 이벤트는 이미 처리됐지만, 스코어 정정이 다음 폴링에서 반영되는 경우"도 커버해야 함.
+        #    단, last_dis_id0 > 0 만으로 허용하면 VAR와 무관한 스코어 감소까지 열릴 수 있어서
+        #    실제 Goal Disallowed 이벤트가 존재하는 경기인지 한 번 더 확인한다.
+        has_any_disallowed = False
+        if raw_decreased and not has_new_dis:
+            chk2 = fetch_one(
+                """
+                SELECT 1 AS ok
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Var'
+                  AND detail ILIKE 'Goal Disallowed%%'
+                LIMIT 1
+                """,
+                (match_id,),
+            )
+            has_any_disallowed = bool(chk2)
+
+        allow_goal_decrease = raw_decreased and (has_new_dis or has_any_disallowed)
+
+
     except Exception:
         log.exception("Failed to compute allow_goal_decrease for match %s", match_id)
 
