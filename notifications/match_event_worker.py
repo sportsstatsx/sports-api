@@ -789,6 +789,14 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         # 첫 진입은 raw 기준으로 저장(기본값 컬럼들도 함께 생김)
         save_state(current_raw)
 
+        # ✅ kickoff_10m 누락 방지:
+        # 첫 진입 폴링에서 바로 10분 전 창(0~600초)에 들어올 수 있으니
+        # state row 생성 직후 한 번은 즉시 체크/발송 시도한다.
+        try:
+            maybe_send_kickoff_10m(fcm, current_raw)
+        except Exception:
+            log.exception("Error while processing kickoff_10m on first state init for match %s", match_id)
+
         mx = fetch_one(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id
@@ -811,8 +819,9 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             (max_id, match_id),
         )
 
-        # 첫 루프는 알림 없이 종료 (과거 이벤트 폭탄 방지)
+        # 첫 루프는 알림(일반 이벤트) 없이 종료 (과거 이벤트 폭탄 방지)
         return
+
 
     # ✅ goal disallowed가 새로 들어온 poll이고, raw 스코어가 감소한 경우에만 감소 허용
     allow_goal_decrease = False
