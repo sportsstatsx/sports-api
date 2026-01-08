@@ -189,6 +189,12 @@ def terms_ko():
     # KO
     return send_from_directory(STATIC_DIR, "terms_ko.html")
 
+@app.route("/app-ads.txt")
+def app_ads_txt():
+    # AdMob app-ads.txt verification
+    return send_from_directory(STATIC_DIR, "app-ads.txt", mimetype="text/plain")
+
+
 
 
 # ─────────────────────────────────────────
@@ -347,6 +353,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
