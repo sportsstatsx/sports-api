@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 from functools import wraps
 from typing import Dict, List, Any
 
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory, redirect
 from werkzeug.exceptions import HTTPException
 import pytz  # 타임존 계산용
 
@@ -146,6 +146,20 @@ def track_metrics(endpoint_name):
         return wrapper
 
     return decorator
+
+
+# ─────────────────────────────────────────
+# Root: redirect to Google Play
+# ─────────────────────────────────────────
+PLAY_STORE_URL = os.getenv(
+    "PLAY_STORE_URL",
+    "https://play.google.com/store/apps/details?id=com.sportsstatsx.app",
+)
+
+@app.route("/")
+def root_redirect():
+    return redirect(PLAY_STORE_URL, code=302)  # 안정화되면 301로 바꿔도 됨
+
 
 
 # ─────────────────────────────────────────
@@ -353,6 +367,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
