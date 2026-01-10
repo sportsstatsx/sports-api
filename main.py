@@ -100,10 +100,13 @@ def handle_exception(e):
 # ─────────────────────────────────────────
 # Prometheus 메트릭
 # ─────────────────────────────────────────
+import time
+from flask import g
+
 REQUEST_COUNT = Counter(
     "api_request_total",
     "Total API Requests",
-    ["service", "version", "endpoint", "method"],
+    ["service", "version", "endpoint", "method", "status_code", "class"],
 )
 
 REQUEST_LATENCY = Histogram(
@@ -119,33 +122,72 @@ ACTIVE_REQUESTS = Gauge(
 )
 
 
-def track_metrics(endpoint_name):
-    """API 호출 측정용 데코레이터"""
+def _code_class(status_code: int) -> str:
+    try:
+        return f"{int(status_code) // 100}xx"
+    except Exception:
+        return "unknown"
 
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            REQUEST_COUNT.labels(
-                SERVICE_NAME, SERVICE_VERSION, endpoint_name, request.method
-            ).inc()
 
-            ACTIVE_REQUESTS.labels(
-                SERVICE_NAME, SERVICE_VERSION
-            ).inc()
+def _should_skip_metrics(path: str) -> bool:
+    # Prometheus가 /metrics를 긁을 때 그 요청까지 카운트하면 노이즈가 커져서 보통 제외
+    return path in ("/metrics",)
 
-            with REQUEST_LATENCY.labels(
-                SERVICE_NAME, SERVICE_VERSION, endpoint_name
-            ).time():
-                try:
-                    return fn(*args, **kwargs)
-                finally:
-                    ACTIVE_REQUESTS.labels(
-                        SERVICE_NAME, SERVICE_VERSION
-                    ).dec()
 
-        return wrapper
+@app.before_request
+def _metrics_before_request():
+    if _should_skip_metrics(request.path):
+        return
+    g._metrics_started = True
+    g._metrics_start_time = time.time()
+    ACTIVE_REQUESTS.labels(SERVICE_NAME, SERVICE_VERSION).inc()
 
-    return decorator
+
+@app.after_request
+def _metrics_after_request(response):
+    if _should_skip_metrics(request.path):
+        return response
+
+    started = getattr(g, "_metrics_started", False)
+    if not started:
+        return response
+
+    endpoint = request.path
+    method = request.method
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    klass = _code_class(status_code)
+
+    REQUEST_COUNT.labels(
+        SERVICE_NAME,
+        SERVICE_VERSION,
+        endpoint,
+        method,
+        str(status_code),
+        klass,
+    ).inc()
+
+    start_t = getattr(g, "_metrics_start_time", None)
+    if start_t is not None:
+        REQUEST_LATENCY.labels(SERVICE_NAME, SERVICE_VERSION, endpoint).observe(
+            time.time() - start_t
+        )
+
+    ACTIVE_REQUESTS.labels(SERVICE_NAME, SERVICE_VERSION).dec()
+    g._metrics_started = False
+    return response
+
+
+@app.teardown_request
+def _metrics_teardown_request(exc):
+    # 예외로 after_request가 안 타는 케이스 방어용 (대부분은 after_request가 실행됨)
+    started = getattr(g, "_metrics_started", False)
+    if started:
+        try:
+            ACTIVE_REQUESTS.labels(SERVICE_NAME, SERVICE_VERSION).dec()
+        except Exception:
+            pass
+        g._metrics_started = False
+
 
 
 # ─────────────────────────────────────────
@@ -166,7 +208,6 @@ def root_redirect():
 # API: /health
 # ─────────────────────────────────────────
 @app.route("/health")
-@track_metrics("/health")
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
 
@@ -215,7 +256,6 @@ def app_ads_txt():
 # API: /api/fixtures  (타임존 + 다중 리그 필터)
 # ─────────────────────────────────────────
 @app.route("/api/fixtures")
-@track_metrics("/api/fixtures")
 def list_fixtures():
     """
     사용자의 지역 날짜를 기반으로 경기 조회.
@@ -367,6 +407,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
