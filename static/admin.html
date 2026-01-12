@@ -33,6 +33,9 @@
     .item:hover { background:#fafafa; }
     .item.sel { background:#f3f6ff; }
     .badge { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .item.hidden { opacity: 0.55; }
+    .badge.ovr { border-color:#000; }
+    .badge.hid { border-color:#d33; color:#d33; }
     .right { margin-left:auto; text-align:right; }
     .small { font-size:12px; }
     .k { font-weight:600; }
@@ -229,6 +232,7 @@
             <option value="override_delete">override_delete</option>
             <option value="logs_list">logs_list</option>
             <option value="fixtures_raw_list">fixtures_raw_list</option>
+            <option value="fixtures_merged_list">fixtures_merged_list</option>
           </select>
           <button onclick="loadLogs()">새로고침</button>
         </div>
@@ -396,7 +400,12 @@
 
     for (const f of filtered) {
       const div = document.createElement("div");
-      div.className = "item" + ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "");
+      const isHidden = (f.hidden === true);
+      div.className =
+        "item" +
+        ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
+        (isHidden ? " hidden" : "");
+
       div.onclick = () => selectFixture(f.fixture_id);
 
       const tz = document.getElementById("fxTz").value || "UTC";
@@ -405,6 +414,13 @@
       const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
       const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
 
+      const isOvr = (f._has_override === true);
+      const badges = [
+        `<span class="badge mono">${(f.status_group||"").toUpperCase()}</span>`,
+        isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
+        isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
+      ].filter(Boolean).join(" ");
+
       div.innerHTML = `
         <div>
           <div class="small muted mono">${when}</div>
@@ -412,11 +428,12 @@
           <div class="small muted">${f.league_name || ""} · ${f.league_round || ""}</div>
         </div>
         <div class="right">
-          <div><span class="badge mono">${(f.status_group||"").toUpperCase()}</span></div>
+          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges}</div>
           <div class="mono" style="margin-top:6px;">${score}</div>
           <div class="small muted mono">HT ${ht}</div>
         </div>
       `;
+
       list.appendChild(div);
     }
 
@@ -489,6 +506,7 @@
     if (isObj(a) && isObj(b)) {
       const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
       for (const k of keys) {
+        if (String(k).startsWith("_")) continue; // 내부 메타키 제외
         diffObjects(a[k], b[k], path ? (path + "." + k) : k, out);
       }
       return out;
@@ -525,12 +543,20 @@
     document.getElementById("fxPreviewRaw").textContent = JSON.stringify(raw || {}, null, 2);
 
     if (raw && selectedFixture) {
-      const diffs = diffObjects(raw, selectedFixture, "", []);
-      const limited = diffs.slice(0, 200);
-      document.getElementById("fxPreviewDiff").textContent = JSON.stringify(limited, null, 2);
+      const diffs = diffObjects(raw, selectedFixture, "", []).slice(0, 200);
+
+      const lines = diffs.map(d => {
+        const a = JSON.stringify(d.raw);
+        const b = JSON.stringify(d.now);
+        return `${d.path}: ${a} -> ${b}`;
+      });
+
+      document.getElementById("fxPreviewDiff").textContent =
+        lines.length ? lines.join("\n") : "(변경 없음)";
     } else {
-      document.getElementById("fxPreviewDiff").textContent = "[]";
+      document.getElementById("fxPreviewDiff").textContent = "(비교 데이터 없음)";
     }
+
   }
 
   async function selectFixture(fixtureId) {
@@ -566,7 +592,9 @@
     const qs = buildFixturesQuery();
 
     setStatusLine("fixtures 불러오는 중...");
-    const r = await publicApi("/api/fixtures?" + qs.toString());
+    // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용
+    const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
+
     if (r.status >= 400 || !r.data || !r.data.ok) {
       setStatusLine("");
       alert("fixtures 로드 실패: " + JSON.stringify(r.data));
@@ -574,6 +602,9 @@
     }
 
     currentFixtures = r.data.rows || [];
+
+    // 선택 유지(저장/삭제 후 재선택을 위해)
+    const keepId = selectedFixture ? String(selectedFixture.fixture_id) : "";
     selectedFixture = null;
 
     // raw 캐시 무효화(필터 변경될 수 있으니)
@@ -588,8 +619,16 @@
 
     setStatusLine("");
     renderFixtures();
+
+    // ✅ 가능하면 이전 선택 재선택
+    if (keepId) {
+      const exists = currentFixtures.find(x => String(x.fixture_id) === keepId);
+      if (exists) await selectFixture(keepId);
+    }
+
     showTab("now");
   }
+
 
   async function getOverride() {
     const id = document.getElementById("fixtureId").value.trim();
@@ -622,6 +661,9 @@
       return setOv("Patch JSON 파싱 실패", false);
     }
 
+    const ok = confirm("저장(Upsert)할까요? (override가 즉시 적용됩니다)");
+    if (!ok) return;
+
     const r = await api(adminUrl(`/api/overrides/${id}`), {
       method: "PUT",
       body: JSON.stringify(patch),
@@ -637,6 +679,9 @@
   async function deleteOverride() {
     const id = document.getElementById("fixtureId").value.trim();
     if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const ok = confirm("삭제(원복)할까요? (override가 제거되고 원본으로 돌아갑니다)");
+    if (!ok) return;
 
     const r = await api(adminUrl(`/api/overrides/${id}`), { method: "DELETE" });
     setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
