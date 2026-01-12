@@ -96,6 +96,37 @@ def handle_exception(e):
         "error": str(e)
     }), 500
 
+def _deep_merge(base: Any, patch: Any) -> Any:
+    """
+    dict는 재귀 병합, list/primitive는 patch가 base를 대체.
+    """
+    if isinstance(base, dict) and isinstance(patch, dict):
+        out = dict(base)
+        for k, v in patch.items():
+            if k in out:
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+    return patch
+
+
+def _load_match_overrides(fixture_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    if not fixture_ids:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(fixture_ids))
+    sql = f"""
+        SELECT fixture_id, patch
+        FROM match_overrides
+        WHERE fixture_id IN ({placeholders})
+    """
+    rows = fetch_all(sql, tuple(fixture_ids))
+    out: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        out[int(r["fixture_id"])] = r["patch"] or {}
+    return out
+
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -399,7 +430,24 @@ def list_fixtures():
         })
 
 
-    return jsonify({"ok": True, "rows": fixtures})
+    # ✅ overrides 적용 (웹에서 수정된 값이 우선)
+    fixture_ids = [f["fixture_id"] for f in fixtures]
+    override_map = _load_match_overrides(fixture_ids)
+
+    merged = []
+    for f in fixtures:
+        patch = override_map.get(f["fixture_id"])
+        if patch:
+            f2 = _deep_merge(f, patch)
+            # hidden=true면 노출 제외(삭제 대신 숨김)
+            if f2.get("hidden") is True:
+                continue
+            merged.append(f2)
+        else:
+            merged.append(f)
+
+    return jsonify({"ok": True, "rows": merged})
+
 
 
 # ─────────────────────────────────────────
@@ -407,6 +455,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
