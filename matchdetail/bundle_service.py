@@ -64,32 +64,30 @@ def _reconcile_header_aliases(header: Dict[str, Any]) -> None:
     - home.ft <-> home.score
     - away.ft <-> away.score
     """
-    if "elapsed" in header and header.get("elapsed") is not None:
+    if header.get("elapsed") is not None:
         header["minute"] = header.get("elapsed")
-    elif "minute" in header and header.get("minute") is not None:
+    elif header.get("minute") is not None:
         header["elapsed"] = header.get("minute")
 
-    if "date_utc" in header and header.get("date_utc") is not None:
+    if header.get("date_utc") is not None:
         header["kickoff_utc"] = header.get("date_utc")
-    elif "kickoff_utc" in header and header.get("kickoff_utc") is not None:
+    elif header.get("kickoff_utc") is not None:
         header["date_utc"] = header.get("kickoff_utc")
 
     home = header.get("home")
     if isinstance(home, dict):
-        if "ft" in home and home.get("ft") is not None:
+        if home.get("ft") is not None:
             home["score"] = home.get("ft")
-        elif "score" in home and home.get("score") is not None:
+        elif home.get("score") is not None:
             home["ft"] = home.get("score")
 
     away = header.get("away")
     if isinstance(away, dict):
-        if "ft" in away and away.get("ft") is not None:
+        if away.get("ft") is not None:
             away["score"] = away.get("ft")
-        elif "score" in away and away.get("score") is not None:
+        elif away.get("score") is not None:
             away["ft"] = away.get("score")
 
-
-    return header
 
 
 def get_match_detail_bundle(
@@ -130,16 +128,16 @@ def get_match_detail_bundle(
 
     header["filters"] = header_filters  # 다시 덮어쓰기
 
-        # ✅ override 적용 (디테일 번들에서도 수정 반영)
+    # 3) ✅ override 적용 (디테일 번들에서도 수정 반영) - 딱 1번만
     if apply_override:
         patch = _load_override_patch(fixture_id)
 
-        # hidden=true면 디테일도 원본처럼 접근 불가 처리(리스트와 일관성)
-        if patch.get("hidden") is True:
+        # hidden=true면 디테일도 접근 불가 처리(리스트와 일관성)
+        if isinstance(patch, dict) and patch.get("hidden") is True:
             return None
 
-        if patch:
-            # patch가 {header:{...}} 형태면 header만 머지, 아니면 기존 방식(루트키) 그대로 머지
+        if isinstance(patch, dict) and patch:
+            # patch가 { "header": {...} } 형태면 header만 머지
             if isinstance(patch.get("header"), dict):
                 header = _deep_merge(header, patch["header"])
             else:
@@ -147,23 +145,17 @@ def get_match_detail_bundle(
 
             _reconcile_header_aliases(header)
 
-
-    # 3) 나머지 블록
-    form = build_form_block(header)
-
-
-    # 3) ✅ override 적용 (header에 먼저)
-    patch = _load_override_patch(fixture_id)
-
-    # patch 형태가 "fixtures 스타일(venue_name/home.ft...)"인 경우를 우선 지원:
-    # -> header 루트에 그대로 병합해도 의미있는 키들은 header_block에서 이미 제공하도록 맞춰둠.
-    if patch:
-        header = _deep_merge(header, patch)
-        header = _reconcile_header_aliases(header)
-
-    # 4) 나머지 블록
+    # 4) 나머지 블록 (override 반영된 header로 생성)
     form = build_form_block(header)
     timeline = build_timeline_block(header)
+    lineups = build_lineups_block(header)
+    stats = build_stats_block(header)
+    h2h = build_h2h_block(header)
+    standings = build_standings_block(header)
+
+    insights_overall = build_insights_overall_block(header)
+    ai_predictions = build_ai_predictions_block(header, insights_overall)
+
     lineups = build_lineups_block(header)
     stats = build_stats_block(header)
     h2h = build_h2h_block(header)
