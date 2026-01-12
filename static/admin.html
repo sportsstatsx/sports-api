@@ -117,6 +117,9 @@
         <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
         <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
         <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
+        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')">bundle(raw)</button>
+        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')">bundle(merged)</button>
+        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')">bundle diff</button>
       </div>
 
       <div class="tabpane active" id="tab_now">
@@ -139,6 +142,22 @@
         <div class="muted">원본(raw) → 현재(노출) 변경 요약</div>
         <pre class="mono" id="fxPreviewDiff">[]</pre>
       </div>
+
+      <div class="tabpane" id="tab_bundle_raw">
+        <div class="muted">선택된 경기(bundle 원본: override 미적용)</div>
+        <pre class="mono" id="bundlePreviewRaw">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_merged">
+        <div class="muted">선택된 경기(bundle merged: override 적용)</div>
+        <pre class="mono" id="bundlePreviewMerged">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_diff">
+        <div class="muted">bundle(raw) → bundle(merged) 변경 요약</div>
+        <pre class="mono" id="bundlePreviewDiff">[]</pre>
+      </div>
+      
     </div>
 
     <!-- RIGHT: Editor + logs -->
@@ -261,6 +280,10 @@
   const tokenKey = "SSX_ADMIN_TOKEN";
   let selectedFixture = null;
 
+  let bundleRaw = null;
+  let bundleMerged = null;
+
+
   // 현재(노출) fixtures
   let currentFixtures = [];
 
@@ -367,13 +390,17 @@
     return 5;
   }
 
+
   function showTab(name) {
-    const names = ["now","raw","patch","diff"];
+    const names = ["now","raw","patch","diff","bundle_raw","bundle_merged","bundle_diff"];
     for (const n of names) {
-      document.getElementById("tab_" + n).classList.toggle("active", n === name);
-      document.getElementById("tab_" + n + "_btn").classList.toggle("active", n === name);
+      const pane = document.getElementById("tab_" + n);
+      const btn = document.getElementById("tab_" + n + "_btn");
+      if (pane) pane.classList.toggle("active", n === name);
+      if (btn) btn.classList.toggle("active", n === name);
     }
   }
+
 
   function renderFixtures() {
     const list = document.getElementById("fxList");
@@ -559,6 +586,68 @@
 
   }
 
+    async function loadBundleViews() {
+    if (!selectedFixture) {
+      document.getElementById("bundlePreviewRaw").textContent = "{}";
+      document.getElementById("bundlePreviewMerged").textContent = "{}";
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+      bundleRaw = null;
+      bundleMerged = null;
+      return;
+    }
+
+    const fx = selectedFixture.fixture_id;
+    const lg = selectedFixture.league_id;
+    const se = selectedFixture.season;
+
+    if (fx == null || lg == null || se == null) {
+      document.getElementById("bundlePreviewRaw").textContent = "{}";
+      document.getElementById("bundlePreviewMerged").textContent = "{}";
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+      bundleRaw = null;
+      bundleMerged = null;
+      return;
+    }
+
+    const base = new URLSearchParams({
+      fixture_id: String(fx),
+      league_id: String(lg),
+      season: String(se),
+    });
+
+    // raw (override 미적용)
+    const qsRaw = new URLSearchParams(base);
+    qsRaw.set("apply_override", "0");
+
+    // merged (override 적용)
+    const qsMerged = new URLSearchParams(base);
+    qsMerged.set("apply_override", "1");
+
+    // ✅ match_detail_bundle는 public endpoint이므로 publicApi 사용
+    const r1 = await publicApi("/api/match_detail_bundle?" + qsRaw.toString());
+    const r2 = await publicApi("/api/match_detail_bundle?" + qsMerged.toString());
+
+    bundleRaw = (r1.status < 400 && r1.data && r1.data.ok) ? (r1.data.data || null) : null;
+    bundleMerged = (r2.status < 400 && r2.data && r2.data.ok) ? (r2.data.data || null) : null;
+
+    document.getElementById("bundlePreviewRaw").textContent =
+      JSON.stringify(bundleRaw || { _error: "raw load failed", status: r1.status, data: r1.data }, null, 2);
+
+    document.getElementById("bundlePreviewMerged").textContent =
+      JSON.stringify(bundleMerged || { _error: "merged load failed", status: r2.status, data: r2.data }, null, 2);
+
+    if (bundleRaw && bundleMerged) {
+      const diffs = diffObjects(bundleRaw, bundleMerged, "", []).slice(0, 300);
+      const lines = diffs.map(d => `${d.path}: ${JSON.stringify(d.raw)} -> ${JSON.stringify(d.now)}`);
+      document.getElementById("bundlePreviewDiff").textContent =
+        lines.length ? lines.join("\n") : "(변경 없음)";
+    } else {
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+    }
+  }
+
+
+
   async function selectFixture(fixtureId) {
     const f = currentFixtures.find(x => String(x.fixture_id) === String(fixtureId));
     if (!f) return;
@@ -617,6 +706,14 @@
     document.getElementById("fxPreviewDiff").textContent = "[]";
     document.getElementById("rawHint").textContent = "";
 
+    // ✅ bundle 프리뷰도 초기화(선택이 해제되었는데 이전 데이터가 남는 문제 방지)
+    document.getElementById("bundlePreviewRaw").textContent = "{}";
+    document.getElementById("bundlePreviewMerged").textContent = "{}";
+    document.getElementById("bundlePreviewDiff").textContent = "[]";
+    bundleRaw = null;
+    bundleMerged = null;
+
+
     setStatusLine("");
     renderFixtures();
 
@@ -645,6 +742,7 @@
         setOv(`override 없음 · status=${r.status}`, true);
       }
       updateComparisonViews();
+      await loadBundleViews();
     } else {
       setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
     }
