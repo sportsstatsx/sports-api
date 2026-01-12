@@ -459,6 +459,181 @@ def admin_list_logs():
     _admin_log("logs_list", ok=True, status_code=200, detail={"limit": limit, "event_type": event_type, "fixture_id": fixture_id})
     return jsonify({"ok": True, "rows": rows})
 
+# ─────────────────────────────────────────
+# Admin API: fixtures (raw/merged)
+# - merged 는 override 반영하지만 hidden=true도 "제외하지 않고" 포함
+# - 리스트 UI에서 배지 표시를 위해 _has_override 필드 추가
+# ─────────────────────────────────────────
+@app.route(f"/{ADMIN_PATH}/api/fixtures_merged")
+@require_admin
+def admin_list_fixtures_merged():
+    """
+    관리자용 fixtures 조회:
+    - /api/fixtures 와 동일한 필터(date/timezone/league_ids)
+    - override 반영
+    - hidden=true 도 제외하지 않고 포함(관리자가 다시 숨김해제 가능해야 함)
+    - _has_override 플래그 추가
+    """
+    # 🔹 리그 필터
+    league_id = request.args.get("league_id", type=int)
+    league_ids_raw = request.args.get("league_ids", type=str)
+
+    league_ids: List[int] = []
+    if league_ids_raw:
+        for part in league_ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                league_ids.append(int(part))
+            except ValueError:
+                continue
+
+    # 🔹 날짜 / 타임존
+    date_str = request.args.get("date", type=str)
+    tz_str = request.args.get("timezone", "UTC")
+
+    if not date_str:
+        _admin_log("fixtures_merged_list", ok=False, status_code=400, detail={"error": "date required"})
+        return jsonify({"ok": False, "error": "date is required (YYYY-MM-DD)"}), 400
+
+    try:
+        user_tz = pytz.timezone(tz_str)
+    except Exception:
+        _admin_log("fixtures_merged_list", ok=False, status_code=400, detail={"error": "invalid timezone", "timezone": tz_str})
+        return jsonify({"ok": False, "error": f"Invalid timezone: {tz_str}"}), 400
+
+    try:
+        local_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        _admin_log("fixtures_merged_list", ok=False, status_code=400, detail={"error": "invalid date", "date": date_str})
+        return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
+
+    local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
+    local_end   = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    utc_start = local_start.astimezone(timezone.utc)
+    utc_end   = local_end.astimezone(timezone.utc)
+
+    params: List[Any] = [utc_start, utc_end]
+    where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
+
+    if league_ids:
+        placeholders = ", ".join(["%s"] * len(league_ids))
+        where_clauses.append(f"m.league_id IN ({placeholders})")
+        params.extend(league_ids)
+    elif league_id is not None and league_id > 0:
+        where_clauses.append("m.league_id = %s")
+        params.append(league_id)
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
+        SELECT
+            m.fixture_id,
+            m.league_id,
+            m.season,
+            m.date_utc,
+            m.status_group,
+            m.status,
+            m.elapsed,
+            m.status_long,
+            m.home_id,
+            m.away_id,
+            m.home_ft,
+            m.away_ft,
+            m.home_ht,
+            m.away_ht,
+            m.venue_name,
+            m.league_round,
+            th.name AS home_name,
+            ta.name AS away_name,
+            th.logo AS home_logo,
+            ta.logo AS away_logo,
+            l.name AS league_name,
+            l.logo AS league_logo,
+            l.country AS league_country,
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                AND e.team_id = m.home_id
+                AND e.type = 'Card'
+                AND e.detail = 'Red Card'
+            ) AS home_red_cards,
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                AND e.team_id = m.away_id
+                AND e.type = 'Card'
+                AND e.detail = 'Red Card'
+            ) AS away_red_cards
+        FROM matches m
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
+        JOIN leagues l ON l.id = m.league_id
+        WHERE {where_sql}
+        ORDER BY m.date_utc ASC
+    """
+
+    rows = fetch_all(sql, tuple(params))
+
+    fixtures = []
+    for r in rows:
+        fixtures.append({
+            "fixture_id": r["fixture_id"],
+            "league_id": r["league_id"],
+            "season": r["season"],
+            "date_utc": r["date_utc"],
+            "status_group": r["status_group"],
+            "status": r["status"],
+            "elapsed": r["elapsed"],
+            "status_long": r["status_long"],
+            "league_name": r["league_name"],
+            "league_logo": r["league_logo"],
+            "league_country": r["league_country"],
+            "league_round": r["league_round"],
+            "venue_name": r["venue_name"],
+            "home": {
+                "id": r["home_id"],
+                "name": r["home_name"],
+                "logo": r["home_logo"],
+                "ft": r["home_ft"],
+                "ht": r["home_ht"],
+                "red_cards": r["home_red_cards"],
+            },
+            "away": {
+                "id": r["away_id"],
+                "name": r["away_name"],
+                "logo": r["away_logo"],
+                "ft": r["away_ft"],
+                "ht": r["away_ht"],
+                "red_cards": r["away_red_cards"],
+            },
+        })
+
+    fixture_ids = [f["fixture_id"] for f in fixtures]
+    override_map = _load_match_overrides(fixture_ids)
+
+    merged = []
+    for f in fixtures:
+        patch = override_map.get(f["fixture_id"])
+        if patch:
+            f2 = _deep_merge(f, patch)
+            # 관리자용이므로 hidden=true도 제외하지 않음
+            f2["_has_override"] = True
+            merged.append(f2)
+        else:
+            f["_has_override"] = False
+            merged.append(f)
+
+    _admin_log(
+        "fixtures_merged_list",
+        ok=True,
+        status_code=200,
+        detail={"date": date_str, "timezone": tz_str, "league_ids": league_ids_raw or "", "rows": len(merged)},
+    )
+    return jsonify({"ok": True, "rows": merged})
+
+
 @app.route(f"/{ADMIN_PATH}/api/fixtures_raw", methods=["GET"])
 @require_admin
 def admin_fixtures_raw():
@@ -796,6 +971,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
