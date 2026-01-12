@@ -6,85 +6,237 @@
   <title>SportsStatsX Admin</title>
   <style>
     body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+    .muted { color:#666; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:14px; max-width: 980px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
     .card h2 { margin:0 0 10px 0; font-size: 16px; }
     input, textarea, button, select { font-size: 14px; }
-    input, textarea { width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc; }
+    input, textarea, select {
+      width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc;
+      background:#fff;
+    }
     textarea { min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
     button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
     button.primary { border-color:#000; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
-    .muted { color:#666; font-size:12px; }
+    button.danger { border-color:#d33; color:#d33; }
+    button.soft { opacity:0.9; }
+    .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:12px; align-items:start; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+
+    /* Fixtures list */
+    .listWrap { max-height: 560px; overflow:auto; border:1px solid #eee; border-radius:10px; }
+    .item {
+      padding:10px 12px; border-bottom:1px solid #f0f0f0; cursor:pointer;
+      display:flex; gap:10px; align-items:flex-start;
+    }
+    .item:hover { background:#fafafa; }
+    .item.sel { background:#f3f6ff; }
+    .badge { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .right { margin-left:auto; text-align:right; }
+    .small { font-size:12px; }
+    .k { font-weight:600; }
     .ok { color:#0a7; }
     .bad { color:#d33; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    pre {
+      margin:0; padding:10px; background:#fafafa; border:1px solid #eee; border-radius:10px;
+      max-height: 240px; overflow:auto;
+    }
+
+    table { width:100%; border-collapse:collapse; }
+    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
   </style>
 </head>
 <body>
-  <h1 style="margin:0 0 14px 0;">SportsStatsX Admin</h1>
-  <div class="muted">
-    경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">SportsStatsX Admin</h1>
+      <div class="muted">
+        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+        · <button class="soft" style="padding:6px 10px;" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+      </div>
+    </div>
+    <div class="muted" id="statusLine"></div>
   </div>
 
-  <div class="row" style="margin-top:14px;">
-    <div class="card" style="flex: 1 1 420px;">
-      <h2>Override</h2>
-      <label class="muted">Fixture ID</label>
-      <input id="fixtureId" placeholder="예: 123456"/>
+  <div class="grid" style="margin-top:14px;">
+    <!-- LEFT: Fixtures browser -->
+    <div class="card">
+      <h2>Fixtures Browser</h2>
 
-      <div style="height:10px;"></div>
-      <label class="muted">Patch JSON (부분만)</label>
-      <textarea id="patch" placeholder='예: { "venue_name": "Edited", "home": { "ft": 2 } }'></textarea>
-
-      <div style="height:10px;"></div>
       <div class="row">
-        <button class="primary" onclick="upsertOverride()">저장(Upsert)</button>
-        <button onclick="getOverride()">조회</button>
-        <button onclick="deleteOverride()">삭제(원복)</button>
+        <div style="min-width:190px; flex: 0 0 190px;">
+          <label class="muted">Date</label>
+          <input id="fxDate" type="date"/>
+        </div>
+
+        <div style="min-width:220px; flex: 1 1 220px;">
+          <label class="muted">Timezone</label>
+          <select id="fxTz">
+            <option value="Asia/Seoul">Asia/Seoul</option>
+            <option value="UTC">UTC</option>
+            <option value="Europe/London">Europe/London</option>
+            <option value="America/New_York">America/New_York</option>
+            <option value="America/Los_Angeles">America/Los_Angeles</option>
+          </select>
+        </div>
+
+        <div style="min-width:260px; flex: 1 1 260px;">
+          <label class="muted">League IDs (comma, optional)</label>
+          <input id="fxLeagueIds" placeholder="예: 39,140,78"/>
+        </div>
+
+        <div style="min-width:220px; flex: 1 1 220px;">
+          <label class="muted">Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
+        </div>
+
+        <div style="min-width:140px; flex: 0 0 140px; align-self:flex-end;">
+          <button class="primary" style="width:100%;" onclick="loadFixtures()">불러오기</button>
+        </div>
       </div>
-      <div id="ovResult" class="muted" style="margin-top:10px;"></div>
+
+      <div class="muted" style="margin-top:10px;" id="fxHint"></div>
+
+      <div class="listWrap" style="margin-top:10px;">
+        <div id="fxList"></div>
+      </div>
+
+      <div style="margin-top:12px;">
+        <div class="muted">선택된 경기(override 반영 결과) 미리보기</div>
+        <pre class="mono" id="fxPreview">{}</pre>
+      </div>
     </div>
 
-    <div class="card" style="flex: 1 1 520px;">
-      <h2>Admin Logs</h2>
-      <div class="row">
-        <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
-        <select id="logEvent">
-          <option value="">event_type 전체</option>
-          <option value="access">access</option>
-          <option value="auth_fail">auth_fail</option>
-          <option value="override_get">override_get</option>
-          <option value="override_upsert">override_upsert</option>
-          <option value="override_delete">override_delete</option>
-          <option value="logs_list">logs_list</option>
-        </select>
-        <button onclick="loadLogs()">새로고침</button>
+    <!-- RIGHT: Editor + logs -->
+    <div class="row" style="align-items:stretch;">
+      <div class="card" style="flex: 1 1 520px;">
+        <h2>Override Editor</h2>
+
+        <div class="row">
+          <div style="flex: 1 1 220px;">
+            <label class="muted">Fixture ID</label>
+            <input id="fixtureId" placeholder="예: 123456"/>
+          </div>
+          <div style="flex: 1 1 220px;">
+            <label class="muted">Quick actions</label>
+            <div class="row" style="gap:8px;">
+              <button onclick="getOverride()">조회</button>
+              <button class="danger" onclick="deleteOverride()">삭제(원복)</button>
+              <button onclick="hideFixture()">숨김(hidden=true)</button>
+              <button onclick="unhideFixture()">숨김해제(hidden=false)</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Venue</label>
+            <input id="qeVenue" placeholder="venue_name"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">League Round</label>
+            <input id="qeRound" placeholder="league_round"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Status Long</label>
+            <input id="qeStatusLong" placeholder="status_long"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Elapsed</label>
+            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Home FT</label>
+            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Away FT</label>
+            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Home HT</label>
+            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Away HT</label>
+            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
+          <button onclick="upsertOverride()">저장(Upsert)</button>
+        </div>
+
+        <div style="height:10px;"></div>
+        <label class="muted">Patch JSON (부분만)</label>
+        <textarea id="patch" placeholder='예: { "venue_name": "Edited", "home": { "ft": 2 } }'></textarea>
+
+        <div id="ovResult" class="muted" style="margin-top:10px;"></div>
       </div>
 
-      <div style="height:10px;"></div>
-      <table>
-        <thead>
-          <tr>
-            <th style="width:160px;">ts</th>
-            <th style="width:140px;">type</th>
-            <th style="width:80px;">ok</th>
-            <th>detail</th>
-          </tr>
-        </thead>
-        <tbody id="logsBody"></tbody>
-      </table>
-      <div id="logHint" class="muted" style="margin-top:10px;"></div>
+      <div class="card" style="flex: 1 1 520px;">
+        <h2>Admin Logs</h2>
+        <div class="row">
+          <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
+          <select id="logEvent" style="min-width:160px;">
+            <option value="">event_type 전체</option>
+            <option value="access">access</option>
+            <option value="auth_fail">auth_fail</option>
+            <option value="override_get">override_get</option>
+            <option value="override_upsert">override_upsert</option>
+            <option value="override_delete">override_delete</option>
+            <option value="logs_list">logs_list</option>
+          </select>
+          <button onclick="loadLogs()">새로고침</button>
+        </div>
+
+        <div style="height:10px;"></div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:160px;">ts</th>
+              <th style="width:140px;">type</th>
+              <th style="width:80px;">ok</th>
+              <th>detail</th>
+            </tr>
+          </thead>
+          <tbody id="logsBody"></tbody>
+        </table>
+        <div id="logHint" class="muted" style="margin-top:10px;"></div>
+      </div>
     </div>
   </div>
 
 <script>
-  // 현재 URL path에서 adminPath 계산: "/admin19900731" -> "admin19900731"
+  // adminPath 계산: "/admin19900731" -> "admin19900731"
   const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
   document.getElementById("adminPathText").textContent = "/" + adminPath;
 
   const tokenKey = "SSX_ADMIN_TOKEN";
+  let selectedFixture = null;
+  let currentFixtures = [];
+
+  function setStatusLine(msg) {
+    document.getElementById("statusLine").textContent = msg || "";
+  }
+
+  function logoutToken() {
+    localStorage.removeItem(tokenKey);
+    alert("토큰을 삭제했습니다. 다음 API 호출 시 다시 입력합니다.");
+  }
 
   function adminHeaders() {
     const t = localStorage.getItem(tokenKey) || "";
@@ -104,7 +256,6 @@
   }
 
   function adminUrl(path) {
-    // path는 "/api/logs" 같은 형태로 넘김
     return "/" + adminPath + path;
   }
 
@@ -120,9 +271,195 @@
     return { status: res.status, data };
   }
 
+  async function publicApi(path) {
+    const res = await fetch(path);
+    const txt = await res.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+    return { status: res.status, data };
+  }
+
   function setOv(msg, ok=true) {
     const el = document.getElementById("ovResult");
     el.innerHTML = ok ? `<span class="ok">${msg}</span>` : `<span class="bad">${msg}</span>`;
+  }
+
+  function safeNum(v) {
+    if (v === "" || v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function deepMerge(base, patch) {
+    if (base && typeof base === "object" && !Array.isArray(base) &&
+        patch && typeof patch === "object" && !Array.isArray(patch)) {
+      const out = { ...base };
+      for (const k of Object.keys(patch)) {
+        out[k] = deepMerge(out[k], patch[k]);
+      }
+      return out;
+    }
+    return patch;
+  }
+
+  function isoDateLocal() {
+    // 브라우저 로컬 기준 YYYY-MM-DD
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth()+1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function fmtInTz(dateUtcStr, tz) {
+    try {
+      const d = new Date(dateUtcStr);
+      return d.toLocaleString("sv-SE", { timeZone: tz, hour12: false }).replace(" ", " ");
+    } catch (e) {
+      return dateUtcStr || "";
+    }
+  }
+
+  function statusOrderKey(sg) {
+    const v = (sg || "").toUpperCase();
+    // 대충 우선순위: LIVE -> NS(예정) -> HT/1H/2H -> FT -> 기타
+    if (v.includes("LIVE")) return 0;
+    if (v === "NS") return 1;
+    if (v.includes("1H") || v.includes("2H") || v.includes("HT")) return 2;
+    if (v.includes("FT")) return 9;
+    return 5;
+  }
+
+  function renderFixtures() {
+    const list = document.getElementById("fxList");
+    list.innerHTML = "";
+
+    const q = (document.getElementById("fxSearch").value || "").trim().toLowerCase();
+
+    const filtered = currentFixtures.filter(f => {
+      if (!q) return true;
+      const s = [
+        f.league_name, f.league_country, f.league_round,
+        f.home?.name, f.away?.name,
+        String(f.fixture_id || "")
+      ].join(" ").toLowerCase();
+      return s.includes(q);
+    });
+
+    filtered.sort((a,b) => {
+      const ka = statusOrderKey(a.status_group);
+      const kb = statusOrderKey(b.status_group);
+      if (ka !== kb) return ka - kb;
+      const ta = (a.date_utc || "");
+      const tb = (b.date_utc || "");
+      return ta.localeCompare(tb);
+    });
+
+    for (const f of filtered) {
+      const div = document.createElement("div");
+      div.className = "item" + ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "");
+      div.onclick = () => selectFixture(f.fixture_id);
+
+      const tz = document.getElementById("fxTz").value || "UTC";
+      const when = fmtInTz(f.date_utc, tz);
+
+      const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
+      const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
+
+      div.innerHTML = `
+        <div>
+          <div class="small muted mono">${when}</div>
+          <div class="k">${f.home?.name || "HOME"} <span class="muted">vs</span> ${f.away?.name || "AWAY"}</div>
+          <div class="small muted">${f.league_name || ""} · ${f.league_round || ""}</div>
+        </div>
+        <div class="right">
+          <div><span class="badge mono">${(f.status_group||"").toUpperCase()}</span></div>
+          <div class="mono" style="margin-top:6px;">${score}</div>
+          <div class="small muted mono">HT ${ht}</div>
+        </div>
+      `;
+      list.appendChild(div);
+    }
+
+    document.getElementById("fxHint").textContent =
+      `rows: ${filtered.length} / ${currentFixtures.length} · 클릭하면 편집 패널이 자동 채워집니다`;
+  }
+
+  function fillQuickEditFromFixture(f) {
+    document.getElementById("qeVenue").value = f.venue_name ?? "";
+    document.getElementById("qeRound").value = f.league_round ?? "";
+    document.getElementById("qeStatusLong").value = f.status_long ?? "";
+    document.getElementById("qeElapsed").value = (f.elapsed ?? "") === null ? "" : (f.elapsed ?? "");
+
+    document.getElementById("qeHomeFt").value = (f.home?.ft ?? "") === null ? "" : (f.home?.ft ?? "");
+    document.getElementById("qeAwayFt").value = (f.away?.ft ?? "") === null ? "" : (f.away?.ft ?? "");
+    document.getElementById("qeHomeHt").value = (f.home?.ht ?? "") === null ? "" : (f.home?.ht ?? "");
+    document.getElementById("qeAwayHt").value = (f.away?.ht ?? "") === null ? "" : (f.away?.ht ?? "");
+  }
+
+  function selectFixture(fixtureId) {
+    const f = currentFixtures.find(x => String(x.fixture_id) === String(fixtureId));
+    if (!f) return;
+
+    selectedFixture = f;
+    renderFixtures();
+
+    document.getElementById("fixtureId").value = String(f.fixture_id);
+    document.getElementById("fxPreview").textContent = JSON.stringify(f, null, 2);
+    fillQuickEditFromFixture(f);
+
+    setStatusLine(`선택: fixture_id=${f.fixture_id}`);
+    // 선택하면 override도 바로 조회해줌(편의)
+    getOverride();
+  }
+
+  async function loadFixtures() {
+    const date = document.getElementById("fxDate").value;
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
+
+    if (!date) {
+      alert("Date를 선택하세요");
+      return;
+    }
+
+    const qs = new URLSearchParams();
+    qs.set("date", date);
+    qs.set("timezone", tz);
+    if (leagueIds) qs.set("league_ids", leagueIds);
+
+    setStatusLine("fixtures 불러오는 중...");
+    const r = await publicApi("/api/fixtures?" + qs.toString());
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setStatusLine("");
+      alert("fixtures 로드 실패: " + JSON.stringify(r.data));
+      return;
+    }
+
+    currentFixtures = r.data.rows || [];
+    selectedFixture = null;
+    document.getElementById("fxPreview").textContent = "{}";
+    setStatusLine("");
+    renderFixtures();
+  }
+
+  async function getOverride() {
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "GET" });
+    if (r.status < 400 && r.data) {
+      const p = r.data.patch;
+      if (p && typeof p === "object") {
+        document.getElementById("patch").value = JSON.stringify(p, null, 2);
+        setOv(`override 존재 · status=${r.status}`, true);
+      } else {
+        document.getElementById("patch").value = "";
+        setOv(`override 없음 · status=${r.status}`, true);
+      }
+    } else {
+      setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
+    }
   }
 
   async function upsertOverride() {
@@ -141,17 +478,9 @@
       body: JSON.stringify(patch),
     });
     setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
-  }
 
-  async function getOverride() {
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "GET" });
-    if (r.status < 400 && r.data && r.data.patch) {
-      document.getElementById("patch").value = JSON.stringify(r.data.patch, null, 2);
-    }
-    setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
+    // 저장 후 목록 최신화(현재 날짜 기준)
+    if (r.status < 400) loadFixtures();
   }
 
   async function deleteOverride() {
@@ -160,6 +489,66 @@
 
     const r = await api(adminUrl(`/api/overrides/${id}`), { method: "DELETE" });
     setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
+
+    if (r.status < 400) {
+      document.getElementById("patch").value = "";
+      loadFixtures();
+    }
+  }
+
+  function applyQuickEditToPatch() {
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    const p = {};
+
+    const v = (document.getElementById("qeVenue").value || "").trim();
+    const r = (document.getElementById("qeRound").value || "").trim();
+    const sl = (document.getElementById("qeStatusLong").value || "").trim();
+    const el = safeNum(document.getElementById("qeElapsed").value);
+
+    if (v) p["venue_name"] = v;
+    if (r) p["league_round"] = r;
+    if (sl) p["status_long"] = sl;
+    if (el !== null) p["elapsed"] = el;
+
+    const hft = safeNum(document.getElementById("qeHomeFt").value);
+    const aft = safeNum(document.getElementById("qeAwayFt").value);
+    const hht = safeNum(document.getElementById("qeHomeHt").value);
+    const aht = safeNum(document.getElementById("qeAwayHt").value);
+
+    if (hft !== null || hht !== null) {
+      p["home"] = p["home"] || {};
+      if (hft !== null) p["home"]["ft"] = hft;
+      if (hht !== null) p["home"]["ht"] = hht;
+    }
+    if (aft !== null || aht !== null) {
+      p["away"] = p["away"] || {};
+      if (aft !== null) p["away"]["ft"] = aft;
+      if (aht !== null) p["away"]["ht"] = aht;
+    }
+
+    const merged = deepMerge(basePatch, p);
+    document.getElementById("patch").value = JSON.stringify(merged, null, 2);
+    setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
+  }
+
+  async function hideFixture() {
+    document.getElementById("patch").value = JSON.stringify({ hidden: true }, null, 2);
+    setOv("hidden=true 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
+  }
+
+  async function unhideFixture() {
+    document.getElementById("patch").value = JSON.stringify({ hidden: false }, null, 2);
+    setOv("hidden=false 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
   }
 
   async function loadLogs() {
@@ -196,6 +585,12 @@
     document.getElementById("logHint").textContent = `rows: ${rows.length} (limit=200)`;
   }
 
+  // 초기값 세팅
+  document.getElementById("fxDate").value = isoDateLocal();
+  document.getElementById("fxTz").value = "Asia/Seoul";
+
+  // 첫 로드: 오늘 fixtures 바로 불러오기 + 로그
+  loadFixtures();
   loadLogs();
 </script>
 </body>
