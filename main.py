@@ -368,13 +368,9 @@ def admin_page():
     if not _admin_enabled():
         return jsonify({"ok": False, "error": "admin disabled"}), 404
 
-    # 페이지 접속 로그(토큰 없이도 페이지는 보이게 할지? -> 여기서는 토큰 필요하게 함)
-    token = request.headers.get("X-Admin-Token", "") or ""
-    if token != ADMIN_TOKEN:
-        _admin_log("auth_fail", ok=False, status_code=401, detail={"note": "page access"})
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    _admin_log("access", ok=True, status_code=200)
+    # ✅ 페이지(HTML)는 토큰 없이도 로드되게 함 (브라우저는 커스텀 헤더를 못 넣음)
+    #    대신 실제 API들은 @require_admin 으로 토큰 보호됨.
+    _admin_log("access", ok=True, status_code=200, detail={"note": "admin page loaded"})
 
     html = f"""
 <!doctype html>
@@ -403,7 +399,7 @@ def admin_page():
 </head>
 <body>
   <h1 style="margin:0 0 14px 0;">SportsStatsX Admin</h1>
-  <div class="muted">경로: /{ADMIN_PATH} · 헤더: <span class="mono">X-Admin-Token</span> 필요</div>
+  <div class="muted">경로: /{ADMIN_PATH} · API 헤더: <span class="mono">X-Admin-Token</span> 필요</div>
 
   <div class="row" style="margin-top:14px;">
     <div class="card" style="flex: 1 1 420px;">
@@ -457,8 +453,8 @@ def admin_page():
   </div>
 
 <script>
-  // 토큰은 localStorage에 보관 (혼자 쓰는 관리자 기준)
   const tokenKey = "SSX_ADMIN_TOKEN";
+
   function adminHeaders() {{
     const t = localStorage.getItem(tokenKey) || "";
     return {{
@@ -564,13 +560,13 @@ def admin_page():
     document.getElementById("logHint").textContent = `rows: ${{rows.length}} (limit=200)`;
   }}
 
-  // 초기 로드
   loadLogs();
 </script>
 </body>
 </html>
 """
     return Response(html, mimetype="text/html")
+
 
 
 # ─────────────────────────────────────────
@@ -828,6 +824,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
