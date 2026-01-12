@@ -368,204 +368,14 @@ def admin_page():
     if not _admin_enabled():
         return jsonify({"ok": False, "error": "admin disabled"}), 404
 
-    # ✅ 페이지(HTML)는 토큰 없이도 로드되게 함 (브라우저는 커스텀 헤더를 못 넣음)
-    #    대신 실제 API들은 @require_admin 으로 토큰 보호됨.
     _admin_log("access", ok=True, status_code=200, detail={"note": "admin page loaded"})
 
-    html = f"""
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>SportsStatsX Admin</title>
-  <style>
-    body {{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }}
-    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .card {{ border:1px solid #ddd; border-radius:10px; padding:14px; max-width: 980px; }}
-    .card h2 {{ margin:0 0 10px 0; font-size: 16px; }}
-    input, textarea, button, select {{ font-size: 14px; }}
-    input, textarea {{ width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc; }}
-    textarea {{ min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
-    button {{ padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }}
-    button.primary {{ border-color:#000; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }}
-    .muted {{ color:#666; font-size:12px; }}
-    .ok {{ color:#0a7; }}
-    .bad {{ color:#d33; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
-  </style>
-</head>
-<body>
-  <h1 style="margin:0 0 14px 0;">SportsStatsX Admin</h1>
-  <div class="muted">경로: /{ADMIN_PATH} · API 헤더: <span class="mono">X-Admin-Token</span> 필요</div>
+    # ✅ HTML은 static/admin.html 파일로 분리
+    # - 캐시 방지용으로 headers 추가(개발/운영 초기엔 편함)
+    resp = send_from_directory(STATIC_DIR, "admin.html", mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
-  <div class="row" style="margin-top:14px;">
-    <div class="card" style="flex: 1 1 420px;">
-      <h2>Override</h2>
-      <label class="muted">Fixture ID</label>
-      <input id="fixtureId" placeholder="예: 123456"/>
-
-      <div style="height:10px;"></div>
-      <label class="muted">Patch JSON (부분만)</label>
-      <textarea id="patch" placeholder='예: {{ "venue_name": "Edited", "home": {{ "ft": 2 }} }}'></textarea>
-
-      <div style="height:10px;"></div>
-      <div class="row">
-        <button class="primary" onclick="upsertOverride()">저장(Upsert)</button>
-        <button onclick="getOverride()">조회</button>
-        <button onclick="deleteOverride()">삭제(원복)</button>
-      </div>
-      <div id="ovResult" class="muted" style="margin-top:10px;"></div>
-    </div>
-
-    <div class="card" style="flex: 1 1 520px;">
-      <h2>Admin Logs</h2>
-      <div class="row">
-        <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
-        <select id="logEvent">
-          <option value="">event_type 전체</option>
-          <option value="access">access</option>
-          <option value="auth_fail">auth_fail</option>
-          <option value="override_get">override_get</option>
-          <option value="override_upsert">override_upsert</option>
-          <option value="override_delete">override_delete</option>
-          <option value="logs_list">logs_list</option>
-        </select>
-        <button onclick="loadLogs()">새로고침</button>
-      </div>
-
-      <div style="height:10px;"></div>
-      <table>
-        <thead>
-          <tr>
-            <th style="width:160px;">ts</th>
-            <th style="width:140px;">type</th>
-            <th style="width:80px;">ok</th>
-            <th>detail</th>
-          </tr>
-        </thead>
-        <tbody id="logsBody"></tbody>
-      </table>
-      <div id="logHint" class="muted" style="margin-top:10px;"></div>
-    </div>
-  </div>
-
-<script>
-  const tokenKey = "SSX_ADMIN_TOKEN";
-
-  function adminHeaders() {{
-    const t = localStorage.getItem(tokenKey) || "";
-    return {{
-      "Content-Type": "application/json",
-      "X-Admin-Token": t,
-    }};
-  }}
-
-  function ensureToken() {{
-    let t = localStorage.getItem(tokenKey);
-    if (!t) {{
-      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
-      if (t) localStorage.setItem(tokenKey, t);
-    }}
-    return t;
-  }}
-
-  async function api(path, opt={{}}) {{
-    ensureToken();
-    const res = await fetch(path, {{
-      ...opt,
-      headers: {{ ...(opt.headers||{{}}), ...adminHeaders() }},
-    }});
-    const txt = await res.text();
-    let data = null;
-    try {{ data = JSON.parse(txt); }} catch (e) {{ data = {{ raw: txt }}; }}
-    return {{ status: res.status, data }};
-  }}
-
-  function setOv(msg, ok=true) {{
-    const el = document.getElementById("ovResult");
-    el.innerHTML = ok ? `<span class="ok">${{msg}}</span>` : `<span class="bad">${{msg}}</span>`;
-  }}
-
-  async function upsertOverride() {{
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    let patch = null;
-    try {{
-      patch = JSON.parse(document.getElementById("patch").value || "{{}}");
-    }} catch (e) {{
-      return setOv("Patch JSON 파싱 실패", false);
-    }}
-
-    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }});
-    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
-  }}
-
-  async function getOverride() {{
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{ method: "GET" }});
-    if (r.status < 400 && r.data && r.data.patch) {{
-      document.getElementById("patch").value = JSON.stringify(r.data.patch, null, 2);
-    }}
-    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
-  }}
-
-  async function deleteOverride() {{
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{ method: "DELETE" }});
-    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
-  }}
-
-  async function loadLogs() {{
-    const fx = document.getElementById("logFixture").value.trim();
-    const ev = document.getElementById("logEvent").value;
-
-    const qs = new URLSearchParams();
-    qs.set("limit", "200");
-    if (fx) qs.set("fixture_id", fx);
-    if (ev) qs.set("event_type", ev);
-
-    const r = await api(`/{ADMIN_PATH}/api/logs?` + qs.toString(), {{ method: "GET" }});
-
-    const body = document.getElementById("logsBody");
-    body.innerHTML = "";
-
-    if (r.status >= 400) {{
-      document.getElementById("logHint").textContent = "로그 로드 실패: " + JSON.stringify(r.data);
-      return;
-    }}
-
-    const rows = (r.data && r.data.rows) ? r.data.rows : [];
-    for (const row of rows) {{
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono">${{row.ts || ""}}</td>
-        <td class="mono">${{row.event_type || ""}}</td>
-        <td>${{row.ok ? "✅" : "❌"}}</td>
-        <td class="mono">${{JSON.stringify(row.detail || {{}})}}</td>
-      `;
-      body.appendChild(tr);
-    }}
-
-    document.getElementById("logHint").textContent = `rows: ${{rows.length}} (limit=200)`;
-  }}
-
-  loadLogs();
-</script>
-</body>
-</html>
-"""
-    return Response(html, mimetype="text/html")
 
 
 
@@ -824,6 +634,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
