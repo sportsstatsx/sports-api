@@ -25,7 +25,6 @@
     .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:12px; align-items:start; }
     @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
 
-    /* Fixtures list */
     .listWrap { max-height: 560px; overflow:auto; border:1px solid #eee; border-radius:10px; }
     .item {
       padding:10px 12px; border-bottom:1px solid #f0f0f0; cursor:pointer;
@@ -39,10 +38,17 @@
     .k { font-weight:600; }
     .ok { color:#0a7; }
     .bad { color:#d33; }
+
     pre {
       margin:0; padding:10px; background:#fafafa; border:1px solid #eee; border-radius:10px;
-      max-height: 240px; overflow:auto;
+      max-height: 260px; overflow:auto;
     }
+
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+    .tabbtn { padding:8px 10px; border-radius:999px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:12px; }
+    .tabbtn.active { border-color:#000; }
+    .tabpane { display:none; margin-top:10px; }
+    .tabpane.active { display:block; }
 
     table { width:100%; border-collapse:collapse; }
     th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
@@ -103,9 +109,32 @@
         <div id="fxList"></div>
       </div>
 
-      <div style="margin-top:12px;">
-        <div class="muted">선택된 경기(override 반영 결과) 미리보기</div>
-        <pre class="mono" id="fxPreview">{}</pre>
+      <div class="tabs">
+        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')">현재(노출)</button>
+        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
+        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
+        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
+      </div>
+
+      <div class="tabpane active" id="tab_now">
+        <div class="muted">선택된 경기(override 반영 결과)</div>
+        <pre class="mono" id="fxPreviewNow">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_raw">
+        <div class="muted">선택된 경기(override 미적용 원본)</div>
+        <pre class="mono" id="fxPreviewRaw">{}</pre>
+        <div class="muted" style="margin-top:8px;" id="rawHint"></div>
+      </div>
+
+      <div class="tabpane" id="tab_patch">
+        <div class="muted">현재 override patch</div>
+        <pre class="mono" id="fxPreviewPatch">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_diff">
+        <div class="muted">원본(raw) → 현재(노출) 변경 요약</div>
+        <pre class="mono" id="fxPreviewDiff">[]</pre>
       </div>
     </div>
 
@@ -199,6 +228,7 @@
             <option value="override_upsert">override_upsert</option>
             <option value="override_delete">override_delete</option>
             <option value="logs_list">logs_list</option>
+            <option value="fixtures_raw_list">fixtures_raw_list</option>
           </select>
           <button onclick="loadLogs()">새로고침</button>
         </div>
@@ -221,13 +251,18 @@
   </div>
 
 <script>
-  // adminPath 계산: "/admin19900731" -> "admin19900731"
   const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
   document.getElementById("adminPathText").textContent = "/" + adminPath;
 
   const tokenKey = "SSX_ADMIN_TOKEN";
   let selectedFixture = null;
+
+  // 현재(노출) fixtures
   let currentFixtures = [];
+
+  // 원본(raw) fixtures 캐시: 같은 필터(date/tz/league_ids) 기준으로 한 번만 가져오기
+  let rawCacheKey = "";
+  let rawFixturesMap = null;
 
   function setStatusLine(msg) {
     document.getElementById("statusLine").textContent = msg || "";
@@ -235,7 +270,7 @@
 
   function logoutToken() {
     localStorage.removeItem(tokenKey);
-    alert("토큰을 삭제했습니다. 다음 API 호출 시 다시 입력합니다.");
+    alert("토큰을 삭제했습니다. 다음 admin API 호출 시 다시 입력합니다.");
   }
 
   function adminHeaders() {
@@ -303,7 +338,6 @@
   }
 
   function isoDateLocal() {
-    // 브라우저 로컬 기준 YYYY-MM-DD
     const d = new Date();
     const yyyy = d.getFullYear();
     const mm = String(d.getMonth()+1).padStart(2, "0");
@@ -322,12 +356,19 @@
 
   function statusOrderKey(sg) {
     const v = (sg || "").toUpperCase();
-    // 대충 우선순위: LIVE -> NS(예정) -> HT/1H/2H -> FT -> 기타
     if (v.includes("LIVE")) return 0;
     if (v === "NS") return 1;
     if (v.includes("1H") || v.includes("2H") || v.includes("HT")) return 2;
-    if (v.includes("FT")) return 9;
+    if (v.includes("FT") || v.includes("FINISHED")) return 9;
     return 5;
+  }
+
+  function showTab(name) {
+    const names = ["now","raw","patch","diff"];
+    for (const n of names) {
+      document.getElementById("tab_" + n).classList.toggle("active", n === name);
+      document.getElementById("tab_" + n + "_btn").classList.toggle("active", n === name);
+    }
   }
 
   function renderFixtures() {
@@ -350,9 +391,7 @@
       const ka = statusOrderKey(a.status_group);
       const kb = statusOrderKey(b.status_group);
       if (ka !== kb) return ka - kb;
-      const ta = (a.date_utc || "");
-      const tb = (b.date_utc || "");
-      return ta.localeCompare(tb);
+      return String(a.date_utc||"").localeCompare(String(b.date_utc||""));
     });
 
     for (const f of filtered) {
@@ -382,7 +421,7 @@
     }
 
     document.getElementById("fxHint").textContent =
-      `rows: ${filtered.length} / ${currentFixtures.length} · 클릭하면 편집 패널이 자동 채워집니다`;
+      `rows: ${filtered.length} / ${currentFixtures.length} · 클릭하면 원본/현재/차이까지 비교됩니다`;
   }
 
   function fillQuickEditFromFixture(f) {
@@ -397,7 +436,104 @@
     document.getElementById("qeAwayHt").value = (f.away?.ht ?? "") === null ? "" : (f.away?.ht ?? "");
   }
 
-  function selectFixture(fixtureId) {
+  function getFilterKey() {
+    const date = document.getElementById("fxDate").value || "";
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
+    return `${date}__${tz}__${leagueIds}`;
+  }
+
+  function buildFixturesQuery() {
+    const date = document.getElementById("fxDate").value;
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
+
+    const qs = new URLSearchParams();
+    qs.set("date", date);
+    qs.set("timezone", tz);
+    if (leagueIds) qs.set("league_ids", leagueIds);
+    return qs;
+  }
+
+  async function ensureRawLoaded() {
+    const key = getFilterKey();
+    if (rawFixturesMap && rawCacheKey === key) return true;
+
+    rawFixturesMap = null;
+    rawCacheKey = key;
+
+    const qs = buildFixturesQuery();
+    document.getElementById("rawHint").textContent = "원본(raw) 불러오는 중...";
+    const r = await api(adminUrl(`/api/fixtures_raw?` + qs.toString()), { method: "GET" });
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      document.getElementById("rawHint").textContent = "원본(raw) 로드 실패: " + JSON.stringify(r.data);
+      return false;
+    }
+
+    const rows = r.data.rows || [];
+    const m = {};
+    for (const x of rows) {
+      m[String(x.fixture_id)] = x;
+    }
+    rawFixturesMap = m;
+    document.getElementById("rawHint").textContent = `원본(raw) rows: ${rows.length}`;
+    return true;
+  }
+
+  function diffObjects(a, b, path="", out=[]) {
+    // a=raw, b=current
+    const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+    const isArr = v => Array.isArray(v);
+
+    if (isObj(a) && isObj(b)) {
+      const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+      for (const k of keys) {
+        diffObjects(a[k], b[k], path ? (path + "." + k) : k, out);
+      }
+      return out;
+    }
+
+    if (isArr(a) || isArr(b)) {
+      const sa = JSON.stringify(a);
+      const sb = JSON.stringify(b);
+      if (sa !== sb) out.push({ path, raw: a, now: b });
+      return out;
+    }
+
+    // primitive / null / undefined
+    if ((a ?? null) !== (b ?? null)) out.push({ path, raw: a, now: b });
+    return out;
+  }
+
+  function updateComparisonViews() {
+    // 현재(노출)
+    document.getElementById("fxPreviewNow").textContent = JSON.stringify(selectedFixture || {}, null, 2);
+
+    // patch는 textarea 기준
+    let patchObj = null;
+    try {
+      patchObj = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!patchObj || typeof patchObj !== "object") patchObj = {};
+    } catch (e) {
+      patchObj = { _error: "patch JSON parse failed" };
+    }
+    document.getElementById("fxPreviewPatch").textContent = JSON.stringify(patchObj, null, 2);
+
+    // raw + diff
+    const raw = rawFixturesMap ? rawFixturesMap[String(selectedFixture?.fixture_id)] : null;
+    document.getElementById("fxPreviewRaw").textContent = JSON.stringify(raw || {}, null, 2);
+
+    if (raw && selectedFixture) {
+      const diffs = diffObjects(raw, selectedFixture, "", []);
+      const limited = diffs.slice(0, 200);
+      document.getElementById("fxPreviewDiff").textContent = JSON.stringify(limited, null, 2);
+    } else {
+      document.getElementById("fxPreviewDiff").textContent = "[]";
+    }
+  }
+
+  async function selectFixture(fixtureId) {
     const f = currentFixtures.find(x => String(x.fixture_id) === String(fixtureId));
     if (!f) return;
 
@@ -405,28 +541,29 @@
     renderFixtures();
 
     document.getElementById("fixtureId").value = String(f.fixture_id);
-    document.getElementById("fxPreview").textContent = JSON.stringify(f, null, 2);
     fillQuickEditFromFixture(f);
 
     setStatusLine(`선택: fixture_id=${f.fixture_id}`);
-    // 선택하면 override도 바로 조회해줌(편의)
-    getOverride();
+
+    // override 조회(그리고 patch textarea 채움)
+    await getOverride();
+
+    // raw 로드 후 비교 뷰 갱신
+    const ok = await ensureRawLoaded();
+    if (!ok) {
+      rawFixturesMap = rawFixturesMap || null;
+    }
+    updateComparisonViews();
   }
 
   async function loadFixtures() {
     const date = document.getElementById("fxDate").value;
-    const tz = document.getElementById("fxTz").value || "UTC";
-    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
-
     if (!date) {
       alert("Date를 선택하세요");
       return;
     }
 
-    const qs = new URLSearchParams();
-    qs.set("date", date);
-    qs.set("timezone", tz);
-    if (leagueIds) qs.set("league_ids", leagueIds);
+    const qs = buildFixturesQuery();
 
     setStatusLine("fixtures 불러오는 중...");
     const r = await publicApi("/api/fixtures?" + qs.toString());
@@ -438,9 +575,20 @@
 
     currentFixtures = r.data.rows || [];
     selectedFixture = null;
-    document.getElementById("fxPreview").textContent = "{}";
+
+    // raw 캐시 무효화(필터 변경될 수 있으니)
+    rawFixturesMap = null;
+    rawCacheKey = "";
+
+    document.getElementById("fxPreviewNow").textContent = "{}";
+    document.getElementById("fxPreviewRaw").textContent = "{}";
+    document.getElementById("fxPreviewPatch").textContent = "{}";
+    document.getElementById("fxPreviewDiff").textContent = "[]";
+    document.getElementById("rawHint").textContent = "";
+
     setStatusLine("");
     renderFixtures();
+    showTab("now");
   }
 
   async function getOverride() {
@@ -457,6 +605,7 @@
         document.getElementById("patch").value = "";
         setOv(`override 없음 · status=${r.status}`, true);
       }
+      updateComparisonViews();
     } else {
       setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
     }
@@ -479,8 +628,10 @@
     });
     setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
 
-    // 저장 후 목록 최신화(현재 날짜 기준)
-    if (r.status < 400) loadFixtures();
+    if (r.status < 400) {
+      // 저장 후 현재 목록 새로고침(노출 결과 갱신)
+      await loadFixtures();
+    }
   }
 
   async function deleteOverride() {
@@ -492,7 +643,8 @@
 
     if (r.status < 400) {
       document.getElementById("patch").value = "";
-      loadFixtures();
+      updateComparisonViews();
+      await loadFixtures();
     }
   }
 
@@ -539,16 +691,19 @@
     const merged = deepMerge(basePatch, p);
     document.getElementById("patch").value = JSON.stringify(merged, null, 2);
     setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
+    updateComparisonViews();
   }
 
   async function hideFixture() {
     document.getElementById("patch").value = JSON.stringify({ hidden: true }, null, 2);
     setOv("hidden=true 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
+    updateComparisonViews();
   }
 
   async function unhideFixture() {
     document.getElementById("patch").value = JSON.stringify({ hidden: false }, null, 2);
     setOv("hidden=false 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
+    updateComparisonViews();
   }
 
   async function loadLogs() {
@@ -585,11 +740,9 @@
     document.getElementById("logHint").textContent = `rows: ${rows.length} (limit=200)`;
   }
 
-  // 초기값 세팅
   document.getElementById("fxDate").value = isoDateLocal();
   document.getElementById("fxTz").value = "Asia/Seoul";
 
-  // 첫 로드: 오늘 fixtures 바로 불러오기 + 로그
   loadFixtures();
   loadLogs();
 </script>
