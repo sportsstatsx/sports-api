@@ -17,7 +17,7 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
-from db import fetch_all, fetch_one
+from db import fetch_all, fetch_one, execute
 from services.home_service import (
     get_home_leagues,
     get_home_league_directory,
@@ -220,6 +220,85 @@ def _metrics_teardown_request(exc):
         g._metrics_started = False
 
 
+# ─────────────────────────────────────────
+# Admin (single-user) settings
+# ─────────────────────────────────────────
+ADMIN_PATH = (os.getenv("ADMIN_PATH", "") or "").strip().strip("/")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "") or ""
+
+
+def _admin_enabled() -> bool:
+    return bool(ADMIN_PATH) and bool(ADMIN_TOKEN)
+
+
+def _client_ip() -> str:
+    # Cloudflare / Proxy 고려
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        # 첫 번째가 원 IP인 경우가 대부분
+        return xff.split(",")[0].strip()
+
+    return (request.remote_addr or "").strip()
+
+
+def _admin_log(
+    event_type: str,
+    ok: bool = True,
+    status_code: int | None = None,
+    fixture_id: int | None = None,
+    detail: Dict[str, Any] | None = None,
+) -> None:
+    """
+    admin_logs 테이블에 기록 (실패해도 서비스는 계속 동작해야 하므로 try/except)
+    """
+    try:
+        payload = detail or {}
+        execute(
+            """
+            INSERT INTO admin_logs (event_type, path, method, ip, user_agent, ok, status_code, fixture_id, detail)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                event_type,
+                request.path,
+                request.method,
+                _client_ip(),
+                (request.headers.get("User-Agent") or "")[:400],
+                ok,
+                status_code,
+                fixture_id,
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
+    except Exception:
+        pass
+
+
+def require_admin(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # 토큰/경로 미설정이면 관리자 기능 비활성(404)
+        if not _admin_enabled():
+            return jsonify({"ok": False, "error": "admin disabled"}), 404
+
+        token = request.headers.get("X-Admin-Token", "") or ""
+        if token != ADMIN_TOKEN:
+            _admin_log(
+                event_type="auth_fail",
+                ok=False,
+                status_code=401,
+                detail={"note": "bad token"},
+            )
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        return fn(*args, **kwargs)
+
+    return wrapper
+
 
 # ─────────────────────────────────────────
 # Root: redirect to Google Play
@@ -279,6 +358,300 @@ def terms_ko():
 def app_ads_txt():
     # AdMob app-ads.txt verification
     return send_from_directory(STATIC_DIR, "app-ads.txt", mimetype="text/plain")
+
+
+# ─────────────────────────────────────────
+# Admin Page (single HTML)
+# ─────────────────────────────────────────
+@app.route(f"/{ADMIN_PATH}")
+def admin_page():
+    if not _admin_enabled():
+        return jsonify({"ok": False, "error": "admin disabled"}), 404
+
+    # 페이지 접속 로그(토큰 없이도 페이지는 보이게 할지? -> 여기서는 토큰 필요하게 함)
+    token = request.headers.get("X-Admin-Token", "") or ""
+    if token != ADMIN_TOKEN:
+        _admin_log("auth_fail", ok=False, status_code=401, detail={"note": "page access"})
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    _admin_log("access", ok=True, status_code=200)
+
+    html = f"""
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SportsStatsX Admin</title>
+  <style>
+    body {{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }}
+    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
+    .card {{ border:1px solid #ddd; border-radius:10px; padding:14px; max-width: 980px; }}
+    .card h2 {{ margin:0 0 10px 0; font-size: 16px; }}
+    input, textarea, button, select {{ font-size: 14px; }}
+    input, textarea {{ width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc; }}
+    textarea {{ min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+    button {{ padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }}
+    button.primary {{ border-color:#000; }}
+    table {{ width:100%; border-collapse:collapse; }}
+    th, td {{ border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }}
+    .muted {{ color:#666; font-size:12px; }}
+    .ok {{ color:#0a7; }}
+    .bad {{ color:#d33; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+  </style>
+</head>
+<body>
+  <h1 style="margin:0 0 14px 0;">SportsStatsX Admin</h1>
+  <div class="muted">경로: /{ADMIN_PATH} · 헤더: <span class="mono">X-Admin-Token</span> 필요</div>
+
+  <div class="row" style="margin-top:14px;">
+    <div class="card" style="flex: 1 1 420px;">
+      <h2>Override</h2>
+      <label class="muted">Fixture ID</label>
+      <input id="fixtureId" placeholder="예: 123456"/>
+
+      <div style="height:10px;"></div>
+      <label class="muted">Patch JSON (부분만)</label>
+      <textarea id="patch" placeholder='예: {{ "venue_name": "Edited", "home": {{ "ft": 2 }} }}'></textarea>
+
+      <div style="height:10px;"></div>
+      <div class="row">
+        <button class="primary" onclick="upsertOverride()">저장(Upsert)</button>
+        <button onclick="getOverride()">조회</button>
+        <button onclick="deleteOverride()">삭제(원복)</button>
+      </div>
+      <div id="ovResult" class="muted" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="card" style="flex: 1 1 520px;">
+      <h2>Admin Logs</h2>
+      <div class="row">
+        <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
+        <select id="logEvent">
+          <option value="">event_type 전체</option>
+          <option value="access">access</option>
+          <option value="auth_fail">auth_fail</option>
+          <option value="override_get">override_get</option>
+          <option value="override_upsert">override_upsert</option>
+          <option value="override_delete">override_delete</option>
+          <option value="logs_list">logs_list</option>
+        </select>
+        <button onclick="loadLogs()">새로고침</button>
+      </div>
+
+      <div style="height:10px;"></div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:160px;">ts</th>
+            <th style="width:140px;">type</th>
+            <th style="width:80px;">ok</th>
+            <th>detail</th>
+          </tr>
+        </thead>
+        <tbody id="logsBody"></tbody>
+      </table>
+      <div id="logHint" class="muted" style="margin-top:10px;"></div>
+    </div>
+  </div>
+
+<script>
+  // 토큰은 localStorage에 보관 (혼자 쓰는 관리자 기준)
+  const tokenKey = "SSX_ADMIN_TOKEN";
+  function adminHeaders() {{
+    const t = localStorage.getItem(tokenKey) || "";
+    return {{
+      "Content-Type": "application/json",
+      "X-Admin-Token": t,
+    }};
+  }}
+
+  function ensureToken() {{
+    let t = localStorage.getItem(tokenKey);
+    if (!t) {{
+      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
+      if (t) localStorage.setItem(tokenKey, t);
+    }}
+    return t;
+  }}
+
+  async function api(path, opt={{}}) {{
+    ensureToken();
+    const res = await fetch(path, {{
+      ...opt,
+      headers: {{ ...(opt.headers||{{}}), ...adminHeaders() }},
+    }});
+    const txt = await res.text();
+    let data = null;
+    try {{ data = JSON.parse(txt); }} catch (e) {{ data = {{ raw: txt }}; }}
+    return {{ status: res.status, data }};
+  }}
+
+  function setOv(msg, ok=true) {{
+    const el = document.getElementById("ovResult");
+    el.innerHTML = ok ? `<span class="ok">${{msg}}</span>` : `<span class="bad">${{msg}}</span>`;
+  }}
+
+  async function upsertOverride() {{
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    let patch = null;
+    try {{
+      patch = JSON.parse(document.getElementById("patch").value || "{{}}");
+    }} catch (e) {{
+      return setOv("Patch JSON 파싱 실패", false);
+    }}
+
+    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }});
+    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
+  }}
+
+  async function getOverride() {{
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{ method: "GET" }});
+    if (r.status < 400 && r.data && r.data.patch) {{
+      document.getElementById("patch").value = JSON.stringify(r.data.patch, null, 2);
+    }}
+    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
+  }}
+
+  async function deleteOverride() {{
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const r = await api(`/{ADMIN_PATH}/api/overrides/${{id}}`, {{ method: "DELETE" }});
+    setOv(`status=${{r.status}} · ${{JSON.stringify(r.data)}}`, r.status < 400);
+  }}
+
+  async function loadLogs() {{
+    const fx = document.getElementById("logFixture").value.trim();
+    const ev = document.getElementById("logEvent").value;
+
+    const qs = new URLSearchParams();
+    qs.set("limit", "200");
+    if (fx) qs.set("fixture_id", fx);
+    if (ev) qs.set("event_type", ev);
+
+    const r = await api(`/{ADMIN_PATH}/api/logs?` + qs.toString(), {{ method: "GET" }});
+
+    const body = document.getElementById("logsBody");
+    body.innerHTML = "";
+
+    if (r.status >= 400) {{
+      document.getElementById("logHint").textContent = "로그 로드 실패: " + JSON.stringify(r.data);
+      return;
+    }}
+
+    const rows = (r.data && r.data.rows) ? r.data.rows : [];
+    for (const row of rows) {{
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${{row.ts || ""}}</td>
+        <td class="mono">${{row.event_type || ""}}</td>
+        <td>${{row.ok ? "✅" : "❌"}}</td>
+        <td class="mono">${{JSON.stringify(row.detail || {{}})}}</td>
+      `;
+      body.appendChild(tr);
+    }}
+
+    document.getElementById("logHint").textContent = `rows: ${{rows.length}} (limit=200)`;
+  }}
+
+  // 초기 로드
+  loadLogs();
+</script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
+
+
+# ─────────────────────────────────────────
+# Admin APIs
+# ─────────────────────────────────────────
+@app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["GET"])
+@require_admin
+def admin_get_override(fixture_id: int):
+    row = fetch_one(
+        "SELECT fixture_id, patch, updated_at FROM match_overrides WHERE fixture_id = %s",
+        (fixture_id,),
+    )
+    _admin_log("override_get", ok=True, status_code=200, fixture_id=fixture_id)
+    return jsonify({"ok": True, "row": row, "patch": (row["patch"] if row else None)})
+
+
+@app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["PUT"])
+@require_admin
+def admin_upsert_override(fixture_id: int):
+    patch = request.get_json(silent=True)
+    if not isinstance(patch, dict):
+        _admin_log("override_upsert", ok=False, status_code=400, fixture_id=fixture_id, detail={"error": "patch must be object"})
+        return jsonify({"ok": False, "error": "patch must be a JSON object"}), 400
+
+    execute(
+        """
+        INSERT INTO match_overrides (fixture_id, patch, updated_at)
+        VALUES (%s, %s::jsonb, now())
+        ON CONFLICT (fixture_id)
+        DO UPDATE SET patch = EXCLUDED.patch, updated_at = now()
+        """,
+        (fixture_id, json.dumps(patch, ensure_ascii=False)),
+    )
+
+    _admin_log("override_upsert", ok=True, status_code=200, fixture_id=fixture_id, detail={"keys": list(patch.keys())[:50]})
+    return jsonify({"ok": True, "fixture_id": fixture_id})
+
+
+@app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["DELETE"])
+@require_admin
+def admin_delete_override(fixture_id: int):
+    execute("DELETE FROM match_overrides WHERE fixture_id = %s", (fixture_id,))
+    _admin_log("override_delete", ok=True, status_code=200, fixture_id=fixture_id)
+    return jsonify({"ok": True, "fixture_id": fixture_id})
+
+
+@app.route(f"/{ADMIN_PATH}/api/logs", methods=["GET"])
+@require_admin
+def admin_list_logs():
+    limit = request.args.get("limit", type=int) or 200
+    limit = max(1, min(limit, 500))
+
+    event_type = request.args.get("event_type", type=str) or ""
+    fixture_id = request.args.get("fixture_id", type=int)
+
+    where = []
+    params: List[Any] = []
+
+    if event_type:
+        where.append("event_type = %s")
+        params.append(event_type)
+
+    if fixture_id is not None:
+        where.append("fixture_id = %s")
+        params.append(fixture_id)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    rows = fetch_all(
+        f"""
+        SELECT ts, event_type, ok, status_code, fixture_id, detail
+        FROM admin_logs
+        {where_sql}
+        ORDER BY ts DESC
+        LIMIT %s
+        """,
+        tuple(params + [limit]),
+    )
+
+    _admin_log("logs_list", ok=True, status_code=200, detail={"limit": limit, "event_type": event_type, "fixture_id": fixture_id})
+    return jsonify({"ok": True, "rows": rows})
 
 
 
@@ -455,6 +828,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
