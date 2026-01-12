@@ -24,6 +24,11 @@ def match_detail_bundle():
         comp = request.args.get("comp")     # e.g. "League", "Cup", "All"
         last_n = request.args.get("last_n") # e.g. "Last 5", "Last 10"
 
+        # ✅ 관리자/디버그용: override 적용 여부 (기본: 적용)
+        apply_override = request.args.get("apply_override", default=1, type=int)
+        apply_override = bool(apply_override)
+
+
         if fixture_id is None or league_id is None or season is None:
             return (
                 jsonify(
@@ -42,7 +47,9 @@ def match_detail_bundle():
             season=season,
             comp=comp,
             last_n=last_n,
+            apply_override=apply_override,
         )
+
 
         if not bundle:
             return jsonify({"ok": False, "error": "Match not found"}), 404
