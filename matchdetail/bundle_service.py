@@ -128,7 +128,10 @@ def get_match_detail_bundle(
 
     header["filters"] = header_filters  # 다시 덮어쓰기
 
-    # 3) ✅ override 적용 (디테일 번들에서도 수정 반영) - 딱 1번만
+    # 3) ✅ override 로드 (hidden 체크 포함)
+    header_patch = {}
+    bundle_patch = {}
+
     if apply_override:
         patch = _load_override_patch(fixture_id)
 
@@ -137,15 +140,41 @@ def get_match_detail_bundle(
             return None
 
         if isinstance(patch, dict) and patch:
-            # patch가 { "header": {...} } 형태면 header만 머지
+            # meta 키는 머지 대상에서 제외
+            patch = {k: v for k, v in patch.items() if k != "hidden"}
+
+            # (A) patch가 {"header": {...}} 구조면 header/bundle 분리
             if isinstance(patch.get("header"), dict):
-                header = _deep_merge(header, patch["header"])
+                header_patch = patch.get("header") or {}
+                bundle_patch = dict(patch)
+                bundle_patch.pop("header", None)
             else:
-                header = _deep_merge(header, patch)
+                # (B) 하위호환: 예전엔 patch 전체를 header에 머지했음
+                #     그런데 admin에서 timeline 같은 번들 키를 직접 넣기 시작했으니
+                #     "번들 키가 하나라도 있으면" bundle_patch로 처리
+                bundle_keys = {
+                    "timeline",
+                    "form",
+                    "lineups",
+                    "stats",
+                    "h2h",
+                    "standings",
+                    "insights_overall",
+                    "ai_predictions",
+                    "header",
+                }
+                has_bundle_key = any((k in patch) for k in bundle_keys)
 
-            _reconcile_header_aliases(header)
+                if has_bundle_key:
+                    bundle_patch = patch
+                else:
+                    header_patch = patch
 
-    # 4) 나머지 블록 (override 반영된 header로 생성)
+            if isinstance(header_patch, dict) and header_patch:
+                header = _deep_merge(header, header_patch)
+                _reconcile_header_aliases(header)
+
+    # 4) 나머지 블록 생성
     form = build_form_block(header)
     timeline = build_timeline_block(header)
     lineups = build_lineups_block(header)
@@ -164,7 +193,7 @@ def get_match_detail_bundle(
     insights_overall = build_insights_overall_block(header)
     ai_predictions = build_ai_predictions_block(header, insights_overall)
 
-    return {
+    bundle = {
         "header": header,
         "form": form,
         "timeline": timeline,
@@ -175,3 +204,16 @@ def get_match_detail_bundle(
         "insights_overall": insights_overall,
         "ai_predictions": ai_predictions,
     }
+
+    # 5) ✅ 번들 완성 후, bundle_patch를 최종 머지 (timeline 삭제/수정 등이 여기서 반영됨)
+    if apply_override and isinstance(bundle_patch, dict) and bundle_patch:
+        # meta 키는 노출/머지에서 제외
+        bundle_patch = {k: v for k, v in bundle_patch.items() if k != "hidden"}
+        bundle = _deep_merge(bundle, bundle_patch)
+
+        # header가 bundle_patch에서 바뀌었을 수도 있으니 동의어 재동기화
+        if isinstance(bundle.get("header"), dict):
+            _reconcile_header_aliases(bundle["header"])
+
+    return bundle
+
