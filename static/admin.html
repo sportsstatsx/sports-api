@@ -1198,9 +1198,11 @@
       ui_extraMain: String(extraMain || ""),
       ui_detail: String(detail || ""),
     };
+  }
 
 
   function evtApplyUiToRaw(row) {
+
     // UI 필드를 원본 객체에 최대한 무해하게 반영(없던 키는 "event_admin" 네임스페이스로 보관)
     const r = row._raw || {};
     if (!isObj(r)) return row;
