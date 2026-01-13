@@ -1062,18 +1062,25 @@
       const hasType = keys.some(k => ["type","event_type","kind","detail","name"].includes(k));
       const hasTime = keys.some(k => ["time","minute","min","elapsed","elapsed_min","elapsedMinute"].includes(k));
       const hasTeam = keys.some(k => ["team","team_id","teamId","side"].includes(k));
-      const hasPlayer = keys.some(k => ["player","player_name","playerName","assist","sub_in","sub_out"].includes(k));
+
+      // ✅ timeline 스키마(line1/line2 등)도 player 힌트로 인정
+      const hasPlayer = keys.some(k => ["player","player_name","playerName","assist","sub_in","sub_out","line1","line2"].includes(k));
+
+      // ✅ timeline 전용 키가 있으면 후보일 확률이 높아서 가산점
+      const hasTimelineKeys = keys.some(k => ["minute_label","minute_extra","side_home","snapshot_score","id_stable"].includes(k));
 
       if (hasType) score += 2;
       if (hasTime) score += 3;
       if (hasTeam) score += 1;
       if (hasPlayer) score += 1;
+      if (hasTimelineKeys) score += 2;
     }
     // 길이가 너무 길면(배당/통계 배열 등) 오탐 방지용 가산/감산
     if (arr.length >= 5) score += 2;
     if (arr.length > 200) score -= 3;
     return score;
   }
+
 
   function evtFindCandidates(root) {
     const out = [];
@@ -1389,45 +1396,48 @@
 
     // 새 이벤트 객체는 서버 스키마를 모르므로, "event_admin" 네임스페이스로 안전하게 추가
     const p = (evtState.path || "").toLowerCase();
+    const pLast = p.split(".").filter(Boolean).pop() || "";
 
-// timeline 스키마로 생성(가장 흔한 케이스)
-let raw = null;
+    // timeline 스키마로 생성(가장 흔한 케이스)
+    let raw = null;
 
-if (p === "timeline" || p.includes("timeline")) {
-  const m = (min === "" ? null : Number(min));
-  const e = (ex === "" ? null : Number(ex));
-  const side = String(team || "");
-  const minuteLabel =
-    (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+    if (pLast === "timeline") {
+      const m = (min === "" ? null : Number(min));
+      const e = (ex === "" ? null : Number(ex));
+      const side = String(team || "");
 
-  raw = {
-    id_stable: `admin-${Date.now()}`,     // 임시 unique
-    line1: String(main || ""),
-    line2: String(extraMain || "") || null,
-    minute: m,
-    minute_extra: e,
-    minute_label: minuteLabel,
-    period: "",                            // 모르면 빈값 유지
-    side: side,
-    side_home: (side === "home"),
-    snapshot_score: null,
-    type: String(type || "OTHER"),
-    detail: String(detail || "") || null,
-  };
-} else {
-  // fallback: 스키마 모를 때
-  raw = {
-    event_admin: {
-      minute: min === "" ? null : Number(min),
-      extra: ex === "" ? null : Number(ex),
-      team,
-      type,
-      main,
-      extraMain,
-      detail,
+      const minuteLabel =
+        (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+
+      raw = {
+        id_stable: `admin-${Date.now()}`,     // 임시 unique
+        line1: String(main || ""),
+        line2: (String(extraMain || "").trim() === "" ? null : String(extraMain || "")),
+        minute: m,
+        minute_extra: e,
+        minute_label: minuteLabel,
+        period: "",                            // 모르면 빈값 유지
+        side: side,
+        side_home: (side === "home"),
+        snapshot_score: null,
+        type: String(type || "OTHER"),
+        detail: (String(detail || "").trim() === "" ? null : String(detail || "")),
+      };
+    } else {
+      // fallback: 스키마 모를 때
+      raw = {
+        event_admin: {
+          minute: min === "" ? null : Number(min),
+          extra: ex === "" ? null : Number(ex),
+          team,
+          type,
+          main,
+          extraMain,
+          detail,
+        }
+      };
     }
-  };
-}
+
 
 
     const row = evtNormalizeForUi(raw);
