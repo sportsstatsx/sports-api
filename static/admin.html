@@ -55,6 +55,19 @@
 
     table { width:100%; border-collapse:collapse; }
     th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
+        /* ---- Event Editor ---- */
+    .subcard { border:1px solid #eee; border-radius:10px; padding:12px; background:#fff; }
+    .subcard h3 { margin:0 0 10px 0; font-size:14px; }
+    .mini { font-size:12px; }
+    .btnsm { padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; font-size:12px; }
+    .btnsm.primary { border-color:#000; }
+    .btnsm.danger { border-color:#d33; color:#d33; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+    .evtTable input, .evtTable select { padding:8px; font-size:12px; }
+    .evtTable td { padding:6px; }
+
   </style>
 </head>
 <body>
@@ -230,6 +243,98 @@
           <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
           <button onclick="upsertOverride()">저장(Upsert)</button>
         </div>
+
+        <!-- Event Editor -->
+        <div style="height:12px;"></div>
+        <div class="subcard">
+          <h3>Event Editor (Goals / Cards / Subs)</h3>
+
+          <div class="row" style="align-items:flex-end;">
+            <div style="flex:1 1 320px;">
+              <label class="muted mini">이벤트 배열 경로(자동 탐지)</label>
+              <select id="evtPath"></select>
+              <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
+            </div>
+            <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btnsm" onclick="evtReloadFromBundle()">bundle에서 불러오기</button>
+              <button class="btnsm" onclick="evtApplyToPatch(false)">Patch에 반영</button>
+              <button class="btnsm danger" onclick="evtClearAll()">전체 삭제</button>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+          <!-- Add row -->
+          <div class="grid2">
+            <div>
+              <label class="muted mini">Minute</label>
+              <input id="evtMin" type="number" placeholder="예: 57" />
+            </div>
+            <div>
+              <label class="muted mini">Extra(+)</label>
+              <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
+            </div>
+
+            <div>
+              <label class="muted mini">Team</label>
+              <select id="evtTeam">
+                <option value="">(none)</option>
+                <option value="home">home</option>
+                <option value="away">away</option>
+              </select>
+            </div>
+            <div>
+              <label class="muted mini">Type</label>
+              <select id="evtType">
+                <option value="GOAL">GOAL</option>
+                <option value="RED">RED</option>
+                <option value="YELLOW">YELLOW</option>
+                <option value="SUB">SUB</option>
+                <option value="OTHER">OTHER</option>
+              </select>
+            </div>
+
+            <div>
+              <label class="muted mini">Player / Main</label>
+              <input id="evtPlayer" placeholder="예: Messi / Player name" />
+            </div>
+            <div>
+              <label class="muted mini">Assist / SubOut</label>
+              <input id="evtAssist" placeholder="예: Assist / Sub out" />
+            </div>
+
+            <div style="grid-column: 1 / -1;">
+              <label class="muted mini">Detail</label>
+              <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
+            </div>
+
+            <div style="grid-column: 1 / -1; display:flex; gap:8px;">
+              <button class="btnsm primary" onclick="evtAdd()">+ 이벤트 추가</button>
+              <button class="btnsm" onclick="evtSort()">정렬(시간순)</button>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+          <div class="muted mini">이벤트 목록 (행 수정/삭제 가능) · 수정하면 Patch JSON에 자동 반영됩니다</div>
+          <div style="height:6px;"></div>
+
+          <table class="evtTable" style="width:100%; border-collapse:collapse;">
+            <thead>
+              <tr>
+                <th style="width:80px;">min</th>
+                <th style="width:70px;">team</th>
+                <th style="width:90px;">type</th>
+                <th>main</th>
+                <th>extra</th>
+                <th>detail</th>
+                <th style="width:80px;">del</th>
+              </tr>
+            </thead>
+            <tbody id="evtBody"></tbody>
+          </table>
+        </div>
+
 
         <div style="height:10px;"></div>
         <label class="muted">Patch JSON (부분만)</label>
@@ -644,6 +749,7 @@
     } else {
       document.getElementById("bundlePreviewDiff").textContent = "[]";
     }
+    evtReloadFromBundle();
   }
 
 
@@ -669,7 +775,9 @@
       rawFixturesMap = rawFixturesMap || null;
     }
     updateComparisonViews();
+    // ⚠️ loadBundleViews()는 getOverride()에서 처리 (중복 호출 방지)
   }
+
 
   async function loadFixtures() {
     const date = document.getElementById("fxDate").value;
@@ -745,6 +853,7 @@
       await loadBundleViews();
     } else {
       setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
+      await loadBundleViews();
     }
   }
 
@@ -754,6 +863,7 @@
 
     // ✅ 1단계: 저장 버튼 누르면 Quick Edit → Patch 자동 반영(변경된 항목만)
     applyQuickEditToPatch({ silent: true, onlyIfChanged: true });
+    evtApplyToPatch(true);
 
     let patch = null;
     try {
@@ -892,18 +1002,460 @@
     return true;
   }
 
+  // ─────────────────────────────────────
+  // Event Editor (Goals/Cards/Subs) - bundle에서 이벤트 배열 경로 자동 탐지 후 배열 통째로 override
+  // ─────────────────────────────────────
+
+  let evtState = {
+    path: "",        // 선택된 이벤트 배열 경로 (예: "timeline.events" 같은 형태)
+    candidates: [],  // {path, score, sample}
+    events: [],      // 편집 중인 이벤트 배열(원본 객체 유지)
+  };
+
+  function isObj(v){ return v && typeof v === "object" && !Array.isArray(v); }
+
+  function deepClone(v) {
+    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
+  }
+
+  function getByPath(obj, path) {
+    if (!obj || !path) return undefined;
+    const parts = String(path).split(".").filter(Boolean);
+    let cur = obj;
+    for (const p of parts) {
+      if (!cur) return undefined;
+      cur = cur[p];
+    }
+    return cur;
+  }
+
+  function setByPath(obj, path, value) {
+    const parts = String(path).split(".").filter(Boolean);
+    if (!parts.length) return obj;
+    let cur = obj;
+    for (let i=0;i<parts.length;i++) {
+      const k = parts[i];
+      const last = (i === parts.length-1);
+      if (last) {
+        cur[k] = value;
+      } else {
+        if (!isObj(cur[k])) cur[k] = {};
+        cur = cur[k];
+      }
+    }
+    return obj;
+  }
+
+  function evtScoreArray(arr) {
+    // 이벤트 배열 후보인지 점수화(휴리스틱)
+    if (!Array.isArray(arr) || arr.length < 1) return 0;
+
+    let score = 0;
+    const n = Math.min(arr.length, 30);
+    for (let i=0;i<n;i++) {
+      const e = arr[i];
+      if (!isObj(e)) continue;
+
+      const keys = Object.keys(e);
+      const hasType = keys.some(k => ["type","event_type","kind","detail","name"].includes(k));
+      const hasTime = keys.some(k => ["time","minute","min","elapsed","elapsed_min","elapsedMinute"].includes(k));
+      const hasTeam = keys.some(k => ["team","team_id","teamId","side"].includes(k));
+      const hasPlayer = keys.some(k => ["player","player_name","playerName","assist","sub_in","sub_out"].includes(k));
+
+      if (hasType) score += 2;
+      if (hasTime) score += 3;
+      if (hasTeam) score += 1;
+      if (hasPlayer) score += 1;
+    }
+    // 길이가 너무 길면(배당/통계 배열 등) 오탐 방지용 가산/감산
+    if (arr.length >= 5) score += 2;
+    if (arr.length > 200) score -= 3;
+    return score;
+  }
+
+  function evtFindCandidates(root) {
+    const out = [];
+    const seen = new Set();
+    const stack = [{ obj: root, path: "" }];
+
+    while (stack.length) {
+      const { obj, path } = stack.pop();
+      if (!obj) continue;
+
+      if (Array.isArray(obj)) {
+        const sc = evtScoreArray(obj);
+        if (sc >= 8) {
+          const p = path || "(root_array)";
+          if (!seen.has(p)) {
+            seen.add(p);
+            out.push({
+              path: p,
+              score: sc,
+              sample: obj.slice(0, 2),
+              len: obj.length,
+            });
+          }
+        }
+        // 배열 내부도 탐색(객체면)
+        for (let i=0;i<Math.min(obj.length, 30);i++) {
+          const v = obj[i];
+          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: path }); // path 유지
+        }
+        continue;
+      }
+
+      if (isObj(obj)) {
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          const p2 = path ? (path + "." + k) : k;
+          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: p2 });
+        }
+      }
+    }
+
+    out.sort((a,b) => b.score - a.score);
+    return out.slice(0, 12);
+  }
+
+  function evtRefreshPathSelect() {
+    const sel = document.getElementById("evtPath");
+    const hint = document.getElementById("evtHint");
+    sel.innerHTML = "";
+
+    const cands = evtState.candidates || [];
+    if (!cands.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
+      sel.appendChild(opt);
+      evtState.path = "";
+      hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
+      return;
+    }
+
+    for (const c of cands) {
+      const opt = document.createElement("option");
+      opt.value = c.path;
+      opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
+      sel.appendChild(opt);
+    }
+
+    // 기존 선택 유지 시도
+    const keep = evtState.path && cands.find(x => x.path === evtState.path);
+    evtState.path = keep ? evtState.path : cands[0].path;
+    sel.value = evtState.path;
+
+    hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
+
+    sel.onchange = () => {
+      evtState.path = sel.value || "";
+      evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
+    };
+  }
+
+  function evtNormalizeForUi(e) {
+    // 다양한 스키마를 UI 공통 필드로 매핑(최대한 안전하게)
+    const o = isObj(e) ? e : {};
+    const pick = (...ks) => {
+      for (const k of ks) if (o[k] !== undefined && o[k] !== null) return o[k];
+      return "";
+    };
+
+    const type = String(pick("type","event_type","kind","name","detail") || "").toUpperCase();
+    const minute = pick("minute","min","elapsed","elapsed_min","elapsedMinute");
+    const extra = pick("extra","stoppage","added","extra_time");
+    const team = pick("team","side","team_key","teamSide");
+
+    const main = pick("player","player_name","playerName","main","scorer","sub_in");
+    const extraMain = pick("assist","assist_name","assistName","sub_out","second_player");
+
+    const detail = pick("detail","comment","reason","note","event_detail");
+
+    return {
+      _raw: o, // 원본 보관
+      ui_min: minute === "" ? "" : Number(minute),
+      ui_extra: extra === "" ? "" : Number(extra),
+      ui_team: String(team || "").toLowerCase(),
+      ui_type: type || "OTHER",
+      ui_main: String(main || ""),
+      ui_extraMain: String(extraMain || ""),
+      ui_detail: String(detail || ""),
+    };
+  }
+
+  function evtApplyUiToRaw(row) {
+    // UI 필드를 원본 객체에 최대한 무해하게 반영(없던 키는 "event_admin" 네임스페이스로 보관)
+    const r = row._raw || {};
+    if (!isObj(r)) return row;
+
+    // 기존 키가 있으면 그 키를 우선 업데이트, 없으면 event_admin에 저장
+    const setPref = (keys, val) => {
+      for (const k of keys) {
+        if (r[k] !== undefined) { r[k] = val; return true; }
+      }
+      return false;
+    };
+
+    // minute/extra
+    const minVal = (row.ui_min === "" || row.ui_min === null || row.ui_min === undefined) ? null : Number(row.ui_min);
+    const exVal = (row.ui_extra === "" || row.ui_extra === null || row.ui_extra === undefined) ? null : Number(row.ui_extra);
+
+    if (!setPref(["minute","min","elapsed","elapsed_min","elapsedMinute"], minVal)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.minute = minVal;
+    }
+    if (!setPref(["extra","stoppage","added","extra_time"], exVal)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.extra = exVal;
+    }
+
+    // type/team/main/assist/detail
+    if (!setPref(["type","event_type","kind","name"], row.ui_type)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.type = row.ui_type;
+    }
+    if (!setPref(["team","side","team_key","teamSide"], row.ui_team)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.team = row.ui_team;
+    }
+    if (!setPref(["player","player_name","playerName","main","scorer","sub_in"], row.ui_main)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.main = row.ui_main;
+    }
+    if (!setPref(["assist","assist_name","assistName","sub_out","second_player"], row.ui_extraMain)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.extraMain = row.ui_extraMain;
+    }
+    if (!setPref(["detail","comment","reason","note","event_detail"], row.ui_detail)) {
+      r.event_admin = r.event_admin || {};
+      r.event_admin.detail = row.ui_detail;
+    }
+
+    return row;
+  }
+
+  function evtRender() {
+    const body = document.getElementById("evtBody");
+    body.innerHTML = "";
+
+    const rows = evtState.events || [];
+    for (let i=0;i<rows.length;i++) {
+      const row = rows[i];
+      const tr = document.createElement("tr");
+
+      tr.innerHTML = `
+        <td><input type="number" value="${row.ui_min ?? ""}" data-k="ui_min" style="width:70px;"></td>
+        <td>
+          <select data-k="ui_team">
+            <option value="" ${row.ui_team===""?"selected":""}>(none)</option>
+            <option value="home" ${row.ui_team==="home"?"selected":""}>home</option>
+            <option value="away" ${row.ui_team==="away"?"selected":""}>away</option>
+          </select>
+        </td>
+        <td>
+          <select data-k="ui_type">
+            <option value="GOAL" ${row.ui_type==="GOAL"?"selected":""}>GOAL</option>
+            <option value="RED" ${row.ui_type==="RED"?"selected":""}>RED</option>
+            <option value="YELLOW" ${row.ui_type==="YELLOW"?"selected":""}>YELLOW</option>
+            <option value="SUB" ${row.ui_type==="SUB"?"selected":""}>SUB</option>
+            <option value="OTHER" ${row.ui_type==="OTHER"?"selected":""}>OTHER</option>
+          </select>
+        </td>
+        <td><input value="${(row.ui_main||"").replace(/"/g,"&quot;")}" data-k="ui_main" placeholder="main" style="width:100%;"></td>
+        <td><input value="${(row.ui_extraMain||"").replace(/"/g,"&quot;")}" data-k="ui_extraMain" placeholder="assist/sub out" style="width:100%;"></td>
+        <td><input value="${(row.ui_detail||"").replace(/"/g,"&quot;")}" data-k="ui_detail" placeholder="detail" style="width:100%;"></td>
+        <td><button class="btnsm danger" data-act="del">삭제</button></td>
+      `;
+
+      // onchange: state 갱신 + patch 반영
+      tr.querySelectorAll("input,select").forEach(el => {
+        el.onchange = () => {
+          const k = el.getAttribute("data-k");
+          if (!k) return;
+          if (k === "ui_min") row.ui_min = (el.value === "" ? "" : Number(el.value));
+          else if (k === "ui_team") row.ui_team = String(el.value || "");
+          else if (k === "ui_type") row.ui_type = String(el.value || "OTHER");
+          else if (k === "ui_main") row.ui_main = String(el.value || "");
+          else if (k === "ui_extraMain") row.ui_extraMain = String(el.value || "");
+          else if (k === "ui_detail") row.ui_detail = String(el.value || "");
+
+          evtApplyUiToRaw(row);
+          evtApplyToPatch(true);
+        };
+      });
+
+      tr.querySelector('[data-act="del"]').onclick = () => {
+        evtState.events.splice(i, 1);
+        evtApplyToPatch(true);
+        evtRender();
+      };
+
+      body.appendChild(tr);
+    }
+  }
+
+  function evtLoadFromBundleCurrent() {
+    const hint = document.getElementById("evtHint");
+    const src = bundleMerged || bundleRaw;
+    if (!src) {
+      hint.textContent = "bundle 데이터가 없습니다. (왼쪽에서 경기 선택 후 bundle 탭이 로드되어야 함)";
+      evtState.events = [];
+      evtRender();
+      return;
+    }
+
+    const path = evtState.path || "";
+    if (!path || path === "(root_array)") {
+      hint.textContent = "이벤트 배열 경로가 비어있습니다. 후보 선택을 확인하세요.";
+      evtState.events = [];
+      evtRender();
+      return;
+    }
+
+    const arr = getByPath(src, path);
+    if (!Array.isArray(arr)) {
+      hint.textContent = `선택한 경로에 배열이 없습니다: ${path}`;
+      evtState.events = [];
+      evtRender();
+      return;
+    }
+
+    // UI row로 변환
+    evtState.events = arr.map(e => evtNormalizeForUi(e));
+    hint.textContent = `로드됨: ${path} (len=${arr.length})`;
+    evtRender();
+  }
+
+  function evtReloadFromBundle() {
+    evtState.candidates = evtFindCandidates(bundleMerged || bundleRaw);
+    evtRefreshPathSelect();
+    evtLoadFromBundleCurrent();
+  }
+
+  function evtSort() {
+    evtState.events.sort((a,b) => {
+      const am = (a.ui_min === "" ? 9999 : Number(a.ui_min));
+      const bm = (b.ui_min === "" ? 9999 : Number(b.ui_min));
+      if (am !== bm) return am - bm;
+      const ae = (a.ui_extra === "" ? 0 : Number(a.ui_extra));
+      const be = (b.ui_extra === "" ? 0 : Number(b.ui_extra));
+      return ae - be;
+    });
+    evtApplyToPatch(true);
+    evtRender();
+  }
+
+  function evtAdd() {
+    const min = document.getElementById("evtMin").value;
+    const ex = document.getElementById("evtExtra").value;
+    const team = document.getElementById("evtTeam").value;
+    const type = document.getElementById("evtType").value;
+    const main = document.getElementById("evtPlayer").value;
+    const extraMain = document.getElementById("evtAssist").value;
+    const detail = document.getElementById("evtDetail").value;
+
+    // 새 이벤트 객체는 서버 스키마를 모르므로, "event_admin" 네임스페이스로 안전하게 추가
+    const raw = {
+      event_admin: {
+        minute: min === "" ? null : Number(min),
+        extra: ex === "" ? null : Number(ex),
+        team,
+        type,
+        main,
+        extraMain,
+        detail,
+      }
+    };
+
+    const row = evtNormalizeForUi(raw);
+    row.ui_min = (min === "" ? "" : Number(min));
+    row.ui_extra = (ex === "" ? "" : Number(ex));
+    row.ui_team = String(team || "");
+    row.ui_type = String(type || "OTHER");
+    row.ui_main = String(main || "");
+    row.ui_extraMain = String(extraMain || "");
+    row.ui_detail = String(detail || "");
+    evtApplyUiToRaw(row);
+
+    evtState.events.push(row);
+    evtSort();
+
+    // 입력칸 정리(선택 유지)
+    document.getElementById("evtPlayer").value = "";
+    document.getElementById("evtAssist").value = "";
+    document.getElementById("evtDetail").value = "";
+  }
+
+  function evtClearAll() {
+    const ok = confirm("이벤트를 전부 삭제할까요? (해당 배열을 빈 배열로 override)");
+    if (!ok) return;
+    evtState.events = [];
+    evtApplyToPatch(false);
+    evtRender();
+  }
+
+  function evtApplyToPatch(silent=true) {
+    // 현재 evtState.events를 patch JSON에 "선택된 경로"로 세팅
+    const path = evtState.path || "";
+    if (!path || path === "(root_array)") {
+      if (!silent) setOv("이벤트 배열 경로가 비어있습니다. (자동 탐지/선택 확인)", false);
+      return false;
+    }
+
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    const arr = evtState.events.map(r => r._raw || {});
+    // 배열은 통째로 replace
+    setByPath(basePatch, path, arr);
+
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+    if (!silent) setOv(`이벤트를 Patch에 반영했습니다: ${path} (len=${arr.length})`, true);
+
+    updateComparisonViews();
+    return true;
+  }
+
+
 
   async function hideFixture() {
-    document.getElementById("patch").value = JSON.stringify({ hidden: true }, null, 2);
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    basePatch.hidden = true; // 또는 false
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+
     setOv("hidden=true 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
     updateComparisonViews();
   }
 
+
   async function unhideFixture() {
-    document.getElementById("patch").value = JSON.stringify({ hidden: false }, null, 2);
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    basePatch.hidden = false;
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+
     setOv("hidden=false 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
     updateComparisonViews();
   }
+
 
   async function loadLogs() {
     const fx = document.getElementById("logFixture").value.trim();
