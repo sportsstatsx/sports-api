@@ -863,9 +863,10 @@
     const id = document.getElementById("fixtureId").value.trim();
     if (!id) return setOv("fixture_id가 필요합니다", false);
 
-    // ✅ 1단계: 저장 버튼 누르면 Quick Edit → Patch 자동 반영(변경된 항목만)
     applyQuickEditToPatch({ silent: true, onlyIfChanged: true });
-    evtApplyToPatch(true);
+    // evtApplyToPatch(true);  // ✅ 제거: 저장 직전에 Event Editor 내용으로 patch를 강제 덮어쓰지 않음
+
+
 
     let patch = null;
     try {
