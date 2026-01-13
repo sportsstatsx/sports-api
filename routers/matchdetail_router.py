@@ -14,6 +14,7 @@ def match_detail_bundle():
       - season     (int, 필수)
       - comp       (string, 선택)   ← 추가됨
       - last_n     (string, 선택)   ← 추가됨
+      - apply_override (0/1, 선택) ← 관리자 raw/merged 비교용
     """
     try:
         fixture_id = request.args.get("fixture_id", type=int)
@@ -24,10 +25,13 @@ def match_detail_bundle():
         comp = request.args.get("comp")     # e.g. "League", "Cup", "All"
         last_n = request.args.get("last_n") # e.g. "Last 5", "Last 10"
 
-        # ✅ 관리자/디버그용: override 적용 여부 (기본: 적용)
-        apply_override = request.args.get("apply_override", default=1, type=int)
-        apply_override = bool(apply_override)
-
+        # ✅ override 적용 여부 (기본 True)
+        ao_raw = request.args.get("apply_override")
+        if ao_raw is None:
+            apply_override = True
+        else:
+            v = str(ao_raw).strip().lower()
+            apply_override = not (v in ("0", "false", "no", "off"))
 
         if fixture_id is None or league_id is None or season is None:
             return (
@@ -40,7 +44,6 @@ def match_detail_bundle():
                 400,
             )
 
-        # 🔥 필터를 bundle_service로 전달해야 함
         bundle = get_match_detail_bundle(
             fixture_id=fixture_id,
             league_id=league_id,
@@ -49,7 +52,6 @@ def match_detail_bundle():
             last_n=last_n,
             apply_override=apply_override,
         )
-
 
         if not bundle:
             return jsonify({"ok": False, "error": "Match not found"}), 404
