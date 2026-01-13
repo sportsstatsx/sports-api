@@ -323,12 +323,14 @@
             <thead>
               <tr>
                 <th style="width:80px;">min</th>
+                <th style="width:80px;">extra(+)</th>
                 <th style="width:70px;">team</th>
                 <th style="width:90px;">type</th>
                 <th>main</th>
-                <th>extra</th>
+                <th>assist/sub</th>
                 <th>detail</th>
                 <th style="width:80px;">del</th>
+
               </tr>
             </thead>
             <tbody id="evtBody"></tbody>
@@ -1163,11 +1165,13 @@
 
     const type = String(pick("type","event_type","kind","name","detail") || "").toUpperCase();
     const minute = pick("minute","min","elapsed","elapsed_min","elapsedMinute");
-    const extra = pick("extra","stoppage","added","extra_time");
-    const team = pick("team","side","team_key","teamSide");
+    const extra = pick("minute_extra","extra","stoppage","added","extra_time"); // ✅ minute_extra 추가
 
-    const main = pick("player","player_name","playerName","main","scorer","sub_in");
-    const extraMain = pick("assist","assist_name","assistName","sub_out","second_player");
+    const team = pick("side","team","team_id","teamId","team_key","teamSide"); // ✅ side 우선
+    
+    const main = pick("line1","player","player_name","playerName","main","scorer","sub_in"); // ✅ line1
+    const extraMain = pick("line2","assist","assist_name","assistName","sub_out","second_player"); // ✅ line2
+
 
     const detail = pick("detail","comment","reason","note","event_detail");
 
@@ -1198,38 +1202,62 @@
 
     // minute/extra
     const minVal = (row.ui_min === "" || row.ui_min === null || row.ui_min === undefined) ? null : Number(row.ui_min);
-    const exVal = (row.ui_extra === "" || row.ui_extra === null || row.ui_extra === undefined) ? null : Number(row.ui_extra);
+    const exVal  = (row.ui_extra === "" || row.ui_extra === null || row.ui_extra === undefined) ? null : Number(row.ui_extra);
 
     if (!setPref(["minute","min","elapsed","elapsed_min","elapsedMinute"], minVal)) {
       r.event_admin = r.event_admin || {};
       r.event_admin.minute = minVal;
     }
-    if (!setPref(["extra","stoppage","added","extra_time"], exVal)) {
+    if (!setPref(["minute_extra","extra","stoppage","added","extra_time"], exVal)) { // ✅ minute_extra 추가
       r.event_admin = r.event_admin || {};
       r.event_admin.extra = exVal;
     }
 
-    // type/team/main/assist/detail
+    // ✅ minute_label이 있는 스키마(timeline 등)면 라벨도 같이 동기화
+    if (r["minute_label"] !== undefined) {
+      const m = (minVal == null ? null : Number(minVal));
+      const e = (exVal == null ? null : Number(exVal));
+      r["minute_label"] = (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+    }
+
+
+    // type
     if (!setPref(["type","event_type","kind","name"], row.ui_type)) {
       r.event_admin = r.event_admin || {};
       r.event_admin.type = row.ui_type;
     }
-    if (!setPref(["team","side","team_key","teamSide"], row.ui_team)) {
+
+    // team/side (+ side_home 동기화)
+    const sideVal = row.ui_team; // home/away/""
+    if (!setPref(["side","team","team_key","teamSide"], sideVal)) {
       r.event_admin = r.event_admin || {};
-      r.event_admin.team = row.ui_team;
+      r.event_admin.team = sideVal;
     }
-    if (!setPref(["player","player_name","playerName","main","scorer","sub_in"], row.ui_main)) {
+
+    // ✅ side_home이 있는 스키마면, side 키 유무와 무관하게 UI 선택값 기준으로 동기화
+    if (r["side_home"] !== undefined) {
+      r["side_home"] = (String(sideVal).toLowerCase() === "home");
+    } else if (r["side"] !== undefined) {
+      r["side_home"] = (String(r["side"]).toLowerCase() === "home");
+    }
+
+
+    // main/assist (timeline: line1/line2 우선)
+    if (!setPref(["line1","player","player_name","playerName","main","scorer","sub_in"], row.ui_main)) {
       r.event_admin = r.event_admin || {};
       r.event_admin.main = row.ui_main;
     }
-    if (!setPref(["assist","assist_name","assistName","sub_out","second_player"], row.ui_extraMain)) {
+    if (!setPref(["line2","assist","assist_name","assistName","sub_out","second_player"], row.ui_extraMain)) {
       r.event_admin = r.event_admin || {};
       r.event_admin.extraMain = row.ui_extraMain;
     }
+
+    // detail
     if (!setPref(["detail","comment","reason","note","event_detail"], row.ui_detail)) {
       r.event_admin = r.event_admin || {};
       r.event_admin.detail = row.ui_detail;
     }
+
 
     return row;
   }
@@ -1245,6 +1273,7 @@
 
       tr.innerHTML = `
         <td><input type="number" value="${row.ui_min ?? ""}" data-k="ui_min" style="width:70px;"></td>
+        <td><input type="number" value="${row.ui_extra ?? ""}" data-k="ui_extra" style="width:70px;"></td>
         <td>
           <select data-k="ui_team">
             <option value="" ${row.ui_team===""?"selected":""}>(none)</option>
@@ -1267,22 +1296,26 @@
         <td><button class="btnsm danger" data-act="del">삭제</button></td>
       `;
 
+
       // onchange: state 갱신 + patch 반영
       tr.querySelectorAll("input,select").forEach(el => {
         el.onchange = () => {
-          const k = el.getAttribute("data-k");
-          if (!k) return;
-          if (k === "ui_min") row.ui_min = (el.value === "" ? "" : Number(el.value));
-          else if (k === "ui_team") row.ui_team = String(el.value || "");
-          else if (k === "ui_type") row.ui_type = String(el.value || "OTHER");
-          else if (k === "ui_main") row.ui_main = String(el.value || "");
-          else if (k === "ui_extraMain") row.ui_extraMain = String(el.value || "");
-          else if (k === "ui_detail") row.ui_detail = String(el.value || "");
+            const k = el.getAttribute("data-k");
+            if (!k) return;
 
-          evtApplyUiToRaw(row);
-          evtApplyToPatch(true);
-        };
-      });
+            if (k === "ui_min") row.ui_min = (el.value === "" ? "" : Number(el.value));
+            else if (k === "ui_extra") row.ui_extra = (el.value === "" ? "" : Number(el.value)); // ✅ 추가
+            else if (k === "ui_team") row.ui_team = String(el.value || "");
+            else if (k === "ui_type") row.ui_type = String(el.value || "OTHER");
+            else if (k === "ui_main") row.ui_main = String(el.value || "");
+            else if (k === "ui_extraMain") row.ui_extraMain = String(el.value || "");
+            else if (k === "ui_detail") row.ui_detail = String(el.value || "");
+
+            evtApplyUiToRaw(row);
+            evtApplyToPatch(true);
+          };
+        });
+
 
       tr.querySelector('[data-act="del"]').onclick = () => {
         evtState.events.splice(i, 1);
@@ -1355,17 +1388,47 @@
     const detail = document.getElementById("evtDetail").value;
 
     // 새 이벤트 객체는 서버 스키마를 모르므로, "event_admin" 네임스페이스로 안전하게 추가
-    const raw = {
-      event_admin: {
-        minute: min === "" ? null : Number(min),
-        extra: ex === "" ? null : Number(ex),
-        team,
-        type,
-        main,
-        extraMain,
-        detail,
-      }
-    };
+    const p = (evtState.path || "").toLowerCase();
+
+// timeline 스키마로 생성(가장 흔한 케이스)
+let raw = null;
+
+if (p === "timeline" || p.includes("timeline")) {
+  const m = (min === "" ? null : Number(min));
+  const e = (ex === "" ? null : Number(ex));
+  const side = String(team || "");
+  const minuteLabel =
+    (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+
+  raw = {
+    id_stable: `admin-${Date.now()}`,     // 임시 unique
+    line1: String(main || ""),
+    line2: String(extraMain || "") || null,
+    minute: m,
+    minute_extra: e,
+    minute_label: minuteLabel,
+    period: "",                            // 모르면 빈값 유지
+    side: side,
+    side_home: (side === "home"),
+    snapshot_score: null,
+    type: String(type || "OTHER"),
+    detail: String(detail || "") || null,
+  };
+} else {
+  // fallback: 스키마 모를 때
+  raw = {
+    event_admin: {
+      minute: min === "" ? null : Number(min),
+      extra: ex === "" ? null : Number(ex),
+      team,
+      type,
+      main,
+      extraMain,
+      detail,
+    }
+  };
+}
+
 
     const row = evtNormalizeForUi(raw);
     row.ui_min = (min === "" ? "" : Number(min));
