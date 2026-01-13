@@ -752,11 +752,20 @@
     const id = document.getElementById("fixtureId").value.trim();
     if (!id) return setOv("fixture_id가 필요합니다", false);
 
+    // ✅ 1단계: 저장 버튼 누르면 Quick Edit → Patch 자동 반영(변경된 항목만)
+    applyQuickEditToPatch({ silent: true, onlyIfChanged: true });
+
     let patch = null;
     try {
       patch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) patch = {};
     } catch (e) {
       return setOv("Patch JSON 파싱 실패", false);
+    }
+
+    // ✅ 변경이 없으면 저장 막기(빈 patch로 override 만들어서 OVR 생기는 문제 방지)
+    if (Object.keys(patch).length === 0) {
+      return setOv("변경사항이 없습니다. (Patch JSON이 비어있어서 저장하지 않았습니다)", false);
     }
 
     const ok = confirm("저장(Upsert)할까요? (override가 즉시 적용됩니다)");
@@ -773,6 +782,7 @@
       await loadFixtures();
     }
   }
+
 
   async function deleteOverride() {
     const id = document.getElementById("fixtureId").value.trim();
@@ -791,9 +801,28 @@
     }
   }
 
-  function applyQuickEditToPatch() {
+  function applyQuickEditToPatch(opts = {}) {
+    const silent = (opts && opts.silent === true);
+    const onlyIfChanged = (opts && opts.onlyIfChanged === true);
+
     const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
+    if (!id) {
+      if (!silent) setOv("fixture_id가 필요합니다", false);
+      return false;
+    }
+
+    // selectedFixture(현재 노출/override 반영 상태) 기준으로 "변경된 항목만" patch에 넣는다
+    const cur = selectedFixture || {};
+
+    const normStr = (x) => (x == null ? "" : String(x)).trim();
+    const sameStr = (a, b) => normStr(a) === normStr(b);
+
+    const normNum = (x) => {
+      if (x === "" || x === null || x === undefined) return null;
+      const n = Number(x);
+      return Number.isFinite(n) ? n : null;
+    };
+    const sameNum = (a, b) => (a ?? null) === (b ?? null);
 
     let basePatch = {};
     try {
@@ -805,37 +834,64 @@
 
     const p = {};
 
-    const v = (document.getElementById("qeVenue").value || "").trim();
-    const r = (document.getElementById("qeRound").value || "").trim();
-    const sl = (document.getElementById("qeStatusLong").value || "").trim();
-    const el = safeNum(document.getElementById("qeElapsed").value);
+    const v = normStr(document.getElementById("qeVenue").value);
+    const r = normStr(document.getElementById("qeRound").value);
+    const sl = normStr(document.getElementById("qeStatusLong").value);
+    const el = normNum(document.getElementById("qeElapsed").value);
 
-    if (v) p["venue_name"] = v;
-    if (r) p["league_round"] = r;
-    if (sl) p["status_long"] = sl;
-    if (el !== null) p["elapsed"] = el;
+    // ✅ 문자열: 현재 값과 다를 때만 포함
+    if (!sameStr(v, cur.venue_name)) p["venue_name"] = v;
+    if (!sameStr(r, cur.league_round)) p["league_round"] = r;
+    if (!sameStr(sl, cur.status_long)) p["status_long"] = sl;
 
-    const hft = safeNum(document.getElementById("qeHomeFt").value);
-    const aft = safeNum(document.getElementById("qeAwayFt").value);
-    const hht = safeNum(document.getElementById("qeHomeHt").value);
-    const aht = safeNum(document.getElementById("qeAwayHt").value);
+    // ✅ 숫자: 현재 값과 다를 때만 포함
+    if (!sameNum(el, (cur.elapsed ?? null))) p["elapsed"] = el;
 
-    if (hft !== null || hht !== null) {
+    const hft = normNum(document.getElementById("qeHomeFt").value);
+    const aft = normNum(document.getElementById("qeAwayFt").value);
+    const hht = normNum(document.getElementById("qeHomeHt").value);
+    const aht = normNum(document.getElementById("qeAwayHt").value);
+
+    const curHft = (cur.home && cur.home.ft !== undefined) ? cur.home.ft : null;
+    const curAft = (cur.away && cur.away.ft !== undefined) ? cur.away.ft : null;
+    const curHht = (cur.home && cur.home.ht !== undefined) ? cur.home.ht : null;
+    const curAht = (cur.away && cur.away.ht !== undefined) ? cur.away.ht : null;
+
+    const homeChanged = (!sameNum(hft, (curHft ?? null))) || (!sameNum(hht, (curHht ?? null)));
+    const awayChanged = (!sameNum(aft, (curAft ?? null))) || (!sameNum(aht, (curAht ?? null)));
+
+    if (homeChanged) {
       p["home"] = p["home"] || {};
-      if (hft !== null) p["home"]["ft"] = hft;
-      if (hht !== null) p["home"]["ht"] = hht;
+      if (!sameNum(hft, (curHft ?? null))) p["home"]["ft"] = hft;
+      if (!sameNum(hht, (curHht ?? null))) p["home"]["ht"] = hht;
     }
-    if (aft !== null || aht !== null) {
+    if (awayChanged) {
       p["away"] = p["away"] || {};
-      if (aft !== null) p["away"]["ft"] = aft;
-      if (aht !== null) p["away"]["ht"] = aht;
+      if (!sameNum(aft, (curAft ?? null))) p["away"]["ft"] = aft;
+      if (!sameNum(aht, (curAht ?? null))) p["away"]["ht"] = aht;
     }
 
+    // ✅ 변경 없으면(그리고 onlyIfChanged면) patch를 건드리지 않음
+    const hasAny =
+      Object.keys(p).length > 0 ||
+      (p.home && Object.keys(p.home).length > 0) ||
+      (p.away && Object.keys(p.away).length > 0);
+
+    if (!hasAny && onlyIfChanged) {
+      if (!silent) setOv("Quick Edit 변경사항이 없습니다.", true);
+      return false;
+    }
+
+    // ✅ 기존 patch + quick edit 변경분 merge (quick edit 변경분이 우선)
     const merged = deepMerge(basePatch, p);
     document.getElementById("patch").value = JSON.stringify(merged, null, 2);
-    setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
+
+    if (!silent) setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
+
     updateComparisonViews();
+    return true;
   }
+
 
   async function hideFixture() {
     document.getElementById("patch").value = JSON.stringify({ hidden: true }, null, 2);
