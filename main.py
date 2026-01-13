@@ -128,6 +128,55 @@ def _load_match_overrides(fixture_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def _recalc_cards_from_timeline(timeline: Any):
+    if not isinstance(timeline, list):
+        return None
+
+    home_red = away_red = home_yellow = away_yellow = 0
+    for e in timeline:
+        if not isinstance(e, dict):
+            continue
+        t = str(e.get("type") or "").upper()
+        side = str(e.get("side") or "").lower()
+        if side not in ("home", "away"):
+            continue
+
+        if t == "RED":
+            if side == "home":
+                home_red += 1
+            else:
+                away_red += 1
+        elif t == "YELLOW":
+            if side == "home":
+                home_yellow += 1
+            else:
+                away_yellow += 1
+
+    return home_red, away_red, home_yellow, away_yellow
+
+
+def _apply_timeline_card_counts_to_fixture_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    override patch에 timeline이 포함되어 들어오는 경우(=타임라인을 override로 바꾼 경우),
+    fixtures 리스트에서도 home/away red/yellow 카운트를 그 timeline 기준으로 덮어쓴다.
+    """
+    timeline = row.get("timeline")
+    rec = _recalc_cards_from_timeline(timeline)
+    if not rec:
+        return row
+
+    hr, ar, hy, ay = rec
+    home = row.get("home")
+    away = row.get("away")
+    if isinstance(home, dict):
+        home["red_cards"] = hr
+        home["yellow_cards"] = hy
+    if isinstance(away, dict):
+        away["red_cards"] = ar
+        away["yellow_cards"] = ay
+    return row
+
+
 # ─────────────────────────────────────────
 # Prometheus 메트릭
 # ─────────────────────────────────────────
@@ -1034,12 +1083,17 @@ def list_fixtures():
         patch = override_map.get(f["fixture_id"])
         if patch:
             f2 = _deep_merge(f, patch)
+
+            # ✅ [추가] timeline override가 있으면 카드 집계값(red/yellow)을 timeline 기준으로 덮어쓰기
+            f2 = _apply_timeline_card_counts_to_fixture_row(f2)
+
             # hidden=true면 노출 제외(삭제 대신 숨김)
             if f2.get("hidden") is True:
                 continue
             merged.append(f2)
         else:
             merged.append(f)
+
 
     return jsonify({"ok": True, "rows": merged})
 
@@ -1050,6 +1104,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
