@@ -1182,17 +1182,23 @@
 
     const detail = pick("detail","comment","reason","note","event_detail");
 
+    const toNumOrBlank = (v) => {
+      if (v === "" || v === null || v === undefined) return "";
+      const n = Number(v);
+      return Number.isFinite(n) ? n : "";
+    };
+
     return {
       _raw: o, // 원본 보관
-      ui_min: minute === "" ? "" : Number(minute),
-      ui_extra: extra === "" ? "" : Number(extra),
+      ui_min: toNumOrBlank(minute),
+      ui_extra: toNumOrBlank(extra),
       ui_team: String(team || "").toLowerCase(),
       ui_type: type || "OTHER",
       ui_main: String(main || ""),
       ui_extraMain: String(extraMain || ""),
       ui_detail: String(detail || ""),
     };
-  }
+
 
   function evtApplyUiToRaw(row) {
     // UI 필드를 원본 객체에 최대한 무해하게 반영(없던 키는 "event_admin" 네임스페이스로 보관)
@@ -1241,12 +1247,11 @@
       r.event_admin.team = sideVal;
     }
 
-    // ✅ side_home이 있는 스키마면, side 키 유무와 무관하게 UI 선택값 기준으로 동기화
+    // ✅ side_home 키가 "원래 존재하는 스키마"에서만 동기화 (없던 키를 새로 만들지 않음)
     if (r["side_home"] !== undefined) {
       r["side_home"] = (String(sideVal).toLowerCase() === "home");
-    } else if (r["side"] !== undefined) {
-      r["side_home"] = (String(r["side"]).toLowerCase() === "home");
     }
+
 
 
     // main/assist (timeline: line1/line2 우선)
@@ -1345,20 +1350,34 @@
     }
 
     const path = evtState.path || "";
-    if (!path || path === "(root_array)") {
+    if (!path) {
       hint.textContent = "이벤트 배열 경로가 비어있습니다. 후보 선택을 확인하세요.";
       evtState.events = [];
       evtRender();
       return;
     }
 
-    const arr = getByPath(src, path);
-    if (!Array.isArray(arr)) {
-      hint.textContent = `선택한 경로에 배열이 없습니다: ${path}`;
-      evtState.events = [];
-      evtRender();
-      return;
+    // ✅ root_array 지원: bundle 자체가 배열인 경우 로드 허용
+    let arr = null;
+    if (path === "(root_array)") {
+      if (Array.isArray(src)) {
+        arr = src;
+      } else {
+        hint.textContent = "선택 경로가 (root_array)이지만 bundle root가 배열이 아닙니다.";
+        evtState.events = [];
+        evtRender();
+        return;
+      }
+    } else {
+      arr = getByPath(src, path);
+      if (!Array.isArray(arr)) {
+        hint.textContent = `선택한 경로에 배열이 없습니다: ${path}`;
+        evtState.events = [];
+        evtRender();
+        return;
+      }
     }
+
 
     // UI row로 변환
     evtState.events = arr.map(e => evtNormalizeForUi(e));
