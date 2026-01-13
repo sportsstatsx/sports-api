@@ -398,21 +398,100 @@ def admin_get_override(fixture_id: int):
 def admin_upsert_override(fixture_id: int):
     patch = request.get_json(silent=True)
     if not isinstance(patch, dict):
-        _admin_log("override_upsert", ok=False, status_code=400, fixture_id=fixture_id, detail={"error": "patch must be object"})
         return jsonify({"ok": False, "error": "patch must be a JSON object"}), 400
 
-    execute(
-        """
-        INSERT INTO match_overrides (fixture_id, patch, updated_at)
-        VALUES (%s, %s::jsonb, now())
-        ON CONFLICT (fixture_id)
-        DO UPDATE SET patch = EXCLUDED.patch, updated_at = now()
-        """,
-        (fixture_id, json.dumps(patch, ensure_ascii=False)),
+    # ✅ timeline 이벤트를 수정한 경우(RED/YELLOW 삭제/추가 등),
+    #    매치카드/헤더에서 쓰는 집계값(home/away red_cards/yellow_cards)도 같이 맞춰야
+    #    override가 "우선 표기"됩니다.
+    def _augment_patch_card_counts(p: dict) -> dict:
+        # patch 안에서 이벤트 배열 후보를 찾는다 (현재 admin.html은 주로 "timeline"을 사용)
+        arr = None
+        if isinstance(p.get("timeline"), list):
+            arr = p.get("timeline")
+        elif isinstance(p.get("timeline"), dict) and isinstance(p["timeline"].get("events"), list):
+            arr = p["timeline"]["events"]
+
+        if not isinstance(arr, list):
+            return p  # 이벤트 override가 아니면 건드리지 않음
+
+        home_red = home_yellow = away_red = away_yellow = 0
+
+        def _is_home(e: dict):
+            # 가장 우선: boolean
+            if isinstance(e.get("side_home"), bool):
+                return e.get("side_home")
+
+            # 문자열 후보들
+            side = e.get("side") or e.get("team") or e.get("team_side") or e.get("teamSide")
+            if isinstance(side, str):
+                s = side.strip().lower()
+                if s == "home":
+                    return True
+                if s == "away":
+                    return False
+
+            return None
+
+        for e in arr:
+            if not isinstance(e, dict):
+                continue
+
+            t = str(e.get("type") or e.get("event_type") or e.get("kind") or "").strip().upper()
+            # timeline 스키마에서는 보통 RED / YELLOW
+            if t not in ("RED", "YELLOW"):
+                continue
+
+            ih = _is_home(e)
+            if ih is None:
+                continue
+
+            if t == "RED":
+                if ih:
+                    home_red += 1
+                else:
+                    away_red += 1
+            else:  # YELLOW
+                if ih:
+                    home_yellow += 1
+                else:
+                    away_yellow += 1
+
+        # patch에 집계값을 "명시"해서 다른 블록들도 override가 우선 적용되게 함
+        p.setdefault("home", {})
+        p.setdefault("away", {})
+
+        if isinstance(p["home"], dict):
+            p["home"]["red_cards"] = home_red
+            p["home"]["yellow_cards"] = home_yellow
+
+        if isinstance(p["away"], dict):
+            p["away"]["red_cards"] = away_red
+            p["away"]["yellow_cards"] = away_yellow
+
+        return p
+
+    patch = _augment_patch_card_counts(patch)
+
+    existing = fetch_one(
+        "SELECT fixture_id, patch, updated_at FROM match_overrides WHERE fixture_id=%s",
+        (fixture_id,),
     )
 
-    _admin_log("override_upsert", ok=True, status_code=200, fixture_id=fixture_id, detail={"keys": list(patch.keys())[:50]})
-    return jsonify({"ok": True, "fixture_id": fixture_id})
+    fetch_one(
+        """
+        INSERT INTO match_overrides (fixture_id, patch)
+        VALUES (%s, %s::jsonb)
+        ON CONFLICT (fixture_id) DO UPDATE SET
+          patch = EXCLUDED.patch,
+          updated_at = NOW()
+        RETURNING fixture_id
+        """,
+        (fixture_id, json.dumps(patch)),
+    )
+
+    _admin_log("override_upsert", fixture_id=fixture_id, prev_patch=(existing["patch"] if existing else None), new_patch=patch)
+    return jsonify({"ok": True})
+
 
 
 @app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["DELETE"])
@@ -971,6 +1050,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
