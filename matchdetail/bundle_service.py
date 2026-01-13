@@ -1,14 +1,19 @@
 # matchdetail/bundle_service.py
 
+from typing import Any, Dict, Optional
 import json
-from typing import Dict, Any, Optional, List, Tuple
 
 from db import fetch_one
 
-from matchdetail.header_block import build_header_block
-from matchdetail.timeline_block import build_timeline_block
-from matchdetail.stats_block import build_stats_block
-from matchdetail.lineups_block import build_lineups_block
+from .header_block import build_header_block
+from .form_block import build_form_block
+from .timeline_block import build_timeline_block
+from .lineups_block import build_lineups_block
+from .stats_block import build_stats_block
+from .h2h_block import build_h2h_block
+from .standings_block import build_standings_block
+from .insights_block import build_insights_overall_block
+from .ai_predictions_block import build_ai_predictions_block
 
 
 def _deep_merge(base: Any, patch: Any) -> Any:
@@ -28,74 +33,61 @@ def _deep_merge(base: Any, patch: Any) -> Any:
 
 def _load_override_patch(fixture_id: int) -> Dict[str, Any]:
     row = fetch_one(
-        "SELECT patch FROM match_overrides WHERE fixture_id=%s",
+        "SELECT patch FROM match_overrides WHERE fixture_id = %s",
         (fixture_id,),
     )
     if not row:
         return {}
 
-    patch = row.get("patch") or {}
-    # JSON이 문자열로 들어오는 환경도 방어
-    if isinstance(patch, str):
+    p = row.get("patch")
+    if p is None:
+        return {}
+
+    # jsonb가 dict로 올 수도/문자열로 올 수도 있으니 방어
+    if isinstance(p, dict):
+        return p
+    if isinstance(p, str):
         try:
-            patch = json.loads(patch)
+            v = json.loads(p)
+            return v if isinstance(v, dict) else {}
         except Exception:
             return {}
-    return patch if isinstance(patch, dict) else {}
+
+    return {}
 
 
-def _recalc_cards_from_timeline(timeline: Any) -> Tuple[int, int, int, int]:
+def _reconcile_header_aliases(header: Dict[str, Any]) -> None:
     """
-    timeline 이벤트 리스트(서버 타임라인 블록 형식)에서
-    RED/YELLOW 카드 수를 (home_red, away_red, home_yellow, away_yellow)로 재계산
+    override 적용 후 동의어 키 동기화.
+    - elapsed <-> minute
+    - date_utc <-> kickoff_utc
+    - home.ft <-> home.score
+    - away.ft <-> away.score
     """
-    if not isinstance(timeline, list):
-        return 0, 0, 0, 0
+    if header.get("elapsed") is not None:
+        header["minute"] = header.get("elapsed")
+    elif header.get("minute") is not None:
+        header["elapsed"] = header.get("minute")
 
-    home_red = away_red = home_yellow = away_yellow = 0
-    for e in timeline:
-        if not isinstance(e, dict):
-            continue
-        t = str(e.get("type") or "").upper()
-        side = str(e.get("side") or "").lower()
-
-        if side not in ("home", "away"):
-            continue
-
-        if t == "RED":
-            if side == "home":
-                home_red += 1
-            else:
-                away_red += 1
-        elif t == "YELLOW":
-            if side == "home":
-                home_yellow += 1
-            else:
-                away_yellow += 1
-
-    return home_red, away_red, home_yellow, away_yellow
-
-
-def _apply_timeline_card_counts_into_header(data: Dict[str, Any]) -> None:
-    """
-    최종 timeline 결과를 기준으로 header의 red/yellow 카운트를 덮어쓴다.
-    (override로 타임라인에서 카드를 지웠을 때 스코어블럭도 같이 변해야 함)
-    """
-    header = data.get("header")
-    if not isinstance(header, dict):
-        return
-
-    timeline = data.get("timeline")
-    hr, ar, hy, ay = _recalc_cards_from_timeline(timeline)
+    if header.get("date_utc") is not None:
+        header["kickoff_utc"] = header.get("date_utc")
+    elif header.get("kickoff_utc") is not None:
+        header["date_utc"] = header.get("kickoff_utc")
 
     home = header.get("home")
-    away = header.get("away")
     if isinstance(home, dict):
-        home["red_cards"] = hr
-        home["yellow_cards"] = hy
+        if home.get("ft") is not None:
+            home["score"] = home.get("ft")
+        elif home.get("score") is not None:
+            home["ft"] = home.get("score")
+
+    away = header.get("away")
     if isinstance(away, dict):
-        away["red_cards"] = ar
-        away["yellow_cards"] = ay
+        if away.get("ft") is not None:
+            away["score"] = away.get("ft")
+        elif away.get("score") is not None:
+            away["ft"] = away.get("score")
+
 
 
 def get_match_detail_bundle(
@@ -103,49 +95,83 @@ def get_match_detail_bundle(
     league_id: int,
     season: int,
     *,
-    apply_override: bool = True
+    comp: Optional[str] = None,
+    last_n: Optional[str] = None,
+    apply_override: bool = True,
 ) -> Optional[Dict[str, Any]]:
 
-    header = build_header_block(fixture_id, league_id, season)
-    if not header:
+    """
+    매치디테일 번들의 진입점 (sync 버전).
+    comp / last_n 필터를 라우터에서 받아 header.filters 에 반영한다.
+
+    ✅ 추가:
+    - match_overrides.patch를 읽어서 header에 병합(디테일에서도 수정 반영)
+    """
+
+    # 1) header 블록 생성
+    header = build_header_block(
+        fixture_id=fixture_id,
+        league_id=league_id,
+        season=season,
+    )
+    if header is None:
         return None
 
-    # 원본 블록 생성
-    data: Dict[str, Any] = {
-        "header": header,
-        "timeline": build_timeline_block(header),
-        "stats": build_stats_block(header),
-        "lineups": build_lineups_block(header),
-    }
+    # 2) comp / last_n 필터 덮어쓰기 (앱 → 서버)
+    header_filters = header.get("filters", {})
 
-    # ✅ override 적용
+    if comp is not None:
+        header_filters["comp"] = comp
+
+    if last_n is not None:
+        header_filters["last_n"] = last_n
+
+    header["filters"] = header_filters  # 다시 덮어쓰기
+
+    # 3) ✅ override 적용 (디테일 번들에서도 수정 반영) - 딱 1번만
     if apply_override:
         patch = _load_override_patch(fixture_id)
-        if patch:
-            # 1) header 패치: (a) patch["header"] 있으면 적용
-            #              (b) 나머지 키 중 block키가 아닌 것들은 header로 간주하고 적용
-            header_patch: Dict[str, Any] = {}
+
+        # hidden=true면 디테일도 접근 불가 처리(리스트와 일관성)
+        if isinstance(patch, dict) and patch.get("hidden") is True:
+            return None
+
+        if isinstance(patch, dict) and patch:
+            # patch가 { "header": {...} } 형태면 header만 머지
             if isinstance(patch.get("header"), dict):
-                header_patch = _deep_merge(header_patch, patch["header"])
+                header = _deep_merge(header, patch["header"])
+            else:
+                header = _deep_merge(header, patch)
 
-            for k, v in patch.items():
-                if k in ("header", "timeline", "stats", "lineups"):
-                    continue
-                header_patch[k] = v
+            _reconcile_header_aliases(header)
 
-            if header_patch:
-                data["header"] = _deep_merge(data["header"], header_patch)
+    # 4) 나머지 블록 (override 반영된 header로 생성)
+    form = build_form_block(header)
+    timeline = build_timeline_block(header)
+    lineups = build_lineups_block(header)
+    stats = build_stats_block(header)
+    h2h = build_h2h_block(header)
+    standings = build_standings_block(header)
 
-            # 2) block 패치
-            for k in ("timeline", "stats", "lineups"):
-                if k in patch:
-                    data[k] = _deep_merge(data.get(k), patch[k])
+    insights_overall = build_insights_overall_block(header)
+    ai_predictions = build_ai_predictions_block(header, insights_overall)
 
-            # 3) ✅ 타임라인 최종 결과 기반으로 카드 카운트 재계산 → 스코어블럭까지 동기화
-            _apply_timeline_card_counts_into_header(data)
+    lineups = build_lineups_block(header)
+    stats = build_stats_block(header)
+    h2h = build_h2h_block(header)
+    standings = build_standings_block(header)
 
-            # 디버그/표시용
-            if isinstance(data["header"], dict):
-                data["header"]["_has_override"] = True
+    insights_overall = build_insights_overall_block(header)
+    ai_predictions = build_ai_predictions_block(header, insights_overall)
 
-    return data
+    return {
+        "header": header,
+        "form": form,
+        "timeline": timeline,
+        "lineups": lineups,
+        "stats": stats,
+        "h2h": h2h,
+        "standings": standings,
+        "insights_overall": insights_overall,
+        "ai_predictions": ai_predictions,
+    }
