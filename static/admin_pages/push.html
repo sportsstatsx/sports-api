@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Push</title>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .muted { color:#666; font-size:12px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; }
+    select, input, textarea, button { font-size:14px; }
+    input, textarea, select { padding:10px; border-radius:8px; border:1px solid #ccc; width:100%; box-sizing:border-box; }
+    textarea { min-height: 120px; }
+    button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Push (football/hockey 통일 UI)</h2>
+    <div class="muted">여기서 스포츠 선택 토글(home/hockey) + 전송대상(전체/리그/경기) 기능을 붙이면 됨</div>
+
+    <div style="height:12px;"></div>
+    <div class="row">
+      <div style="min-width:180px; flex: 0 0 180px;">
+        <label class="muted">Sport</label>
+        <select>
+          <option>football</option>
+          <option>hockey</option>
+        </select>
+      </div>
+      <div style="flex: 1 1 320px;">
+        <label class="muted">Title</label>
+        <input placeholder="푸시 제목"/>
+      </div>
+    </div>
+
+    <div style="height:10px;"></div>
+    <label class="muted">Body</label>
+    <textarea placeholder="푸시 내용"></textarea>
+
+    <div style="height:10px;"></div>
+    <button>전송(placeholder)</button>
+  </div>
+</body>
+</html>
