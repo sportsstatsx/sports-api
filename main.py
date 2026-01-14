@@ -392,138 +392,14 @@ def admin_get_override(fixture_id: int):
     _admin_log("override_get", ok=True, status_code=200, fixture_id=fixture_id)
     return jsonify({"ok": True, "row": row, "patch": (row["patch"] if row else None)})
 
-def _admin_sync_header_from_timeline_patch(patch: Dict[str, Any]) -> None:
-    """
-    Admin 이벤트(timeline) 수정 시 표시 레이어(매치리스트/스코어블럭/헤더)도 같이 동기화:
-    - timeline(list)에서 GOAL/PEN_GOAL/OWN_GOAL, RED를 집계해서
-      patch.header.home/away의 ft/ht/score/red_cards 를 자동 갱신한다.
-    - DB 원본(matches/match_events)는 건드리지 않음(옵션1).
-    """
-    if not isinstance(patch, dict):
-        return
-    timeline = patch.get("timeline")
-    if not isinstance(timeline, list):
-        return
-
-    def _as_int(v: Any) -> int:
-        try:
-            if v is None or v == "":
-                return 0
-            return int(v)
-        except Exception:
-            return 0
-
-    def _pick(o: Dict[str, Any], *keys: str) -> Any:
-        for k in keys:
-            if k in o and o.get(k) is not None:
-                return o.get(k)
-        return None
-
-    def _canon_side(raw: Any) -> str:
-        s = str(raw or "").strip().lower()
-        if s in ("home", "h"):
-            return "home"
-        if s in ("away", "a"):
-            return "away"
-        return ""
-
-    def _canon_type(raw_type: Any, raw_detail: Any) -> str:
-        t = str(raw_type or "").strip().upper()
-        d = str(raw_detail or "").strip().upper()
-
-        if t in ("CARD", "CARDS"):
-            if "RED" in d:
-                return "RED"
-            if "YELLOW" in d:
-                return "YELLOW"
-            return "CARD"
-
-        if t in ("RED CARD", "RED_CARD"):
-            return "RED"
-        if t in ("YELLOW CARD", "YELLOW_CARD"):
-            return "YELLOW"
-
-        return t
-
-    home_ft = away_ft = 0
-    home_ht = away_ht = 0
-    home_red = away_red = 0
-
-    for e in timeline:
-        if not isinstance(e, dict):
-            continue
-
-        minute = _as_int(_pick(e, "minute", "min", "elapsed"))
-        side = _canon_side(_pick(e, "side", "team", "teamSide", "team_side"))
-        typ = _canon_type(_pick(e, "type", "event_type"), _pick(e, "detail", "reason", "note"))
-
-        if typ in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
-            if side == "home":
-                home_ft += 1
-                if minute <= 45:
-                    home_ht += 1
-            elif side == "away":
-                away_ft += 1
-                if minute <= 45:
-                    away_ht += 1
-
-        if typ == "RED":
-            if side == "home":
-                home_red += 1
-            elif side == "away":
-                away_red += 1
-
-    header = patch.get("header")
-    if not isinstance(header, dict):
-        header = {}
-        patch["header"] = header
-
-    home = header.get("home")
-    if not isinstance(home, dict):
-        home = {}
-        header["home"] = home
-
-    away = header.get("away")
-    if not isinstance(away, dict):
-        away = {}
-        header["away"] = away
-
-    # ✅ 표시 레이어 동기화(FT/HT/score/red_cards)
-    home["ft"] = home_ft
-    home["ht"] = home_ht
-    home["score"] = home_ft
-    home["red_cards"] = home_red
-
-    away["ft"] = away_ft
-    away["ht"] = away_ht
-    away["score"] = away_ft
-    away["red_cards"] = away_red
-
-    # (혹시 루트 home/away도 쓰는 곳이 있으면 같이 맞춰둠)
-    if isinstance(patch.get("home"), dict):
-        patch["home"]["ft"] = home_ft
-        patch["home"]["ht"] = home_ht
-        patch["home"]["score"] = home_ft
-        patch["home"]["red_cards"] = home_red
-
-    if isinstance(patch.get("away"), dict):
-        patch["away"]["ft"] = away_ft
-        patch["away"]["ht"] = away_ht
-        patch["away"]["score"] = away_ft
-        patch["away"]["red_cards"] = away_red
-
-
 
 @app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["PUT"])
 @require_admin
 def admin_upsert_override(fixture_id: int):
     patch = request.get_json(silent=True)
     if not isinstance(patch, dict):
-        _admin_log("override_upsert", ok=False, status_code=400,...fixture_id=fixture_id, detail={"error": "patch must be object"})
+        _admin_log("override_upsert", ok=False, status_code=400, fixture_id=fixture_id, detail={"error": "patch must be object"})
         return jsonify({"ok": False, "error": "patch must be a JSON object"}), 400
-
-    # ✅ 옵션1: timeline 수정 시 표시용 header(FT/HT/RED) 자동 동기화
-    _admin_sync_header_from_timeline_patch(patch)
 
     execute(
         """
@@ -537,7 +413,6 @@ def admin_upsert_override(fixture_id: int):
 
     _admin_log("override_upsert", ok=True, status_code=200, fixture_id=fixture_id, detail={"keys": list(patch.keys())[:50]})
     return jsonify({"ok": True, "fixture_id": fixture_id})
-
 
 
 @app.route(f"/{ADMIN_PATH}/api/overrides/<int:fixture_id>", methods=["DELETE"])
@@ -1114,7 +989,6 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
 
 
 
