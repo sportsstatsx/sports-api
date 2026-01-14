@@ -104,11 +104,13 @@ def get_match_detail_bundle(
     매치디테일 번들의 진입점 (sync 버전).
     comp / last_n 필터를 라우터에서 받아 header.filters 에 반영한다.
 
-    ✅ 추가:
-    - match_overrides.patch를 읽어서 header에 병합(디테일에서도 수정 반영)
+    ✅ override 동작
+    - match_overrides.patch.hidden=true 면 None 리턴 (접근 차단)
+    - header 관련 키는 header에 먼저 merge (다른 블록 생성에 영향 주기 위해)
+    - 그 외 키(예: timeline 배열 override)는 번들(dict) 완성 후 최종 merge
     """
 
-    # 1) header 블록 생성
+    # header 블록 생성
     header = build_header_block(
         fixture_id=fixture_id,
         league_id=league_id,
@@ -117,18 +119,17 @@ def get_match_detail_bundle(
     if header is None:
         return None
 
-    # 2) comp / last_n 필터 덮어쓰기 (앱 → 서버)
+    # comp / last_n 필터 덮어쓰기 (앱 → 서버)
     header_filters = header.get("filters", {})
-
     if comp is not None:
         header_filters["comp"] = comp
-
     if last_n is not None:
         header_filters["last_n"] = last_n
+    header["filters"] = header_filters
 
-    header["filters"] = header_filters  # 다시 덮어쓰기
+    bundle_patch: Dict[str, Any] = {}
 
-    # 3) ✅ override 적용 (디테일 번들에서도 수정 반영) - 딱 1번만
+    # ✅ override 적용
     if apply_override:
         patch = _load_override_patch(fixture_id)
 
@@ -137,34 +138,47 @@ def get_match_detail_bundle(
             return None
 
         if isinstance(patch, dict) and patch:
-            # patch가 { "header": {...} } 형태면 header만 머지
+            # 1) header_patch / bundle_patch 분리
             if isinstance(patch.get("header"), dict):
-                header = _deep_merge(header, patch["header"])
+                header_patch = patch.get("header") or {}
+                bundle_patch = {k: v for k, v in patch.items() if k not in ("header", "hidden")}
             else:
-                header = _deep_merge(header, patch)
+                # legacy(지금 admin.html quick edit이 만드는 형태) 지원:
+                # header 필드와 bundle 필드가 섞여있을 수 있으니, 아는 header 키만 header로 보내고 나머지는 bundle로 보냄
+                header_keys = {
+                    "fixture_id", "league_id", "season",
+                    "date_utc", "kickoff_utc",
+                    "status_group", "status", "elapsed", "minute", "status_long",
+                    "league_round", "venue_name",
+                    "league_name", "league_logo", "league_country",
+                    "home", "away", "filters",
+                }
+                header_patch = {}
+                bundle_patch = {}
+                for k, v in patch.items():
+                    if k in ("hidden",):
+                        continue
+                    if k in header_keys:
+                        header_patch[k] = v
+                    else:
+                        bundle_patch[k] = v
 
-            _reconcile_header_aliases(header)
+            # 2) header 먼저 merge (다른 블록 생성에 영향)
+            if isinstance(header_patch, dict) and header_patch:
+                header = _deep_merge(header, header_patch)
+                _reconcile_header_aliases(header)
 
-    # 4) 나머지 블록 (override 반영된 header로 생성)
+    # 나머지 블록 생성 (override 반영된 header로 생성)
     form = build_form_block(header)
     timeline = build_timeline_block(header)
     lineups = build_lineups_block(header)
     stats = build_stats_block(header)
     h2h = build_h2h_block(header)
     standings = build_standings_block(header)
-
     insights_overall = build_insights_overall_block(header)
     ai_predictions = build_ai_predictions_block(header, insights_overall)
 
-    lineups = build_lineups_block(header)
-    stats = build_stats_block(header)
-    h2h = build_h2h_block(header)
-    standings = build_standings_block(header)
-
-    insights_overall = build_insights_overall_block(header)
-    ai_predictions = build_ai_predictions_block(header, insights_overall)
-
-    return {
+    bundle = {
         "header": header,
         "form": form,
         "timeline": timeline,
@@ -175,3 +189,10 @@ def get_match_detail_bundle(
         "insights_overall": insights_overall,
         "ai_predictions": ai_predictions,
     }
+
+    # 3) ✅ bundle 최종 merge (timeline/events 같은 “블록 자체 override”는 여기서 먹게 됨)
+    if isinstance(bundle_patch, dict) and bundle_patch:
+        bundle = _deep_merge(bundle, bundle_patch)
+
+    return bundle
+
