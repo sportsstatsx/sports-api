@@ -174,18 +174,29 @@ def build_stats_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     match_team_stats 테이블을 기반으로 StatsBlock(team=...) 생성.
 
-    ✅ 동기화 규칙(중요):
-    - 기본은 DB(match_team_stats)
-    - 하지만 matchdetail 번들에서 header가 'timeline 기반으로 이미 동기화'되어 내려온다면
-      (home/away.ft/ht/red_cards 등),
-      stats_block에서도 아래 항목은 header 값을 우선으로 덮어쓴다:
+    최종 구조:
 
-        - red_cards
-        - (선택) yellow_cards  ※ header에 값이 있을 때만
-        - goals(=ft), goals_ht(=ht)  ※ stats에 goals 계열 키가 있으면 같이 맞춤
+      {
+        "team": {
+          "home_team_id": ...,
+          "away_team_id": ...,
+          "home": {
+            "team_id": ...,
+            "stats": { "shots_total": 20, "shots_on_goal": 4, ... },
+            "extras": { ... name 원본 ... }
+          },
+          "away": { ... 동일 ... },
+          "raw_rows": [ ... 원본 row ... ]
+        },
+        "players": null
+      }
 
-    이걸 해야 admin에서 timeline 이벤트 삭제/추가 시
-    stats / matchlist / scoreblock이 한 번에 일관되게 맞는다.
+    Kotlin:
+      data class StatsBlock(
+          val team: Any? = null,
+          val players: Any? = null
+      )
+    와 그대로 호환됨.
     """
     fixture_id, home_team_id, away_team_id = _extract_ids_from_header(header)
 
@@ -205,83 +216,6 @@ def build_stats_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     home_block = _build_side_stats(rows, home_team_id) if home_team_id is not None else None
     away_block = _build_side_stats(rows, away_team_id) if away_team_id is not None else None
 
-    # ─────────────────────────────────────────
-    # ✅ header 기반 동기화(핵심)
-    # - bundle_service에서 header를 최종 timeline 기준으로 맞춘 상태가 "정답"
-    # - stats에서 이벤트성 지표는 header 값을 우선 반영
-    # ─────────────────────────────────────────
-    home_h = header.get("home") if isinstance(header.get("home"), dict) else {}
-    away_h = header.get("away") if isinstance(header.get("away"), dict) else {}
-
-    def _safe_int(v: Any) -> Optional[int]:
-        if v is None:
-            return None
-        if isinstance(v, bool):
-            return int(v)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, float):
-            return int(v)
-        s = str(v).strip()
-        if not s:
-            return None
-        # "2" / "02" 같은 경우
-        if s.isdigit():
-            return int(s)
-        return None
-
-    # header에서 동기화 대상 값 추출
-    home_red = _safe_int(home_h.get("red_cards"))
-    away_red = _safe_int(away_h.get("red_cards"))
-
-    home_yellow = _safe_int(home_h.get("yellow_cards"))
-    away_yellow = _safe_int(away_h.get("yellow_cards"))
-
-    home_ft = _safe_int(home_h.get("ft") if home_h.get("ft") is not None else home_h.get("score"))
-    away_ft = _safe_int(away_h.get("ft") if away_h.get("ft") is not None else away_h.get("score"))
-
-    home_ht = _safe_int(home_h.get("ht"))
-    away_ht = _safe_int(away_h.get("ht"))
-
-    def _apply_sync(side_block: Optional[Dict[str, Any]], *, red: Optional[int], yellow: Optional[int], ft: Optional[int], ht: Optional[int]) -> None:
-        """
-        side_block 구조:
-          {
-            "team_id": ...,
-            "stats": {...},
-            "extras": {...}
-          }
-        """
-        if not isinstance(side_block, dict):
-            return
-
-        stats = side_block.get("stats")
-        if not isinstance(stats, dict):
-            return
-
-        # ✅ Red Cards는 항상 동기화(값이 있으면)
-        if red is not None:
-            stats["red_cards"] = float(red)
-
-        # ✅ Yellow Cards는 header에 값이 있을 때만 동기화
-        if yellow is not None:
-            stats["yellow_cards"] = float(yellow)
-
-        # ✅ 득점 동기화:
-        # - match_team_stats에 goals 계열을 저장해두는 환경이 있으면(혹은 extras로 들어온 경우)
-        #   여기도 header 기준으로 맞춰준다.
-        # - 내부 표준 키가 없으니, "goals" / "goals_ht" 후보 키들을 함께 세팅
-        if ft is not None:
-            stats.setdefault("goals", float(ft))
-            # 일부 UI가 shots/possession 외에 goals 키를 본다면
-            stats["goals"] = float(ft)
-
-        if ht is not None:
-            stats["goals_ht"] = float(ht)
-
-    _apply_sync(home_block, red=home_red, yellow=home_yellow, ft=home_ft, ht=home_ht)
-    _apply_sync(away_block, red=away_red, yellow=away_yellow, ft=away_ft, ht=away_ht)
-
     team_block: Dict[str, Any] = {
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
@@ -294,4 +228,3 @@ def build_stats_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "team": team_block,
         "players": None,
     }
-
