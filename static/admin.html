@@ -5,22 +5,105 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SportsStatsX Admin</title>
   <style>
-    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
-    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
-    .muted { color:#666; font-size:12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-
-    .nav { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
-    .navbtn {
-      padding:8px 12px; border-radius:999px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:12px;
+    :root{
+      --bg:#f6f7f9;
+      --panel:#ffffff;
+      --panel2:#fbfbfc;
+      --text:#101114;
+      --muted:#6b6f76;
+      --border:rgba(16,17,20,0.14);
+      --border2:rgba(16,17,20,0.10);
+      --shadow:0 10px 28px rgba(0,0,0,0.08);
+      --chip:rgba(16,17,20,0.06);
+      --chipActive:rgba(16,17,20,0.12);
     }
-    .navbtn.active { border-color:#000; }
+    html[data-theme="dark"]{
+      --bg:#0b0c0f;
+      --panel:#12141a;
+      --panel2:#0f1116;
+      --text:#f1f3f5;
+      --muted:#9aa3ad;
+      --border:rgba(241,243,245,0.14);
+      --border2:rgba(241,243,245,0.10);
+      --shadow:0 14px 34px rgba(0,0,0,0.50);
+      --chip:rgba(241,243,245,0.08);
+      --chipActive:rgba(241,243,245,0.16);
+    }
 
-    .frameWrap { margin-top:12px; border:1px solid #eee; border-radius:12px; overflow:hidden; }
-    iframe { width:100%; height: 820px; border:0; background:#fff; }
+    html, body { height:100%; }
+    body{
+      font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      margin:18px;
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(0,0,0,0.06), transparent 55%),
+        radial-gradient(900px 480px at 95% 0%, rgba(0,0,0,0.05), transparent 50%),
+        var(--bg);
+      color:var(--text);
+    }
+    html[data-theme="dark"] body{
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(255,255,255,0.06), transparent 55%),
+        radial-gradient(900px 480px at 95% 0%, rgba(255,255,255,0.05), transparent 50%),
+        var(--bg);
+    }
 
-    button.soft { opacity:0.9; padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+    .muted{ color:var(--muted); font-size:12px; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+
+    .nav{
+      display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;
+      padding:10px;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,0.55);
+      border-radius:14px;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    html[data-theme="dark"] .nav{
+      background:rgba(18,20,26,0.55);
+    }
+
+    .navbtn{
+      padding:8px 12px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      cursor:pointer;
+      font-size:12px;
+      color:var(--text);
+      transition: transform .06s ease, background .12s ease, border-color .12s ease;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.03);
+    }
+    .navbtn:hover{ transform: translateY(-1px); background:var(--panel2); }
+    .navbtn.active{
+      background:var(--chipActive);
+      border-color:var(--border2);
+      transform:none;
+    }
+
+    .frameWrap{
+      margin-top:12px;
+      border:1px solid var(--border);
+      border-radius:14px;
+      overflow:hidden;
+      background:var(--panel);
+      box-shadow: var(--shadow);
+    }
+    iframe{ width:100%; height:820px; border:0; background:var(--panel); }
+
+    button.soft{
+      opacity:0.95;
+      padding:6px 10px;
+      border-radius:10px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      color:var(--text);
+      cursor:pointer;
+    }
+    button.soft:hover{ background:var(--panel2); }
   </style>
+
 </head>
 <body>
   <div class="top">
@@ -30,6 +113,7 @@
         경로: <span id="adminPathText" class="mono"></span>
         · API 헤더: <span class="mono">X-Admin-Token</span> 필요
         · <button class="soft" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+        · <button class="soft" id="themeBtn" onclick="toggleTheme()">테마: (loading)</button>
       </div>
     </div>
     <div class="muted" id="statusLine"></div>
@@ -43,6 +127,40 @@
 
 <script>
   const tokenKey = "SSX_ADMIN_TOKEN";
+
+  const themeKey = "SSX_ADMIN_THEME";
+
+  function resolveInitialTheme() {
+    const saved = localStorage.getItem(themeKey);
+    if (saved === "light" || saved === "dark") return saved;
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    const btn = document.getElementById("themeBtn");
+    if (btn) btn.textContent = "테마: " + (theme === "dark" ? "다크" : "라이트");
+  }
+
+  function broadcastTheme(theme) {
+    const f = document.getElementById("contentFrame");
+    try {
+      if (f && f.contentWindow) f.contentWindow.postMessage({ type: "ssx_theme", theme }, "*");
+    } catch (e) {}
+  }
+
+  function toggleTheme() {
+    const cur = (document.documentElement.dataset.theme === "dark") ? "dark" : "light";
+    const next = (cur === "dark") ? "light" : "dark";
+    localStorage.setItem(themeKey, next);
+    applyTheme(next);
+    broadcastTheme(next);
+  }
+
+  // 초기 적용
+  applyTheme(resolveInitialTheme());
+
 
   const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
   document.getElementById("adminPathText").textContent = "/" + adminPath;
@@ -65,6 +183,7 @@
     // iframe 페이지도 초기화되게 reload
     const f = document.getElementById("contentFrame");
     f.src = f.src;
+    broadcastTheme(document.documentElement.dataset.theme || resolveInitialTheme());
   }
 
   function pageUrl(file) {
@@ -82,7 +201,10 @@
     const p = pages.find(x => x.key === key) || pages[0];
     setActive(p.key);
     setStatusLine("열기: " + p.key);
-    document.getElementById("contentFrame").src = pageUrl(p.file);
+    const frame = document.getElementById("contentFrame");
+    frame.src = pageUrl(p.file);
+    frame.onload = () => broadcastTheme(document.documentElement.dataset.theme || resolveInitialTheme());
+
     history.replaceState({}, "", "/" + adminPath + "#" + p.key);
   }
 
