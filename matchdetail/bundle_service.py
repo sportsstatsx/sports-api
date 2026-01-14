@@ -110,8 +110,9 @@ def get_match_detail_bundle(
     - 그 외 키(예: timeline/insights_overall 같은 블록 override)는 bundle 완성 후 최종 merge
 
     ✅ 추가(중요):
-    - override로 timeline을 수정/삭제한 경우, header.home/away.red_cards는 DB match_events 기준으로
-      남아있을 수 있으니 최종 timeline 기준으로 red_cards를 다시 동기화한다.
+    - override로 timeline을 수정/삭제한 경우,
+      header(home/away)의 red_cards / ft / ht 를 최종 timeline 기준으로 재동기화한다.
+      (스코어블럭/리스트/타임라인 불일치 방지)
     """
 
     def _is_red_event(e: Dict[str, Any]) -> bool:
@@ -130,21 +131,53 @@ def get_match_detail_bundle(
             return True
         return False
 
-    def _sync_header_red_cards_from_timeline(bundle_obj: Dict[str, Any]) -> None:
+    def _is_goal_event(e: Dict[str, Any]) -> bool:
+        t = e.get("type")
+        d = e.get("detail")
+        if isinstance(t, str):
+            tu = t.strip().upper()
+            if tu in ("GOAL", "GOAL_NORMAL", "GOAL_PENALTY", "PENALTY_GOAL"):
+                return True
+        if isinstance(d, str) and "GOAL" in d.upper():
+            return True
+        l1 = e.get("line1")
+        if isinstance(l1, str) and "GOAL" in l1.upper():
+            return True
+        return False
+
+    def _get_minute(e: Dict[str, Any]) -> Optional[int]:
+        for k in ("minute", "elapsed", "time", "min"):
+            v = e.get(k)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str):
+                s = v.strip()
+                if s.isdigit():
+                    return int(s)
+        v2 = e.get("minute")
+        if isinstance(v2, str) and "+" in v2:
+            base = v2.split("+", 1)[0].strip()
+            if base.isdigit():
+                return int(base)
+        return None
+
+    def _extract_timeline(bundle_obj: Dict[str, Any]) -> Optional[List[Any]]:
+        tl = bundle_obj.get("timeline")
+        if isinstance(tl, list):
+            return tl
+        if isinstance(tl, dict):
+            ev = tl.get("events")
+            if isinstance(ev, list):
+                return ev
+        return None
+
+    def _sync_header_from_timeline(bundle_obj: Dict[str, Any]) -> None:
         if not isinstance(bundle_obj, dict):
             return
 
-        tl = bundle_obj.get("timeline")
+        tl = _extract_timeline(bundle_obj)
         if not isinstance(tl, list):
-            # {"timeline": {"events":[...]}} 케이스 방어
-            if isinstance(tl, dict):
-                ev = tl.get("events")
-                if isinstance(ev, list):
-                    tl = ev
-                else:
-                    return
-            else:
-                return
+            return
 
         header_obj = bundle_obj.get("header")
         if not isinstance(header_obj, dict):
@@ -160,40 +193,74 @@ def get_match_detail_bundle(
 
         home_rc = 0
         away_rc = 0
+        home_ft = 0
+        away_ft = 0
+        home_ht = 0
+        away_ht = 0
 
         for item in tl:
             if not isinstance(item, dict):
                 continue
-            if not _is_red_event(item):
-                continue
+
+            # side 판별(최대한 많이 방어)
+            resolved_side: Optional[str] = None
 
             side = item.get("side")
             if isinstance(side, str):
                 s = side.strip().lower()
-                if s == "home":
-                    home_rc += 1
-                    continue
-                if s == "away":
-                    away_rc += 1
-                    continue
+                if s in ("home", "away"):
+                    resolved_side = s
 
-            side_home = item.get("side_home")
-            if isinstance(side_home, bool):
-                if side_home:
+            if resolved_side is None:
+                side_home = item.get("side_home")
+                if isinstance(side_home, bool):
+                    resolved_side = "home" if side_home else "away"
+
+            if resolved_side is None:
+                team_id = item.get("team_id") or item.get("teamId")
+                if team_id is not None:
+                    if team_id == home_id:
+                        resolved_side = "home"
+                    elif team_id == away_id:
+                        resolved_side = "away"
+
+            # 레드카드
+            if _is_red_event(item):
+                if resolved_side == "home":
                     home_rc += 1
-                else:
+                elif resolved_side == "away":
                     away_rc += 1
                 continue
 
-            team_id = item.get("team_id") or item.get("teamId")
-            if team_id is not None:
-                if team_id == home_id:
-                    home_rc += 1
-                elif team_id == away_id:
-                    away_rc += 1
+            # 골(ft/ht)
+            if _is_goal_event(item):
+                if resolved_side == "home":
+                    home_ft += 1
+                elif resolved_side == "away":
+                    away_ft += 1
 
+                m = _get_minute(item)
+                if m is not None and m <= 45:
+                    if resolved_side == "home":
+                        home_ht += 1
+                    elif resolved_side == "away":
+                        away_ht += 1
+                continue
+
+        # header에 반영
         home["red_cards"] = home_rc
         away["red_cards"] = away_rc
+
+        home["ft"] = home_ft
+        away["ft"] = away_ft
+        home["ht"] = home_ht
+        away["ht"] = away_ht
+
+        # alias도 같이 맞춤(스코어블럭이 score를 볼 수도 있어서)
+        if home.get("score") is not None or True:
+            home["score"] = home_ft
+        if away.get("score") is not None or True:
+            away["score"] = away_ft
 
     header = build_header_block(
         fixture_id=fixture_id,
@@ -203,7 +270,6 @@ def get_match_detail_bundle(
     if header is None:
         return None
 
-    # filters 오버라이드(앱에서 내려준 comp/last_n 우선)
     header_filters = header.get("filters") or {}
     if comp is not None:
         header_filters["comp"] = comp
@@ -217,17 +283,14 @@ def get_match_detail_bundle(
     if apply_override:
         patch = _load_override_patch(fixture_id) or {}
 
-        # hidden=true면 디테일 접근 차단
         if isinstance(patch, dict) and patch.get("hidden") is True:
             return None
 
         if isinstance(patch, dict) and patch:
-            # patch가 {"header": {.}, "timeline": [.]} 구조면 header/bundle 분리
             if isinstance(patch.get("header"), dict):
                 header_patch = patch.get("header") or {}
                 bundle_patch = {k: v for k, v in patch.items() if k not in ("header", "hidden")}
             else:
-                # legacy: header 필드와 bundle 필드가 섞여 있을 수 있어, header로 확실한 키만 분리
                 header_keys = {
                     "fixture_id", "league_id", "season",
                     "date_utc", "kickoff_utc",
@@ -244,12 +307,10 @@ def get_match_detail_bundle(
                     else:
                         bundle_patch[k] = v
 
-            # header를 먼저 merge (이 값으로 form/timeline 등 블록 생성)
             if header_patch:
                 header = _deep_merge(header, header_patch)
                 _reconcile_header_aliases(header)
 
-    # 블록 생성 (override 반영된 header 기반)
     form = build_form_block(header)
     timeline = build_timeline_block(header)
     lineups = build_lineups_block(header)
@@ -271,14 +332,14 @@ def get_match_detail_bundle(
         "ai_predictions": ai_predictions,
     }
 
-    # ✅ bundle 자체 override 최종 반영 (timeline/events 같은 블록 수정이 여기서 실제로 먹음)
     if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
-    # ✅ 최종 timeline 기준으로 header.red_cards 재동기화 (스코어블럭/리스트 불일치 방지)
-    _sync_header_red_cards_from_timeline(bundle)
+    # ✅ 최종 timeline 기준으로 header(red_cards/ft/ht/score) 재동기화
+    _sync_header_from_timeline(bundle)
 
     return bundle
+
 
 
 
