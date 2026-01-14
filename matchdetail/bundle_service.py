@@ -108,7 +108,92 @@ def get_match_detail_bundle(
     - match_overrides.patch.hidden=true 면 None 리턴 (디테일 숨김)
     - header 관련 키는 header에 먼저 merge (다른 블록 생성에 영향 주기 위해)
     - 그 외 키(예: timeline/insights_overall 같은 블록 override)는 bundle 완성 후 최종 merge
+
+    ✅ 추가(중요):
+    - override로 timeline을 수정/삭제한 경우, header.home/away.red_cards는 DB match_events 기준으로
+      남아있을 수 있으니 최종 timeline 기준으로 red_cards를 다시 동기화한다.
     """
+
+    def _is_red_event(e: Dict[str, Any]) -> bool:
+        t = e.get("type")
+        d = e.get("detail")
+        if isinstance(t, str):
+            tu = t.strip().upper()
+            if tu in ("RED", "RED_CARD", "REDCARD"):
+                return True
+            if tu == "CARD" and isinstance(d, str) and "RED" in d.upper():
+                return True
+        if isinstance(d, str) and "RED" in d.upper():
+            return True
+        l1 = e.get("line1")
+        if isinstance(l1, str) and "RED" in l1.upper():
+            return True
+        return False
+
+    def _sync_header_red_cards_from_timeline(bundle_obj: Dict[str, Any]) -> None:
+        if not isinstance(bundle_obj, dict):
+            return
+
+        tl = bundle_obj.get("timeline")
+        if not isinstance(tl, list):
+            # {"timeline": {"events":[...]}} 케이스 방어
+            if isinstance(tl, dict):
+                ev = tl.get("events")
+                if isinstance(ev, list):
+                    tl = ev
+                else:
+                    return
+            else:
+                return
+
+        header_obj = bundle_obj.get("header")
+        if not isinstance(header_obj, dict):
+            return
+
+        home = header_obj.get("home")
+        away = header_obj.get("away")
+        if not isinstance(home, dict) or not isinstance(away, dict):
+            return
+
+        home_id = home.get("id")
+        away_id = away.get("id")
+
+        home_rc = 0
+        away_rc = 0
+
+        for item in tl:
+            if not isinstance(item, dict):
+                continue
+            if not _is_red_event(item):
+                continue
+
+            side = item.get("side")
+            if isinstance(side, str):
+                s = side.strip().lower()
+                if s == "home":
+                    home_rc += 1
+                    continue
+                if s == "away":
+                    away_rc += 1
+                    continue
+
+            side_home = item.get("side_home")
+            if isinstance(side_home, bool):
+                if side_home:
+                    home_rc += 1
+                else:
+                    away_rc += 1
+                continue
+
+            team_id = item.get("team_id") or item.get("teamId")
+            if team_id is not None:
+                if team_id == home_id:
+                    home_rc += 1
+                elif team_id == away_id:
+                    away_rc += 1
+
+        home["red_cards"] = home_rc
+        away["red_cards"] = away_rc
 
     header = build_header_block(
         fixture_id=fixture_id,
@@ -137,7 +222,7 @@ def get_match_detail_bundle(
             return None
 
         if isinstance(patch, dict) and patch:
-            # patch가 {"header": {...}, "timeline": [...]} 구조면 header/bundle 분리
+            # patch가 {"header": {.}, "timeline": [.]} 구조면 header/bundle 분리
             if isinstance(patch.get("header"), dict):
                 header_patch = patch.get("header") or {}
                 bundle_patch = {k: v for k, v in patch.items() if k not in ("header", "hidden")}
@@ -190,6 +275,10 @@ def get_match_detail_bundle(
     if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
+    # ✅ 최종 timeline 기준으로 header.red_cards 재동기화 (스코어블럭/리스트 불일치 방지)
+    _sync_header_red_cards_from_timeline(bundle)
+
     return bundle
+
 
 
