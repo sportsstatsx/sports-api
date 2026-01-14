@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SportsStatsX Admin</title>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+    .muted { color:#666; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+
+    .nav { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .navbtn {
+      padding:8px 12px; border-radius:999px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:12px;
+    }
+    .navbtn.active { border-color:#000; }
+
+    .frameWrap { margin-top:12px; border:1px solid #eee; border-radius:12px; overflow:hidden; }
+    iframe { width:100%; height: 820px; border:0; background:#fff; }
+
+    button.soft { opacity:0.9; padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">SportsStatsX Admin</h1>
+      <div class="muted">
+        경로: <span id="adminPathText" class="mono"></span>
+        · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+        · <button class="soft" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+      </div>
+    </div>
+    <div class="muted" id="statusLine"></div>
+  </div>
+
+  <div class="nav" id="nav"></div>
+
+  <div class="frameWrap">
+    <iframe id="contentFrame" title="admin-content"></iframe>
+  </div>
+
+<script>
+  const tokenKey = "SSX_ADMIN_TOKEN";
+
+  const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
+  document.getElementById("adminPathText").textContent = "/" + adminPath;
+
+  const pages = [
+    { key: "football-override", label: "football-override", file: "football_override.html" },
+    { key: "hockey-override",   label: "hockey-override",   file: "hockey_override.html" },
+    { key: "push",              label: "Push",              file: "push.html" },
+    { key: "subs",              label: "Subscriptions/Devices", file: "subs_devices.html" },
+    { key: "logs",              label: "Logs/Ops",           file: "logs_ops.html" },
+  ];
+
+  function setStatusLine(msg) {
+    document.getElementById("statusLine").textContent = msg || "";
+  }
+
+  function logoutToken() {
+    localStorage.removeItem(tokenKey);
+    alert("토큰을 삭제했습니다. 각 페이지에서 API 호출 시 다시 입력합니다.");
+    // iframe 페이지도 초기화되게 reload
+    const f = document.getElementById("contentFrame");
+    f.src = f.src;
+  }
+
+  function pageUrl(file) {
+    // /{ADMIN_PATH}/pages/{file}
+    return "/" + adminPath + "/pages/" + file;
+  }
+
+  function setActive(key) {
+    document.querySelectorAll(".navbtn").forEach(b => {
+      b.classList.toggle("active", b.dataset.key === key);
+    });
+  }
+
+  function openPage(key) {
+    const p = pages.find(x => x.key === key) || pages[0];
+    setActive(p.key);
+    setStatusLine("열기: " + p.key);
+    document.getElementById("contentFrame").src = pageUrl(p.file);
+    history.replaceState({}, "", "/" + adminPath + "#" + p.key);
+  }
+
+  // nav render
+  const nav = document.getElementById("nav");
+  pages.forEach(p => {
+    const b = document.createElement("button");
+    b.className = "navbtn";
+    b.textContent = p.label;
+    b.dataset.key = p.key;
+    b.onclick = () => openPage(p.key);
+    nav.appendChild(b);
+  });
+
+  // initial route by hash
+  const init = (location.hash || "").replace("#", "").trim();
+  openPage(init || "football-override");
+</script>
+</body>
+</html>
