@@ -357,38 +357,7 @@
         <div id="ovResult" class="muted" style="margin-top:10px;"></div>
       </div>
 
-      <div class="card" style="flex: 1 1 520px;">
-        <h2>Admin Logs</h2>
-        <div class="row">
-          <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
-          <select id="logEvent" style="min-width:160px;">
-            <option value="">event_type 전체</option>
-            <option value="access">access</option>
-            <option value="auth_fail">auth_fail</option>
-            <option value="override_get">override_get</option>
-            <option value="override_upsert">override_upsert</option>
-            <option value="override_delete">override_delete</option>
-            <option value="logs_list">logs_list</option>
-            <option value="fixtures_raw_list">fixtures_raw_list</option>
-            <option value="fixtures_merged_list">fixtures_merged_list</option>
-          </select>
-          <button onclick="loadLogs()">새로고침</button>
-        </div>
-
-        <div style="height:10px;"></div>
-        <table>
-          <thead>
-            <tr>
-              <th style="width:160px;">ts</th>
-              <th style="width:140px;">type</th>
-              <th style="width:80px;">ok</th>
-              <th>detail</th>
-            </tr>
-          </thead>
-          <tbody id="logsBody"></tbody>
-        </table>
-        <div id="logHint" class="muted" style="margin-top:10px;"></div>
-      </div>
+      
     </div>
   </div>
 
@@ -1562,45 +1531,10 @@
   }
 
 
-  async function loadLogs() {
-    const fx = document.getElementById("logFixture").value.trim();
-    const ev = document.getElementById("logEvent").value;
-
-    const qs = new URLSearchParams();
-    qs.set("limit", "200");
-    if (fx) qs.set("fixture_id", fx);
-    if (ev) qs.set("event_type", ev);
-
-    const r = await api(adminUrl(`/api/logs?` + qs.toString()), { method: "GET" });
-
-    const body = document.getElementById("logsBody");
-    body.innerHTML = "";
-
-    if (r.status >= 400) {
-      document.getElementById("logHint").textContent = "로그 로드 실패: " + JSON.stringify(r.data);
-      return;
-    }
-
-    const rows = (r.data && r.data.rows) ? r.data.rows : [];
-    for (const row of rows) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono">${row.ts || ""}</td>
-        <td class="mono">${row.event_type || ""}</td>
-        <td>${row.ok ? "✅" : "❌"}</td>
-        <td class="mono">${JSON.stringify(row.detail || {})}</td>
-      `;
-      body.appendChild(tr);
-    }
-
-    document.getElementById("logHint").textContent = `rows: ${rows.length} (limit=200)`;
-  }
-
   document.getElementById("fxDate").value = isoDateLocal();
   document.getElementById("fxTz").value = "Asia/Seoul";
 
   loadFixtures();
-  loadLogs();
 </script>
 </body>
 </html>
