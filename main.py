@@ -3,7 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any
 
 from flask import Flask, request, jsonify, Response, send_from_directory, redirect
 from werkzeug.exceptions import HTTPException
@@ -473,147 +473,7 @@ def admin_list_fixtures_merged():
     - override 반영
     - hidden=true 도 제외하지 않고 포함(관리자가 다시 숨김해제 가능해야 함)
     - _has_override 플래그 추가
-
-    ✅ 중요:
-    - override patch에 timeline이 있으면, 그 timeline 기준으로
-      red_cards / ft / ht 를 재계산해서 리스트에 동기화한다.
-      (타임라인만 수정했는데 리스트/스코어가 안 바뀌는 문제 해결)
     """
-
-    def _extract_timeline_list(patch_obj: Any) -> Optional[List[Any]]:
-        if not isinstance(patch_obj, dict):
-            return None
-        tl = patch_obj.get("timeline")
-        if isinstance(tl, list):
-            return tl
-        if isinstance(tl, dict):
-            ev = tl.get("events")
-            if isinstance(ev, list):
-                return ev
-        return None
-
-    def _get_minute(e: Dict[str, Any]) -> Optional[int]:
-        # admin.html / 서버 timeline 모두 방어적으로 지원
-        for k in ("minute", "elapsed", "time", "min"):
-            v = e.get(k)
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str):
-                s = v.strip()
-                if s.isdigit():
-                    return int(s)
-        # "45+2" 같은 문자열 방어
-        v2 = e.get("minute")
-        if isinstance(v2, str) and "+" in v2:
-            base = v2.split("+", 1)[0].strip()
-            if base.isdigit():
-                return int(base)
-        return None
-
-    def _is_red_event(e: Dict[str, Any]) -> bool:
-        t = e.get("type")
-        d = e.get("detail")
-
-        if isinstance(t, str):
-            tu = t.strip().upper()
-            if tu in ("RED", "RED_CARD", "REDCARD"):
-                return True
-            if tu == "CARD" and isinstance(d, str) and "RED" in d.upper():
-                return True
-
-        if isinstance(d, str) and "RED" in d.upper():
-            return True
-
-        l1 = e.get("line1")
-        if isinstance(l1, str) and "RED" in l1.upper():
-            return True
-
-        return False
-
-    def _is_goal_event(e: Dict[str, Any]) -> bool:
-        t = e.get("type")
-        d = e.get("detail")
-
-        if isinstance(t, str):
-            tu = t.strip().upper()
-            if tu in ("GOAL", "GOAL_NORMAL", "GOAL_PENALTY", "PENALTY_GOAL"):
-                return True
-
-        # 서버/수집 데이터 방어
-        if isinstance(d, str) and "GOAL" in d.upper():
-            return True
-
-        l1 = e.get("line1")
-        if isinstance(l1, str) and "GOAL" in l1.upper():
-            return True
-
-        return False
-
-    def _calc_from_timeline(
-        timeline_list: List[Any],
-        home_id: Any,
-        away_id: Any,
-    ) -> Tuple[int, int, int, int, int, int]:
-        """
-        return: (home_ft, away_ft, home_ht, away_ht, home_red, away_red)
-        """
-        home_ft = away_ft = 0
-        home_ht = away_ht = 0
-        home_red = away_red = 0
-
-        for item in timeline_list:
-            if not isinstance(item, dict):
-                continue
-
-            # side 판별
-            side = item.get("side")
-            team_side = item.get("team") or item.get("team_key") or item.get("teamSide")
-            side_home = item.get("side_home")
-            team_id = item.get("team_id") or item.get("teamId")
-
-            resolved_side: Optional[str] = None
-            if isinstance(side, str):
-                s = side.strip().lower()
-                if s in ("home", "away"):
-                    resolved_side = s
-            elif isinstance(team_side, str):
-                s = team_side.strip().lower()
-                if s in ("home", "away"):
-                    resolved_side = s
-            elif isinstance(side_home, bool):
-                resolved_side = "home" if side_home else "away"
-            elif team_id is not None:
-                if team_id == home_id:
-                    resolved_side = "home"
-                elif team_id == away_id:
-                    resolved_side = "away"
-
-
-            # 레드카드
-            if _is_red_event(item):
-                if resolved_side == "home":
-                    home_red += 1
-                elif resolved_side == "away":
-                    away_red += 1
-                continue
-
-            # 골
-            if _is_goal_event(item):
-                if resolved_side == "home":
-                    home_ft += 1
-                elif resolved_side == "away":
-                    away_ft += 1
-
-                m = _get_minute(item)
-                if m is not None and m <= 45:
-                    if resolved_side == "home":
-                        home_ht += 1
-                    elif resolved_side == "away":
-                        away_ht += 1
-                continue
-
-        return home_ft, away_ft, home_ht, away_ht, home_red, away_red
-
     # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
     league_ids_raw = request.args.get("league_ids", type=str)
@@ -767,7 +627,7 @@ def admin_list_fixtures_merged():
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
         if patch and isinstance(patch, dict):
-            # ✅ admin 목록에는 큰 블록(timeline/insights_overall 등)이 붙지 않게, 필요한 키만 추려서 merge
+            # ✅ 목록에는 큰 블록(timeline/insights_overall 등)이 붙지 않게, 필요한 키만 추려서 merge
             if isinstance(patch.get("header"), dict):
                 p2 = dict(patch.get("header") or {})
                 if "hidden" in patch:
@@ -775,32 +635,7 @@ def admin_list_fixtures_merged():
             else:
                 p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
 
-            # ✅ timeline이 있으면, 그 timeline 기준으로 ft/ht/red_cards를 재계산해서 p2에 주입
-            tl = _extract_timeline_list(patch)
-            if isinstance(tl, list):
-                home_id = (f.get("home") or {}).get("id")
-                away_id = (f.get("away") or {}).get("id")
-                hft, aft, hht, aht, hrc, arc = _calc_from_timeline(tl, home_id, away_id)
-
-                home_p = p2.get("home") if isinstance(p2.get("home"), dict) else {}
-                away_p = p2.get("away") if isinstance(p2.get("away"), dict) else {}
-
-                home_p = dict(home_p)
-                away_p = dict(away_p)
-
-                home_p["ft"] = hft
-                away_p["ft"] = aft
-                home_p["ht"] = hht
-                away_p["ht"] = aht
-                home_p["red_cards"] = hrc
-                away_p["red_cards"] = arc
-
-                p2["home"] = home_p
-                p2["away"] = away_p
-
             f2 = _deep_merge(f, p2)
-
-            # 관리자용이므로 hidden=true도 제외하지 않음
             f2["_has_override"] = True
             merged.append(f2)
         else:
@@ -814,8 +649,6 @@ def admin_list_fixtures_merged():
         detail={"date": date_str, "timezone": tz_str, "league_ids": league_ids_raw or "", "rows": len(merged)},
     )
     return jsonify({"ok": True, "rows": merged})
-
-
 
 
 
@@ -991,134 +824,7 @@ def admin_fixtures_raw():
 def list_fixtures():
     """
     사용자의 지역 날짜를 기반으로 경기 조회.
-    ✅ override 반영
-    ✅ override에 timeline이 있으면 timeline 기준으로 ft/ht/red_cards를 재계산해 동기화
     """
-
-    def _extract_timeline_list(patch_obj: Any) -> Optional[List[Any]]:
-        if not isinstance(patch_obj, dict):
-            return None
-        tl = patch_obj.get("timeline")
-        if isinstance(tl, list):
-            return tl
-        if isinstance(tl, dict):
-            ev = tl.get("events")
-            if isinstance(ev, list):
-                return ev
-        return None
-
-    def _get_minute(e: Dict[str, Any]) -> Optional[int]:
-        for k in ("minute", "elapsed", "time", "min"):
-            v = e.get(k)
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str):
-                s = v.strip()
-                if s.isdigit():
-                    return int(s)
-        v2 = e.get("minute")
-        if isinstance(v2, str) and "+" in v2:
-            base = v2.split("+", 1)[0].strip()
-            if base.isdigit():
-                return int(base)
-        return None
-
-    def _is_red_event(e: Dict[str, Any]) -> bool:
-        t = e.get("type")
-        d = e.get("detail")
-
-        if isinstance(t, str):
-            tu = t.strip().upper()
-            if tu in ("RED", "RED_CARD", "REDCARD"):
-                return True
-            if tu == "CARD" and isinstance(d, str) and "RED" in d.upper():
-                return True
-
-        if isinstance(d, str) and "RED" in d.upper():
-            return True
-
-        l1 = e.get("line1")
-        if isinstance(l1, str) and "RED" in l1.upper():
-            return True
-
-        return False
-
-    def _is_goal_event(e: Dict[str, Any]) -> bool:
-        t = e.get("type")
-        d = e.get("detail")
-
-        if isinstance(t, str):
-            tu = t.strip().upper()
-            if tu in ("GOAL", "GOAL_NORMAL", "GOAL_PENALTY", "PENALTY_GOAL"):
-                return True
-
-        if isinstance(d, str) and "GOAL" in d.upper():
-            return True
-
-        l1 = e.get("line1")
-        if isinstance(l1, str) and "GOAL" in l1.upper():
-            return True
-
-        return False
-
-    def _calc_from_timeline(
-        timeline_list: List[Any],
-        home_id: Any,
-        away_id: Any,
-    ) -> Tuple[int, int, int, int, int, int]:
-        home_ft = away_ft = 0
-        home_ht = away_ht = 0
-        home_red = away_red = 0
-
-        for item in timeline_list:
-            if not isinstance(item, dict):
-                continue
-
-            side = item.get("side")
-            team_side = item.get("team") or item.get("team_key") or item.get("teamSide")
-            side_home = item.get("side_home")
-            team_id = item.get("team_id") or item.get("teamId")
-
-            resolved_side: Optional[str] = None
-            if isinstance(side, str):
-                s = side.strip().lower()
-                if s in ("home", "away"):
-                    resolved_side = s
-            elif isinstance(team_side, str):
-                s = team_side.strip().lower()
-                if s in ("home", "away"):
-                    resolved_side = s
-            elif isinstance(side_home, bool):
-                resolved_side = "home" if side_home else "away"
-            elif team_id is not None:
-                if team_id == home_id:
-                    resolved_side = "home"
-                elif team_id == away_id:
-                    resolved_side = "away"
-
-
-            if _is_red_event(item):
-                if resolved_side == "home":
-                    home_red += 1
-                elif resolved_side == "away":
-                    away_red += 1
-                continue
-
-            if _is_goal_event(item):
-                if resolved_side == "home":
-                    home_ft += 1
-                elif resolved_side == "away":
-                    away_ft += 1
-
-                m = _get_minute(item)
-                if m is not None and m <= 45:
-                    if resolved_side == "home":
-                        home_ht += 1
-                    elif resolved_side == "away":
-                        away_ht += 1
-                continue
-
-        return home_ft, away_ft, home_ht, away_ht, home_red, away_red
 
     # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
@@ -1152,12 +858,14 @@ def list_fixtures():
     except ValueError:
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
+    # 날짜 생성
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
     local_end   = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
 
     utc_start = local_start.astimezone(timezone.utc)
     utc_end   = local_end.astimezone(timezone.utc)
 
+    # SQL
     params: List[Any] = [utc_start, utc_end]
     where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
 
@@ -1197,14 +905,14 @@ def list_fixtures():
             l.logo AS league_logo,
             l.country AS league_country,
             (
-                SELECT COUNT(*) FROM match_events e
+                SELECT COUNT(*) FROM match_events e 
                 WHERE e.fixture_id = m.fixture_id
                 AND e.team_id = m.home_id
                 AND e.type = 'Card'
                 AND e.detail = 'Red Card'
             ) AS home_red_cards,
             (
-                SELECT COUNT(*) FROM match_events e
+                SELECT COUNT(*) FROM match_events e 
                 WHERE e.fixture_id = m.fixture_id
                 AND e.team_id = m.away_id
                 AND e.type = 'Card'
@@ -1218,6 +926,7 @@ def list_fixtures():
         ORDER BY m.date_utc ASC
     """
 
+
     rows = fetch_all(sql, tuple(params))
 
     fixtures = []
@@ -1230,18 +939,18 @@ def list_fixtures():
             "status_group": r["status_group"],
             "status": r["status"],
             "elapsed": r["elapsed"],
-            "status_long": r["status_long"],
+            "status_long": r["status_long"],   # ✅ 추가
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
-            "league_round": r["league_round"],
-            "venue_name": r["venue_name"],
+            "league_round": r["league_round"], # ✅ 추가
+            "venue_name": r["venue_name"],     # ✅ 추가
             "home": {
                 "id": r["home_id"],
                 "name": r["home_name"],
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
-                "ht": r["home_ht"],
+                "ht": r["home_ht"],            # ✅ 추가
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -1249,65 +958,24 @@ def list_fixtures():
                 "name": r["away_name"],
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
-                "ht": r["away_ht"],
+                "ht": r["away_ht"],            # ✅ 추가
                 "red_cards": r["away_red_cards"],
             },
         })
 
+
+    # ✅ overrides 적용 (웹에서 수정된 값이 우선)
     fixture_ids = [f["fixture_id"] for f in fixtures]
     override_map = _load_match_overrides(fixture_ids)
-
-    fixture_patch_keys = {
-        "fixture_id", "league_id", "season",
-        "date_utc", "kickoff_utc",
-        "status_group", "status", "elapsed", "minute", "status_long",
-        "league_round", "venue_name",
-        "league_name", "league_logo", "league_country",
-        "home", "away",
-        "hidden",
-    }
 
     merged = []
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
-        if patch and isinstance(patch, dict):
-            # 목록에는 필요한 키만 merge
-            if isinstance(patch.get("header"), dict):
-                p2 = dict(patch.get("header") or {})
-                if "hidden" in patch:
-                    p2["hidden"] = patch.get("hidden")
-            else:
-                p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
-
-            # ✅ timeline이 있으면 timeline 기준으로 ft/ht/red_cards 동기화해서 p2에 주입
-            tl = _extract_timeline_list(patch)
-            if isinstance(tl, list):
-                home_id = (f.get("home") or {}).get("id")
-                away_id = (f.get("away") or {}).get("id")
-                hft, aft, hht, aht, hrc, arc = _calc_from_timeline(tl, home_id, away_id)
-
-                home_p = p2.get("home") if isinstance(p2.get("home"), dict) else {}
-                away_p = p2.get("away") if isinstance(p2.get("away"), dict) else {}
-
-                home_p = dict(home_p)
-                away_p = dict(away_p)
-
-                home_p["ft"] = hft
-                away_p["ft"] = aft
-                home_p["ht"] = hht
-                away_p["ht"] = aht
-                home_p["red_cards"] = hrc
-                away_p["red_cards"] = arc
-
-                p2["home"] = home_p
-                p2["away"] = away_p
-
-            f2 = _deep_merge(f, p2)
-
-            # hidden=true면 노출 제외
+        if patch:
+            f2 = _deep_merge(f, patch)
+            # hidden=true면 노출 제외(삭제 대신 숨김)
             if f2.get("hidden") is True:
                 continue
-
             merged.append(f2)
         else:
             merged.append(f)
@@ -1321,9 +989,6 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
-
-
 
 
 
