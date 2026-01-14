@@ -217,11 +217,23 @@
           </div>
         </div>
 
+                <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Status Group</label>
+            <input id="qeStatusGroup" placeholder="status_group (ex: INPLAY / UPCOMING / FINISHED)"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Status</label>
+            <input id="qeStatus" placeholder="status (ex: 1H / HT / FT / NS)"/>
+          </div>
+        </div>
+
         <div class="row">
           <div style="flex:1 1 220px;">
             <label class="muted">Home FT</label>
             <input id="qeHomeFt" type="number" placeholder="home.ft"/>
           </div>
+          
           <div style="flex:1 1 220px;">
             <label class="muted">Away FT</label>
             <input id="qeAwayFt" type="number" placeholder="away.ft"/>
@@ -580,12 +592,15 @@
     document.getElementById("qeRound").value = f.league_round ?? "";
     document.getElementById("qeStatusLong").value = f.status_long ?? "";
     document.getElementById("qeElapsed").value = (f.elapsed ?? "") === null ? "" : (f.elapsed ?? "");
+    document.getElementById("qeStatusGroup").value = f.status_group ?? "";
+    document.getElementById("qeStatus").value = f.status ?? "";
 
     document.getElementById("qeHomeFt").value = (f.home?.ft ?? "") === null ? "" : (f.home?.ft ?? "");
     document.getElementById("qeAwayFt").value = (f.away?.ft ?? "") === null ? "" : (f.away?.ft ?? "");
     document.getElementById("qeHomeHt").value = (f.home?.ht ?? "") === null ? "" : (f.home?.ht ?? "");
     document.getElementById("qeAwayHt").value = (f.away?.ht ?? "") === null ? "" : (f.away?.ht ?? "");
   }
+
 
   function getFilterKey() {
     const date = document.getElementById("fxDate").value || "";
@@ -931,8 +946,9 @@
     const sameStr = (a, b) => normStr(a) === normStr(b);
 
     const normNum = (x) => {
-      if (x === "" || x === null || x === undefined) return null;
-      const n = Number(x);
+      const s = String(x ?? "").trim();
+      if (s === "") return null;
+      const n = Number(s);
       return Number.isFinite(n) ? n : null;
     };
     const sameNum = (a, b) => (a ?? null) === (b ?? null);
@@ -947,55 +963,48 @@
 
     const p = {};
 
-    const v = normStr(document.getElementById("qeVenue").value);
-    const r = normStr(document.getElementById("qeRound").value);
+    const v  = normStr(document.getElementById("qeVenue").value);
+    const r  = normStr(document.getElementById("qeRound").value);
     const sl = normStr(document.getElementById("qeStatusLong").value);
     const el = normNum(document.getElementById("qeElapsed").value);
+    const sg = normStr(document.getElementById("qeStatusGroup").value);
+    const st = normStr(document.getElementById("qeStatus").value);
 
-    // ✅ 문자열: 현재 값과 다를 때만 포함
-    if (!sameStr(v, cur.venue_name)) p["venue_name"] = v;
-    if (!sameStr(r, cur.league_round)) p["league_round"] = r;
-    if (!sameStr(sl, cur.status_long)) p["status_long"] = sl;
+    if (!sameStr(v,  cur.venue_name))   p["venue_name"] = v;
+    if (!sameStr(r,  cur.league_round)) p["league_round"] = r;
+    if (!sameStr(sl, cur.status_long))  p["status_long"] = sl;
+    if (!sameNum(el, cur.elapsed))      p["elapsed"] = el;
 
-    // ✅ 숫자: 현재 값과 다를 때만 포함
-    if (!sameNum(el, (cur.elapsed ?? null))) p["elapsed"] = el;
+    if (!sameStr(sg, cur.status_group)) p["status_group"] = sg;
+    if (!sameStr(st, cur.status))       p["status"] = st;
 
     const hft = normNum(document.getElementById("qeHomeFt").value);
     const aft = normNum(document.getElementById("qeAwayFt").value);
     const hht = normNum(document.getElementById("qeHomeHt").value);
     const aht = normNum(document.getElementById("qeAwayHt").value);
 
-    const curHft = (cur.home && cur.home.ft !== undefined) ? cur.home.ft : null;
-    const curAft = (cur.away && cur.away.ft !== undefined) ? cur.away.ft : null;
-    const curHht = (cur.home && cur.home.ht !== undefined) ? cur.home.ht : null;
-    const curAht = (cur.away && cur.away.ht !== undefined) ? cur.away.ht : null;
+    const homeCur = cur.home || {};
+    const awayCur = cur.away || {};
 
-    const homeChanged = (!sameNum(hft, (curHft ?? null))) || (!sameNum(hht, (curHht ?? null)));
-    const awayChanged = (!sameNum(aft, (curAft ?? null))) || (!sameNum(aht, (curAht ?? null)));
+    let homePatch = null;
+    let awayPatch = null;
 
-    if (homeChanged) {
-      p["home"] = p["home"] || {};
-      if (!sameNum(hft, (curHft ?? null))) p["home"]["ft"] = hft;
-      if (!sameNum(hht, (curHht ?? null))) p["home"]["ht"] = hht;
-    }
-    if (awayChanged) {
-      p["away"] = p["away"] || {};
-      if (!sameNum(aft, (curAft ?? null))) p["away"]["ft"] = aft;
-      if (!sameNum(aht, (curAht ?? null))) p["away"]["ht"] = aht;
-    }
+    if (!sameNum(hft, homeCur.ft)) { homePatch = homePatch || {}; homePatch["ft"] = hft; }
+    if (!sameNum(hht, homeCur.ht)) { homePatch = homePatch || {}; homePatch["ht"] = hht; }
+    if (!sameNum(aft, awayCur.ft)) { awayPatch = awayPatch || {}; awayPatch["ft"] = aft; }
+    if (!sameNum(aht, awayCur.ht)) { awayPatch = awayPatch || {}; awayPatch["ht"] = aht; }
 
-    // ✅ 변경 없으면(그리고 onlyIfChanged면) patch를 건드리지 않음
-    const hasAny =
-      Object.keys(p).length > 0 ||
-      (p.home && Object.keys(p.home).length > 0) ||
-      (p.away && Object.keys(p.away).length > 0);
+    if (homePatch) p["home"] = deepMerge(p["home"] || {}, homePatch);
+    if (awayPatch) p["away"] = deepMerge(p["away"] || {}, awayPatch);
 
+    if (!basePatch.fixture_id) basePatch.fixture_id = Number(id);
+
+    const hasAny = Object.keys(p).length > 0;
     if (!hasAny && onlyIfChanged) {
       if (!silent) setOv("Quick Edit 변경사항이 없습니다.", true);
       return false;
     }
 
-    // ✅ 기존 patch + quick edit 변경분 merge (quick edit 변경분이 우선)
     const merged = deepMerge(basePatch, p);
     document.getElementById("patch").value = JSON.stringify(merged, null, 2);
 
@@ -1004,6 +1013,7 @@
     updateComparisonViews();
     return true;
   }
+
 
   // ─────────────────────────────────────
   // Event Editor (Goals/Cards/Subs) - bundle에서 이벤트 배열 경로 자동 탐지 후 배열 통째로 override
