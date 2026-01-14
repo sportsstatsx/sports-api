@@ -80,7 +80,10 @@ def get_target_matches() -> List[Dict[str, Any]]:
 # 이벤트 업데이트
 # ─────────────────────────────────────
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]):
-    execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
+    # ⚠️ 기존 "DELETE 후 재삽입" 방식은 match_events.id가 매번 바뀌어서
+    # match_event_worker가 같은 이벤트를 계속 "새 이벤트"로 오인 → 푸시 중복 발생.
+    # 여기서는 (fixture_id, type, minute, extra, team_id, player_id, player_in_id) 조합으로
+    # 기존 행을 UPDATE 하고, 없을 때만 INSERT 해서 id를 안정화한다.
 
     for ev in events:
         minute = ev["time"]["elapsed"]
@@ -90,24 +93,55 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]):
         assist_id = ev.get("assist", {}).get("id")
         assist_name = ev.get("assist", {}).get("name")
         p_in = ev["player"].get("id_in") if "player" in ev else None
+        p_in_name = None
 
         sql = """
+            WITH upd AS (
+                UPDATE match_events
+                   SET detail = %s,
+                       assist_player_id = %s,
+                       assist_name = %s,
+                       player_in_name = %s
+                 WHERE fixture_id = %s
+                   AND type = %s
+                   AND minute = %s
+                   AND extra = %s
+                   AND team_id IS NOT DISTINCT FROM %s
+                   AND player_id IS NOT DISTINCT FROM %s
+                   AND player_in_id IS NOT DISTINCT FROM %s
+                 RETURNING id
+            )
             INSERT INTO match_events (
                 fixture_id, team_id, player_id,
                 type, detail, minute, extra,
                 assist_player_id, assist_name,
                 player_in_id, player_in_name
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            SELECT
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                %s, %s
+            WHERE NOT EXISTS (SELECT 1 FROM upd);
         """
 
         execute(sql, (
+            # upd
+            ev.get("detail"),
+            assist_id, assist_name,
+            p_in_name,
+            fixture_id,
+            ev.get("type"),
+            minute, extra,
+            team_id, player_id, p_in,
+            # insert
             fixture_id, team_id, player_id,
             ev.get("type"), ev.get("detail"),
             minute, extra,
             assist_id, assist_name,
-            p_in, None
+            p_in, p_in_name,
         ))
+
 
 
 # ─────────────────────────────────────

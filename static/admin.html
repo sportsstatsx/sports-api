@@ -5,410 +5,173 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>SportsStatsX Admin</title>
   <style>
-    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    :root{
+      --bg:#f6f7f9;
+      --panel:#ffffff;
+      --panel2:#fbfbfc;
+      --text:#101114;
+      --muted:#6b6f76;
+      --border:rgba(16,17,20,0.14);
+      --border2:rgba(16,17,20,0.10);
+      --shadow:0 10px 28px rgba(0,0,0,0.08);
+      --chip:rgba(16,17,20,0.06);
+      --chipActive:rgba(16,17,20,0.12);
+    }
+    html[data-theme="dark"]{
+      --bg:#0b0c0f;
+      --panel:#12141a;
+      --panel2:#0f1116;
+      --text:#f1f3f5;
+      --muted:#9aa3ad;
+      --border:rgba(241,243,245,0.14);
+      --border2:rgba(241,243,245,0.10);
+      --shadow:0 14px 34px rgba(0,0,0,0.50);
+      --chip:rgba(241,243,245,0.08);
+      --chipActive:rgba(241,243,245,0.16);
+    }
+
+    html, body { height:100%; }
+    body{
+      font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      margin:18px;
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(0,0,0,0.06), transparent 55%),
+        radial-gradient(900px 480px at 95% 0%, rgba(0,0,0,0.05), transparent 50%),
+        var(--bg);
+      color:var(--text);
+    }
+    html[data-theme="dark"] body{
+      background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(255,255,255,0.06), transparent 55%),
+        radial-gradient(900px 480px at 95% 0%, rgba(255,255,255,0.05), transparent 50%),
+        var(--bg);
+    }
+
     .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
-    .muted { color:#666; font-size:12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
-    .card h2 { margin:0 0 10px 0; font-size: 16px; }
-    input, textarea, button, select { font-size: 14px; }
-    input, textarea, select {
-      width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc;
-      background:#fff;
-    }
-    textarea { min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
-    button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
-    button.primary { border-color:#000; }
-    button.danger { border-color:#d33; color:#d33; }
-    button.soft { opacity:0.9; }
-    .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:12px; align-items:start; }
-    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+    .muted{ color:var(--muted); font-size:12px; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
 
-    .listWrap { max-height: 560px; overflow:auto; border:1px solid #eee; border-radius:10px; }
-    .item {
-      padding:10px 12px; border-bottom:1px solid #f0f0f0; cursor:pointer;
-      display:flex; gap:10px; align-items:flex-start;
+    .nav{
+      display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;
+      padding:10px;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,0.55);
+      border-radius:14px;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
     }
-    .item:hover { background:#fafafa; }
-    .item.sel { background:#f3f6ff; }
-    .badge { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
-    .item.hidden { opacity: 0.55; }
-    .badge.ovr { border-color:#000; }
-    .badge.hid { border-color:#d33; color:#d33; }
-    .right { margin-left:auto; text-align:right; }
-    .small { font-size:12px; }
-    .k { font-weight:600; }
-    .ok { color:#0a7; }
-    .bad { color:#d33; }
-
-    pre {
-      margin:0; padding:10px; background:#fafafa; border:1px solid #eee; border-radius:10px;
-      max-height: 260px; overflow:auto;
+    html[data-theme="dark"] .nav{
+      background:rgba(18,20,26,0.55);
     }
 
-    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
-    .tabbtn { padding:8px 10px; border-radius:999px; border:1px solid #ddd; background:#fff; cursor:pointer; font-size:12px; }
-    .tabbtn.active { border-color:#000; }
-    .tabpane { display:none; margin-top:10px; }
-    .tabpane.active { display:block; }
+    .navbtn{
+      padding:8px 12px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      cursor:pointer;
+      font-size:12px;
+      color:var(--text);
+      transition: transform .06s ease, background .12s ease, border-color .12s ease;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.03);
+    }
+    .navbtn:hover{ transform: translateY(-1px); background:var(--panel2); }
+    .navbtn.active{
+      background:var(--chipActive);
+      border-color:var(--border2);
+      transform:none;
+    }
 
-    table { width:100%; border-collapse:collapse; }
-    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
-        /* ---- Event Editor ---- */
-    .subcard { border:1px solid #eee; border-radius:10px; padding:12px; background:#fff; }
-    .subcard h3 { margin:0 0 10px 0; font-size:14px; }
-    .mini { font-size:12px; }
-    .btnsm { padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; font-size:12px; }
-    .btnsm.primary { border-color:#000; }
-    .btnsm.danger { border-color:#d33; color:#d33; }
-    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
-    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
-    @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
-    .evtTable input, .evtTable select { padding:8px; font-size:12px; }
-    .evtTable td { padding:6px; }
+    .frameWrap{
+      margin-top:12px;
+      border:1px solid var(--border);
+      border-radius:14px;
+      overflow:hidden;
+      background:var(--panel);
+      box-shadow: var(--shadow);
+    }
+    iframe{ width:100%; height:820px; border:0; background:var(--panel); }
 
+    button.soft{
+      opacity:0.95;
+      padding:6px 10px;
+      border-radius:10px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      color:var(--text);
+      cursor:pointer;
+    }
+    button.soft:hover{ background:var(--panel2); }
   </style>
+
 </head>
 <body>
   <div class="top">
     <div>
       <h1 style="margin:0 0 6px 0;">SportsStatsX Admin</h1>
       <div class="muted">
-        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
-        · <button class="soft" style="padding:6px 10px;" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+        경로: <span id="adminPathText" class="mono"></span>
+        · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+        · <button class="soft" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+        · <button class="soft" id="themeBtn" onclick="toggleTheme()">테마: (loading)</button>
       </div>
     </div>
     <div class="muted" id="statusLine"></div>
   </div>
 
-  <div class="grid" style="margin-top:14px;">
-    <!-- LEFT: Fixtures browser -->
-    <div class="card">
-      <h2>Fixtures Browser</h2>
+  <div class="nav" id="nav"></div>
 
-      <div class="row">
-        <div style="min-width:190px; flex: 0 0 190px;">
-          <label class="muted">Date</label>
-          <input id="fxDate" type="date"/>
-        </div>
-
-        <div style="min-width:220px; flex: 1 1 220px;">
-          <label class="muted">Timezone</label>
-          <select id="fxTz">
-            <option value="Asia/Seoul">Asia/Seoul</option>
-            <option value="UTC">UTC</option>
-            <option value="Europe/London">Europe/London</option>
-            <option value="America/New_York">America/New_York</option>
-            <option value="America/Los_Angeles">America/Los_Angeles</option>
-          </select>
-        </div>
-
-        <div style="min-width:260px; flex: 1 1 260px;">
-          <label class="muted">League IDs (comma, optional)</label>
-          <input id="fxLeagueIds" placeholder="예: 39,140,78"/>
-        </div>
-
-        <div style="min-width:220px; flex: 1 1 220px;">
-          <label class="muted">Search (team/league)</label>
-          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
-        </div>
-
-        <div style="min-width:140px; flex: 0 0 140px; align-self:flex-end;">
-          <button class="primary" style="width:100%;" onclick="loadFixtures()">불러오기</button>
-        </div>
-      </div>
-
-      <div class="muted" style="margin-top:10px;" id="fxHint"></div>
-
-      <div class="listWrap" style="margin-top:10px;">
-        <div id="fxList"></div>
-      </div>
-
-      <div class="tabs">
-        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')">현재(노출)</button>
-        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
-        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
-        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
-        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')">bundle(raw)</button>
-        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')">bundle(merged)</button>
-        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')">bundle diff</button>
-      </div>
-
-      <div class="tabpane active" id="tab_now">
-        <div class="muted">선택된 경기(override 반영 결과)</div>
-        <pre class="mono" id="fxPreviewNow">{}</pre>
-      </div>
-
-      <div class="tabpane" id="tab_raw">
-        <div class="muted">선택된 경기(override 미적용 원본)</div>
-        <pre class="mono" id="fxPreviewRaw">{}</pre>
-        <div class="muted" style="margin-top:8px;" id="rawHint"></div>
-      </div>
-
-      <div class="tabpane" id="tab_patch">
-        <div class="muted">현재 override patch</div>
-        <pre class="mono" id="fxPreviewPatch">{}</pre>
-      </div>
-
-      <div class="tabpane" id="tab_diff">
-        <div class="muted">원본(raw) → 현재(노출) 변경 요약</div>
-        <pre class="mono" id="fxPreviewDiff">[]</pre>
-      </div>
-
-      <div class="tabpane" id="tab_bundle_raw">
-        <div class="muted">선택된 경기(bundle 원본: override 미적용)</div>
-        <pre class="mono" id="bundlePreviewRaw">{}</pre>
-      </div>
-
-      <div class="tabpane" id="tab_bundle_merged">
-        <div class="muted">선택된 경기(bundle merged: override 적용)</div>
-        <pre class="mono" id="bundlePreviewMerged">{}</pre>
-      </div>
-
-      <div class="tabpane" id="tab_bundle_diff">
-        <div class="muted">bundle(raw) → bundle(merged) 변경 요약</div>
-        <pre class="mono" id="bundlePreviewDiff">[]</pre>
-      </div>
-      
-    </div>
-
-    <!-- RIGHT: Editor + logs -->
-    <div class="row" style="align-items:stretch;">
-      <div class="card" style="flex: 1 1 520px;">
-        <h2>Override Editor</h2>
-
-        <div class="row">
-          <div style="flex: 1 1 220px;">
-            <label class="muted">Fixture ID</label>
-            <input id="fixtureId" placeholder="예: 123456"/>
-          </div>
-          <div style="flex: 1 1 220px;">
-            <label class="muted">Quick actions</label>
-            <div class="row" style="gap:8px;">
-              <button onclick="getOverride()">조회</button>
-              <button class="danger" onclick="deleteOverride()">삭제(원복)</button>
-              <button onclick="hideFixture()">숨김(hidden=true)</button>
-              <button onclick="unhideFixture()">숨김해제(hidden=false)</button>
-            </div>
-          </div>
-        </div>
-
-        <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Venue</label>
-            <input id="qeVenue" placeholder="venue_name"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">League Round</label>
-            <input id="qeRound" placeholder="league_round"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Status Long</label>
-            <input id="qeStatusLong" placeholder="status_long"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">Elapsed</label>
-            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
-          </div>
-        </div>
-
-                <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Status Group</label>
-            <input id="qeStatusGroup" placeholder="status_group (ex: INPLAY / UPCOMING / FINISHED)"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">Status</label>
-            <input id="qeStatus" placeholder="status (ex: 1H / HT / FT / NS)"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Home FT</label>
-            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
-          </div>
-          
-          <div style="flex:1 1 220px;">
-            <label class="muted">Away FT</label>
-            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Home HT</label>
-            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">Away HT</label>
-            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
-          </div>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
-          <button onclick="upsertOverride()">저장(Upsert)</button>
-        </div>
-
-        <!-- Event Editor -->
-        <div style="height:12px;"></div>
-        <div class="subcard">
-          <h3>Event Editor (Goals / Cards / Subs)</h3>
-
-          <div class="row" style="align-items:flex-end;">
-            <div style="flex:1 1 320px;">
-              <label class="muted mini">이벤트 배열 경로(자동 탐지)</label>
-              <select id="evtPath"></select>
-              <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
-            </div>
-            <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btnsm" onclick="evtReloadFromBundle()">bundle에서 불러오기</button>
-              <button class="btnsm" onclick="evtApplyToPatch(false)">Patch에 반영</button>
-              <button class="btnsm danger" onclick="evtClearAll()">전체 삭제</button>
-            </div>
-          </div>
-
-          <div style="height:10px;"></div>
-
-          <!-- Add row -->
-          <div class="grid2">
-            <div>
-              <label class="muted mini">Minute</label>
-              <input id="evtMin" type="number" placeholder="예: 57" />
-            </div>
-            <div>
-              <label class="muted mini">Extra(+)</label>
-              <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
-            </div>
-
-            <div>
-              <label class="muted mini">Team</label>
-              <select id="evtTeam">
-                <option value="">(none)</option>
-                <option value="home">home</option>
-                <option value="away">away</option>
-              </select>
-            </div>
-            <div>
-              <label class="muted mini">Type</label>
-              <select id="evtType">
-                <option value="GOAL">GOAL</option>
-                <option value="RED">RED</option>
-                <option value="YELLOW">YELLOW</option>
-                <option value="SUB">SUB</option>
-                <option value="OTHER">OTHER</option>
-              </select>
-            </div>
-
-            <div>
-              <label class="muted mini">Player / Main</label>
-              <input id="evtPlayer" placeholder="예: Messi / Player name" />
-            </div>
-            <div>
-              <label class="muted mini">Assist / SubOut</label>
-              <input id="evtAssist" placeholder="예: Assist / Sub out" />
-            </div>
-
-            <div style="grid-column: 1 / -1;">
-              <label class="muted mini">Detail</label>
-              <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
-            </div>
-
-            <div style="grid-column: 1 / -1; display:flex; gap:8px;">
-              <button class="btnsm primary" onclick="evtAdd()">+ 이벤트 추가</button>
-              <button class="btnsm" onclick="evtSort()">정렬(시간순)</button>
-            </div>
-          </div>
-
-          <div style="height:10px;"></div>
-
-          <div class="muted mini">이벤트 목록 (행 수정/삭제 가능) · 수정하면 Patch JSON에 자동 반영됩니다</div>
-          <div style="height:6px;"></div>
-
-          <table class="evtTable" style="width:100%; border-collapse:collapse;">
-            <thead>
-              <tr>
-                <th style="width:80px;">min</th>
-                <th style="width:80px;">extra(+)</th>
-                <th style="width:70px;">team</th>
-                <th style="width:90px;">type</th>
-                <th>main</th>
-                <th>assist/sub</th>
-                <th>detail</th>
-                <th style="width:80px;">del</th>
-
-              </tr>
-            </thead>
-            <tbody id="evtBody"></tbody>
-          </table>
-        </div>
-
-
-        <div style="height:10px;"></div>
-        <label class="muted">Patch JSON (부분만)</label>
-        <textarea id="patch" placeholder='예: { "venue_name": "Edited", "home": { "ft": 2 } }'></textarea>
-
-        <div id="ovResult" class="muted" style="margin-top:10px;"></div>
-      </div>
-
-      <div class="card" style="flex: 1 1 520px;">
-        <h2>Admin Logs</h2>
-        <div class="row">
-          <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
-          <select id="logEvent" style="min-width:160px;">
-            <option value="">event_type 전체</option>
-            <option value="access">access</option>
-            <option value="auth_fail">auth_fail</option>
-            <option value="override_get">override_get</option>
-            <option value="override_upsert">override_upsert</option>
-            <option value="override_delete">override_delete</option>
-            <option value="logs_list">logs_list</option>
-            <option value="fixtures_raw_list">fixtures_raw_list</option>
-            <option value="fixtures_merged_list">fixtures_merged_list</option>
-          </select>
-          <button onclick="loadLogs()">새로고침</button>
-        </div>
-
-        <div style="height:10px;"></div>
-        <table>
-          <thead>
-            <tr>
-              <th style="width:160px;">ts</th>
-              <th style="width:140px;">type</th>
-              <th style="width:80px;">ok</th>
-              <th>detail</th>
-            </tr>
-          </thead>
-          <tbody id="logsBody"></tbody>
-        </table>
-        <div id="logHint" class="muted" style="margin-top:10px;"></div>
-      </div>
-    </div>
+  <div class="frameWrap">
+    <iframe id="contentFrame" title="admin-content"></iframe>
   </div>
 
 <script>
+  const tokenKey = "SSX_ADMIN_TOKEN";
+
+  const themeKey = "SSX_ADMIN_THEME";
+
+  function resolveInitialTheme() {
+    const saved = localStorage.getItem(themeKey);
+    if (saved === "light" || saved === "dark") return saved;
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    const btn = document.getElementById("themeBtn");
+    if (btn) btn.textContent = "테마: " + (theme === "dark" ? "다크" : "라이트");
+  }
+
+  function broadcastTheme(theme) {
+    const f = document.getElementById("contentFrame");
+    try {
+      if (f && f.contentWindow) f.contentWindow.postMessage({ type: "ssx_theme", theme }, "*");
+    } catch (e) {}
+  }
+
+  function toggleTheme() {
+    const cur = (document.documentElement.dataset.theme === "dark") ? "dark" : "light";
+    const next = (cur === "dark") ? "light" : "dark";
+    localStorage.setItem(themeKey, next);
+    applyTheme(next);
+    broadcastTheme(next);
+  }
+
+  // 초기 적용
+  applyTheme(resolveInitialTheme());
+
+
   const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
   document.getElementById("adminPathText").textContent = "/" + adminPath;
 
-  const tokenKey = "SSX_ADMIN_TOKEN";
-  let selectedFixture = null;
-
-  let bundleRaw = null;
-  let bundleMerged = null;
-
-
-  // 현재(노출) fixtures
-  let currentFixtures = [];
-
-  // 원본(raw) fixtures 캐시: 같은 필터(date/tz/league_ids) 기준으로 한 번만 가져오기
-  let rawCacheKey = "";
-  let rawFixturesMap = null;
+  const pages = [
+    { key: "football-override", label: "football-override", file: "football_override.html" },
+    { key: "hockey-override",   label: "hockey-override",   file: "hockey_override.html" },
+    { key: "push",              label: "Push",              file: "push.html" },
+    { key: "subs",              label: "Subscriptions/Devices", file: "subs_devices.html" },
+    { key: "logs",              label: "Logs/Ops",           file: "logs_ops.html" },
+  ];
 
   function setStatusLine(msg) {
     document.getElementById("statusLine").textContent = msg || "";
@@ -416,1191 +179,49 @@
 
   function logoutToken() {
     localStorage.removeItem(tokenKey);
-    alert("토큰을 삭제했습니다. 다음 admin API 호출 시 다시 입력합니다.");
+    alert("토큰을 삭제했습니다. 각 페이지에서 API 호출 시 다시 입력합니다.");
+    // iframe 페이지도 초기화되게 reload
+    const f = document.getElementById("contentFrame");
+    f.src = f.src;
+    broadcastTheme(document.documentElement.dataset.theme || resolveInitialTheme());
   }
 
-  function adminHeaders() {
-    const t = localStorage.getItem(tokenKey) || "";
-    return {
-      "Content-Type": "application/json",
-      "X-Admin-Token": t,
-    };
+  function pageUrl(file) {
+    // /{ADMIN_PATH}/pages/{file}
+    return "/" + adminPath + "/pages/" + file;
   }
 
-  function ensureToken() {
-    let t = localStorage.getItem(tokenKey);
-    if (!t) {
-      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
-      if (t) localStorage.setItem(tokenKey, t);
-    }
-    return t;
-  }
-
-  function adminUrl(path) {
-    return "/" + adminPath + path;
-  }
-
-  async function api(path, opt={}) {
-    ensureToken();
-    const res = await fetch(path, {
-      ...opt,
-      headers: { ...(opt.headers||{}), ...adminHeaders() },
+  function setActive(key) {
+    document.querySelectorAll(".navbtn").forEach(b => {
+      b.classList.toggle("active", b.dataset.key === key);
     });
-    const txt = await res.text();
-    let data = null;
-    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
-    return { status: res.status, data };
   }
 
-  async function publicApi(path) {
-    const res = await fetch(path);
-    const txt = await res.text();
-    let data = null;
-    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
-    return { status: res.status, data };
+  function openPage(key) {
+    const p = pages.find(x => x.key === key) || pages[0];
+    setActive(p.key);
+    setStatusLine("열기: " + p.key);
+    const frame = document.getElementById("contentFrame");
+    frame.src = pageUrl(p.file);
+    frame.onload = () => broadcastTheme(document.documentElement.dataset.theme || resolveInitialTheme());
+
+    history.replaceState({}, "", "/" + adminPath + "#" + p.key);
   }
 
-  function setOv(msg, ok=true) {
-    const el = document.getElementById("ovResult");
-    el.innerHTML = ok ? `<span class="ok">${msg}</span>` : `<span class="bad">${msg}</span>`;
-  }
-
-  function safeNum(v) {
-    if (v === "" || v === null || v === undefined) return null;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  function deepMerge(base, patch) {
-    if (base && typeof base === "object" && !Array.isArray(base) &&
-        patch && typeof patch === "object" && !Array.isArray(patch)) {
-      const out = { ...base };
-      for (const k of Object.keys(patch)) {
-        out[k] = deepMerge(out[k], patch[k]);
-      }
-      return out;
-    }
-    return patch;
-  }
-
-  function isoDateLocal() {
-    const d = new Date();
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth()+1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  function fmtInTz(dateUtcStr, tz) {
-    try {
-      const d = new Date(dateUtcStr);
-      return d.toLocaleString("sv-SE", { timeZone: tz, hour12: false }).replace(" ", " ");
-    } catch (e) {
-      return dateUtcStr || "";
-    }
-  }
-
-  function statusOrderKey(sg) {
-    const v = (sg || "").toUpperCase();
-    if (v.includes("LIVE")) return 0;
-    if (v === "NS") return 1;
-    if (v.includes("1H") || v.includes("2H") || v.includes("HT")) return 2;
-    if (v.includes("FT") || v.includes("FINISHED")) return 9;
-    return 5;
-  }
-
-
-  function showTab(name) {
-    const names = ["now","raw","patch","diff","bundle_raw","bundle_merged","bundle_diff"];
-    for (const n of names) {
-      const pane = document.getElementById("tab_" + n);
-      const btn = document.getElementById("tab_" + n + "_btn");
-      if (pane) pane.classList.toggle("active", n === name);
-      if (btn) btn.classList.toggle("active", n === name);
-    }
-  }
-
-
-  function renderFixtures() {
-    const list = document.getElementById("fxList");
-    list.innerHTML = "";
-
-    const q = (document.getElementById("fxSearch").value || "").trim().toLowerCase();
-
-    const filtered = currentFixtures.filter(f => {
-      if (!q) return true;
-      const s = [
-        f.league_name, f.league_country, f.league_round,
-        f.home?.name, f.away?.name,
-        String(f.fixture_id || "")
-      ].join(" ").toLowerCase();
-      return s.includes(q);
-    });
-
-    filtered.sort((a,b) => {
-      const ka = statusOrderKey(a.status_group);
-      const kb = statusOrderKey(b.status_group);
-      if (ka !== kb) return ka - kb;
-      return String(a.date_utc||"").localeCompare(String(b.date_utc||""));
-    });
-
-    for (const f of filtered) {
-      const div = document.createElement("div");
-      const isHidden = (f.hidden === true);
-      div.className =
-        "item" +
-        ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
-        (isHidden ? " hidden" : "");
-
-      div.onclick = () => selectFixture(f.fixture_id);
-
-      const tz = document.getElementById("fxTz").value || "UTC";
-      const when = fmtInTz(f.date_utc, tz);
-
-      const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
-      const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
-
-      const isOvr = (f._has_override === true);
-      const badges = [
-        `<span class="badge mono">${(f.status_group||"").toUpperCase()}</span>`,
-        isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
-        isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
-      ].filter(Boolean).join(" ");
-
-      div.innerHTML = `
-        <div>
-          <div class="small muted mono">${when}</div>
-          <div class="k">${f.home?.name || "HOME"} <span class="muted">vs</span> ${f.away?.name || "AWAY"}</div>
-          <div class="small muted">${f.league_name || ""} · ${f.league_round || ""}</div>
-        </div>
-        <div class="right">
-          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges}</div>
-          <div class="mono" style="margin-top:6px;">${score}</div>
-          <div class="small muted mono">HT ${ht}</div>
-        </div>
-      `;
-
-      list.appendChild(div);
-    }
-
-    document.getElementById("fxHint").textContent =
-      `rows: ${filtered.length} / ${currentFixtures.length} · 클릭하면 원본/현재/차이까지 비교됩니다`;
-  }
-
-  function fillQuickEditFromFixture(f) {
-    document.getElementById("qeVenue").value = f.venue_name ?? "";
-    document.getElementById("qeRound").value = f.league_round ?? "";
-    document.getElementById("qeStatusLong").value = f.status_long ?? "";
-    document.getElementById("qeElapsed").value = (f.elapsed ?? "") === null ? "" : (f.elapsed ?? "");
-    document.getElementById("qeStatusGroup").value = f.status_group ?? "";
-    document.getElementById("qeStatus").value = f.status ?? "";
-
-    document.getElementById("qeHomeFt").value = (f.home?.ft ?? "") === null ? "" : (f.home?.ft ?? "");
-    document.getElementById("qeAwayFt").value = (f.away?.ft ?? "") === null ? "" : (f.away?.ft ?? "");
-    document.getElementById("qeHomeHt").value = (f.home?.ht ?? "") === null ? "" : (f.home?.ht ?? "");
-    document.getElementById("qeAwayHt").value = (f.away?.ht ?? "") === null ? "" : (f.away?.ht ?? "");
-  }
-
-
-  function getFilterKey() {
-    const date = document.getElementById("fxDate").value || "";
-    const tz = document.getElementById("fxTz").value || "UTC";
-    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
-    return `${date}__${tz}__${leagueIds}`;
-  }
-
-  function buildFixturesQuery() {
-    const date = document.getElementById("fxDate").value;
-    const tz = document.getElementById("fxTz").value || "UTC";
-    const leagueIds = (document.getElementById("fxLeagueIds").value || "").trim();
-
-    const qs = new URLSearchParams();
-    qs.set("date", date);
-    qs.set("timezone", tz);
-    if (leagueIds) qs.set("league_ids", leagueIds);
-    return qs;
-  }
-
-  async function ensureRawLoaded() {
-    const key = getFilterKey();
-    if (rawFixturesMap && rawCacheKey === key) return true;
-
-    rawFixturesMap = null;
-    rawCacheKey = key;
-
-    const qs = buildFixturesQuery();
-    document.getElementById("rawHint").textContent = "원본(raw) 불러오는 중...";
-    const r = await api(adminUrl(`/api/fixtures_raw?` + qs.toString()), { method: "GET" });
-
-    if (r.status >= 400 || !r.data || !r.data.ok) {
-      document.getElementById("rawHint").textContent = "원본(raw) 로드 실패: " + JSON.stringify(r.data);
-      return false;
-    }
-
-    const rows = r.data.rows || [];
-    const m = {};
-    for (const x of rows) {
-      m[String(x.fixture_id)] = x;
-    }
-    rawFixturesMap = m;
-    document.getElementById("rawHint").textContent = `원본(raw) rows: ${rows.length}`;
-    return true;
-  }
-
-  function diffObjects(a, b, path="", out=[]) {
-    // a=raw, b=current
-    const isObj = v => v && typeof v === "object" && !Array.isArray(v);
-    const isArr = v => Array.isArray(v);
-
-    if (isObj(a) && isObj(b)) {
-      const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-      for (const k of keys) {
-        if (String(k).startsWith("_")) continue; // 내부 메타키 제외
-        diffObjects(a[k], b[k], path ? (path + "." + k) : k, out);
-      }
-      return out;
-    }
-
-    if (isArr(a) || isArr(b)) {
-      const sa = JSON.stringify(a);
-      const sb = JSON.stringify(b);
-      if (sa !== sb) out.push({ path, raw: a, now: b });
-      return out;
-    }
-
-    // primitive / null / undefined
-    if ((a ?? null) !== (b ?? null)) out.push({ path, raw: a, now: b });
-    return out;
-  }
-
-  function updateComparisonViews() {
-    // 현재(노출)
-    document.getElementById("fxPreviewNow").textContent = JSON.stringify(selectedFixture || {}, null, 2);
-
-    // patch는 textarea 기준
-    let patchObj = null;
-    try {
-      patchObj = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!patchObj || typeof patchObj !== "object") patchObj = {};
-    } catch (e) {
-      patchObj = { _error: "patch JSON parse failed" };
-    }
-    document.getElementById("fxPreviewPatch").textContent = JSON.stringify(patchObj, null, 2);
-
-    // raw + diff
-    const raw = rawFixturesMap ? rawFixturesMap[String(selectedFixture?.fixture_id)] : null;
-    document.getElementById("fxPreviewRaw").textContent = JSON.stringify(raw || {}, null, 2);
-
-    if (raw && selectedFixture) {
-      const diffs = diffObjects(raw, selectedFixture, "", []).slice(0, 200);
-
-      const lines = diffs.map(d => {
-        const a = JSON.stringify(d.raw);
-        const b = JSON.stringify(d.now);
-        return `${d.path}: ${a} -> ${b}`;
-      });
-
-      document.getElementById("fxPreviewDiff").textContent =
-        lines.length ? lines.join("\n") : "(변경 없음)";
-    } else {
-      document.getElementById("fxPreviewDiff").textContent = "(비교 데이터 없음)";
-    }
-
-  }
-
-    async function loadBundleViews() {
-    if (!selectedFixture) {
-      document.getElementById("bundlePreviewRaw").textContent = "{}";
-      document.getElementById("bundlePreviewMerged").textContent = "{}";
-      document.getElementById("bundlePreviewDiff").textContent = "[]";
-      bundleRaw = null;
-      bundleMerged = null;
-      return;
-    }
-
-    const fx = selectedFixture.fixture_id;
-    const lg = selectedFixture.league_id;
-    const se = selectedFixture.season;
-
-    if (fx == null || lg == null || se == null) {
-      document.getElementById("bundlePreviewRaw").textContent = "{}";
-      document.getElementById("bundlePreviewMerged").textContent = "{}";
-      document.getElementById("bundlePreviewDiff").textContent = "[]";
-      bundleRaw = null;
-      bundleMerged = null;
-      return;
-    }
-
-    const base = new URLSearchParams({
-      fixture_id: String(fx),
-      league_id: String(lg),
-      season: String(se),
-    });
-
-    // raw (override 미적용)
-    const qsRaw = new URLSearchParams(base);
-    qsRaw.set("apply_override", "0");
-
-    // merged (override 적용)
-    const qsMerged = new URLSearchParams(base);
-    qsMerged.set("apply_override", "1");
-
-    // ✅ match_detail_bundle는 public endpoint이므로 publicApi 사용
-    const r1 = await publicApi("/api/match_detail_bundle?" + qsRaw.toString());
-    const r2 = await publicApi("/api/match_detail_bundle?" + qsMerged.toString());
-
-    bundleRaw = (r1.status < 400 && r1.data && r1.data.ok) ? (r1.data.data || null) : null;
-    bundleMerged = (r2.status < 400 && r2.data && r2.data.ok) ? (r2.data.data || null) : null;
-
-    document.getElementById("bundlePreviewRaw").textContent =
-      JSON.stringify(bundleRaw || { _error: "raw load failed", status: r1.status, data: r1.data }, null, 2);
-
-    document.getElementById("bundlePreviewMerged").textContent =
-      JSON.stringify(bundleMerged || { _error: "merged load failed", status: r2.status, data: r2.data }, null, 2);
-
-    if (bundleRaw && bundleMerged) {
-      const diffs = diffObjects(bundleRaw, bundleMerged, "", []).slice(0, 300);
-      const lines = diffs.map(d => `${d.path}: ${JSON.stringify(d.raw)} -> ${JSON.stringify(d.now)}`);
-      document.getElementById("bundlePreviewDiff").textContent =
-        lines.length ? lines.join("\n") : "(변경 없음)";
-    } else {
-      document.getElementById("bundlePreviewDiff").textContent = "[]";
-    }
-    evtReloadFromBundle();
-  }
-
-
-
-  async function selectFixture(fixtureId) {
-    const f = currentFixtures.find(x => String(x.fixture_id) === String(fixtureId));
-    if (!f) return;
-
-    selectedFixture = f;
-    renderFixtures();
-
-    document.getElementById("fixtureId").value = String(f.fixture_id);
-    fillQuickEditFromFixture(f);
-
-    setStatusLine(`선택: fixture_id=${f.fixture_id}`);
-
-    // override 조회(그리고 patch textarea 채움)
-    await getOverride();
-
-    // raw 로드 후 비교 뷰 갱신
-    const ok = await ensureRawLoaded();
-    if (!ok) {
-      rawFixturesMap = rawFixturesMap || null;
-    }
-    updateComparisonViews();
-    // ⚠️ loadBundleViews()는 getOverride()에서 처리 (중복 호출 방지)
-  }
-
-
-  async function loadFixtures() {
-    const date = document.getElementById("fxDate").value;
-    if (!date) {
-      alert("Date를 선택하세요");
-      return;
-    }
-
-    const qs = buildFixturesQuery();
-
-    setStatusLine("fixtures 불러오는 중...");
-    // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용
-    const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
-
-    if (r.status >= 400 || !r.data || !r.data.ok) {
-      setStatusLine("");
-      alert("fixtures 로드 실패: " + JSON.stringify(r.data));
-      return;
-    }
-
-    currentFixtures = r.data.rows || [];
-
-    // 선택 유지(저장/삭제 후 재선택을 위해)
-    const keepId = selectedFixture ? String(selectedFixture.fixture_id) : "";
-    selectedFixture = null;
-
-    // raw 캐시 무효화(필터 변경될 수 있으니)
-    rawFixturesMap = null;
-    rawCacheKey = "";
-
-    document.getElementById("fxPreviewNow").textContent = "{}";
-    document.getElementById("fxPreviewRaw").textContent = "{}";
-    document.getElementById("fxPreviewPatch").textContent = "{}";
-    document.getElementById("fxPreviewDiff").textContent = "[]";
-    document.getElementById("rawHint").textContent = "";
-
-    // ✅ bundle 프리뷰도 초기화(선택이 해제되었는데 이전 데이터가 남는 문제 방지)
-    document.getElementById("bundlePreviewRaw").textContent = "{}";
-    document.getElementById("bundlePreviewMerged").textContent = "{}";
-    document.getElementById("bundlePreviewDiff").textContent = "[]";
-    bundleRaw = null;
-    bundleMerged = null;
-
-
-    setStatusLine("");
-    renderFixtures();
-
-    // ✅ 가능하면 이전 선택 재선택
-    if (keepId) {
-      const exists = currentFixtures.find(x => String(x.fixture_id) === keepId);
-      if (exists) await selectFixture(keepId);
-    }
-
-    showTab("now");
-  }
-
-
-  async function getOverride() {
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "GET" });
-    if (r.status < 400 && r.data) {
-      const p = r.data.patch;
-      if (p && typeof p === "object") {
-        document.getElementById("patch").value = JSON.stringify(p, null, 2);
-        setOv(`override 존재 · status=${r.status}`, true);
-      } else {
-        document.getElementById("patch").value = "";
-        setOv(`override 없음 · status=${r.status}`, true);
-      }
-      updateComparisonViews();
-      await loadBundleViews();
-    } else {
-      setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
-      await loadBundleViews();
-    }
-  }
-
-  async function upsertOverride() {
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    applyQuickEditToPatch({ silent: true, onlyIfChanged: true });
-    // evtApplyToPatch(true);  // ✅ 제거: 저장 직전에 Event Editor 내용으로 patch를 강제 덮어쓰지 않음
-
-
-
-    let patch = null;
-    try {
-      patch = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!patch || typeof patch !== "object" || Array.isArray(patch)) patch = {};
-    } catch (e) {
-      return setOv("Patch JSON 파싱 실패", false);
-    }
-
-    // ✅ 변경이 없으면 저장 막기(빈 patch로 override 만들어서 OVR 생기는 문제 방지)
-    if (Object.keys(patch).length === 0) {
-      return setOv("변경사항이 없습니다. (Patch JSON이 비어있어서 저장하지 않았습니다)", false);
-    }
-
-    const ok = confirm("저장(Upsert)할까요? (override가 즉시 적용됩니다)");
-    if (!ok) return;
-
-    const r = await api(adminUrl(`/api/overrides/${id}`), {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    });
-    setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
-
-    if (r.status < 400) {
-      // 저장 후 현재 목록 새로고침(노출 결과 갱신)
-      await loadFixtures();
-    }
-  }
-
-
-  async function deleteOverride() {
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) return setOv("fixture_id가 필요합니다", false);
-
-    const ok = confirm("삭제(원복)할까요? (override가 제거되고 원본으로 돌아갑니다)");
-    if (!ok) return;
-
-    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "DELETE" });
-    setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
-
-    if (r.status < 400) {
-      document.getElementById("patch").value = "";
-      updateComparisonViews();
-      await loadFixtures();
-    }
-  }
-
-  function applyQuickEditToPatch(opts = {}) {
-    const silent = (opts && opts.silent === true);
-    const onlyIfChanged = (opts && opts.onlyIfChanged === true);
-
-    const id = document.getElementById("fixtureId").value.trim();
-    if (!id) {
-      if (!silent) setOv("fixture_id가 필요합니다", false);
-      return false;
-    }
-
-    // selectedFixture(현재 노출/override 반영 상태) 기준으로 "변경된 항목만" patch에 넣는다
-    const cur = selectedFixture || {};
-
-    const normStr = (x) => (x == null ? "" : String(x)).trim();
-    const sameStr = (a, b) => normStr(a) === normStr(b);
-
-    const normNum = (x) => {
-      const s = String(x ?? "").trim();
-      if (s === "") return null;
-      const n = Number(s);
-      return Number.isFinite(n) ? n : null;
-    };
-    const sameNum = (a, b) => (a ?? null) === (b ?? null);
-
-    let basePatch = {};
-    try {
-      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
-    } catch (e) {
-      basePatch = {};
-    }
-
-    const p = {};
-
-    const v  = normStr(document.getElementById("qeVenue").value);
-    const r  = normStr(document.getElementById("qeRound").value);
-    const sl = normStr(document.getElementById("qeStatusLong").value);
-    const el = normNum(document.getElementById("qeElapsed").value);
-    const sg = normStr(document.getElementById("qeStatusGroup").value);
-    const st = normStr(document.getElementById("qeStatus").value);
-
-    if (!sameStr(v,  cur.venue_name))   p["venue_name"] = v;
-    if (!sameStr(r,  cur.league_round)) p["league_round"] = r;
-    if (!sameStr(sl, cur.status_long))  p["status_long"] = sl;
-    if (!sameNum(el, cur.elapsed))      p["elapsed"] = el;
-
-    if (!sameStr(sg, cur.status_group)) p["status_group"] = sg;
-    if (!sameStr(st, cur.status))       p["status"] = st;
-
-    const hft = normNum(document.getElementById("qeHomeFt").value);
-    const aft = normNum(document.getElementById("qeAwayFt").value);
-    const hht = normNum(document.getElementById("qeHomeHt").value);
-    const aht = normNum(document.getElementById("qeAwayHt").value);
-
-    const homeCur = cur.home || {};
-    const awayCur = cur.away || {};
-
-    let homePatch = null;
-    let awayPatch = null;
-
-    if (!sameNum(hft, homeCur.ft)) { homePatch = homePatch || {}; homePatch["ft"] = hft; }
-    if (!sameNum(hht, homeCur.ht)) { homePatch = homePatch || {}; homePatch["ht"] = hht; }
-    if (!sameNum(aft, awayCur.ft)) { awayPatch = awayPatch || {}; awayPatch["ft"] = aft; }
-    if (!sameNum(aht, awayCur.ht)) { awayPatch = awayPatch || {}; awayPatch["ht"] = aht; }
-
-    if (homePatch) p["home"] = deepMerge(p["home"] || {}, homePatch);
-    if (awayPatch) p["away"] = deepMerge(p["away"] || {}, awayPatch);
-
-    if (!basePatch.fixture_id) basePatch.fixture_id = Number(id);
-
-    const hasAny = Object.keys(p).length > 0;
-    if (!hasAny && onlyIfChanged) {
-      if (!silent) setOv("Quick Edit 변경사항이 없습니다.", true);
-      return false;
-    }
-
-    const merged = deepMerge(basePatch, p);
-    document.getElementById("patch").value = JSON.stringify(merged, null, 2);
-
-    if (!silent) setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
-
-    updateComparisonViews();
-    return true;
-  }
-
-
-  // ─────────────────────────────────────
-  // Event Editor (Goals/Cards/Subs) - bundle에서 이벤트 배열 경로 자동 탐지 후 배열 통째로 override
-  // ─────────────────────────────────────
-
-  let evtState = {
-    path: "",        // 선택된 이벤트 배열 경로 (예: "timeline.events" 같은 형태)
-    candidates: [],  // {path, score, sample}
-    events: [],      // 편집 중인 이벤트 배열(원본 객체 유지)
-  };
-
-  function isObj(v){ return v && typeof v === "object" && !Array.isArray(v); }
-
-  function deepClone(v) {
-    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
-  }
-
-  function getByPath(obj, path) {
-    if (!obj || !path) return undefined;
-    const parts = String(path).split(".").filter(Boolean);
-    let cur = obj;
-    for (const p of parts) {
-      if (!cur) return undefined;
-      cur = cur[p];
-    }
-    return cur;
-  }
-
-  function setByPath(obj, path, value) {
-    const parts = String(path).split(".").filter(Boolean);
-    if (!parts.length) return obj;
-    let cur = obj;
-    for (let i=0;i<parts.length;i++) {
-      const k = parts[i];
-      const last = (i === parts.length-1);
-      if (last) {
-        cur[k] = value;
-      } else {
-        if (!isObj(cur[k])) cur[k] = {};
-        cur = cur[k];
-      }
-    }
-    return obj;
-  }
-
-  function evtScoreArray(arr) {
-    // 이벤트 배열 후보인지 점수화(휴리스틱)
-    if (!Array.isArray(arr) || arr.length < 1) return 0;
-
-    let score = 0;
-    const n = Math.min(arr.length, 30);
-    for (let i=0;i<n;i++) {
-      const e = arr[i];
-      if (!isObj(e)) continue;
-
-      const keys = Object.keys(e);
-      const hasType = keys.some(k => ["type","event_type","kind","detail","name"].includes(k));
-      const hasTime = keys.some(k => ["time","minute","min","elapsed","elapsed_min","elapsedMinute"].includes(k));
-      const hasTeam = keys.some(k => ["team","team_id","teamId","side"].includes(k));
-
-      // ✅ timeline 스키마(line1/line2 등)도 player 힌트로 인정
-      const hasPlayer = keys.some(k => ["player","player_name","playerName","assist","sub_in","sub_out","line1","line2"].includes(k));
-
-      // ✅ timeline 전용 키가 있으면 후보일 확률이 높아서 가산점
-      const hasTimelineKeys = keys.some(k => ["minute_label","minute_extra","side_home","snapshot_score","id_stable"].includes(k));
-
-      if (hasType) score += 2;
-      if (hasTime) score += 3;
-      if (hasTeam) score += 1;
-      if (hasPlayer) score += 1;
-      if (hasTimelineKeys) score += 2;
-    }
-    // 길이가 너무 길면(배당/통계 배열 등) 오탐 방지용 가산/감산
-    if (arr.length >= 5) score += 2;
-    if (arr.length > 200) score -= 3;
-    return score;
-  }
-
-
-  function evtFindCandidates(root) {
-    const out = [];
-    const seen = new Set();
-    const stack = [{ obj: root, path: "" }];
-
-    while (stack.length) {
-      const { obj, path } = stack.pop();
-      if (!obj) continue;
-
-      if (Array.isArray(obj)) {
-        const sc = evtScoreArray(obj);
-        if (sc >= 8) {
-          const p = path || "(root_array)";
-          if (!seen.has(p)) {
-            seen.add(p);
-            out.push({
-              path: p,
-              score: sc,
-              sample: obj.slice(0, 2),
-              len: obj.length,
-            });
-          }
-        }
-        // 배열 내부도 탐색(객체면)
-        for (let i=0;i<Math.min(obj.length, 30);i++) {
-          const v = obj[i];
-          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: path }); // path 유지
-        }
-        continue;
-      }
-
-      if (isObj(obj)) {
-        for (const k of Object.keys(obj)) {
-          const v = obj[k];
-          const p2 = path ? (path + "." + k) : k;
-          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: p2 });
-        }
-      }
-    }
-
-    out.sort((a,b) => b.score - a.score);
-    return out.slice(0, 12);
-  }
-
-  function evtRefreshPathSelect() {
-    const sel = document.getElementById("evtPath");
-    const hint = document.getElementById("evtHint");
-    sel.innerHTML = "";
-
-    const cands = evtState.candidates || [];
-    if (!cands.length) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
-      sel.appendChild(opt);
-      evtState.path = "";
-      hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
-      return;
-    }
-
-    for (const c of cands) {
-      const opt = document.createElement("option");
-      opt.value = c.path;
-      opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
-      sel.appendChild(opt);
-    }
-
-    // 기존 선택 유지 시도
-    const keep = evtState.path && cands.find(x => x.path === evtState.path);
-    evtState.path = keep ? evtState.path : cands[0].path;
-    sel.value = evtState.path;
-
-    hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
-
-    sel.onchange = () => {
-      evtState.path = sel.value || "";
-      evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
-    };
-  }
-
-  function evtNormalizeForUi(e) {
-    // 다양한 스키마를 UI 공통 필드로 매핑(최대한 안전하게)
-    const o = isObj(e) ? e : {};
-    const pick = (...ks) => {
-      for (const k of ks) if (o[k] !== undefined && o[k] !== null) return o[k];
-      return "";
-    };
-
-    const type = String(pick("type","event_type","kind","name","detail") || "").toUpperCase();
-    const minute = pick("minute","min","elapsed","elapsed_min","elapsedMinute");
-    const extra = pick("minute_extra","extra","stoppage","added","extra_time"); // ✅ minute_extra 추가
-
-    const team = pick("side","team","team_id","teamId","team_key","teamSide"); // ✅ side 우선
-    
-    const main = pick("line1","player","player_name","playerName","main","scorer","sub_in"); // ✅ line1
-    const extraMain = pick("line2","assist","assist_name","assistName","sub_out","second_player"); // ✅ line2
-
-
-    const detail = pick("detail","comment","reason","note","event_detail");
-
-    const toNumOrBlank = (v) => {
-      if (v === "" || v === null || v === undefined) return "";
-      const n = Number(v);
-      return Number.isFinite(n) ? n : "";
-    };
-
-    return {
-      _raw: o, // 원본 보관
-      ui_min: toNumOrBlank(minute),
-      ui_extra: toNumOrBlank(extra),
-      ui_team: String(team || "").toLowerCase(),
-      ui_type: type || "OTHER",
-      ui_main: String(main || ""),
-      ui_extraMain: String(extraMain || ""),
-      ui_detail: String(detail || ""),
-    };
-  }
-
-
-  function evtApplyUiToRaw(row) {
-
-    // UI 필드를 원본 객체에 최대한 무해하게 반영(없던 키는 "event_admin" 네임스페이스로 보관)
-    const r = row._raw || {};
-    if (!isObj(r)) return row;
-
-    // 기존 키가 있으면 그 키를 우선 업데이트, 없으면 event_admin에 저장
-    const setPref = (keys, val) => {
-      for (const k of keys) {
-        if (r[k] !== undefined) { r[k] = val; return true; }
-      }
-      return false;
-    };
-
-    // minute/extra
-    const minVal = (row.ui_min === "" || row.ui_min === null || row.ui_min === undefined) ? null : Number(row.ui_min);
-    const exVal  = (row.ui_extra === "" || row.ui_extra === null || row.ui_extra === undefined) ? null : Number(row.ui_extra);
-
-    if (!setPref(["minute","min","elapsed","elapsed_min","elapsedMinute"], minVal)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.minute = minVal;
-    }
-    if (!setPref(["minute_extra","extra","stoppage","added","extra_time"], exVal)) { // ✅ minute_extra 추가
-      r.event_admin = r.event_admin || {};
-      r.event_admin.extra = exVal;
-    }
-
-    // ✅ minute_label이 있는 스키마(timeline 등)면 라벨도 같이 동기화
-    if (r["minute_label"] !== undefined) {
-      const m = (minVal == null ? null : Number(minVal));
-      const e = (exVal == null ? null : Number(exVal));
-      r["minute_label"] = (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
-    }
-
-
-    // type
-    if (!setPref(["type","event_type","kind","name"], row.ui_type)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.type = row.ui_type;
-    }
-
-    // team/side (+ side_home 동기화)
-    const sideVal = row.ui_team; // home/away/""
-    if (!setPref(["side","team","team_key","teamSide"], sideVal)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.team = sideVal;
-    }
-
-    // ✅ side_home 키가 "원래 존재하는 스키마"에서만 동기화 (없던 키를 새로 만들지 않음)
-    if (r["side_home"] !== undefined) {
-      r["side_home"] = (String(sideVal).toLowerCase() === "home");
-    }
-
-
-
-    // main/assist (timeline: line1/line2 우선)
-    if (!setPref(["line1","player","player_name","playerName","main","scorer","sub_in"], row.ui_main)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.main = row.ui_main;
-    }
-    if (!setPref(["line2","assist","assist_name","assistName","sub_out","second_player"], row.ui_extraMain)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.extraMain = row.ui_extraMain;
-    }
-
-    // detail
-    if (!setPref(["detail","comment","reason","note","event_detail"], row.ui_detail)) {
-      r.event_admin = r.event_admin || {};
-      r.event_admin.detail = row.ui_detail;
-    }
-
-
-    return row;
-  }
-
-  function evtRender() {
-    const body = document.getElementById("evtBody");
-    body.innerHTML = "";
-
-    const rows = evtState.events || [];
-    for (let i=0;i<rows.length;i++) {
-      const row = rows[i];
-      const tr = document.createElement("tr");
-
-      tr.innerHTML = `
-        <td><input type="number" value="${row.ui_min ?? ""}" data-k="ui_min" style="width:70px;"></td>
-        <td><input type="number" value="${row.ui_extra ?? ""}" data-k="ui_extra" style="width:70px;"></td>
-        <td>
-          <select data-k="ui_team">
-            <option value="" ${row.ui_team===""?"selected":""}>(none)</option>
-            <option value="home" ${row.ui_team==="home"?"selected":""}>home</option>
-            <option value="away" ${row.ui_team==="away"?"selected":""}>away</option>
-          </select>
-        </td>
-        <td>
-          <select data-k="ui_type">
-            <option value="GOAL" ${row.ui_type==="GOAL"?"selected":""}>GOAL</option>
-            <option value="RED" ${row.ui_type==="RED"?"selected":""}>RED</option>
-            <option value="YELLOW" ${row.ui_type==="YELLOW"?"selected":""}>YELLOW</option>
-            <option value="SUB" ${row.ui_type==="SUB"?"selected":""}>SUB</option>
-            <option value="OTHER" ${row.ui_type==="OTHER"?"selected":""}>OTHER</option>
-          </select>
-        </td>
-        <td><input value="${(row.ui_main||"").replace(/"/g,"&quot;")}" data-k="ui_main" placeholder="main" style="width:100%;"></td>
-        <td><input value="${(row.ui_extraMain||"").replace(/"/g,"&quot;")}" data-k="ui_extraMain" placeholder="assist/sub out" style="width:100%;"></td>
-        <td><input value="${(row.ui_detail||"").replace(/"/g,"&quot;")}" data-k="ui_detail" placeholder="detail" style="width:100%;"></td>
-        <td><button class="btnsm danger" data-act="del">삭제</button></td>
-      `;
-
-
-      // onchange: state 갱신 + patch 반영
-      tr.querySelectorAll("input,select").forEach(el => {
-        el.onchange = () => {
-            const k = el.getAttribute("data-k");
-            if (!k) return;
-
-            if (k === "ui_min") row.ui_min = (el.value === "" ? "" : Number(el.value));
-            else if (k === "ui_extra") row.ui_extra = (el.value === "" ? "" : Number(el.value)); // ✅ 추가
-            else if (k === "ui_team") row.ui_team = String(el.value || "");
-            else if (k === "ui_type") row.ui_type = String(el.value || "OTHER");
-            else if (k === "ui_main") row.ui_main = String(el.value || "");
-            else if (k === "ui_extraMain") row.ui_extraMain = String(el.value || "");
-            else if (k === "ui_detail") row.ui_detail = String(el.value || "");
-
-            evtApplyUiToRaw(row);
-            evtApplyToPatch(true);
-          };
-        });
-
-
-      tr.querySelector('[data-act="del"]').onclick = () => {
-        evtState.events.splice(i, 1);
-        evtApplyToPatch(true);
-        evtRender();
-      };
-
-      body.appendChild(tr);
-    }
-  }
-
-  function evtLoadFromBundleCurrent() {
-    const hint = document.getElementById("evtHint");
-    const src = bundleMerged || bundleRaw;
-    if (!src) {
-      hint.textContent = "bundle 데이터가 없습니다. (왼쪽에서 경기 선택 후 bundle 탭이 로드되어야 함)";
-      evtState.events = [];
-      evtRender();
-      return;
-    }
-
-    const path = evtState.path || "";
-    if (!path) {
-      hint.textContent = "이벤트 배열 경로가 비어있습니다. 후보 선택을 확인하세요.";
-      evtState.events = [];
-      evtRender();
-      return;
-    }
-
-    // ✅ root_array 지원: bundle 자체가 배열인 경우 로드 허용
-    let arr = null;
-    if (path === "(root_array)") {
-      if (Array.isArray(src)) {
-        arr = src;
-      } else {
-        hint.textContent = "선택 경로가 (root_array)이지만 bundle root가 배열이 아닙니다.";
-        evtState.events = [];
-        evtRender();
-        return;
-      }
-    } else {
-      arr = getByPath(src, path);
-      if (!Array.isArray(arr)) {
-        hint.textContent = `선택한 경로에 배열이 없습니다: ${path}`;
-        evtState.events = [];
-        evtRender();
-        return;
-      }
-    }
-
-
-    // UI row로 변환
-    evtState.events = arr.map(e => evtNormalizeForUi(e));
-    hint.textContent = `로드됨: ${path} (len=${arr.length})`;
-    evtRender();
-  }
-
-  function evtReloadFromBundle() {
-    evtState.candidates = evtFindCandidates(bundleMerged || bundleRaw);
-    evtRefreshPathSelect();
-    evtLoadFromBundleCurrent();
-  }
-
-  function evtSort() {
-    evtState.events.sort((a,b) => {
-      const am = (a.ui_min === "" ? 9999 : Number(a.ui_min));
-      const bm = (b.ui_min === "" ? 9999 : Number(b.ui_min));
-      if (am !== bm) return am - bm;
-      const ae = (a.ui_extra === "" ? 0 : Number(a.ui_extra));
-      const be = (b.ui_extra === "" ? 0 : Number(b.ui_extra));
-      return ae - be;
-    });
-    evtApplyToPatch(true);
-    evtRender();
-  }
-
-  function evtAdd() {
-    const min = document.getElementById("evtMin").value;
-    const ex = document.getElementById("evtExtra").value;
-    const team = document.getElementById("evtTeam").value;
-    const type = document.getElementById("evtType").value;
-    const main = document.getElementById("evtPlayer").value;
-    const extraMain = document.getElementById("evtAssist").value;
-    const detail = document.getElementById("evtDetail").value;
-
-    // 새 이벤트 객체는 서버 스키마를 모르므로, "event_admin" 네임스페이스로 안전하게 추가
-    const p = (evtState.path || "").toLowerCase();
-    const pLast = p.split(".").filter(Boolean).pop() || "";
-
-    // timeline 스키마로 생성(가장 흔한 케이스)
-    let raw = null;
-
-    if (pLast === "timeline") {
-      const m = (min === "" ? null : Number(min));
-      const e = (ex === "" ? null : Number(ex));
-      const side = String(team || "");
-
-      const minuteLabel =
-        (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
-
-      raw = {
-        id_stable: `admin-${Date.now()}`,     // 임시 unique
-        line1: String(main || ""),
-        line2: (String(extraMain || "").trim() === "" ? null : String(extraMain || "")),
-        minute: m,
-        minute_extra: e,
-        minute_label: minuteLabel,
-        period: "",                            // 모르면 빈값 유지
-        side: side,
-        side_home: (side === "home"),
-        snapshot_score: null,
-        type: String(type || "OTHER"),
-        detail: (String(detail || "").trim() === "" ? null : String(detail || "")),
-      };
-    } else {
-      // fallback: 스키마 모를 때
-      raw = {
-        event_admin: {
-          minute: min === "" ? null : Number(min),
-          extra: ex === "" ? null : Number(ex),
-          team,
-          type,
-          main,
-          extraMain,
-          detail,
-        }
-      };
-    }
-
-
-
-    const row = evtNormalizeForUi(raw);
-    row.ui_min = (min === "" ? "" : Number(min));
-    row.ui_extra = (ex === "" ? "" : Number(ex));
-    row.ui_team = String(team || "");
-    row.ui_type = String(type || "OTHER");
-    row.ui_main = String(main || "");
-    row.ui_extraMain = String(extraMain || "");
-    row.ui_detail = String(detail || "");
-    evtApplyUiToRaw(row);
-
-    evtState.events.push(row);
-    evtSort();
-
-    // 입력칸 정리(선택 유지)
-    document.getElementById("evtPlayer").value = "";
-    document.getElementById("evtAssist").value = "";
-    document.getElementById("evtDetail").value = "";
-  }
-
-  function evtClearAll() {
-    const ok = confirm("이벤트를 전부 삭제할까요? (해당 배열을 빈 배열로 override)");
-    if (!ok) return;
-    evtState.events = [];
-    evtApplyToPatch(false);
-    evtRender();
-  }
-
-  function evtApplyToPatch(silent=true) {
-    // 현재 evtState.events를 patch JSON에 "선택된 경로"로 세팅
-    const path = evtState.path || "";
-    if (!path || path === "(root_array)") {
-      if (!silent) setOv("이벤트 배열 경로가 비어있습니다. (자동 탐지/선택 확인)", false);
-      return false;
-    }
-
-    let basePatch = {};
-    try {
-      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
-    } catch (e) {
-      basePatch = {};
-    }
-
-    const arr = evtState.events.map(r => r._raw || {});
-    // 배열은 통째로 replace
-    setByPath(basePatch, path, arr);
-
-    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
-    if (!silent) setOv(`이벤트를 Patch에 반영했습니다: ${path} (len=${arr.length})`, true);
-
-    updateComparisonViews();
-    return true;
-  }
-
-
-
-  async function hideFixture() {
-    let basePatch = {};
-    try {
-      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
-    } catch (e) {
-      basePatch = {};
-    }
-
-    basePatch.hidden = true; // 또는 false
-    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
-
-    setOv("hidden=true 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
-    updateComparisonViews();
-  }
-
-
-  async function unhideFixture() {
-    let basePatch = {};
-    try {
-      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
-      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
-    } catch (e) {
-      basePatch = {};
-    }
-
-    basePatch.hidden = false;
-    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
-
-    setOv("hidden=false 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
-    updateComparisonViews();
-  }
-
-
-  async function loadLogs() {
-    const fx = document.getElementById("logFixture").value.trim();
-    const ev = document.getElementById("logEvent").value;
-
-    const qs = new URLSearchParams();
-    qs.set("limit", "200");
-    if (fx) qs.set("fixture_id", fx);
-    if (ev) qs.set("event_type", ev);
-
-    const r = await api(adminUrl(`/api/logs?` + qs.toString()), { method: "GET" });
-
-    const body = document.getElementById("logsBody");
-    body.innerHTML = "";
-
-    if (r.status >= 400) {
-      document.getElementById("logHint").textContent = "로그 로드 실패: " + JSON.stringify(r.data);
-      return;
-    }
-
-    const rows = (r.data && r.data.rows) ? r.data.rows : [];
-    for (const row of rows) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono">${row.ts || ""}</td>
-        <td class="mono">${row.event_type || ""}</td>
-        <td>${row.ok ? "✅" : "❌"}</td>
-        <td class="mono">${JSON.stringify(row.detail || {})}</td>
-      `;
-      body.appendChild(tr);
-    }
-
-    document.getElementById("logHint").textContent = `rows: ${rows.length} (limit=200)`;
-  }
-
-  document.getElementById("fxDate").value = isoDateLocal();
-  document.getElementById("fxTz").value = "Asia/Seoul";
-
-  loadFixtures();
-  loadLogs();
+  // nav render
+  const nav = document.getElementById("nav");
+  pages.forEach(p => {
+    const b = document.createElement("button");
+    b.className = "navbtn";
+    b.textContent = p.label;
+    b.dataset.key = p.key;
+    b.onclick = () => openPage(p.key);
+    nav.appendChild(b);
+  });
+
+  // initial route by hash
+  const init = (location.hash || "").replace("#", "").trim();
+  openPage(init || "football-override");
 </script>
 </body>
 </html>

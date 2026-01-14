@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Subscriptions / Devices</title>
+  <style>
+    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .muted { color:#666; font-size:12px; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
+    /* ─────────────────────────────────────
+   Theme (shared)
+   ───────────────────────────────────── */
+:root{
+  --bg:#ffffff;
+  --panel:#ffffff;
+  --panel2:#fafafa;
+  --text:#111214;
+  --muted:#666;
+  --border:#ddd;
+  --border2:#eee;
+  --danger:#d33;
+  --ok:#0a7;
+}
+html[data-theme="dark"]{
+  --bg:#0b0c0f;
+  --panel:#12141a;
+  --panel2:#0f1116;
+  --text:#f1f3f5;
+  --muted:#9aa3ad;
+  --border:rgba(241,243,245,0.14);
+  --border2:rgba(241,243,245,0.10);
+  --danger:#ff6b6b;
+  --ok:#53e0b2;
+}
+
+body{ background:var(--bg) !important; color:var(--text) !important; }
+.muted{ color:var(--muted) !important; }
+.card{ background:var(--panel) !important; border-color:var(--border) !important; }
+
+input, textarea, select{
+  background:var(--panel) !important;
+  color:var(--text) !important;
+  border-color:var(--border) !important;
+}
+button{
+  background:var(--panel) !important;
+  color:var(--text) !important;
+  border-color:var(--border) !important;
+}
+button.primary{ border-color:var(--text) !important; }
+button.danger{ border-color:var(--danger) !important; color:var(--danger) !important; }
+
+pre{
+  background:var(--panel2) !important;
+  border-color:var(--border2) !important;
+  color:var(--text) !important;
+}
+.ok{ color:var(--ok) !important; }
+.bad{ color:var(--danger) !important; }
+
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Subscriptions / Devices</h2>
+    <div class="muted">구독자 수, 토큰 유효, 리그/경기별 구독 현황 등을 여기로 분리 (placeholder)</div>
+  </div>
+  <script>
+(function(){
+  const themeKey = "SSX_ADMIN_THEME";
+
+  function resolveInitialTheme() {
+    const saved = localStorage.getItem(themeKey);
+    if (saved === "light" || saved === "dark") return saved;
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+  }
+
+  applyTheme(resolveInitialTheme());
+
+  window.addEventListener("message", (ev) => {
+    const d = ev.data || {};
+    if (d && d.type === "ssx_theme" && (d.theme === "light" || d.theme === "dark")) {
+      localStorage.setItem(themeKey, d.theme);
+      applyTheme(d.theme);
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

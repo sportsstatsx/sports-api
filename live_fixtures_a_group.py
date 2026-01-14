@@ -515,6 +515,12 @@ def upsert_match_events(
     """
     A그룹: match_events 테이블 upsert 구현.
 
+    ✅ 중요: 기존에 "DELETE 후 재삽입"을 하면 match_events.id가 매번 바뀌어서
+    match_event_worker가 같은 이벤트(특히 Goal Disallowed)를 계속 새 이벤트로 오인 → 푸시 중복 발생.
+
+    여기서는 (fixture_id, type, minute, extra, team_id, player_id, player_in_id) 조합으로
+    기존 행을 UPDATE 하고, 없을 때만 INSERT 해서 id를 안정화한다.
+
     match_events 스키마:
       id               BIGSERIAL PK
       fixture_id       INTEGER NOT NULL
@@ -529,11 +535,6 @@ def upsert_match_events(
       player_in_id     INTEGER
       player_in_name   TEXT
     """
-    # 기존 이벤트 삭제 후 새로 입력(단순/안전)
-    execute(
-        "DELETE FROM match_events WHERE fixture_id = %s",
-        (fixture_id,),
-    )
 
     for ev in events:
         if not isinstance(ev, dict):
@@ -565,8 +566,22 @@ def upsert_match_events(
             player_in_id = assist_player_id
             player_in_name = assist_name
 
-        execute(
-            """
+        sql = """
+            WITH upd AS (
+                UPDATE match_events
+                   SET detail = %s,
+                       assist_player_id = %s,
+                       assist_name = %s,
+                       player_in_name = %s
+                 WHERE fixture_id = %s
+                   AND type = %s
+                   AND minute = %s
+                   AND extra = %s
+                   AND team_id IS NOT DISTINCT FROM %s
+                   AND player_id IS NOT DISTINCT FROM %s
+                   AND player_in_id IS NOT DISTINCT FROM %s
+                 RETURNING id
+            )
             INSERT INTO match_events (
                 fixture_id,
                 team_id,
@@ -580,9 +595,27 @@ def upsert_match_events(
                 player_in_id,
                 player_in_name
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
+            SELECT
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            WHERE NOT EXISTS (SELECT 1 FROM upd);
+        """
+
+        execute(
+            sql,
             (
+                # upd
+                detail,
+                assist_player_id,
+                assist_name,
+                player_in_name,
+                fixture_id,
+                type_,
+                minute,
+                extra,
+                team_id,
+                player_id,
+                player_in_id,
+                # insert
                 fixture_id,
                 team_id,
                 player_id,
@@ -596,6 +629,7 @@ def upsert_match_events(
                 player_in_name,
             ),
         )
+
 
 
 def upsert_match_events_raw(
