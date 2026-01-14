@@ -567,12 +567,17 @@ def admin_list_fixtures_merged():
 
             # side 판별
             side = item.get("side")
+            team_side = item.get("team") or item.get("team_key") or item.get("teamSide")
             side_home = item.get("side_home")
             team_id = item.get("team_id") or item.get("teamId")
 
             resolved_side: Optional[str] = None
             if isinstance(side, str):
                 s = side.strip().lower()
+                if s in ("home", "away"):
+                    resolved_side = s
+            elif isinstance(team_side, str):
+                s = team_side.strip().lower()
                 if s in ("home", "away"):
                     resolved_side = s
             elif isinstance(side_home, bool):
@@ -582,6 +587,7 @@ def admin_list_fixtures_merged():
                     resolved_side = "home"
                 elif team_id == away_id:
                     resolved_side = "away"
+
 
             # 레드카드
             if _is_red_event(item):
@@ -1069,12 +1075,17 @@ def list_fixtures():
                 continue
 
             side = item.get("side")
+            team_side = item.get("team") or item.get("team_key") or item.get("teamSide")
             side_home = item.get("side_home")
             team_id = item.get("team_id") or item.get("teamId")
 
             resolved_side: Optional[str] = None
             if isinstance(side, str):
                 s = side.strip().lower()
+                if s in ("home", "away"):
+                    resolved_side = s
+            elif isinstance(team_side, str):
+                s = team_side.strip().lower()
                 if s in ("home", "away"):
                     resolved_side = s
             elif isinstance(side_home, bool):
@@ -1084,6 +1095,7 @@ def list_fixtures():
                     resolved_side = "home"
                 elif team_id == away_id:
                     resolved_side = "away"
+
 
             if _is_red_event(item):
                 if resolved_side == "home":
@@ -1309,6 +1321,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
