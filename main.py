@@ -376,6 +376,23 @@ def admin_page():
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
+# ─────────────────────────────────────────
+# Admin Pages (split HTML)
+# - /{ADMIN_PATH}/pages/*.html 로 분리된 페이지 제공
+# ─────────────────────────────────────────
+ADMIN_PAGES_DIR = os.path.join(STATIC_DIR, "admin_pages")
+
+@app.route(f"/{ADMIN_PATH}/pages/<path:filename>")
+def admin_pages(filename: str):
+    if not _admin_enabled():
+        return jsonify({"ok": False, "error": "admin disabled"}), 404
+
+    # pages는 HTML만 제공 (보안은 ADMIN_PATH 난수 + API 토큰으로 보장)
+    resp = send_from_directory(ADMIN_PAGES_DIR, filename)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 
 
 
@@ -1132,6 +1149,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
