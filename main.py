@@ -473,7 +473,89 @@ def admin_list_fixtures_merged():
     - override 반영
     - hidden=true 도 제외하지 않고 포함(관리자가 다시 숨김해제 가능해야 함)
     - _has_override 플래그 추가
+
+    ✅ 추가(중요):
+    - override patch에 timeline 배열이 있으면(타임라인 수정/삭제)
+      그 timeline 기준으로 red_cards를 재계산해서 home/away.red_cards에 반영
+      (DB match_events COUNT와 불일치 문제 해결)
     """
+
+    def _extract_timeline_list(patch_obj: Any) -> Optional[List[Any]]:
+        if not isinstance(patch_obj, dict):
+            return None
+        tl = patch_obj.get("timeline")
+        if isinstance(tl, list):
+            return tl
+        # 혹시 {"timeline": {"events":[...]}} 형태가 들어오면 지원
+        if isinstance(tl, dict):
+            ev = tl.get("events")
+            if isinstance(ev, list):
+                return ev
+        return None
+
+    def _is_red_event(e: Dict[str, Any]) -> bool:
+        t = e.get("type")
+        d = e.get("detail")
+        # admin.html timeline 스키마는 type: "RED" 로 생성됨 :contentReference[oaicite:1]{index=1}
+        if isinstance(t, str):
+            tu = t.strip().upper()
+            if tu in ("RED", "RED_CARD", "REDCARD"):
+                return True
+            # api-football 이벤트류 방어
+            if tu == "CARD" and isinstance(d, str) and "RED" in d.upper():
+                return True
+        if isinstance(d, str) and "RED" in d.upper():
+            return True
+        # line1/line2 같은 텍스트에 Red Card가 들어오는 케이스 방어
+        l1 = e.get("line1")
+        if isinstance(l1, str) and "RED" in l1.upper():
+            return True
+        return False
+
+    def _count_red_cards_from_timeline(
+        timeline_list: List[Any],
+        home_id: Any,
+        away_id: Any,
+    ) -> (int, int):
+        home_rc = 0
+        away_rc = 0
+
+        for item in timeline_list:
+            if not isinstance(item, dict):
+                continue
+
+            if not _is_red_event(item):
+                continue
+
+            # admin.html timeline 스키마: side: "home"/"away", side_home: bool :contentReference[oaicite:2]{index=2}
+            side = item.get("side")
+            if isinstance(side, str):
+                s = side.strip().lower()
+                if s == "home":
+                    home_rc += 1
+                    continue
+                if s == "away":
+                    away_rc += 1
+                    continue
+
+            side_home = item.get("side_home")
+            if isinstance(side_home, bool):
+                if side_home:
+                    home_rc += 1
+                else:
+                    away_rc += 1
+                continue
+
+            # 다른 스키마(team_id 등) 방어
+            team_id = item.get("team_id") or item.get("teamId")
+            if team_id is not None:
+                if team_id == home_id:
+                    home_rc += 1
+                elif team_id == away_id:
+                    away_rc += 1
+
+        return home_rc, away_rc
+
     # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
     league_ids_raw = request.args.get("league_ids", type=str)
@@ -613,29 +695,38 @@ def admin_list_fixtures_merged():
     fixture_ids = [f["fixture_id"] for f in fixtures]
     override_map = _load_match_overrides(fixture_ids)
 
-    fixture_patch_keys = {
-        "fixture_id", "league_id", "season",
-        "date_utc", "kickoff_utc",
-        "status_group", "status", "elapsed", "minute", "status_long",
-        "league_round", "venue_name",
-        "league_name", "league_logo", "league_country",
-        "home", "away",
-        "hidden",
-    }
-
     merged = []
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
         if patch and isinstance(patch, dict):
-            # ✅ 목록에는 큰 블록(timeline/insights_overall 등)이 붙지 않게, 필요한 키만 추려서 merge
-            if isinstance(patch.get("header"), dict):
-                p2 = dict(patch.get("header") or {})
-                if "hidden" in patch:
-                    p2["hidden"] = patch.get("hidden")
-            else:
-                p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
+            # ✅ override에 timeline이 있으면 그걸로 red_cards 재계산해서 patch에 주입
+            tl = _extract_timeline_list(patch)
+            if isinstance(tl, list):
+                home_id = (f.get("home") or {}).get("id")
+                away_id = (f.get("away") or {}).get("id")
+                hrc, arc = _count_red_cards_from_timeline(tl, home_id, away_id)
 
-            f2 = _deep_merge(f, p2)
+                patch2 = dict(patch)  # 원본 patch 오염 방지(shallow copy)
+                home_p = patch2.get("home")
+                away_p = patch2.get("away")
+                if not isinstance(home_p, dict):
+                    home_p = {}
+                if not isinstance(away_p, dict):
+                    away_p = {}
+
+                home_p = dict(home_p)
+                away_p = dict(away_p)
+                home_p["red_cards"] = hrc
+                away_p["red_cards"] = arc
+
+                patch2["home"] = home_p
+                patch2["away"] = away_p
+
+                f2 = _deep_merge(f, patch2)
+            else:
+                f2 = _deep_merge(f, patch)
+
+            # 관리자용이므로 hidden=true도 제외하지 않음
             f2["_has_override"] = True
             merged.append(f2)
         else:
@@ -649,6 +740,7 @@ def admin_list_fixtures_merged():
         detail={"date": date_str, "timezone": tz_str, "league_ids": league_ids_raw or "", "rows": len(merged)},
     )
     return jsonify({"ok": True, "rows": merged})
+
 
 
 
@@ -989,6 +1081,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
