@@ -1103,11 +1103,21 @@ def list_fixtures():
     merged = []
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
-        if patch:
-            f2 = _deep_merge(f, patch)
+        if patch and isinstance(patch, dict):
+            # ✅ Admin과 동일: header 레이어가 있으면 header만 꺼내서 home/away 등을 덮어쓴다.
+            if isinstance(patch.get("header"), dict):
+                p2 = dict(patch.get("header") or {})
+                if "hidden" in patch:
+                    p2["hidden"] = patch.get("hidden")
+            else:
+                p2 = patch
+
+            f2 = _deep_merge(f, p2)
+
             # hidden=true면 노출 제외(삭제 대신 숨김)
             if f2.get("hidden") is True:
                 continue
+
             merged.append(f2)
         else:
             merged.append(f)
@@ -1116,11 +1126,13 @@ def list_fixtures():
 
 
 
+
 # ─────────────────────────────────────────
 # 실행
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
