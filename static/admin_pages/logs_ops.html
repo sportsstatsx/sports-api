@@ -6,14 +6,161 @@
   <title>Logs / Ops</title>
   <style>
     body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
     .muted { color:#666; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
     .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
+    .card h2 { margin:0 0 10px 0; font-size: 16px; }
+    input, button, select { font-size: 14px; }
+    input, select {
+      width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc;
+      background:#fff;
+    }
+    button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    button.primary { border-color:#000; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h2 style="margin:0 0 8px 0;">Logs / Ops</h2>
-    <div class="muted">현재 오른쪽 Admin Logs 테이블을 여기로 옮길 자리 (placeholder)</div>
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">Logs / Ops</h1>
+      <div class="muted">
+        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+      </div>
+    </div>
+    <div class="muted" id="statusLine"></div>
   </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>Admin Logs</h2>
+
+    <div class="row">
+      <div style="min-width:240px; flex: 1 1 240px;">
+        <label class="muted">fixture_id 필터(선택)</label>
+        <input id="logFixture" placeholder="fixture_id 필터(선택)"/>
+      </div>
+
+      <div style="min-width:220px; flex: 1 1 220px;">
+        <label class="muted">event_type</label>
+        <select id="logEvent">
+          <option value="">event_type 전체</option>
+          <option value="access">access</option>
+          <option value="auth_fail">auth_fail</option>
+          <option value="override_get">override_get</option>
+          <option value="override_upsert">override_upsert</option>
+          <option value="override_delete">override_delete</option>
+          <option value="logs_list">logs_list</option>
+          <option value="fixtures_raw_list">fixtures_raw_list</option>
+          <option value="fixtures_merged_list">fixtures_merged_list</option>
+        </select>
+      </div>
+
+      <div style="min-width:160px; flex: 0 0 160px;">
+        <button class="primary" style="width:100%;" onclick="loadLogs()">새로고침</button>
+      </div>
+    </div>
+
+    <div style="height:10px;"></div>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:160px;">ts</th>
+          <th style="width:140px;">type</th>
+          <th style="width:80px;">ok</th>
+          <th>detail</th>
+        </tr>
+      </thead>
+      <tbody id="logsBody"></tbody>
+    </table>
+
+    <div id="logHint" class="muted" style="margin-top:10px;"></div>
+  </div>
+
+<script>
+  const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
+  document.getElementById("adminPathText").textContent = "/" + adminPath;
+
+  const tokenKey = "SSX_ADMIN_TOKEN";
+
+  function setStatusLine(msg) {
+    document.getElementById("statusLine").textContent = msg || "";
+  }
+
+  function adminHeaders() {
+    const t = localStorage.getItem(tokenKey) || "";
+    return {
+      "Content-Type": "application/json",
+      "X-Admin-Token": t,
+    };
+  }
+
+  function ensureToken() {
+    let t = localStorage.getItem(tokenKey);
+    if (!t) {
+      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
+      if (t) localStorage.setItem(tokenKey, t);
+    }
+    return t;
+  }
+
+  function adminUrl(path) {
+    return "/" + adminPath + path;
+  }
+
+  async function api(path, opt={}) {
+    ensureToken();
+    const res = await fetch(path, {
+      ...opt,
+      headers: { ...(opt.headers||{}), ...adminHeaders() },
+    });
+    const txt = await res.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+    return { status: res.status, data };
+  }
+
+  async function loadLogs() {
+    const fx = document.getElementById("logFixture").value.trim();
+    const ev = document.getElementById("logEvent").value;
+
+    const qs = new URLSearchParams();
+    qs.set("limit", "200");
+    if (fx) qs.set("fixture_id", fx);
+    if (ev) qs.set("event_type", ev);
+
+    setStatusLine("logs 불러오는 중...");
+    const r = await api(adminUrl(`/api/logs?` + qs.toString()), { method: "GET" });
+
+    const body = document.getElementById("logsBody");
+    body.innerHTML = "";
+
+    if (r.status >= 400) {
+      setStatusLine("");
+      document.getElementById("logHint").textContent = "로그 로드 실패: " + JSON.stringify(r.data);
+      return;
+    }
+
+    const rows = (r.data && r.data.rows) ? r.data.rows : [];
+    for (const row of rows) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${row.ts || ""}</td>
+        <td class="mono">${row.event_type || ""}</td>
+        <td>${row.ok ? "✅" : "❌"}</td>
+        <td class="mono">${JSON.stringify(row.detail || {})}</td>
+      `;
+      body.appendChild(tr);
+    }
+
+    setStatusLine("");
+    document.getElementById("logHint").textContent = `rows: ${rows.length} (limit=200)`;
+  }
+
+  loadLogs();
+</script>
 </body>
 </html>
