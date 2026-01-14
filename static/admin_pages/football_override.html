@@ -56,17 +56,63 @@
     table { width:100%; border-collapse:collapse; }
     th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
         /* ---- Event Editor ---- */
-    .subcard { border:1px solid #eee; border-radius:10px; padding:12px; background:#fff; }
+    .subcard{
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:12px;
+      background:var(--panel);
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .subcard:hover{
+      background:var(--panel2);
+      border-color:var(--border2);
+    }
+
     .subcard h3 { margin:0 0 10px 0; font-size:14px; }
-    .mini { font-size:12px; }
-    .btnsm { padding:6px 10px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; font-size:12px; }
-    .btnsm.primary { border-color:#000; }
-    .btnsm.danger { border-color:#d33; color:#d33; }
-    .pill { display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
+    .mini { font-size:12px; color:var(--muted); }
+
+    .btnsm{
+      padding:6px 10px;
+      border-radius:8px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      color:var(--text);
+      cursor:pointer;
+      font-size:12px;
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .btnsm:hover{
+      background:var(--panel2);
+      border-color:var(--border2);
+    }
+    .btnsm.primary { border-color: var(--accent); }
+    .btnsm.danger  { border-color: var(--danger); color: var(--danger); }
+
+    .pill{
+      display:inline-block;
+      padding:2px 8px;
+      border:1px solid var(--border2);
+      border-radius:999px;
+      font-size:12px;
+      color:var(--muted);
+      background:transparent;
+    }
+
     .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
     @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
-    .evtTable input, .evtTable select { padding:8px; font-size:12px; }
+
+    .evtTable input, .evtTable select{
+      padding:8px;
+      font-size:12px;
+      background:var(--panel);
+      color:var(--text);
+      border:1px solid var(--border);
+    }
+    .evtTable th, .evtTable td{
+      border-bottom:1px solid var(--border);
+    }
     .evtTable td { padding:6px; }
+
 
     /* ─────────────────────────────────────
    Theme (shared)
