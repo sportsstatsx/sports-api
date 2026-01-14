@@ -613,17 +613,37 @@ def admin_list_fixtures_merged():
     fixture_ids = [f["fixture_id"] for f in fixtures]
     override_map = _load_match_overrides(fixture_ids)
 
+    fixture_patch_keys = {
+        "fixture_id", "league_id", "season",
+        "date_utc", "kickoff_utc",
+        "status_group", "status", "elapsed", "minute", "status_long",
+        "league_round", "venue_name",
+        "league_name", "league_logo", "league_country",
+        "home", "away",
+        "hidden",
+    }
+
     merged = []
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
         if patch:
-            f2 = _deep_merge(f, patch)
-            # 관리자용이므로 hidden=true도 제외하지 않음
+            # header만 fixtures row에 반영 (timeline 같은 건 목록에 붙이지 않음)
+            if isinstance(patch, dict) and isinstance(patch.get("header"), dict):
+                p2 = dict(patch.get("header") or {})
+                if "hidden" in patch:
+                    p2["hidden"] = patch.get("hidden")
+            elif isinstance(patch, dict):
+                p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
+            else:
+                p2 = {}
+
+            f2 = _deep_merge(f, p2)
             f2["_has_override"] = True
             merged.append(f2)
         else:
             f["_has_override"] = False
             merged.append(f)
+
 
     _admin_log(
         "fixtures_merged_list",
@@ -971,6 +991,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
