@@ -105,12 +105,11 @@ def get_match_detail_bundle(
     comp / last_n 필터를 라우터에서 받아 header.filters 에 반영한다.
 
     ✅ override 동작
-    - match_overrides.patch.hidden=true 면 None 리턴 (접근 차단)
+    - match_overrides.patch.hidden=true 면 None 리턴 (디테일 숨김)
     - header 관련 키는 header에 먼저 merge (다른 블록 생성에 영향 주기 위해)
-    - 그 외 키(예: timeline 배열 override)는 번들(dict) 완성 후 최종 merge
+    - 그 외 키(예: timeline/insights_overall 같은 블록 override)는 bundle 완성 후 최종 merge
     """
 
-    # header 블록 생성
     header = build_header_block(
         fixture_id=fixture_id,
         league_id=league_id,
@@ -119,32 +118,31 @@ def get_match_detail_bundle(
     if header is None:
         return None
 
-    # comp / last_n 필터 덮어쓰기 (앱 → 서버)
-    header_filters = header.get("filters", {})
+    # filters 오버라이드(앱에서 내려준 comp/last_n 우선)
+    header_filters = header.get("filters") or {}
     if comp is not None:
         header_filters["comp"] = comp
     if last_n is not None:
         header_filters["last_n"] = last_n
     header["filters"] = header_filters
 
+    header_patch: Dict[str, Any] = {}
     bundle_patch: Dict[str, Any] = {}
 
-    # ✅ override 적용
     if apply_override:
-        patch = _load_override_patch(fixture_id)
+        patch = _load_override_patch(fixture_id) or {}
 
-        # hidden=true면 디테일도 접근 불가 처리(리스트와 일관성)
+        # hidden=true면 디테일 접근 차단
         if isinstance(patch, dict) and patch.get("hidden") is True:
             return None
 
         if isinstance(patch, dict) and patch:
-            # 1) header_patch / bundle_patch 분리
+            # patch가 {"header": {...}, "timeline": [...]} 구조면 header/bundle 분리
             if isinstance(patch.get("header"), dict):
                 header_patch = patch.get("header") or {}
                 bundle_patch = {k: v for k, v in patch.items() if k not in ("header", "hidden")}
             else:
-                # legacy 지원: header 필드와 bundle 필드가 섞여있을 수 있으니,
-                # 아는 header 키만 header로 보내고 나머지는 bundle로 보냄
+                # legacy: header 필드와 bundle 필드가 섞여 있을 수 있어, header로 확실한 키만 분리
                 header_keys = {
                     "fixture_id", "league_id", "season",
                     "date_utc", "kickoff_utc",
@@ -153,8 +151,6 @@ def get_match_detail_bundle(
                     "league_name", "league_logo", "league_country",
                     "home", "away", "filters",
                 }
-                header_patch = {}
-                bundle_patch = {}
                 for k, v in patch.items():
                     if k in ("hidden",):
                         continue
@@ -163,12 +159,12 @@ def get_match_detail_bundle(
                     else:
                         bundle_patch[k] = v
 
-            # 2) header 먼저 merge (다른 블록 생성에 영향)
-            if isinstance(header_patch, dict) and header_patch:
+            # header를 먼저 merge (이 값으로 form/timeline 등 블록 생성)
+            if header_patch:
                 header = _deep_merge(header, header_patch)
                 _reconcile_header_aliases(header)
 
-    # 나머지 블록 생성 (override 반영된 header로 생성)
+    # 블록 생성 (override 반영된 header 기반)
     form = build_form_block(header)
     timeline = build_timeline_block(header)
     lineups = build_lineups_block(header)
@@ -190,9 +186,10 @@ def get_match_detail_bundle(
         "ai_predictions": ai_predictions,
     }
 
-    # 3) ✅ bundle 최종 merge (timeline/events 같은 “블록 자체 override”는 여기서 먹게 됨)
-    if isinstance(bundle_patch, dict) and bundle_patch:
+    # ✅ bundle 자체 override 최종 반영 (timeline/events 같은 블록 수정이 여기서 실제로 먹음)
+    if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
     return bundle
+
 
