@@ -502,12 +502,22 @@
 
   function statusOrderKey(sg) {
     const v = (sg || "").toUpperCase();
-    if (v.includes("LIVE")) return 0;
-    if (v === "NS") return 1;
-    if (v.includes("1H") || v.includes("2H") || v.includes("HT")) return 2;
+
+    // Live / In-play
+    if (v.includes("LIVE") || v.includes("INPLAY")) return 0;
+
+    // Upcoming / Not started
+    if (v.includes("UPCOMING") || v === "NS") return 1;
+
+    // In-play periods
+    if (v.includes("1H") || v.includes("2H") || v.includes("HT") || v.includes("HALF")) return 2;
+
+    // Finished
     if (v.includes("FT") || v.includes("FINISHED")) return 9;
+
     return 5;
   }
+
 
 
   function showTab(name) {
