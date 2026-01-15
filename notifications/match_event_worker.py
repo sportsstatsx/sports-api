@@ -698,12 +698,14 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
     - status 가 아직 NS/TBD 일 때만
     - match_notification_state.kickoff_10m_sent 가 FALSE 일 때만
     - date_utc 기준으로 지금 시각과의 차이가 0~600초(10분) 사이면 발송
+
+    ✅ 개선(기존 동작 유지 + 버그 수정):
+    - 전송이 전부 실패했는데도 kickoff_10m_sent=TRUE 찍혀서 영구 누락되는 케이스 방지
+      -> "한 배치라도 성공"했을 때만 플래그 ON
     """
-    # 이미 시작한 경기면 10분 전 알림은 의미 없음
     if match.status not in ("", "NS", "TBD"):
         return
 
-    # 경기 킥오프 시간 가져오기
     row = fetch_one(
         """
         SELECT date_utc
@@ -716,19 +718,15 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
         return
 
     try:
-        # 예: "2025-12-11T17:45:00+00:00"
         kickoff_dt = datetime.fromisoformat(str(row["date_utc"]))
     except Exception:
         return
 
     now_utc = datetime.now(timezone.utc)
     diff_sec = (kickoff_dt - now_utc).total_seconds()
-
-    # 지금 시각 기준으로 0~600초(10분) 이내만 허용
     if not (0 <= diff_sec <= 600):
         return
 
-    # 이미 10분 전 알림을 보냈는지 확인
     state_row = fetch_one(
         """
         SELECT kickoff_10m_sent
@@ -738,13 +736,10 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
         (match.match_id,),
     )
     if not state_row:
-        # 아직 state row 없는 경우엔 스킵 (다음 루프에서 다시 확인)
         return
-
     if state_row["kickoff_10m_sent"]:
         return
 
-    # 구독 토큰 가져오기 (킥오프와 동일 옵션 사용)
     tokens = get_tokens_for_event(match.match_id, "kickoff_10m")
     if not tokens:
         return
@@ -755,18 +750,19 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
 
     title = "Kickoff in 10 minutes"
     body = f"{home_name} vs {away_name}"
-
     data: Dict[str, Any] = {
         "match_id": match.match_id,
         "event_type": "kickoff_10m",
     }
 
-    # 500개 단위로 잘라서 발송
     batch_size = 500
+    any_success = False
+
     for i in range(0, len(tokens), batch_size):
         batch = tokens[i : i + batch_size]
         try:
             resp = fcm.send_to_tokens(batch, title, body, data)
+            any_success = True
             log.info(
                 "Sent kickoff_10m notification for match %s to %s devices: %s",
                 match.match_id,
@@ -779,16 +775,17 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
                 match.match_id,
             )
 
-    # 플래그 ON
-    execute(
-        """
-        UPDATE match_notification_state
-        SET kickoff_10m_sent = TRUE,
-            updated_at = NOW()
-        WHERE match_id = %s
-        """,
-        (match.match_id,),
-    )
+    if any_success:
+        execute(
+            """
+            UPDATE match_notification_state
+            SET kickoff_10m_sent = TRUE,
+                updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (match.match_id,),
+        )
+
 
 
 def process_match(fcm: FCMClient, match_id: int) -> None:
