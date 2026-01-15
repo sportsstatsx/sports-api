@@ -35,7 +35,7 @@ def _get_api_key() -> str:
         or ""
     )
     if not key:
-        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_KEY)")
+        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_FOOTBALL_KEY / API_KEY)")
     return key
 
 
