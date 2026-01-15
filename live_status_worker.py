@@ -476,7 +476,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
       * 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
       * fixture 종료 시 run_once()에서 cache prune
     """
-    # fixture 단위 signature cache (sig -> last_seen_ts)
     if not hasattr(upsert_match_events, "_sig_cache"):
         upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
     sig_cache: Dict[int, Dict[Tuple[Any, ...], float]] = upsert_match_events._sig_cache  # type: ignore[attr-defined]
@@ -487,15 +486,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         seen = {}
         sig_cache[fixture_id] = seen
 
-    # 주기적으로 오래된 signature 정리(메모리 누적 방지)
     if (len(seen) > 800) or (now_ts - min(seen.values(), default=now_ts) > 1800):
-        cutoff = now_ts - 1800  # 30분 이상 지난 sig 제거
+        cutoff = now_ts - 1800
         for k, v in list(seen.items()):
             if v < cutoff:
                 del seen[k]
-        # 너무 크면 추가로 자르기
         if len(seen) > 1200:
-            # 오래된 것부터 제거
             for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
                 del seen[k]
 
@@ -519,19 +515,17 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         elapsed = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
 
-        # --- signature dedupe (id가 바뀌어도 동일 이벤트면 스킵) ---
         sig = (elapsed, extra, ev_type, detail, t_id, p_id, a_id, comments)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
-            # 10분 내 동일 signature는 중복으로 간주
             continue
         seen[sig] = now_ts
 
-        # (substitution 보강용 placeholder - 기존 로직 유지)
         player_in_id = None
         player_in_name = None
-        if ev_type.lower() == "subst" or (detail and "Substitution" in detail):
-            # API에 따라 구조가 다를 수 있어 안전 처리
+
+        ev_type_l = (ev_type or "").lower()
+        if ev_type_l == "subst" or ((detail or "") and "Substitution" in (detail or "")):
             pass
 
         execute(
@@ -576,6 +570,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 player_in_name,
             ),
         )
+
 
 
 
