@@ -339,12 +339,9 @@ def upsert_match_row_from_fixture(
     dev 스키마(matches) 정확 매핑 업서트.
     반환: (fixture_id, home_id, away_id, status_group, date_utc)
 
-    matches 컬럼(확인됨):
-      fixture_id(PK), league_id, season, date_utc, status, status_group,
-      home_id, away_id, home_ft, away_ft, elapsed, home_ht, away_ht,
-      referee, fixture_timezone, fixture_timestamp,
-      status_short, status_long, status_elapsed, status_extra,
-      venue_id, venue_name, venue_city, league_round
+    추가(스키마 변경 없음):
+    - upsert_match_events()가 Own Goal team_id를 '득점 인정팀'으로 뒤집을 수 있도록
+      런타임 캐시(LINEUPS_STATE)에 home_id/away_id를 저장한다.
     """
 
     # ---- 필수 입력(스키마 NOT NULL) ----
@@ -522,7 +519,16 @@ def upsert_match_row_from_fixture(
         ),
     )
 
+    # ✅ 런타임 캐시 저장(스키마 변경 없음): Own Goal team_id flip에 사용
+    try:
+        st_cache = _ensure_lineups_state(fixture_id)
+        st_cache["home_id"] = int(home_id)
+        st_cache["away_id"] = int(away_id)
+    except Exception:
+        pass
+
     return fixture_id, home_id, away_id, status_group, date_utc
+
 
 
 
@@ -635,7 +641,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     3) ✅ signature dedupe 안정화:
        - extra는 None/0 흔들려서 extra0=coalesce로 통일
        - 카드 dedupe에서 assist_id 변동으로 중복 생성되는 문제 방지 위해 sig에서 a_id 제외
-    4) 기존 유지:
+    4) ✅ Own Goal team_id 정규화(중요):
+       - API-Sports /fixtures/events 에서 Own Goal은 team_id가 '자책한 팀(source team)'으로 내려옴
+       - 앱 타임라인은 match_events.team_id를 득점팀으로 해석하므로,
+         DB에는 '득점 인정팀(benefit team)'으로 뒤집어서 저장한다.
+       - home/away는 upsert_match_row_from_fixture()에서 LINEUPS_STATE에 저장한 값을 사용한다.
+    5) 기존 유지:
        - events.id 없으면 synthetic id(음수)
        - synthetic Goal 유령 정리
     """
@@ -784,10 +795,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         detail = safe_text(ev.get("detail"))
         comments = safe_text(ev.get("comments"))
 
-        # ---- 벤치/스태프 Card 차단 ----
-        if _is_bench_staff_card(t_id, p_id, ev_type):
-            continue
-
         tm = ev.get("time") or {}
         minute = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
@@ -798,6 +805,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type_norm = _norm(ev_type)
         detail_norm = _norm(detail)
+
+        # ---- 벤치/스태프 Card 차단 ----
+        if _is_bench_staff_card(t_id, p_id, ev_type):
+            continue
 
         # ✅ Second Yellow가 있으면 같은 키의 Red Card는 스킵(레드 2장 표시 방지)
         if ev_type_norm == "card":
@@ -842,10 +853,25 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 current_cards_detail.append(detail_norm)
                 current_cards_player.append(int(p_id))
 
+        # ✅ Own Goal team_id 정규화(여기가 핵심)
+        # - API: team_id = 자책한 팀(source team)
+        # - DB(match_events): team_id = 득점 인정팀(benefit team)으로 저장
+        effective_team_id = t_id
+        if ev_type_norm == "goal" and ("own goal" in detail_norm) and (t_id is not None):
+            st_cache = LINEUPS_STATE.get(fixture_id) or {}
+            hid = safe_int(st_cache.get("home_id"))
+            aid = safe_int(st_cache.get("away_id"))
+            if hid is not None and aid is not None:
+                if t_id == hid:
+                    effective_team_id = aid
+                elif t_id == aid:
+                    effective_team_id = hid
+
         # ✅ signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
         # - extra는 extra0로 통일(None/0 흔들림 방지)
         # - a_id는 카드에서 흔들려 중복을 만들 수 있어 제외
-        sig = (int(minute), int(extra0), ev_type_norm, detail_norm, t_id, p_id)
+        # - team_id는 DB에 저장될 team_id 기준으로 dedupe 해야 앱 표시가 안정적
+        sig = (int(minute), int(extra0), ev_type_norm, detail_norm, effective_team_id, p_id)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
             continue
@@ -878,7 +904,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             (
                 ev_id,
                 fixture_id,
-                t_id,
+                effective_team_id,  # ✅ OG면 반대팀으로 저장
                 p_id,
                 ev_type,
                 detail,
@@ -1007,6 +1033,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 fixture_id,
             ),
         )
+
 
 
 
