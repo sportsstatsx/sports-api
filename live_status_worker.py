@@ -189,7 +189,7 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
 
         # 값이 0이면 '제한 없음'으로 취급(기존 동작 유지)
         rate_per_sec = (per_min / 60.0) if per_min > 0 else 0.0
-        max_tokens = burst if burst > 0 else (rate_per_sec * 5 if rate_per_sec > 0 else 0.0)
+        max_tokens = burst if burst > 0 else (max(1.0, rate_per_sec * 5) if rate_per_sec > 0 else 0.0)
 
         api_get._rl = {
             "rate": rate_per_sec,
@@ -328,169 +328,109 @@ def upsert_fixture_row(
 
 
 
-def upsert_match_row_from_fixture(
-    fixture_obj: Dict[str, Any],
-    league_id: int,
-    season: int,
-) -> Tuple[int, int, int, str, str]:
+def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    matches 테이블 스키마에 맞춰 최대한 채우되, 없는 값은 NULL 허용 컬럼만 NULL로.
-    returns: (fixture_id, home_id, away_id, status_group, date_utc)
+    match_events PK는 id 단일.
+    - 중복 id는 DO NOTHING(기존)
+    - 추가 개선(스키마 변경 없음):
+      * 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
+      * fixture 종료 시 run_once()에서 cache prune
     """
-    fx = fixture_obj.get("fixture") or {}
-    teams = fixture_obj.get("teams") or {}
-    goals = fixture_obj.get("goals") or {}
-    score = fixture_obj.get("score") or {}
-    league = fixture_obj.get("league") or {}
-    venue = fx.get("venue") or {}
-    st = fx.get("status") or {}
+    if not hasattr(upsert_match_events, "_sig_cache"):
+        upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
+    sig_cache: Dict[int, Dict[Tuple[Any, ...], float]] = upsert_match_events._sig_cache  # type: ignore[attr-defined]
 
-    fixture_id = safe_int(fx.get("id")) or 0
-    date_utc = safe_text(fx.get("date")) or ""
-    referee = safe_text(fx.get("referee"))
+    now_ts = time.time()
+    seen = sig_cache.get(fixture_id)
+    if seen is None:
+        seen = {}
+        sig_cache[fixture_id] = seen
 
-    home = teams.get("home") or {}
-    away = teams.get("away") or {}
-    home_id = safe_int(home.get("id")) or 0
-    away_id = safe_int(away.get("id")) or 0
+    if (len(seen) > 800) or (now_ts - min(seen.values(), default=now_ts) > 1800):
+        cutoff = now_ts - 1800
+        for k, v in list(seen.items()):
+            if v < cutoff:
+                del seen[k]
+        if len(seen) > 1200:
+            for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
+                del seen[k]
 
-    # goals: {home, away}
-    home_ft = safe_int(goals.get("home"))
-    away_ft = safe_int(goals.get("away"))
+    for ev in events or []:
+        ev_id = safe_int(ev.get("id"))
+        if ev_id is None:
+            continue
 
-    # halftime score
-    ht = (score.get("halftime") or {}) if isinstance(score, dict) else {}
-    home_ht = safe_int(ht.get("home"))
-    away_ht = safe_int(ht.get("away"))
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+        assist = ev.get("assist") or {}
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+        a_id = safe_int(assist.get("id"))
 
-    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
-    status_long = safe_text(st.get("long"))
-    status_elapsed = safe_int(st.get("elapsed"))
-    status_extra = safe_int(st.get("extra"))
-    status_group = map_status_group(status_short)
-    status = status_short
+        ev_type = safe_text(ev.get("type"))
+        detail = safe_text(ev.get("detail"))
+        comments = safe_text(ev.get("comments"))
 
-    fixture_timezone = safe_text(fx.get("timezone"))
-    fixture_timestamp = safe_int(fx.get("timestamp"))
+        tm = ev.get("time") or {}
+        elapsed = safe_int(tm.get("elapsed"))
+        extra = safe_int(tm.get("extra"))
 
-    venue_id = safe_int(venue.get("id"))
-    venue_name = safe_text(venue.get("name"))
-    venue_city = safe_text(venue.get("city"))
+        sig = (elapsed, extra, ev_type, detail, t_id, p_id, a_id, comments)
+        prev_ts = seen.get(sig)
+        if prev_ts is not None and (now_ts - prev_ts) < 600:
+            continue
+        seen[sig] = now_ts
 
-    league_round = safe_text(league.get("round"))
+        player_in_id = None
+        player_in_name = None
 
-    execute(
-        """
-        INSERT INTO matches (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status,
-            status_group,
-            home_id,
-            away_id,
-            home_ft,
-            away_ft,
-            elapsed,
-            home_ht,
-            away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            timezone,
-            timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round
+        ev_type_l = (ev_type or "").lower()
+        if ev_type_l == "subst" or ((detail or "") and "Substitution" in (detail or "")):
+            pass
+
+        execute(
+            """
+            INSERT INTO match_events (
+                id,
+                fixture_id,
+                team_id,
+                player_id,
+                type,
+                detail,
+                comments,
+                time_elapsed,
+                time_extra,
+                assist_id,
+                team_name,
+                player_name,
+                assist_name,
+                player_in_id,
+                player_in_name
+            )
+            VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            )
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                ev_id,
+                fixture_id,
+                t_id,
+                p_id,
+                ev_type,
+                detail,
+                comments,
+                elapsed,
+                extra,
+                a_id,
+                safe_text(team.get("name")),
+                safe_text(player.get("name")),
+                safe_text(assist.get("name")),
+                player_in_id,
+                player_in_name,
+            ),
         )
-        VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-        )
-        ON CONFLICT (fixture_id) DO UPDATE SET
-            league_id         = EXCLUDED.league_id,
-            season            = EXCLUDED.season,
-            date_utc          = EXCLUDED.date_utc,
-            status            = EXCLUDED.status,
-            status_group      = EXCLUDED.status_group,
-            home_id           = EXCLUDED.home_id,
-            away_id           = EXCLUDED.away_id,
-            home_ft           = CASE WHEN matches.status_group = 'INPLAY' AND EXCLUDED.status_group = 'INPLAY' THEN matches.home_ft ELSE EXCLUDED.home_ft END,
-            away_ft           = CASE WHEN matches.status_group = 'INPLAY' AND EXCLUDED.status_group = 'INPLAY' THEN matches.away_ft ELSE EXCLUDED.away_ft END,
-            elapsed           = EXCLUDED.elapsed,
-            home_ht           = EXCLUDED.home_ht,
-            away_ht           = EXCLUDED.away_ht,
-            referee           = EXCLUDED.referee,
-            fixture_timezone  = EXCLUDED.fixture_timezone,
-            fixture_timestamp = EXCLUDED.fixture_timestamp,
-            status_short      = EXCLUDED.status_short,
-            status_long       = EXCLUDED.status_long,
-            status_elapsed    = EXCLUDED.status_elapsed,
-            status_extra      = EXCLUDED.status_extra,
-            venue_id          = EXCLUDED.venue_id,
-            venue_name        = EXCLUDED.venue_name,
-            venue_city        = EXCLUDED.venue_city,
-            league_round      = EXCLUDED.league_round
-        WHERE
-            matches.league_id         IS DISTINCT FROM EXCLUDED.league_id OR
-            matches.season            IS DISTINCT FROM EXCLUDED.season OR
-            matches.date_utc          IS DISTINCT FROM EXCLUDED.date_utc OR
-            matches.status            IS DISTINCT FROM EXCLUDED.status OR
-            matches.status_group      IS DISTINCT FROM EXCLUDED.status_group OR
-            matches.home_id           IS DISTINCT FROM EXCLUDED.home_id OR
-            matches.away_id           IS DISTINCT FROM EXCLUDED.away_id OR
-            matches.home_ft           IS DISTINCT FROM EXCLUDED.home_ft OR
-            matches.away_ft           IS DISTINCT FROM EXCLUDED.away_ft OR
-            matches.elapsed           IS DISTINCT FROM EXCLUDED.elapsed OR
-            matches.home_ht           IS DISTINCT FROM EXCLUDED.home_ht OR
-            matches.away_ht           IS DISTINCT FROM EXCLUDED.away_ht OR
-            matches.referee           IS DISTINCT FROM EXCLUDED.referee OR
-            matches.fixture_timezone  IS DISTINCT FROM EXCLUDED.fixture_timezone OR
-            matches.fixture_timestamp IS DISTINCT FROM EXCLUDED.fixture_timestamp OR
-            matches.status_short      IS DISTINCT FROM EXCLUDED.status_short OR
-            matches.status_long       IS DISTINCT FROM EXCLUDED.status_long OR
-            matches.status_elapsed    IS DISTINCT FROM EXCLUDED.status_elapsed OR
-            matches.status_extra      IS DISTINCT FROM EXCLUDED.status_extra OR
-            matches.venue_id          IS DISTINCT FROM EXCLUDED.venue_id OR
-            matches.venue_name        IS DISTINCT FROM EXCLUDED.venue_name OR
-            matches.venue_city        IS DISTINCT FROM EXCLUDED.venue_city OR
-            matches.league_round      IS DISTINCT FROM EXCLUDED.league_round
-        """,
-        (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status,
-            status_group,
-            home_id,
-            away_id,
-            home_ft,
-            away_ft,
-            status_elapsed,
-            home_ht,
-            away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            fixture_timezone,
-            fixture_timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round,
-        ),
-    )
-    return fixture_id, home_id, away_id, status_group, date_utc
+
 
 
 
