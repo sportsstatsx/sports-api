@@ -377,35 +377,61 @@ pre{
                 <div class="row">
   <div style="flex:1 1 220px;">
     <label class="muted">Status Group</label>
-    <select id="qeStatusGroup">
-      <option value="">(keep)</option>
-      <option value="UPCOMING">UPCOMING</option>
-      <option value="INPLAY">INPLAY</option>
-      <option value="FINISHED">FINISHED</option>
-      <option value="PST">PST</option>
-      <option value="SUSP">SUSP</option>
-      <option value="CANC">CANC</option>
-      <option value="TBD">TBD</option>
-    </select>
+
+    <!-- ✅ 드롭다운 + 직접타이핑 -->
+    <input
+      id="qeStatusGroup"
+      list="qeStatusGroupList"
+      placeholder="(keep) 또는 직접 입력"
+      autocomplete="off"
+      inputmode="latin"
+    />
+    <datalist id="qeStatusGroupList">
+      <option value="UPCOMING"></option>
+      <option value="INPLAY"></option>
+      <option value="FINISHED"></option>
+      <option value="PST"></option>
+      <option value="SUSP"></option>
+      <option value="CANC"></option>
+      <option value="TBD"></option>
+    </datalist>
   </div>
+
   <div style="flex:1 1 220px;">
     <label class="muted">Status</label>
-    <select id="qeStatus">
-      <option value="">(keep)</option>
-      <option value="NS">NS</option>
-      <option value="1H">1H</option>
-      <option value="HT">HT</option>
-      <option value="2H">2H</option>
-      <option value="ET">ET</option>
-      <option value="P">P</option>
-      <option value="FT">FT</option>
-      <option value="AET">AET</option>
-      <option value="PEN">PEN</option>
-      <option value="SUSP">SUSP</option>
-      <option value="PST">PST</option>
-    </select>
+
+    <!-- ✅ 드롭다운 + 직접타이핑 -->
+    <input
+      id="qeStatus"
+      list="qeStatusList"
+      placeholder="(keep) 또는 직접 입력"
+      autocomplete="off"
+      inputmode="latin"
+    />
+    <datalist id="qeStatusList">
+      <!-- API-Football에서 흔한 코드들 + 네가 쓰던 것들 -->
+      <option value="NS"></option>
+      <option value="1H"></option>
+      <option value="HT"></option>
+      <option value="2H"></option>
+      <option value="ET"></option>
+      <option value="BT"></option>
+      <option value="P"></option>
+      <option value="FT"></option>
+      <option value="AET"></option>
+      <option value="PEN"></option>
+      <option value="SUSP"></option>
+      <option value="INT"></option>
+      <option value="PST"></option>
+      <option value="CANC"></option>
+      <option value="ABD"></option>
+      <option value="AWD"></option>
+      <option value="WO"></option>
+      <option value="LIVE"></option>
+    </datalist>
   </div>
 </div>
+
 
 
         <div class="row">
@@ -1772,6 +1798,7 @@ pre{
 
   loadFixtures();
 </script>
+  
 
   <script>
 (function(){
