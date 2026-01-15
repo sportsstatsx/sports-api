@@ -635,9 +635,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     3) ✅ signature dedupe 안정화:
        - extra는 None/0 흔들려서 extra0=coalesce로 통일
        - 카드 dedupe에서 assist_id 변동으로 중복 생성되는 문제 방지 위해 sig에서 a_id 제외
-    4) 기존 유지:
-       - events.id 없으면 synthetic id(음수)
-       - synthetic Goal 유령 정리
+    4) ✅ A안 적용:
+       - synthetic Goal "즉시 삭제" 제거
+       - Goal이 API 응답에서 N회(기본 3회) 연속 누락될 때만 synthetic goal 삭제
+       - 이번 응답에서 Goal이 0개면(API 흔들림 가능) miss_count 증가/삭제 모두 스킵
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -711,6 +712,19 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
     sig_cache: Dict[int, Dict[Tuple[Any, ...], float]] = upsert_match_events._sig_cache  # type: ignore[attr-defined]
 
+    # ✅ Goal 누락 카운트 캐시: {fixture_id: {goal_sig: {"miss":int, "ts":float}}}
+    if not hasattr(upsert_match_events, "_goal_miss_cache"):
+        upsert_match_events._goal_miss_cache = {}  # type: ignore[attr-defined]
+    goal_miss_cache: Dict[int, Dict[Tuple[Any, ...], Dict[str, Any]]] = upsert_match_events._goal_miss_cache  # type: ignore[attr-defined]
+
+    # ✅ N회 연속 누락 시 삭제(기본 3회 = interval 10초면 30초)
+    try:
+        GOAL_MISS_THRESHOLD = int(os.environ.get("GOAL_MISS_THRESHOLD", "3") or "3")
+    except Exception:
+        GOAL_MISS_THRESHOLD = 3
+    if GOAL_MISS_THRESHOLD < 2:
+        GOAL_MISS_THRESHOLD = 2
+
     now_ts = time.time()
     seen = sig_cache.get(fixture_id)
     if seen is None:
@@ -727,8 +741,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
                 del seen[k]
 
-    # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(유령 골 정리용)
+    # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(참고용)
     current_goal_ids: List[int] = []
+
+    # ✅ A안용: 이번 fetch에서 본 Goal signature 모음(누락 카운트 갱신/삭제 판단용)
+    # goal_sig: (minute, extra0, team_id, player_id, detail_norm)
+    current_goal_sigs: set = set()
 
     # ✅ 이번 fetch에서 "player_id 확정된 Card" 시그니처 모음(카드 중복 정리용)
     #   (minute, extra0, team_id, detail_norm, player_id)
@@ -829,9 +847,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 comments_=comments,
             )
 
-        # ✅ Goal이면 현재 Goal id 목록에 추가(정리용)
+        # ✅ Goal이면 현재 Goal id 목록 + signature에 추가
         if ev_type_norm == "goal":
             current_goal_ids.append(ev_id)
+            if t_id is not None and p_id is not None:
+                gsig = (int(minute), int(extra0), int(t_id), int(p_id), detail_norm)
+                current_goal_sigs.add(gsig)
 
         # ✅ Card인데 player_id가 확정된 경우만 "정리 기준"으로 저장
         if ev_type_norm == "card":
@@ -891,20 +912,122 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             ),
         )
 
-    # ✅ 유령 골 정리:
-    # - 현재 API 응답에 포함된 Goal id 목록에 없는 "synthetic Goal(id<0)"은 삭제
-    # - current_goal_ids가 비었으면(Goal이 하나도 없으면) 정리하지 않음(오탐 방지)
-    if current_goal_ids:
-        execute(
-            """
-            DELETE FROM match_events
-            WHERE fixture_id = %s
-              AND id < 0
-              AND LOWER(type) = 'goal'
-              AND NOT (id = ANY(%s))
-            """,
-            (fixture_id, current_goal_ids),
-        )
+    # ✅ A안: synthetic goal 삭제는 "N회 연속 누락"에서만 수행
+    # - 이번 응답에서 Goal이 0개면(API 흔들림 가능) miss_count 증가/삭제 모두 스킵(안전)
+    if current_goal_sigs:
+        miss_map = goal_miss_cache.get(fixture_id)
+        if miss_map is None:
+            miss_map = {}
+            goal_miss_cache[fixture_id] = miss_map
+
+        # miss_map 정리(너무 커지면 오래된 것 제거)
+        if len(miss_map) > 400:
+            cutoff = now_ts - 1800
+            for k, v in list(miss_map.items()):
+                try:
+                    ts = float(v.get("ts") or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts < cutoff:
+                    del miss_map[k]
+            if len(miss_map) > 500:
+                # 그래도 크면 일부만 남김(오래된 것부터)
+                items = []
+                for k, v in miss_map.items():
+                    try:
+                        ts = float(v.get("ts") or 0.0)
+                    except Exception:
+                        ts = 0.0
+                    items.append((ts, k))
+                items.sort()
+                for _, k in items[: len(miss_map) - 350]:
+                    miss_map.pop(k, None)
+
+        # 기존 sig들 업데이트
+        for sig_k, rec in list(miss_map.items()):
+            if sig_k in current_goal_sigs:
+                rec["miss"] = 0
+                rec["ts"] = now_ts
+            else:
+                try:
+                    rec["miss"] = int(rec.get("miss") or 0) + 1
+                except Exception:
+                    rec["miss"] = 1
+                rec["ts"] = now_ts
+
+        # 새로 본 sig 추가
+        for sig_k in current_goal_sigs:
+            if sig_k not in miss_map:
+                miss_map[sig_k] = {"miss": 0, "ts": now_ts}
+
+        # 삭제 대상 선별(miss >= threshold)
+        to_delete: List[Tuple[int, int, int, int, str]] = []
+        for sig_k, rec in list(miss_map.items()):
+            try:
+                miss_cnt = int(rec.get("miss") or 0)
+            except Exception:
+                miss_cnt = 0
+            if miss_cnt >= GOAL_MISS_THRESHOLD:
+                # sig_k = (minute, extra0, team_id, player_id, detail_norm)
+                try:
+                    m, ex0, tid, pid, dnorm = sig_k  # type: ignore[misc]
+                    to_delete.append((int(m), int(ex0), int(tid), int(pid), str(dnorm)))
+                except Exception:
+                    continue
+
+        if to_delete:
+            del_min: List[int] = []
+            del_extra: List[int] = []
+            del_team: List[int] = []
+            del_player: List[int] = []
+            del_detail: List[str] = []
+
+            for m, ex0, tid, pid, dnorm in to_delete:
+                del_min.append(m)
+                del_extra.append(ex0)
+                del_team.append(tid)
+                del_player.append(pid)
+                del_detail.append(dnorm)
+
+            execute(
+                r"""
+                DELETE FROM match_events me
+                USING (
+                  SELECT *
+                  FROM unnest(
+                    %s::int[],
+                    %s::int[],
+                    %s::int[],
+                    %s::int[],
+                    %s::text[]
+                  ) AS t(minute, extra0, team_id, player_id, detail_norm)
+                ) cur
+                WHERE me.fixture_id = %s
+                  AND me.id < 0
+                  AND LOWER(me.type) = 'goal'
+                  AND me.minute = cur.minute
+                  AND COALESCE(me.extra, 0) = cur.extra0
+                  AND me.team_id = cur.team_id
+                  AND me.player_id = cur.player_id
+                  AND translate(
+                        lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
+                        '"`.,:;!?()[]{}|',
+                        ''
+                      ) = cur.detail_norm
+                """,
+                (
+                    del_min,
+                    del_extra,
+                    del_team,
+                    del_player,
+                    del_detail,
+                    fixture_id,
+                ),
+            )
+
+            # 삭제 확정된 sig는 miss_map에서 제거(반복 삭제/메모리 누적 방지)
+            for m, ex0, tid, pid, dnorm in to_delete:
+                miss_map.pop((m, ex0, tid, pid, dnorm), None)
 
     # ✅ Second Yellow가 확정된 경우 같은 키의 Red Card는 DB에서도 제거(레드 2장 방지)
     if second_yellow_min:
@@ -1007,6 +1130,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 fixture_id,
             ),
         )
+
 
 
 
