@@ -122,6 +122,21 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
 
+    # ✅ 0) VAR + "취소골" (DB 패턴 기반)
+    # - type=Var + detail:
+    #   * Goal cancelled
+    #   * Goal Disallowed
+    #   * Goal Disallowed - offside/handball/foul ...
+    if (t == "var" or "var" in t or "var" in d) and ("goal" in d) and (
+        "cancel" in d or "disallow" in d
+    ):
+        return "CANCELLED_GOAL"
+
+    # ✅ 0-b) VAR + "Red card cancelled" 는 타임라인에 노출시키고 싶음
+    # - 예: type=Var, detail="Red card cancelled"
+    if (t == "var" or "var" in t or "var" in d) and ("red" in d) and ("cancel" in d):
+        return "RED_CARD_CANCELLED"
+
     # ✅ 1) 패널티 실축을 최우선으로 판별
     if (("pen" in t or "pen" in d or "penalty" in d)
             and ("miss" in d or "saved" in d)):
@@ -135,7 +150,6 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     if "goal" in t:
         return "GOAL"
 
-
     if "card" in t and "red" in d:
         return "RED"
     if "card" in t and "yellow" in d:
@@ -144,9 +158,7 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     if t.startswith("subst") or t.startswith("sub"):
         return "SUB"
 
-    if ("pen" in t or "pen" in d) and ("miss" in d or "saved" in d):
-        return "PEN_MISSED"
-
+    # ✅ VAR(취소골/레드취소 외 VAR)은 기존처럼 VAR로 유지 (아래에서 숨김 처리됨)
     if "var" in t or "var" in d:
         return "VAR"
 
@@ -165,12 +177,13 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
         return "YELLOW"
     if "sub" in d:
         return "SUB"
-    if "pen" in d and "miss" in d:
-        return "PEN_MISSED"
     if "var" in d:
         return "VAR"
 
     return "OTHER"
+
+
+
 
 
 def _map_period(minute: int, has_et: bool) -> str:
@@ -286,11 +299,9 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     home_score = 0
     away_score = 0
 
-
     status_u = str(header.get("status") or "").upper()
     elapsed = int(header.get("elapsed") or 0)
     has_et = (status_u in ("AET", "PEN", "ET")) or (elapsed >= 105)
-
 
     for idx, r in enumerate(rows):
         minute = int(r.get("minute") or 0)
@@ -311,14 +322,12 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         else:
             side = "unknown"
 
-
         period = _map_period(minute, has_et)
         label, minute_extra = _build_minute_label(
             minute,
             r.get("extra") if "extra" in r else r.get("time_extra"),
             period,
         )
-
 
         player_id = r.get("player_id")
         assist_id = r.get("assist_player_id")
@@ -329,15 +338,11 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
         # 스코어 스냅샷 (득점 이벤트만)
         snapshot_score: str | None = None
         if t_canon in ("GOAL", "PEN_GOAL", "OWN_GOAL"):
-            # API 기준: team_id = 득점 팀
-            # → side 가 home/away 어느 쪽이든 그대로 +1 만 해주면 된다
             if side == "home":
                 home_score += 1
             elif side == "away":
                 away_score += 1
-
             snapshot_score = f"{home_score} - {away_score}"
-
 
         # line1 / line2
         line1: str
@@ -349,7 +354,6 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             line1 = f"In {in_nm}" if in_nm else "Substitution"
             line2 = f"Out {out_nm}" if out_nm else None
 
-            # In / Out 이름이 같으면 line2 숨김
             if line2:
                 a = _normalize_name_light(line1.replace("In", "", 1).strip())
                 b = _normalize_name_light(line2.replace("Out", "", 1).strip())
@@ -381,6 +385,11 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             who = name_for(player_id)
             line1 = who or "Card"
 
+        elif t_canon == "RED_CARD_CANCELLED":
+            # ✅ VAR로 인해 "레드카드가 취소됨" (노출)
+            who = name_for(player_id)
+            line1 = " ".join([x for x in [who, "Red card cancelled"] if x]) if who else "Red card cancelled"
+
         else:
             # CANCELLED_GOAL 등 기타
             who = name_for(player_id)
@@ -408,19 +417,11 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Kotlin 과 동일한 정렬 규칙
     order_map = {"H1": 0, "H2": 1, "ET": 2, "PEN": 3}
 
-    # ✅ 같은 시간대(분/추가시간)가 겹칠 때 타입 우선순위
-    #    - 패널티 실축(PEN_MISSED)은 실제 골보다 먼저 보이도록
     type_order = {
-        "PEN_MISSED": -1,  # 실축이 항상 골보다 먼저
+        "PEN_MISSED": -1,
     }
 
     def _sort_time_key(e: Dict[str, Any]) -> tuple[int, int]:
-        """
-        minute_label 기준으로 시간 정렬되게 보정.
-        - H1: 45’+x 는 (45, x)
-        - H2: 90’+x 는 (90, x)
-        - 그 외: (minute, extra)
-        """
         m = int(e.get("minute") or 0)
         x = int(e.get("minute_extra") or 0)
         p = e.get("period")
@@ -433,17 +434,13 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     events.sort(
         key=lambda e: (
-            # 1) 전/후반/연장/승부차기 순서
             order_map.get(e["period"], 9),
-            # 2) 시간 정렬(표시 기준)
             *_sort_time_key(e),
-            # 3) 같은 시각이면 타입 우선순위 (기본 0, PEN_MISSED 는 -1)
             type_order.get(e["type"], 0),
-            # 4) 마지막으로 id_stable 로 안정 정렬
             e["id_stable"],
         )
     )
 
-
     return events
+
 

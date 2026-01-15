@@ -60,8 +60,11 @@ def load_current_match_state(match_id: int) -> MatchState | None:
     현재 match_id 경기의 상태를 DB에서 읽어서 MatchState로 반환한다.
 
     - 골 수는 matches.home_ft / matches.away_ft 사용
-    - 레드카드는 match_events 에서 type='Card' + detail 이 레드카드인 이벤트를
+    - 레드카드는 match_events(type='Card', detail IN (...)) 를
       홈/원정팀별로 COUNT 해서 계산
+
+    ✅ 개선(동작 동일):
+    - 홈/원정 레드카드 COUNT 서브쿼리 2개를 1회 JOIN+집계로 축소(폴링 부하 감소)
     """
     row = fetch_one(
         """
@@ -71,29 +74,36 @@ def load_current_match_state(match_id: int) -> MatchState | None:
             COALESCE(m.home_ft, 0) AS home_goals,
             COALESCE(m.away_ft, 0) AS away_goals,
             COALESCE(
-                (
-                    SELECT COUNT(*)
-                    FROM match_events e
-                    WHERE e.fixture_id = m.fixture_id
-                      AND e.type = 'Card'
-                      AND e.detail IN ('Red Card', 'Second Yellow Card')
-                      AND e.team_id = m.home_id
+                SUM(
+                    CASE
+                        WHEN e.type = 'Card'
+                         AND e.detail IN ('Red Card', 'Second Yellow Card')
+                         AND e.team_id = m.home_id
+                        THEN 1 ELSE 0
+                    END
                 ),
                 0
             ) AS home_red,
             COALESCE(
-                (
-                    SELECT COUNT(*)
-                    FROM match_events e
-                    WHERE e.fixture_id = m.fixture_id
-                      AND e.type = 'Card'
-                      AND e.detail IN ('Red Card', 'Second Yellow Card')
-                      AND e.team_id = m.away_id
+                SUM(
+                    CASE
+                        WHEN e.type = 'Card'
+                         AND e.detail IN ('Red Card', 'Second Yellow Card')
+                         AND e.team_id = m.away_id
+                        THEN 1 ELSE 0
+                    END
                 ),
                 0
             ) AS away_red
         FROM matches m
+        LEFT JOIN match_events e
+               ON e.fixture_id = m.fixture_id
+              AND e.type = 'Card'
+              AND e.detail IN ('Red Card', 'Second Yellow Card')
+              AND e.team_id IN (m.home_id, m.away_id)
         WHERE m.fixture_id = %s
+        GROUP BY
+            m.fixture_id, m.status, m.home_ft, m.away_ft
         """,
         (match_id,),
     )
@@ -110,6 +120,7 @@ def load_current_match_state(match_id: int) -> MatchState | None:
         home_red=int(row["home_red"] or 0),
         away_red=int(row["away_red"] or 0),
     )
+
 
 
 def load_last_state(match_id: int) -> MatchState | None:
@@ -389,13 +400,6 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
 
     # ==========================
     # 4) 연장 / 승부차기 / 최종 종료 흐름
-    #
-    # 의도한 플로우
-    #  - 2H → FT        → ft만
-    #  - 2H → ET        → et_start만
-    #  - ET → AET       → et_end → ft
-    #  - ET → PEN       → et_end → pen_start
-    #  - PEN → FT/AET   → pen_end → ft
     # ==========================
 
     # 4-1) 2H(또는 기타) → ET : 연장 시작
@@ -417,10 +421,12 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
         events.append(("pen_end", {}))
         events.append(("ft", {}))
 
-    # 4-5) 연장/승부차기 없이 바로 끝나는 경기:
-    #      위 케이스들에서 아무 이벤트도 안 쌓인 상태에서 FT/AET 가 되면 ft 1번만 보냄
-    if new_status in ("FT", "AET") and not events:
-        events.append(("ft", {}))
+    # ✅ (버그 수정) "FT/AET 전환"은 score/redcard 등 다른 이벤트가 있어도 누락되면 안 됨
+    ft_transition = (old_status not in ("FT", "AET")) and (new_status in ("FT", "AET"))
+    if ft_transition:
+        already_has_ft = any(ev[0] == "ft" for ev in events)
+        if not already_has_ft:
+            events.append(("ft", {}))
 
     # ==========================
     # 5) Goal (증가만 감지)
@@ -455,9 +461,14 @@ def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict
 
 
 
+
 def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
     """
     이벤트 종류에 따라 해당 옵션을 켜둔 구독자 토큰만 가져오기.
+
+    ✅ 개선:
+    - fcm_token NULL/빈값/공백 제거 (FCM 예외로 인한 무한 재전송/반복 스팸 방지에 핵심)
+    - DISTINCT 로 중복 토큰 제거
     """
     option_column = {
         # 킥오프 관련
@@ -481,21 +492,35 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
         "pen_end": "notify_ft",
     }[event_type]
 
-
-
     rows = fetch_all(
         f"""
-        SELECT u.fcm_token
+        SELECT DISTINCT u.fcm_token
         FROM match_notification_subscriptions s
         JOIN user_devices u ON u.device_id = s.device_id
         WHERE s.match_id = %s
           AND s.{option_column} = TRUE
           AND u.notifications_enabled = TRUE
+          AND u.fcm_token IS NOT NULL
+          AND BTRIM(u.fcm_token) <> ''
+          AND LOWER(BTRIM(u.fcm_token)) <> 'none'
         """,
         (match_id,),
     )
 
-    return [str(r["fcm_token"]) for r in rows]
+    # 방어적으로 strip + 빈값 제거
+    out: List[str] = []
+    for r in rows:
+        tok = r.get("fcm_token")
+        if tok is None:
+            continue
+        s = str(tok).strip()
+        if not s:
+            continue
+        if s.lower() == "none":
+            continue
+        out.append(s)
+    return out
+
 
 
 def build_message(
@@ -673,12 +698,14 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
     - status 가 아직 NS/TBD 일 때만
     - match_notification_state.kickoff_10m_sent 가 FALSE 일 때만
     - date_utc 기준으로 지금 시각과의 차이가 0~600초(10분) 사이면 발송
+
+    ✅ 개선(기존 동작 유지 + 버그 수정):
+    - 전송이 전부 실패했는데도 kickoff_10m_sent=TRUE 찍혀서 영구 누락되는 케이스 방지
+      -> "한 배치라도 성공"했을 때만 플래그 ON
     """
-    # 이미 시작한 경기면 10분 전 알림은 의미 없음
     if match.status not in ("", "NS", "TBD"):
         return
 
-    # 경기 킥오프 시간 가져오기
     row = fetch_one(
         """
         SELECT date_utc
@@ -691,19 +718,15 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
         return
 
     try:
-        # 예: "2025-12-11T17:45:00+00:00"
         kickoff_dt = datetime.fromisoformat(str(row["date_utc"]))
     except Exception:
         return
 
     now_utc = datetime.now(timezone.utc)
     diff_sec = (kickoff_dt - now_utc).total_seconds()
-
-    # 지금 시각 기준으로 0~600초(10분) 이내만 허용
     if not (0 <= diff_sec <= 600):
         return
 
-    # 이미 10분 전 알림을 보냈는지 확인
     state_row = fetch_one(
         """
         SELECT kickoff_10m_sent
@@ -713,13 +736,10 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
         (match.match_id,),
     )
     if not state_row:
-        # 아직 state row 없는 경우엔 스킵 (다음 루프에서 다시 확인)
         return
-
     if state_row["kickoff_10m_sent"]:
         return
 
-    # 구독 토큰 가져오기 (킥오프와 동일 옵션 사용)
     tokens = get_tokens_for_event(match.match_id, "kickoff_10m")
     if not tokens:
         return
@@ -730,18 +750,19 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
 
     title = "Kickoff in 10 minutes"
     body = f"{home_name} vs {away_name}"
-
     data: Dict[str, Any] = {
         "match_id": match.match_id,
         "event_type": "kickoff_10m",
     }
 
-    # 500개 단위로 잘라서 발송
     batch_size = 500
+    any_success = False
+
     for i in range(0, len(tokens), batch_size):
         batch = tokens[i : i + batch_size]
         try:
             resp = fcm.send_to_tokens(batch, title, body, data)
+            any_success = True
             log.info(
                 "Sent kickoff_10m notification for match %s to %s devices: %s",
                 match.match_id,
@@ -754,16 +775,17 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
                 match.match_id,
             )
 
-    # 플래그 ON
-    execute(
-        """
-        UPDATE match_notification_state
-        SET kickoff_10m_sent = TRUE,
-            updated_at = NOW()
-        WHERE match_id = %s
-        """,
-        (match.match_id,),
-    )
+    if any_success:
+        execute(
+            """
+            UPDATE match_notification_state
+            SET kickoff_10m_sent = TRUE,
+                updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (match.match_id,),
+        )
+
 
 
 def process_match(fcm: FCMClient, match_id: int) -> None:
@@ -822,7 +844,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         # 첫 루프는 알림(일반 이벤트) 없이 종료 (과거 이벤트 폭탄 방지)
         return
 
-
     # ✅ goal disallowed가 새로 들어온 poll이고, raw 스코어가 감소한 경우에만 감소 허용
     allow_goal_decrease = False
     try:
@@ -880,13 +901,11 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
         allow_goal_decrease = raw_decreased and (has_new_dis or has_any_disallowed)
 
-
     except Exception:
         log.exception("Failed to compute allow_goal_decrease for match %s", match_id)
 
     # ✅ 단조 상태 강제(필요 시 골 감소 허용) — 여기 1번만!
     current = apply_monotonic_state(last, current_raw, allow_goal_decrease=allow_goal_decrease)
-
 
     # 🔹 킥오프 10분 전 알림 시도 (status 가 NS/TBD 인 경우에만 내부에서 처리)
     try:
@@ -896,7 +915,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
     events = diff_events(last, current)
 
-
     # 팀/리그 이름 라벨을 한 번만 로딩해서 여러 이벤트에 사용
     labels = load_match_labels(match_id)
 
@@ -904,6 +922,11 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     # ✅ VAR: Goal Disallowed 처리
     #  - match_notification_state.last_goal_disallowed_event_id 기준으로
     #    새로 들어온 Var 이벤트만 알림
+    #
+    # ✅ 개선(스팸 방지):
+    #  - 토큰 문제/FCM 예외 등으로 전송 실패가 나더라도
+    #    동일 event_id 를 10초마다 무한 재전송하지 않도록
+    #    "시도한 이벤트는 포인터를 진전"시킨다.
     # ==========================
     try:
         st = fetch_one(
@@ -914,7 +937,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             """,
             (match_id,),
         )
-        # state row가 아직 없으면(첫 루프) 과거 이벤트를 쏘지 않기 위해 스킵
         if st:
             last_dis_id = int(st["last_goal_disallowed_event_id"] or 0)
             new_dis = load_new_goal_disallowed_events(match_id, last_dis_id)
@@ -961,31 +983,30 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     }
 
                     tokens = get_tokens_for_event(match_id, "goal_disallowed")
+
+                    # ✅ (중요) 보낼 대상이 없거나/있거나 상관없이,
+                    # "이 event_id 는 처리했다"는 포인터는 일단 올린다.
+                    # - 그래야 구독 토큰 문제/FCM 예외로 무한 스팸 재전송이 안 터짐
+                    execute(
+                        """
+                        UPDATE match_notification_state
+                        SET last_goal_disallowed_event_id = %s,
+                            updated_at = NOW()
+                        WHERE match_id = %s
+                        """,
+                        (ev_id, match_id),
+                    )
+                    last_dis_id = ev_id
+
                     if not tokens:
-                        # 보낼 대상이 없으면 "처리 포인터"는 올려서
-                        # 이후 구독자가 생겼을 때 과거 VAR 이벤트를 재전송하지 않도록 한다.
-                        execute(
-                            """
-                            UPDATE match_notification_state
-                            SET last_goal_disallowed_event_id = %s,
-                                updated_at = NOW()
-                            WHERE match_id = %s
-                            """,
-                            (ev_id, match_id),
-                        )
-                        last_dis_id = ev_id
                         continue
 
-
                     # 메시지 구성 (VAR는 "최신 실제 스코어"를 보여줘야 함)
-                    # - VAR 이벤트가 먼저 들어오고, 스코어 정정(home_ft/away_ft)이 다음 폴링/약간 뒤에 반영되는 케이스가 있음
-                    # - 그래서 알림 직전에 matches 스코어를 짧게 재조회/재시도해서 최신값으로 본문을 만든다.
                     latest_raw = current_raw
                     try:
                         for _ in range(3):
                             rr = load_current_match_state(match_id)
                             if rr:
-                                # 스코어가 바뀌었거나(정정), 상태가 바뀌었으면 최신값 채택
                                 if (rr.home_goals != latest_raw.home_goals) or (rr.away_goals != latest_raw.away_goals) or (rr.status != latest_raw.status):
                                     latest_raw = rr
                                     break
@@ -1001,9 +1022,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     }
                     data.update(extra_payload)
 
-
                     batch_size = 500
-                    send_ok = True
                     for i in range(0, len(tokens), batch_size):
                         batch = tokens[i : i + batch_size]
                         try:
@@ -1015,145 +1034,34 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                                 resp,
                             )
                         except Exception:
-                            send_ok = False
+                            # ✅ 포인터는 이미 올려놨으므로, 여기서 break 해도 다음 루프 무한 스팸은 안 남
                             log.exception(
                                 "Failed to send goal_disallowed notification for match %s (event_id=%s)",
                                 match_id,
                                 ev_id,
                             )
                             break
-
-
-                    # ✅ 전송이 예외 없이 끝난 경우에만 last id 갱신 (누락 방지)
-                    if send_ok:
-                        execute(
-                            """
-                            UPDATE match_notification_state
-                            SET last_goal_disallowed_event_id = %s,
-                                updated_at = NOW()
-                            WHERE match_id = %s
-                            """,
-                            (ev_id, match_id),
-                        )
-                        last_dis_id = ev_id
-                    else:
-                        # 실패 시 다음 루프에서 재시도
-                        break
     except Exception:
         log.exception("Error while processing goal_disallowed for match %s", match_id)
 
     if not events:
-        # 변화 없음 → 상태만 저장
         save_state(current)
         return
 
+    # --- 단계 이벤트 중복/누락 방지: DB 플래그 컬럼 매핑 ---
+    flag_column_by_event: Dict[str, str] = {
+        "kickoff": "kickoff_sent",
+        "ht": "halftime_sent",
+        "2h_start": "secondhalf_sent",
+        "ft": "fulltime_sent",
+        "et_start": "extra_time_start_sent",
+        "et_end": "extra_time_end_sent",
+        "pen_start": "penalties_start_sent",
+        "pen_end": "penalties_end_sent",
+    }
+
     for event_type, extra in events:
-        # extra(튜플에서 온 dict-like)를 방어적으로 복사
         extra = dict(extra)
-
-
-        # --- 이벤트 중복 방지를 위한 플래그 체크 로직 ---
-        state_row = fetch_one(
-            """
-            SELECT
-                kickoff_sent,
-                kickoff_10m_sent,
-                halftime_sent,
-                secondhalf_sent,
-                fulltime_sent,
-                extra_time_start_sent,
-                extra_time_halftime_sent,
-                extra_time_secondhalf_sent,
-                extra_time_end_sent,
-                penalties_start_sent,
-                penalties_end_sent
-            FROM match_notification_state
-            WHERE match_id = %s
-            """,
-            (match_id,),
-        )
-
-
-        # match_notification_state 에 row 가 없을 일은 거의 없지만,
-        # 방어적으로 기본값 dict 하나 만들어둔다.
-        if not state_row:
-            state_row = {
-                "kickoff_sent": False,
-                "kickoff_10m_sent": False,
-                "halftime_sent": False,
-                "secondhalf_sent": False,
-                "fulltime_sent": False,
-                "extra_time_start_sent": False,
-                "extra_time_halftime_sent": False,
-                "extra_time_secondhalf_sent": False,
-                "extra_time_end_sent": False,
-                "penalties_start_sent": False,
-                "penalties_end_sent": False,
-            }
-
-        flag_updates: List[str] = []
-
-        # Kickoff
-        if event_type == "kickoff":
-            if state_row["kickoff_sent"]:
-                # 이미 킥오프 알림 보냈으면 이번 이벤트는 skip
-                continue
-            flag_updates.append("kickoff_sent = TRUE")
-
-        # Half-time (HT)
-        if event_type == "ht":
-            if state_row["halftime_sent"]:
-                continue
-            flag_updates.append("halftime_sent = TRUE")
-
-        # Second half (2H)
-        if event_type == "2h_start":
-            if state_row["secondhalf_sent"]:
-                continue
-            flag_updates.append("secondhalf_sent = TRUE")
-
-        # Full-time (FT)
-        if event_type == "ft":
-            if state_row["fulltime_sent"]:
-                continue
-            flag_updates.append("fulltime_sent = TRUE")
-
-        # Extra time start
-        if event_type == "et_start":
-            if state_row["extra_time_start_sent"]:
-                continue
-            flag_updates.append("extra_time_start_sent = TRUE")
-
-        # Extra time end
-        if event_type == "et_end":
-            if state_row["extra_time_end_sent"]:
-                continue
-            flag_updates.append("extra_time_end_sent = TRUE")
-
-        # Penalties start
-        if event_type == "pen_start":
-            if state_row["penalties_start_sent"]:
-                continue
-            flag_updates.append("penalties_start_sent = TRUE")
-
-        # Penalties end
-        if event_type == "pen_end":
-            if state_row["penalties_end_sent"]:
-                continue
-            flag_updates.append("penalties_end_sent = TRUE")
-
-        # 플래그 DB 적용 (row 가 있을 때만 실제로 업데이트가 일어남)
-        if flag_updates:
-            execute(
-                f"""
-                UPDATE match_notification_state
-                SET {", ".join(flag_updates)}
-                WHERE match_id = %s
-                """,
-                (match_id,),
-            )
-
- 
 
         # score 이벤트라면, 마지막 득점 시간(분+추가시간)을 extra 에 추가
         if event_type == "score":
@@ -1161,14 +1069,10 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             if goal_time:
                 minute = goal_time.get("minute", 0)
                 extra_min = goal_time.get("extra", 0) or 0
-
                 if extra_min:
-                    # 예: 45+2'
                     goal_minute_str = f"{minute}+{extra_min}'"
                 else:
-                    # 예: 67'
                     goal_minute_str = f"{minute}'"
-
                 extra["goal_minute_str"] = goal_minute_str
 
         # redcard 이벤트라면, 마지막 레드카드 시간(분+추가시간)을 extra 에 추가
@@ -1177,19 +1081,35 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             if red_time:
                 minute = red_time.get("minute", 0)
                 extra_min = red_time.get("extra", 0) or 0
-
                 if extra_min:
-                    # 예: 45+2'
                     red_minute_str = f"{minute}+{extra_min}'"
                 else:
-                    # 예: 78'
                     red_minute_str = f"{minute}'"
-
                 extra["red_minute_str"] = red_minute_str
 
+        # --- (중요) 단계 이벤트는 플래그로 중복 방지 ---
+        flag_col = flag_column_by_event.get(event_type)
+        flag_was_set = False
+        if flag_col:
+            # 기존 동작 유지: "한 번 보냈으면 다시 안 보냄"을 DB 플래그로 보장
+            # ✅ 개선: 전송 예외가 나면 플래그를 다시 FALSE로 되돌려서 영구 누락을 방지한다.
+            got = fetch_one(
+                f"""
+                UPDATE match_notification_state
+                SET {flag_col} = TRUE
+                WHERE match_id = %s
+                  AND {flag_col} = FALSE
+                RETURNING 1 AS ok
+                """,
+                (match_id,),
+            )
+            if not got:
+                continue
+            flag_was_set = True
 
         tokens = get_tokens_for_event(match_id, event_type)
         if not tokens:
+            # 대상이 없으면: 단계 이벤트는 "중복 방지"가 더 중요 → 플래그 유지(기존 성격 유지)
             continue
 
         title, body = build_message(event_type, current, extra, labels)
@@ -1199,8 +1119,8 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         }
         data.update(extra)
 
-        # 너무 많이 쏘지 않도록 500개 단위로 잘라서 발송
         batch_size = 500
+        send_failed = False
         for i in range(0, len(tokens), batch_size):
             batch = tokens[i : i + batch_size]
             try:
@@ -1213,14 +1133,30 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     resp,
                 )
             except Exception:
+                send_failed = True
                 log.exception(
                     "Failed to send %s notification for match %s",
                     event_type,
                     match_id,
                 )
+                break
 
-    # 모든 이벤트 처리 후 상태를 최신으로 업데이트
+        # ✅ 전송 실패 시: 단계 이벤트 플래그를 되돌려 다음 루프에 재시도 가능하게(영구 누락 방지)
+        if send_failed and flag_was_set and flag_col:
+            try:
+                execute(
+                    f"""
+                    UPDATE match_notification_state
+                    SET {flag_col} = FALSE
+                    WHERE match_id = %s
+                    """,
+                    (match_id,),
+                )
+            except Exception:
+                log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
+
     save_state(current)
+
 
 
 def run_once(fcm: FCMClient | None = None) -> None:
@@ -1271,7 +1207,8 @@ if __name__ == "__main__":
         try:
             seconds = int(interval)
         except ValueError:
-            seconds = 5  # 잘못된 값이면 기본 10초
+            seconds = 10  # 잘못된 값이면 기본 10초
         run_forever(seconds)
     else:
         run_once()
+
