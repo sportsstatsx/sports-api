@@ -385,14 +385,71 @@ def _pick_leagues() -> List[int]:
         raise RuntimeError("HOCKEY_BACKFILL_LEAGUES is empty. ex) 57,58")
     return leagues
 
+def _resolve_backfill_season_by_league(leagues: List[int]) -> Dict[int, int]:
+    """
+    백필용 season 결정.
 
-def _api_fetch_games(date_yyyy_mm_dd: str, league_id: int) -> List[Dict[str, Any]]:
-    # API-sports hockey: /games?date=YYYY-MM-DD&league=ID
-    payload = _get("/games", {"date": date_yyyy_mm_dd, "league": int(league_id)})
+    우선순위:
+    1) ENV HOCKEY_BACKFILL_SEASON 이 있으면 모든 league에 동일 적용 (가장 안정/권장)
+    2) 없으면 DB(hockey_games)에서 league별 MAX(season)으로 추정
+    3) 그래도 없으면 에러 → ENV로 지정 권장
+    """
+    out: Dict[int, int] = {}
+
+    # (1) ENV 강제
+    forced = (os.getenv("HOCKEY_BACKFILL_SEASON") or "").strip()
+    if forced:
+        try:
+            ss = int(forced)
+            for lid in leagues:
+                out[int(lid)] = ss
+            return out
+        except Exception:
+            raise RuntimeError(f"HOCKEY_BACKFILL_SEASON is invalid int: {forced}")
+
+    # (2) DB에서 league별 MAX(season)
+    try:
+        rows = hockey_fetch_all(
+            """
+            SELECT league_id, MAX(season) AS season
+            FROM hockey_games
+            WHERE league_id = ANY(%s)
+            GROUP BY league_id
+            """,
+            (leagues,),
+        )
+        for r in rows or []:
+            lid = r.get("league_id")
+            ss = r.get("season")
+            if lid is None or ss is None:
+                continue
+            out[int(lid)] = int(ss)
+    except Exception as e:
+        log.warning("resolve backfill season(DB max) failed: %s", e)
+
+    missing = [int(x) for x in leagues if int(x) not in out]
+    if missing:
+        raise RuntimeError(
+            "Backfill season unresolved for leagues=%s. "
+            "Set ENV HOCKEY_BACKFILL_SEASON=2025 (recommended)."
+            % missing
+        )
+
+    return out
+
+
+
+def _api_fetch_games(date_yyyy_mm_dd: str, league_id: int, season: int) -> List[Dict[str, Any]]:
+    # ✅ API-sports hockey: /games?date=YYYY-MM-DD&league=ID&season=YYYY
+    payload = _get(
+        "/games",
+        {"date": date_yyyy_mm_dd, "league": int(league_id), "season": int(season)},
+    )
     resp = payload.get("response") if isinstance(payload, dict) else None
     if not isinstance(resp, list):
         return []
     return [x for x in resp if isinstance(x, dict)]
+
 
 
 def _api_fetch_events(game_id: int) -> List[Dict[str, Any]]:
@@ -416,15 +473,26 @@ def run_backfill() -> None:
 
     leagues = _pick_leagues()
 
+    # ✅ 핵심: backfill에서 /games는 season 없으면 0개가 나오는 리그가 많음
+    season_by_league = _resolve_backfill_season_by_league(leagues)
+
     sleep_sec = _float_env("HOCKEY_BACKFILL_SLEEP_SEC", 0.35)
     only_finished = _int_env("HOCKEY_BACKFILL_ONLY_FINISHED", 1) == 1
 
     meta_on = _int_env("HOCKEY_BACKFILL_META", 0) == 1
     standings_on = _int_env("HOCKEY_BACKFILL_STANDINGS", 0) == 1
 
+    # 로그에 season도 같이 찍어서 다음에 0개 삽질 방지
     log.info(
-        "🏒 hockey backfill start: dates=%s..%s leagues=%s only_finished=%s sleep=%.2fs meta=%s standings=%s",
-        start_d.isoformat(), end_d.isoformat(), leagues, only_finished, sleep_sec, meta_on, standings_on
+        "🏒 hockey backfill start: dates=%s..%s leagues=%s seasons=%s only_finished=%s sleep=%.2fs meta=%s standings=%s",
+        start_d.isoformat(),
+        end_d.isoformat(),
+        leagues,
+        {lid: season_by_league.get(int(lid)) for lid in leagues},
+        only_finished,
+        sleep_sec,
+        meta_on,
+        standings_on,
     )
 
     # 이벤트 유니크키 보장
@@ -462,26 +530,30 @@ def run_backfill() -> None:
         day_str = d.isoformat()
 
         for lid in leagues:
+            season = int(season_by_league.get(int(lid)) or 0)
+            if season <= 0:
+                # 여기 오면 시즌결정 실패인데, 위에서 보통 raise 되므로 보험
+                log.warning("skip league(no season): date=%s league=%s", day_str, lid)
+                continue
+
             try:
-                games = _api_fetch_games(day_str, lid)
+                games = _api_fetch_games(day_str, int(lid), season)
             except Exception as e:
-                log.warning("fetch games failed: date=%s league=%s err=%s", day_str, lid, e)
+                log.warning("fetch games failed: date=%s league=%s season=%s err=%s", day_str, lid, season, e)
                 continue
 
             if not games:
                 continue
 
             for item in games:
-                league_obj = item.get("league") if isinstance(item.get("league"), dict) else {}
-                season = _safe_int(league_obj.get("season")) or 0
-
                 gid = None
                 try:
+                    # fallback season도 우리가 쓴 season으로 고정
                     gid = upsert_game(item, int(lid), int(season))
                     if gid is not None:
                         total_games += 1
                 except Exception as e:
-                    log.warning("upsert_game failed: date=%s league=%s err=%s", day_str, lid, e)
+                    log.warning("upsert_game failed: date=%s league=%s season=%s err=%s", day_str, lid, season, e)
 
                 # events는 "종료 경기만" 기본
                 if gid is None:
@@ -490,7 +562,6 @@ def run_backfill() -> None:
                     continue
 
                 if only_finished:
-                    # DB에 박힌 status/game_date 기준으로 종료 판정
                     row = hockey_fetch_one("SELECT status, game_date FROM hockey_games WHERE id=%s", (gid,))
                     db_status = (row.get("status") or "") if row else ""
                     db_date = row.get("game_date") if row else None
@@ -505,7 +576,7 @@ def run_backfill() -> None:
                         upsert_events(gid, ev_list)
                         total_events += len(ev_list)
                 except Exception as e:
-                    log.warning("events backfill failed: game=%s date=%s league=%s err=%s", gid, day_str, lid, e)
+                    log.warning("events backfill failed: game=%s date=%s league=%s season=%s err=%s", gid, day_str, lid, season, e)
 
                 if sleep_sec > 0:
                     time.sleep(float(sleep_sec))
@@ -513,6 +584,7 @@ def run_backfill() -> None:
         log.info("day done: date=%s cumulative_games=%s cumulative_events=%s", day_str, total_games, total_events)
 
     log.info("✅ hockey backfill done: days=%s games_upserted=%s events_upserted=%s", total_days, total_games, total_events)
+
 
 
 def main() -> None:
