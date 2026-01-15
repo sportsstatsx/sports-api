@@ -540,8 +540,30 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     - 중복 id는 DO NOTHING(기존)
     - 추가 개선(스키마 변경 없음):
       * 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
+      * signature 안정화:
+        - 변동성이 큰 comments는 signature에서 제외
+        - ev_type/detail은 normalize(대소문/공백/구두점 차이로 중복 판정 실패 방지)
       * fixture 종료 시 run_once()에서 cache prune (FINISHED/OTHER)
     """
+
+    def _norm(s: Optional[str]) -> str:
+        """
+        signature용 텍스트 정규화:
+        - lower
+        - strip
+        - 공백류 collapse
+        - 구두점/특수문자 일부 제거(가벼운 normalize)
+        """
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        # 공백 정리
+        x = " ".join(x.split())
+        # 흔한 구두점 제거(너무 세게는 안 지움)
+        for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
+            x = x.replace(ch, "")
+        return x
+
     # fixture 단위 signature cache: {fixture_id: {sig_tuple: last_seen_ts}}
     if not hasattr(upsert_match_events, "_sig_cache"):
         upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
@@ -585,7 +607,9 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         extra = safe_int(tm.get("extra"))
 
         # --- signature dedupe (id가 바뀌어도 동일 이벤트면 스킵) ---
-        sig = (elapsed, extra, ev_type, detail, t_id, p_id, a_id, comments)
+        # comments는 변동성이 커서 제외하고,
+        # ev_type/detail은 normalize로 흔들림 최소화
+        sig = (elapsed, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
             # 10분 내 동일 signature는 중복으로 간주
@@ -642,6 +666,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 player_in_name,
             ),
         )
+
 
 
 
@@ -731,26 +756,46 @@ def calc_score_from_events(
 ) -> Tuple[int, int]:
     """
     - type == "Goal" 만 카운트
-    - detail에 "Cancelled" / "Missed" 포함이면 제외 (취소골 / 실축 PK)
-    - detail에 "Own Goal" 포함이면 팀을 반대로 가산
+    - '골로 인정되지 않는' 케이스는 제외:
+      * 취소/무효: Cancelled, Disallowed, No Goal, Offside, VAR, Foul 등
+      * 실축 PK: Missed Penalty / miss+pen
+    - Own Goal은 반대팀 득점으로 처리
     """
     h = 0
     a = 0
+
+    # 리그/시즌마다 표현이 달라서, "골 무효"류 키워드를 넓게 제외
+    # (너무 공격적으로 빼지 않도록, 'Goal' 이벤트인데도 골이 아닌 케이스 중심)
+    invalid_markers = (
+        "cancel",        # cancelled
+        "disallow",      # disallowed
+        "no goal",       # no goal
+        "var",           # var
+        "offside",       # offside
+        "foul",          # foul
+        "annul",         # annulled(드물지만)
+        "null",          # nullified(드물지만)
+    )
+
     for ev in events or []:
         ev_type = (ev.get("type") or "")
         if str(ev_type).lower() != "goal":
             continue
 
         detail = str(ev.get("detail") or "")
-        dlow = detail.lower()
+        dlow = detail.lower().strip()
 
-        # 취소골/실축PK 제외
-        if "cancel" in dlow:
-            continue
-        if "miss" in dlow and "pen" in dlow:
-            continue
-        # 일부 데이터는 "Missed Penalty"가 detail로만 들어오기도 함
+        # 취소/무효 골 제외 (표현 다양성 대응)
+        if any(m in dlow for m in invalid_markers):
+            # 단, "own goal" 자체는 유효한 득점이므로 여기서 제외하지 않도록 예외 처리
+            # (own goal은 아래에서 반대팀 득점으로 처리)
+            if "own goal" not in dlow:
+                continue
+
+        # 실축PK 제외
         if "missed penalty" in dlow:
+            continue
+        if ("miss" in dlow) and ("pen" in dlow):
             continue
 
         team = ev.get("team") or {}
@@ -777,21 +822,23 @@ def calc_score_from_events(
     return h, a
 
 
+
 def update_live_score_if_needed(fixture_id: int, status_group: str, home_goals: int, away_goals: int) -> None:
     """
     live 중에만 안전하게 덮어쓰기.
-    추가 개선:
+    - status_group 인자는 이미 run_once()에서 판단한 값이므로,
+      DB의 status_group='INPLAY' 조건을 중복으로 걸지 않음(타이밍 이슈로 UPDATE 스킵 방지).
     - 값이 바뀔 때만 UPDATE 해서 불필요한 DB write를 줄임
     """
     if status_group != "INPLAY":
         return
+
     execute(
         """
         UPDATE matches
         SET home_ft = %s,
             away_ft = %s
         WHERE fixture_id = %s
-          AND status_group = 'INPLAY'
           AND (
               matches.home_ft IS DISTINCT FROM %s OR
               matches.away_ft IS DISTINCT FROM %s
@@ -799,6 +846,7 @@ def update_live_score_if_needed(fixture_id: int, status_group: str, home_goals: 
         """,
         (home_goals, away_goals, fixture_id, home_goals, away_goals),
     )
+
 
 
 
