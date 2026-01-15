@@ -625,6 +625,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     추가:
     - 벤치/스태프 Card 이벤트(라인업에 없는 player_id)는 수집(INSERT) 차단
     - 라인업 캐시가 없는 경우는 오탐 방지 위해 차단하지 않음
+
+    ✅ 변경:
+    - 일부 리그/경기에서 events 항목에 id가 없을 수 있음.
+      이 경우 이벤트 내용을 기반으로 안정적인 synthetic id(음수)를 생성하여 저장한다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -655,6 +659,49 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         return p_id not in ids
 
+    def _synthetic_event_id(
+        fixture_id_: int,
+        minute_: int,
+        extra_: Optional[int],
+        t_id_: Optional[int],
+        p_id_: Optional[int],
+        a_id_: Optional[int],
+        ev_type_: Optional[str],
+        detail_: Optional[str],
+        player_name_: Optional[str],
+        assist_name_: Optional[str],
+        comments_: Optional[str],
+    ) -> int:
+        """
+        안정적인 synthetic id 생성(음수):
+        - 동일 이벤트는 재호출/재시작에도 같은 id가 되도록 정규화 문자열을 해시한다.
+        - bigint PK 충돌 방지 위해 음수로 만든다.
+        """
+        import hashlib
+
+        key = "|".join(
+            [
+                str(fixture_id_),
+                str(minute_),
+                str(extra_ or 0),
+                str(t_id_ or 0),
+                str(p_id_ or 0),
+                str(a_id_ or 0),
+                _norm(ev_type_),
+                _norm(detail_),
+                _norm(player_name_),
+                _norm(assist_name_),
+                _norm(comments_),
+            ]
+        )
+
+        digest = hashlib.sha1(key.encode("utf-8")).digest()
+        # 8바이트 -> 63bit 양수 범위로 제한 후 음수로
+        h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+        if h64 == 0:
+            h64 = 1
+        return -h64
+
     # fixture 단위 signature cache: {fixture_id: {sig_tuple: last_seen_ts}}
     if not hasattr(upsert_match_events, "_sig_cache"):
         upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
@@ -677,10 +724,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 del seen[k]
 
     for ev in events or []:
-        ev_id = safe_int(ev.get("id"))
-        if ev_id is None:
-            continue
-
         team = ev.get("team") or {}
         player = ev.get("player") or {}
         assist = ev.get("assist") or {}
@@ -691,6 +734,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
+        comments = safe_text(ev.get("comments"))
 
         # ---- 벤치/스태프 Card 차단 ----
         if _is_bench_staff_card(t_id, p_id, ev_type):
@@ -703,6 +747,23 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         # minute NOT NULL → 없으면 스킵(스키마 위반 방지)
         if minute is None:
             continue
+
+        # ✅ id가 없으면 synthetic id 생성
+        ev_id = safe_int(ev.get("id"))
+        if ev_id is None:
+            ev_id = _synthetic_event_id(
+                fixture_id_=fixture_id,
+                minute_=minute,
+                extra_=extra,
+                t_id_=t_id,
+                p_id_=p_id,
+                a_id_=a_id,
+                ev_type_=ev_type,
+                detail_=detail,
+                player_name_=safe_text(player.get("name")),
+                assist_name_=safe_text(assist.get("name")),
+                comments_=comments,
+            )
 
         # signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
         sig = (minute, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
@@ -751,6 +812,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 player_in_name,
             ),
         )
+
 
 
 
