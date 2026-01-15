@@ -629,6 +629,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     ✅ 변경:
     - 일부 리그/경기에서 events 항목에 id가 없을 수 있음 → synthetic id(음수) 생성
     - ✅ 추가: 현재 API 응답에 더 이상 없는 "synthetic Goal"은 삭제하여 유령 골 방지
+    - ✅ 추가: 현재 API 응답에 동일 Card가 "player_id 확정" 상태로 존재하면,
+             기존에 남아있는 synthetic Card(id<0) 중복(특히 player_id NULL)을 삭제
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -716,6 +718,14 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(유령 골 정리용)
     current_goal_ids: List[int] = []
 
+    # ✅ 이번 fetch에서 "player_id 확정된 Card" 시그니처 모음(중복 카드 정리용)
+    #   (minute, extra0, team_id, detail_norm, player_id)
+    current_cards_min: List[int] = []
+    current_cards_extra: List[int] = []
+    current_cards_team: List[int] = []
+    current_cards_detail: List[str] = []
+    current_cards_player: List[int] = []
+
     for ev in events or []:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
@@ -757,12 +767,24 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 comments_=comments,
             )
 
+        ev_type_norm = _norm(ev_type)
+
         # ✅ Goal이면 현재 Goal id 목록에 추가(정리용)
-        if _norm(ev_type) == "goal":
+        if ev_type_norm == "goal":
             current_goal_ids.append(ev_id)
 
+        # ✅ Card인데 player_id가 확정된 경우만 "정리 기준"으로 저장
+        # (player_id가 NULL인 Card는 정리 기준으로 삼지 않음 → 오탐/깜빡임 방지)
+        if ev_type_norm == "card":
+            if t_id is not None and detail is not None and p_id is not None:
+                current_cards_min.append(int(minute))
+                current_cards_extra.append(int(extra or 0))
+                current_cards_team.append(int(t_id))
+                current_cards_detail.append(_norm(detail))
+                current_cards_player.append(int(p_id))
+
         # signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
-        sig = (minute, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
+        sig = (minute, extra, ev_type_norm, _norm(detail), t_id, p_id, a_id)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
             continue
@@ -822,6 +844,54 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             """,
             (fixture_id, current_goal_ids),
         )
+
+    # ✅ 중복 카드 정리(보수적):
+    # - "현재 API 응답"에 같은 카드가 player_id까지 확정된 상태로 존재하면,
+    #   DB에 남아있는 synthetic 카드(id<0) 중 같은 시그니처(분/extra/팀/디테일)면서
+    #   player_id가 같거나(NULL로 저장된 과거 synthetic 포함)인 row를 삭제한다.
+    #
+    # 조건을 player_id 확정된 카드에만 걸어서,
+    # 초반에 카드가 player_id 없이 흔들리는 구간에서 오탐 삭제(깜빡임) 방지.
+    if current_cards_min:
+        execute(
+            r"""
+            DELETE FROM match_events me
+            USING (
+              SELECT *
+              FROM unnest(
+                %s::int[],
+                %s::int[],
+                %s::int[],
+                %s::text[],
+                %s::int[]
+              ) AS t(minute, extra0, team_id, detail_norm, player_id)
+            ) cur
+            WHERE me.fixture_id = %s
+              AND me.id < 0
+              AND LOWER(me.type) = 'card'
+              AND me.minute = cur.minute
+              AND COALESCE(me.extra, 0) = cur.extra0
+              AND me.team_id = cur.team_id
+              AND translate(
+                    lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
+                    '"`.,:;!?()[]{}|',
+                    ''
+                  ) = cur.detail_norm
+              AND (
+                    me.player_id = cur.player_id
+                 OR me.player_id IS NULL
+              )
+            """,
+            (
+                current_cards_min,
+                current_cards_extra,
+                current_cards_team,
+                current_cards_detail,
+                current_cards_player,
+                fixture_id,
+            ),
+        )
+
 
 
 
