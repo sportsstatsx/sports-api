@@ -337,10 +337,8 @@ def upsert_match_row_from_fixture(
     fixtures 응답 1개(item)를 matches 테이블로 업서트.
     반환: (fixture_id, home_id, away_id, status_group, date_utc)
 
-    matches 스키마(현재 dev):
-    - home_name/away_name 없음
-    - timezone/timestamp 없음 -> fixture_timezone / fixture_timestamp 사용
-    - status NOT NULL -> status_short(없으면 'UNK')로 채움
+    ✅ 현재 dev에서 실제로 없는 컬럼(home_name 등) 때문에 워커가 계속 죽는 상황을 막기 위해,
+    ✅ matches 업서트는 "핵심 컬럼"만 사용한다. (스키마 변경 없음)
     """
     fx = fixture_obj.get("fixture") or {}
     teams = fixture_obj.get("teams") or {}
@@ -353,15 +351,10 @@ def upsert_match_row_from_fixture(
         raise ValueError("fixture_id missing")
 
     date_utc = safe_text(fx.get("date")) or ""
-    referee = safe_text(fx.get("referee"))
-    fixture_timezone = safe_text(fx.get("timezone"))
-    fixture_timestamp = safe_int(fx.get("timestamp"))
 
     st = fx.get("status") or {}
     status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
-    status_long = safe_text(st.get("long"))
     status_elapsed = safe_int(st.get("elapsed"))
-    status_extra = safe_int(st.get("extra"))
 
     status_group = map_status_group(status_short)
     status = status_short.strip() or "UNK"  # matches.status NOT NULL
@@ -378,13 +371,7 @@ def upsert_match_row_from_fixture(
     home_ht = safe_int(ht.get("home"))
     away_ht = safe_int(ht.get("away"))
 
-    venue = fx.get("venue") or {}
-    venue_id = safe_int(venue.get("id"))
-    venue_name = safe_text(venue.get("name"))
-    venue_city = safe_text(venue.get("city"))
-
-    league_round = safe_text(league.get("round"))
-
+    # ✅ matches: dev 스키마에서 확실히 있는 "핵심 컬럼"만 업서트
     execute(
         """
         INSERT INTO matches (
@@ -400,70 +387,37 @@ def upsert_match_row_from_fixture(
             away_ft,
             elapsed,
             home_ht,
-            away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round
+            away_ht
         )
         VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
         )
         ON CONFLICT (fixture_id) DO UPDATE SET
-            league_id         = EXCLUDED.league_id,
-            season            = EXCLUDED.season,
-            date_utc          = EXCLUDED.date_utc,
-            status            = EXCLUDED.status,
-            status_group      = EXCLUDED.status_group,
-            home_id           = EXCLUDED.home_id,
-            away_id           = EXCLUDED.away_id,
-            home_ft           = EXCLUDED.home_ft,
-            away_ft           = EXCLUDED.away_ft,
-            elapsed           = EXCLUDED.elapsed,
-            home_ht           = EXCLUDED.home_ht,
-            away_ht           = EXCLUDED.away_ht,
-            referee           = EXCLUDED.referee,
-            fixture_timezone  = EXCLUDED.fixture_timezone,
-            fixture_timestamp = EXCLUDED.fixture_timestamp,
-            status_short      = EXCLUDED.status_short,
-            status_long       = EXCLUDED.status_long,
-            status_elapsed    = EXCLUDED.status_elapsed,
-            status_extra      = EXCLUDED.status_extra,
-            venue_id          = EXCLUDED.venue_id,
-            venue_name        = EXCLUDED.venue_name,
-            venue_city        = EXCLUDED.venue_city,
-            league_round      = EXCLUDED.league_round
+            league_id    = EXCLUDED.league_id,
+            season       = EXCLUDED.season,
+            date_utc     = EXCLUDED.date_utc,
+            status       = EXCLUDED.status,
+            status_group = EXCLUDED.status_group,
+            home_id      = EXCLUDED.home_id,
+            away_id      = EXCLUDED.away_id,
+            home_ft         = EXCLUDED.home_ft,
+            away_ft      = EXCLUDED.away_ft,
+            elapsed      = EXCLUDED.elapsed,
+            home_ht      = EXCLUDED.home_ht,
+            away_ht      = EXCLUDED.away_ht
         WHERE
-            matches.league_id         IS DISTINCT FROM EXCLUDED.league_id OR
-            matches.season            IS DISTINCT FROM EXCLUDED.season OR
-            matches.date_utc          IS DISTINCT FROM EXCLUDED.date_utc OR
-            matches.status            IS DISTINCT FROM EXCLUDED.status OR
-            matches.status_group      IS DISTINCT FROM EXCLUDED.status_group OR
-            matches.home_id           IS DISTINCT FROM EXCLUDED.home_id OR
-            matches.away_id           IS DISTINCT FROM EXCLUDED.away_id OR
-            matches.home_ft           IS DISTINCT FROM EXCLUDED.home_ft OR
-            matches.away_ft           IS DISTINCT FROM EXCLUDED.away_ft OR
-            matches.elapsed           IS DISTINCT FROM EXCLUDED.elapsed OR
-            matches.home_ht           IS DISTINCT FROM EXCLUDED.home_ht OR
-            matches.away_ht           IS DISTINCT FROM EXCLUDED.away_ht OR
-            matches.referee           IS DISTINCT FROM EXCLUDED.referee OR
-            matches.fixture_timezone  IS DISTINCT FROM EXCLUDED.fixture_timezone OR
-            matches.fixture_timestamp IS DISTINCT FROM EXCLUDED.fixture_timestamp OR
-            matches.status_short      IS DISTINCT FROM EXCLUDED.status_short OR
-            matches.status_long       IS DISTINCT FROM EXCLUDED.status_long OR
-            matches.status_elapsed    IS DISTINCT FROM EXCLUDED.status_elapsed OR
-            matches.status_extra      IS DISTINCT FROM EXCLUDED.status_extra OR
-            matches.venue_id          IS DISTINCT FROM EXCLUDED.venue_id OR
-            matches.venue_name        IS DISTINCT FROM EXCLUDED.venue_name OR
-            matches.venue_city        IS DISTINCT FROM EXCLUDED.venue_city OR
-            matches.league_round      IS DISTINCT FROM EXCLUDED.league_round
+            matches.league_id    IS DISTINCT FROM EXCLUDED.league_id OR
+            matches.season       IS DISTINCT FROM EXCLUDED.season OR
+            matches.date_utc     IS DISTINCT FROM EXCLUDED.date_utc OR
+            matches.status       IS DISTINCT FROM EXCLUDED.status OR
+            matches.status_group IS DISTINCT FROM EXCLUDED.status_group OR
+            matches.home_id      IS DISTINCT FROM EXCLUDED.home_id OR
+            matches.away_id      IS DISTINCT FROM EXCLUDED.away_id OR
+            matches.home_ft      IS DISTINCT FROM EXCLUDED.home_ft OR
+            matches.away_ft      IS DISTINCT FROM EXCLUDED.away_ft OR
+            matches.elapsed      IS DISTINCT FROM EXCLUDED.elapsed OR
+            matches.home_ht      IS DISTINCT FROM EXCLUDED.home_ht OR
+            matches.away_ht      IS DISTINCT FROM EXCLUDED.away_ht
         """,
         (
             fixture_id,
@@ -479,21 +433,11 @@ def upsert_match_row_from_fixture(
             status_elapsed,  # elapsed 컬럼
             home_ht,
             away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round,
         ),
     )
 
     return fixture_id, home_id, away_id, status_group, date_utc
+
 
 
 
