@@ -339,9 +339,12 @@ def upsert_match_row_from_fixture(
     dev 스키마(matches) 정확 매핑 업서트.
     반환: (fixture_id, home_id, away_id, status_group, date_utc)
 
-    추가(스키마 변경 없음):
-    - upsert_match_events()가 Own Goal team_id를 '득점 인정팀'으로 뒤집을 수 있도록
-      런타임 캐시(LINEUPS_STATE)에 home_id/away_id를 저장한다.
+    matches 컬럼(확인됨):
+      fixture_id(PK), league_id, season, date_utc, status, status_group,
+      home_id, away_id, home_ft, away_ft, elapsed, home_ht, away_ht,
+      referee, fixture_timezone, fixture_timestamp,
+      status_short, status_long, status_elapsed, status_extra,
+      venue_id, venue_name, venue_city, league_round
     """
 
     # ---- 필수 입력(스키마 NOT NULL) ----
@@ -519,16 +522,7 @@ def upsert_match_row_from_fixture(
         ),
     )
 
-    # ✅ 런타임 캐시 저장(스키마 변경 없음): Own Goal team_id flip에 사용
-    try:
-        st_cache = _ensure_lineups_state(fixture_id)
-        st_cache["home_id"] = int(home_id)
-        st_cache["away_id"] = int(away_id)
-    except Exception:
-        pass
-
     return fixture_id, home_id, away_id, status_group, date_utc
-
 
 
 
@@ -641,12 +635,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     3) ✅ signature dedupe 안정화:
        - extra는 None/0 흔들려서 extra0=coalesce로 통일
        - 카드 dedupe에서 assist_id 변동으로 중복 생성되는 문제 방지 위해 sig에서 a_id 제외
-    4) ✅ Own Goal team_id 정규화(중요):
-       - API-Sports /fixtures/events 에서 Own Goal은 team_id가 '자책한 팀(source team)'으로 내려옴
-       - 앱 타임라인은 match_events.team_id를 득점팀으로 해석하므로,
-         DB에는 '득점 인정팀(benefit team)'으로 뒤집어서 저장한다.
-       - home/away는 upsert_match_row_from_fixture()에서 LINEUPS_STATE에 저장한 값을 사용한다.
-    5) 기존 유지:
+    4) 기존 유지:
        - events.id 없으면 synthetic id(음수)
        - synthetic Goal 유령 정리
     """
@@ -795,6 +784,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         detail = safe_text(ev.get("detail"))
         comments = safe_text(ev.get("comments"))
 
+        # ---- 벤치/스태프 Card 차단 ----
+        if _is_bench_staff_card(t_id, p_id, ev_type):
+            continue
+
         tm = ev.get("time") or {}
         minute = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
@@ -805,10 +798,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type_norm = _norm(ev_type)
         detail_norm = _norm(detail)
-
-        # ---- 벤치/스태프 Card 차단 ----
-        if _is_bench_staff_card(t_id, p_id, ev_type):
-            continue
 
         # ✅ Second Yellow가 있으면 같은 키의 Red Card는 스킵(레드 2장 표시 방지)
         if ev_type_norm == "card":
@@ -853,25 +842,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 current_cards_detail.append(detail_norm)
                 current_cards_player.append(int(p_id))
 
-        # ✅ Own Goal team_id 정규화(여기가 핵심)
-        # - API: team_id = 자책한 팀(source team)
-        # - DB(match_events): team_id = 득점 인정팀(benefit team)으로 저장
-        effective_team_id = t_id
-        if ev_type_norm == "goal" and ("own goal" in detail_norm) and (t_id is not None):
-            st_cache = LINEUPS_STATE.get(fixture_id) or {}
-            hid = safe_int(st_cache.get("home_id"))
-            aid = safe_int(st_cache.get("away_id"))
-            if hid is not None and aid is not None:
-                if t_id == hid:
-                    effective_team_id = aid
-                elif t_id == aid:
-                    effective_team_id = hid
-
         # ✅ signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
         # - extra는 extra0로 통일(None/0 흔들림 방지)
         # - a_id는 카드에서 흔들려 중복을 만들 수 있어 제외
-        # - team_id는 DB에 저장될 team_id 기준으로 dedupe 해야 앱 표시가 안정적
-        sig = (int(minute), int(extra0), ev_type_norm, detail_norm, effective_team_id, p_id)
+        sig = (int(minute), int(extra0), ev_type_norm, detail_norm, t_id, p_id)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
             continue
@@ -904,7 +878,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             (
                 ev_id,
                 fixture_id,
-                effective_team_id,  # ✅ OG면 반대팀으로 저장
+                t_id,
                 p_id,
                 ev_type,
                 detail,
@@ -1033,7 +1007,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 fixture_id,
             ),
         )
-
 
 
 
@@ -1214,12 +1187,11 @@ def calc_score_from_events(
     ✅ Var 이벤트 중
        - Goal Disallowed / Goal cancelled / No Goal  => 직전 Goal 1개를 취소 처리
        - Goal confirmed                              => 유지(아무것도 안 함)
+    ✅ Own Goal은 반대팀 득점으로 처리 (기존 유지)
     ✅ Missed Penalty(실축)는 득점에서 제외 (기존 유지)
 
-    🔥 중요(너의 최신 파이프라인 기준):
-    - upsert_match_events()에서 Own Goal(team_id)을 이미 "득점 인정팀(benefit team)" 기준으로 정규화해 저장한다.
-    - 따라서 여기서는 Own Goal을 반대팀으로 뒤집으면 "2중 flip"이 발생해서 스코어가 반대로 깨진다.
-    - 결론: calc_score_from_events()에서는 OG를 뒤집지 않고, team_id 그대로 득점팀으로 계산한다.
+    주의:
+    - API-Sports 데이터에서 '취소/무효'는 Goal.detail이 아니라 Var.type으로 내려오는 케이스가 많음
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -1233,29 +1205,40 @@ def calc_score_from_events(
         tm = ev.get("time") or {}
         el = safe_int(tm.get("elapsed"))
         ex = safe_int(tm.get("extra"))
+        # elapsed/extra가 None이면 뒤로 밀리게 안전값
         elv = el if el is not None else 10**9
         exv = ex if ex is not None else 0
         return (elv, exv, fallback_idx)
 
+    # Goal 이벤트에서 '무효/취소'로 볼만한 텍스트(Goal.detail에 실제로 붙는 경우만 처리)
     invalid_markers = (
-        "cancel",
-        "disallow",
-        "no goal",
-        "offside",
-        "foul",
-        "annul",
-        "null",
+        "cancel",        # cancelled
+        "disallow",      # disallowed
+        "no goal",       # no goal
+        "offside",       # offside
+        "foul",          # foul
+        "annul",         # annulled(드물지만)
+        "null",          # nullified(드물지만)
     )
 
+    # 득점 후보 리스트(Var로 취소되면 cancelled=True로 마킹)
+    # 각 항목: {
+    #   "scoring_team_id": int,   # 실제 득점 팀(OG면 반대팀)
+    #   "source_team_id": int,    # 이벤트 team_id (OG면 원래 자책팀)
+    #   "elapsed": Optional[int],
+    #   "extra": Optional[int],
+    #   "cancelled": bool,
+    # }
     goals: List[Dict[str, Any]] = []
 
+    # 시간순 정렬 + 동시간대는 원본 순서(인덱스) 유지
     indexed = list(enumerate(events or []))
     indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
     evs = [ev for _, ev in indexed]
 
+
     def _add_goal(ev: Dict[str, Any]) -> None:
         detail = _norm(ev.get("detail"))
-
         # 실축PK 제외
         if "missed penalty" in detail:
             return
@@ -1275,9 +1258,15 @@ def calc_score_from_events(
         elapsed = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
 
-        # ✅ 핵심: OG 포함 모든 Goal은 team_id 그대로 득점팀으로 처리
-        # (OG flip은 upsert_match_events()에서 이미 정규화된 파이프라인)
+        is_og = "own goal" in detail
+
+        # 득점 팀 결정
         scoring_team_id = team_id
+        if is_og:
+            if team_id == home_id:
+                scoring_team_id = away_id
+            elif team_id == away_id:
+                scoring_team_id = home_id
 
         goals.append(
             {
@@ -1290,6 +1279,11 @@ def calc_score_from_events(
         )
 
     def _apply_var(ev: Dict[str, Any]) -> None:
+        """
+        Var 이벤트로 직전 Goal을 취소/유지 처리
+        - Goal Disallowed / Goal cancelled / No Goal => 직전 Goal 1개 취소
+        - Goal confirmed => 유지(아무것도 안 함)
+        """
         detail = _norm(ev.get("detail"))
         if not detail:
             return
@@ -1297,16 +1291,25 @@ def calc_score_from_events(
         is_disallow = ("goal disallowed" in detail) or ("goal cancelled" in detail) or ("no goal" in detail)
         is_confirm = "goal confirmed" in detail
 
+        # 골 관련 var이 아니면 무시(패널티/레드카드 등)
         if not (is_disallow or is_confirm):
             return
+
+        # confirmed면 굳이 할 작업 없음(이미 골로 카운트되었을 것)
         if is_confirm:
             return
 
+        # 여기서부터는 disallow/cancel/no goal => 직전 Goal 1개 취소
         team = ev.get("team") or {}
-        var_team_id = safe_int(team.get("id"))
+        var_team_id = safe_int(team.get("id"))  # 있는 경우가 많음(네 출력에서도 team 정보가 보통 있음)
         tm = ev.get("time") or {}
         var_elapsed = safe_int(tm.get("elapsed"))
+        var_extra = safe_int(tm.get("extra"))
 
+        # 보수적 취소 규칙:
+        # - var_elapsed 가 없으면 취소하지 않음(오탐 방지)
+        # - 시간 매칭은 단계적으로: 같은 elapsed -> ±1 -> (마지막 수단) ±2
+        # - 팀 정보(var_team_id)가 있으면 일치하는 goal을 우선 취소
         if var_elapsed is None:
             return
 
@@ -1319,37 +1322,45 @@ def calc_score_from_events(
 
                 g_el = g.get("elapsed")
                 if g_el is None:
-                    continue
+                    continue  # 시간 없는 goal은 보수적으로 제외
 
                 if abs(g_el - var_elapsed) > max_delta:
                     continue
 
+                # 팀 매칭 우선
                 if var_team_id is not None:
                     if (g.get("source_team_id") == var_team_id) or (g.get("scoring_team_id") == var_team_id):
                         return i
+                    # 팀 불일치는 후보로만(동일 delta 내에서 fallback)
                     if best is None:
                         best = i
                 else:
+                    # 팀 정보가 없으면 시간만으로 가장 최근 것을 선택
                     return i
 
             return best
 
-        best_idx = _pick_cancel_idx(0)
+        best_idx = _pick_cancel_idx(0)   # 같은 elapsed
         if best_idx is None:
-            best_idx = _pick_cancel_idx(1)
+            best_idx = _pick_cancel_idx(1)   # ±1
         if best_idx is None:
-            best_idx = _pick_cancel_idx(2)
+            best_idx = _pick_cancel_idx(2)   # 마지막 수단 ±2
 
         if best_idx is not None:
             goals[best_idx]["cancelled"] = True
 
+
+    # 메인 루프
     for ev in evs:
         ev_type = _norm(ev.get("type"))
         if ev_type == "goal":
             _add_goal(ev)
         elif ev_type == "var":
             _apply_var(ev)
+        else:
+            continue
 
+    # 최종 합계
     h = 0
     a = 0
     for g in goals:
@@ -1362,7 +1373,6 @@ def calc_score_from_events(
             a += 1
 
     return h, a
-
 
 
 
