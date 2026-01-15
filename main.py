@@ -1408,11 +1408,12 @@ def admin_board_list_posts():
 
     where_sql = " AND ".join(where)
 
+    # ✅ 선택A: country 컬럼은 admin에서도 끊는다(언어권만 관리)
     sql = f"""
     SELECT
       id, sport, fixture_key, category, title, summary, status,
       pin_level, pin_until, publish_at, created_at, updated_at,
-      target_langs, target_countries, block_countries
+      target_langs
     FROM board_posts
     WHERE {where_sql}
     ORDER BY updated_at DESC
@@ -1420,14 +1421,29 @@ def admin_board_list_posts():
     """
 
     try:
-        with _board_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+        conn = _board_connect()
+        try:
+            if psycopg is not None:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, params)
+                        rows = cur.fetchall()
+            else:
+                with conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute(sql, params)
+                        rows = cur.fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
         return jsonify({"ok": True, "rows": rows})
     except Exception as e:
-        log.exception("[admin board list] failed: %s", e)
+        print(f"[admin board list] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.get(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
@@ -1440,16 +1456,31 @@ def admin_board_get_post(post_id: int):
     LIMIT 1
     """
     try:
-        with _board_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, {"id": post_id})
-                row = cur.fetchone()
+        conn = _board_connect()
+        try:
+            if psycopg is not None:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, {"id": post_id})
+                        row = cur.fetchone()
+            else:
+                with conn:
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        cur.execute(sql, {"id": post_id})
+                        row = cur.fetchone()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
         if not row:
             return jsonify({"ok": False, "error": "not_found"}), 404
         return jsonify({"ok": True, "row": row})
     except Exception as e:
-        log.exception("[admin board get] failed: %s", e)
+        print(f"[admin board get] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.post(f"/{ADMIN_PATH}/api/board/posts")
@@ -1460,10 +1491,6 @@ def admin_board_create_post():
     def arr_lower(xs):
         xs = xs or []
         return [str(x).strip().lower() for x in xs if str(x).strip()]
-
-    def arr_upper(xs):
-        xs = xs or []
-        return [str(x).strip().upper() for x in xs if str(x).strip()]
 
     row = {
         "sport": (body.get("sport") or None),
@@ -1478,9 +1505,9 @@ def admin_board_create_post():
         "filters_json": body.get("filters_json") or {},
         "snapshot_json": body.get("snapshot_json") or {},
         "publish_at": body.get("publish_at") or None,
+
+        # ✅ 선택A: 언어권만
         "target_langs": arr_lower(body.get("target_langs")),
-        "target_countries": arr_upper(body.get("target_countries")),
-        "block_countries": arr_upper(body.get("block_countries")),
     }
 
     if not row["title"]:
@@ -1492,11 +1519,11 @@ def admin_board_create_post():
     INSERT INTO board_posts
       (sport, fixture_key, category, title, summary, content_md, status,
        pin_level, pin_until, filters_json, snapshot_json, publish_at,
-       target_langs, target_countries, block_countries)
+       target_langs)
     VALUES
       (%(sport)s, %(fixture_key)s, %(category)s, %(title)s, %(summary)s, %(content_md)s, %(status)s,
        %(pin_level)s, %(pin_until)s, %(filters_json)s::jsonb, %(snapshot_json)s::jsonb, %(publish_at)s,
-       %(target_langs)s, %(target_countries)s, %(block_countries)s)
+       %(target_langs)s)
     RETURNING id
     """
 
@@ -1530,6 +1557,7 @@ def admin_board_create_post():
 
 
 
+
 @app.put(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
 @require_admin
 def admin_board_update_post(post_id: int):
@@ -1538,10 +1566,6 @@ def admin_board_update_post(post_id: int):
     def arr_lower(xs):
         xs = xs or []
         return [str(x).strip().lower() for x in xs if str(x).strip()]
-
-    def arr_upper(xs):
-        xs = xs or []
-        return [str(x).strip().upper() for x in xs if str(x).strip()]
 
     row = {
         "id": post_id,
@@ -1557,9 +1581,9 @@ def admin_board_update_post(post_id: int):
         "filters_json": body.get("filters_json") or {},
         "snapshot_json": body.get("snapshot_json") or {},
         "publish_at": body.get("publish_at") or None,
+
+        # ✅ 선택A: 언어권만
         "target_langs": arr_lower(body.get("target_langs")),
-        "target_countries": arr_upper(body.get("target_countries")),
-        "block_countries": arr_upper(body.get("block_countries")),
     }
 
     if not row["title"]:
@@ -1582,35 +1606,59 @@ def admin_board_update_post(post_id: int):
       filters_json=%(filters_json)s::jsonb,
       snapshot_json=%(snapshot_json)s::jsonb,
       publish_at=%(publish_at)s,
-      target_langs=%(target_langs)s,
-      target_countries=%(target_countries)s,
-      block_countries=%(block_countries)s
+      target_langs=%(target_langs)s
     WHERE id=%(id)s
     """
 
     try:
-        with _board_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, row)
-            conn.commit()
+        conn = _board_connect()
+        try:
+            if psycopg is not None:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, row)
+            else:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql, row)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
         return jsonify({"ok": True})
     except Exception as e:
-        log.exception("[admin board update] failed: %s", e)
+        print(f"[admin board update] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.delete(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
 @require_admin
 def admin_board_delete_post(post_id: int):
     try:
-        with _board_connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM board_posts WHERE id=%(id)s", {"id": post_id})
-            conn.commit()
+        conn = _board_connect()
+        try:
+            if psycopg is not None:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM board_posts WHERE id=%(id)s", {"id": post_id})
+            else:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM board_posts WHERE id=%(id)s", {"id": post_id})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
         return jsonify({"ok": True})
     except Exception as e:
-        log.exception("[admin board delete] failed: %s", e)
+        print(f"[admin board delete] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 # ─────────────────────────────────────────
@@ -1618,6 +1666,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
