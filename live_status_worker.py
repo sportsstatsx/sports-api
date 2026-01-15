@@ -551,7 +551,53 @@ def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any], fetc
 
 
 def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> None:
-    raw = json.dumps(events, ensure_ascii=False, separators=(",", ":"))
+    """
+    추가:
+    - 벤치/스태프 Card 이벤트는 raw에도 저장하지 않음(수집 차단)
+    - 라인업 캐시가 없는 경우(초반/미수집)는 오탐 방지 위해 필터 적용하지 않음
+    """
+
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        return x
+
+    def _is_bench_staff_card(ev: Dict[str, Any]) -> bool:
+        # Card가 아니면 대상 아님
+        ev_type = _norm(safe_text(ev.get("type")))
+        if ev_type != "card":
+            return False
+
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+
+        # player_id가 없으면 애매 -> 오탐 방지 위해 저장 유지
+        if p_id is None or t_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        # 라인업 정보가 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        # 라인업에 없는 player_id인 Card => 벤치/스태프 카드로 간주하여 차단
+        return p_id not in ids
+
+    filtered: List[Dict[str, Any]] = []
+    for ev in events or []:
+        if _is_bench_staff_card(ev):
+            continue
+        filtered.append(ev)
+
+    raw = json.dumps(filtered, ensure_ascii=False, separators=(",", ":"))
     execute(
         """
         INSERT INTO match_events_raw (fixture_id, data_json)
@@ -566,6 +612,7 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 
 
+
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
     match_events 스키마(현재 dev):
@@ -574,6 +621,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
     - 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
     - signature 안정화: ev_type/detail normalize(대소문/공백/구두점 차이 완화)
+
+    추가:
+    - 벤치/스태프 Card 이벤트(라인업에 없는 player_id)는 수집(INSERT) 차단
+    - 라인업 캐시가 없는 경우는 오탐 방지 위해 차단하지 않음
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -584,6 +635,25 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
             x = x.replace(ch, "")
         return x
+
+    def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
+        # Card가 아니면 대상 아님
+        if _norm(ev_type) != "card":
+            return False
+
+        # player/team id 없으면 애매 -> 오탐 방지 위해 저장 유지
+        if t_id is None or p_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        # 라인업 정보 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        return p_id not in ids
 
     # fixture 단위 signature cache: {fixture_id: {sig_tuple: last_seen_ts}}
     if not hasattr(upsert_match_events, "_sig_cache"):
@@ -621,6 +691,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
+
+        # ---- 벤치/스태프 Card 차단 ----
+        if _is_bench_staff_card(t_id, p_id, ev_type):
+            continue
 
         tm = ev.get("time") or {}
         minute = safe_int(tm.get("elapsed"))
@@ -684,6 +758,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
 
 
+
 def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -> None:
     """
     /fixtures/statistics response:
@@ -725,9 +800,32 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
     """
     match_lineups PK: (fixture_id, team_id)
     응답이 유의미하면 True 반환.
+
+    추가:
+    - 런타임 캐시에 (fixture_id, team_id)별 라인업 선수 id set 저장
+      -> 벤치/스태프 Card 이벤트 수집 차단에 사용
     """
     if not lineups_resp:
         return False
+
+    def _extract_player_ids(item: Dict[str, Any]) -> List[int]:
+        out: List[int] = []
+        for key in ("startXI", "substitutes"):
+            arr = item.get(key) or []
+            if not isinstance(arr, list):
+                continue
+            for row in arr:
+                if not isinstance(row, dict):
+                    continue
+                p = row.get("player") or {}
+                if not isinstance(p, dict):
+                    continue
+                pid = safe_int(p.get("id"))
+                if pid is None:
+                    continue
+                out.append(pid)
+        # 중복 제거(순서 무관 set로 쓸 거라 uniq만)
+        return list(set(out))
 
     ok_any = False
     updated_utc = iso_utc(updated_at)
@@ -753,7 +851,21 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
         )
         ok_any = True
 
+        # ---- 런타임 캐시 저장 ----
+        try:
+            st = _ensure_lineups_state(fixture_id)
+            pb = st.get("players_by_team")
+            if not isinstance(pb, dict):
+                pb = {}
+                st["players_by_team"] = pb
+            ids = _extract_player_ids(item)
+            pb[team_id] = set(ids)
+        except Exception:
+            # 캐시는 best-effort (DB 저장에는 영향 주지 않음)
+            pass
+
     return ok_any
+
 
 
 
