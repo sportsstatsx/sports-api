@@ -9,6 +9,35 @@ from flask import Flask, request, jsonify, Response, send_from_directory, redire
 from werkzeug.exceptions import HTTPException
 import pytz  # 타임존 계산용
 
+# ─────────────────────────────────────
+# Board DB (separate database)
+#  - Render env: BOARD_DATABASE_URL
+# ─────────────────────────────────────
+BOARD_DATABASE_URL = os.getenv("BOARD_DATABASE_URL", "").strip()
+
+try:
+    import psycopg  # psycopg v3
+    from psycopg.rows import dict_row as _psycopg_dict_row
+
+    def _board_connect():
+        if not BOARD_DATABASE_URL:
+            raise RuntimeError("BOARD_DATABASE_URL is not set")
+        return psycopg.connect(BOARD_DATABASE_URL, row_factory=_psycopg_dict_row)
+
+except Exception:
+    psycopg = None
+    _psycopg_dict_row = None
+
+    import psycopg2
+    import psycopg2.extras
+
+    def _board_connect():
+        if not BOARD_DATABASE_URL:
+            raise RuntimeError("BOARD_DATABASE_URL is not set")
+        conn = psycopg2.connect(BOARD_DATABASE_URL)
+        return conn
+
+
 from prometheus_client import (
     Counter,
     Histogram,
@@ -1142,6 +1171,416 @@ def list_fixtures():
     return jsonify({"ok": True, "rows": merged})
 
 
+# ─────────────────────────────────────
+# Board APIs (public)
+# ─────────────────────────────────────
+
+def _lang_base(lang: str) -> str:
+    s = (lang or "").strip()
+    if not s:
+        return ""
+    s = s.replace("_", "-")
+    return (s.split("-")[0] or "").lower().strip()
+
+def _country_up(country: str) -> str:
+    return (country or "").strip().upper()
+
+def _arr_nonempty(arr) -> bool:
+    return isinstance(arr, list) and len(arr) > 0
+
+def _parse_text_array_csv(v: str) -> List[str]:
+    # "KR, JP ,us" -> ["KR","JP","US"] (upper)
+    s = (v or "").strip()
+    if not s:
+        return []
+    out = []
+    for x in s.split(","):
+        t = x.strip()
+        if t:
+            out.append(t)
+    return out
+
+@app.get("/api/board/feed")
+def board_feed():
+    """
+    Public feed:
+      /api/board/feed?lang=ko-KR&country=KR&limit=20&offset=0&category=...&sport=...
+    """
+    lang = _lang_base(request.args.get("lang", ""))
+    country = _country_up(request.args.get("country", ""))
+
+    category = (request.args.get("category") or "").strip()
+    sport = (request.args.get("sport") or "").strip()
+    fixture_key = (request.args.get("fixture_key") or "").strip()
+
+    limit = int(request.args.get("limit", "20") or "20")
+    offset = int(request.args.get("offset", "0") or "0")
+    limit = max(1, min(limit, 50))
+    offset = max(0, offset)
+
+    # 안전한 기본값:
+    # - lang/country가 안 오면 "타겟 지정된 글"은 숨기고(=전세계 글만 노출)
+    # - block_countries는 country 없으면 평가 불가라서 그냥 통과
+    lang_missing = (lang == "")
+    country_missing = (country == "")
+
+    where = ["status='published'"]
+
+    # category/sport/fixture_key optional filters
+    if category:
+        where.append("category = %(category)s")
+    if sport:
+        where.append("sport = %(sport)s")
+    if fixture_key:
+        where.append("fixture_key = %(fixture_key)s")
+
+    # block countries
+    if not country_missing:
+        where.append("(array_length(block_countries, 1) IS NULL OR NOT (%(country)s = ANY(block_countries)))")
+
+    # target langs
+    if lang_missing:
+        where.append("(array_length(target_langs, 1) IS NULL)")
+    else:
+        where.append("""(
+            array_length(target_langs, 1) IS NULL
+            OR %(lang)s = ANY (SELECT LOWER(x) FROM unnest(target_langs) x)
+        )""")
+
+    # target countries
+    if country_missing:
+        where.append("(array_length(target_countries, 1) IS NULL)")
+    else:
+        where.append("""(
+            array_length(target_countries, 1) IS NULL
+            OR %(country)s = ANY(target_countries)
+        )""")
+
+    where_sql = " AND ".join(where)
+
+    # pin 만료되면 정렬에서만 pin_level=0 취급(글은 계속 노출)
+    sql = f"""
+    SELECT
+      id, sport, fixture_key, category, title, summary, status,
+      pin_level, pin_until, publish_at, created_at,
+      target_langs, target_countries, block_countries,
+      CASE
+        WHEN pin_level > 0 AND (pin_until IS NULL OR pin_until > NOW()) THEN pin_level
+        ELSE 0
+      END AS effective_pin
+    FROM board_posts
+    WHERE {where_sql}
+    ORDER BY effective_pin DESC, publish_at DESC NULLS LAST, created_at DESC
+    LIMIT %(limit)s OFFSET %(offset)s
+    """
+
+    params = {
+        "lang": lang,
+        "country": country,
+        "category": category,
+        "sport": sport,
+        "fixture_key": fixture_key,
+        "limit": limit,
+        "offset": offset,
+    }
+
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return jsonify({"ok": True, "rows": rows})
+    except Exception as e:
+        log.exception("[/api/board/feed] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/board/posts/<int:post_id>")
+def board_post_detail(post_id: int):
+    lang = _lang_base(request.args.get("lang", ""))
+    country = _country_up(request.args.get("country", ""))
+
+    # 디테일도 동일한 노출 룰 적용
+    lang_missing = (lang == "")
+    country_missing = (country == "")
+
+    where = ["status='published'", "id=%(id)s"]
+
+    if not country_missing:
+        where.append("(array_length(block_countries, 1) IS NULL OR NOT (%(country)s = ANY(block_countries)))")
+
+    if lang_missing:
+        where.append("(array_length(target_langs, 1) IS NULL)")
+    else:
+        where.append("""(
+            array_length(target_langs, 1) IS NULL
+            OR %(lang)s = ANY (SELECT LOWER(x) FROM unnest(target_langs) x)
+        )""")
+
+    if country_missing:
+        where.append("(array_length(target_countries, 1) IS NULL)")
+    else:
+        where.append("""(
+            array_length(target_countries, 1) IS NULL
+            OR %(country)s = ANY(target_countries)
+        )""")
+
+    where_sql = " AND ".join(where)
+
+    sql = f"""
+    SELECT
+      id, sport, fixture_key, category, title, summary, content_md, status,
+      pin_level, pin_until, filters_json, snapshot_json,
+      publish_at, created_at, updated_at,
+      target_langs, target_countries, block_countries
+    FROM board_posts
+    WHERE {where_sql}
+    LIMIT 1
+    """
+
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"id": post_id, "lang": lang, "country": country})
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        return jsonify({"ok": True, "row": row})
+    except Exception as e:
+        log.exception("[/api/board/posts/<id>] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────
+# Board APIs (admin)
+# ─────────────────────────────────────
+
+@app.get(f"/{ADMIN_PATH}/api/board/posts")
+@require_admin
+def admin_board_list_posts():
+    status = (request.args.get("status") or "").strip()  # draft/published/hidden
+    q = (request.args.get("q") or "").strip()
+    category = (request.args.get("category") or "").strip()
+    sport = (request.args.get("sport") or "").strip()
+    fixture_key = (request.args.get("fixture_key") or "").strip()
+
+    limit = int(request.args.get("limit", "50") or "50")
+    offset = int(request.args.get("offset", "0") or "0")
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    where = ["1=1"]
+    params = {"limit": limit, "offset": offset}
+
+    if status:
+        where.append("status=%(status)s")
+        params["status"] = status
+    if category:
+        where.append("category=%(category)s")
+        params["category"] = category
+    if sport:
+        where.append("sport=%(sport)s")
+        params["sport"] = sport
+    if fixture_key:
+        where.append("fixture_key=%(fixture_key)s")
+        params["fixture_key"] = fixture_key
+    if q:
+        where.append("(title ILIKE %(q)s OR summary ILIKE %(q)s)")
+        params["q"] = f"%{q}%"
+
+    where_sql = " AND ".join(where)
+
+    sql = f"""
+    SELECT
+      id, sport, fixture_key, category, title, summary, status,
+      pin_level, pin_until, publish_at, created_at, updated_at,
+      target_langs, target_countries, block_countries
+    FROM board_posts
+    WHERE {where_sql}
+    ORDER BY updated_at DESC
+    LIMIT %(limit)s OFFSET %(offset)s
+    """
+
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return jsonify({"ok": True, "rows": rows})
+    except Exception as e:
+        log.exception("[admin board list] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
+@require_admin
+def admin_board_get_post(post_id: int):
+    sql = """
+    SELECT *
+    FROM board_posts
+    WHERE id=%(id)s
+    LIMIT 1
+    """
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {"id": post_id})
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "not_found"}), 404
+        return jsonify({"ok": True, "row": row})
+    except Exception as e:
+        log.exception("[admin board get] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post(f"/{ADMIN_PATH}/api/board/posts")
+@require_admin
+def admin_board_create_post():
+    body = request.get_json(force=True) or {}
+
+    def arr_lower(xs):
+        xs = xs or []
+        return [str(x).strip().lower() for x in xs if str(x).strip()]
+
+    def arr_upper(xs):
+        xs = xs or []
+        return [str(x).strip().upper() for x in xs if str(x).strip()]
+
+    row = {
+        "sport": (body.get("sport") or None),
+        "fixture_key": (body.get("fixture_key") or None),
+        "category": (body.get("category") or "analysis"),
+        "title": (body.get("title") or "").strip(),
+        "summary": (body.get("summary") or "").strip(),
+        "content_md": (body.get("content_md") or "").strip(),
+        "status": (body.get("status") or "draft"),
+        "pin_level": int(body.get("pin_level") or 0),
+        "pin_until": body.get("pin_until") or None,
+        "filters_json": body.get("filters_json") or {},
+        "snapshot_json": body.get("snapshot_json") or {},
+        "publish_at": body.get("publish_at") or None,
+        "target_langs": arr_lower(body.get("target_langs")),
+        "target_countries": arr_upper(body.get("target_countries")),
+        "block_countries": arr_upper(body.get("block_countries")),
+    }
+
+    if not row["title"]:
+        return jsonify({"ok": False, "error": "title_required"}), 400
+    if not row["content_md"]:
+        return jsonify({"ok": False, "error": "content_required"}), 400
+
+    sql = """
+    INSERT INTO board_posts
+      (sport, fixture_key, category, title, summary, content_md, status,
+       pin_level, pin_until, filters_json, snapshot_json, publish_at,
+       target_langs, target_countries, block_countries)
+    VALUES
+      (%(sport)s, %(fixture_key)s, %(category)s, %(title)s, %(summary)s, %(content_md)s, %(status)s,
+       %(pin_level)s, %(pin_until)s, %(filters_json)s::jsonb, %(snapshot_json)s::jsonb, %(publish_at)s,
+       %(target_langs)s, %(target_countries)s, %(block_countries)s)
+    RETURNING id
+    """
+
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, row)
+                new_id = cur.fetchone()["id"] if isinstance(cur.fetchone, object) else None
+            conn.commit()
+        # psycopg2 fallback: fetchone handling
+        if new_id is None:
+            with _board_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT MAX(id) AS id FROM board_posts;")
+                    new_id = cur.fetchone()[0]
+        return jsonify({"ok": True, "id": new_id})
+    except Exception as e:
+        log.exception("[admin board create] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.put(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
+@require_admin
+def admin_board_update_post(post_id: int):
+    body = request.get_json(force=True) or {}
+
+    def arr_lower(xs):
+        xs = xs or []
+        return [str(x).strip().lower() for x in xs if str(x).strip()]
+
+    def arr_upper(xs):
+        xs = xs or []
+        return [str(x).strip().upper() for x in xs if str(x).strip()]
+
+    row = {
+        "id": post_id,
+        "sport": (body.get("sport") or None),
+        "fixture_key": (body.get("fixture_key") or None),
+        "category": (body.get("category") or "analysis"),
+        "title": (body.get("title") or "").strip(),
+        "summary": (body.get("summary") or "").strip(),
+        "content_md": (body.get("content_md") or "").strip(),
+        "status": (body.get("status") or "draft"),
+        "pin_level": int(body.get("pin_level") or 0),
+        "pin_until": body.get("pin_until") or None,
+        "filters_json": body.get("filters_json") or {},
+        "snapshot_json": body.get("snapshot_json") or {},
+        "publish_at": body.get("publish_at") or None,
+        "target_langs": arr_lower(body.get("target_langs")),
+        "target_countries": arr_upper(body.get("target_countries")),
+        "block_countries": arr_upper(body.get("block_countries")),
+    }
+
+    if not row["title"]:
+        return jsonify({"ok": False, "error": "title_required"}), 400
+    if not row["content_md"]:
+        return jsonify({"ok": False, "error": "content_required"}), 400
+
+    sql = """
+    UPDATE board_posts
+    SET
+      sport=%(sport)s,
+      fixture_key=%(fixture_key)s,
+      category=%(category)s,
+      title=%(title)s,
+      summary=%(summary)s,
+      content_md=%(content_md)s,
+      status=%(status)s,
+      pin_level=%(pin_level)s,
+      pin_until=%(pin_until)s,
+      filters_json=%(filters_json)s::jsonb,
+      snapshot_json=%(snapshot_json)s::jsonb,
+      publish_at=%(publish_at)s,
+      target_langs=%(target_langs)s,
+      target_countries=%(target_countries)s,
+      block_countries=%(block_countries)s
+    WHERE id=%(id)s
+    """
+
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, row)
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("[admin board update] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.delete(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
+@require_admin
+def admin_board_delete_post(post_id: int):
+    try:
+        with _board_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM board_posts WHERE id=%(id)s", {"id": post_id})
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        log.exception("[admin board delete] failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ─────────────────────────────────────────
@@ -1149,6 +1588,7 @@ def list_fixtures():
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
