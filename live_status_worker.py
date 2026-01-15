@@ -805,17 +805,11 @@ def calc_score_from_events(
     # }
     goals: List[Dict[str, Any]] = []
 
-    # 이벤트가 이미 시간순으로 오는 경우가 많지만, 안전하게 정렬(동시간대는 원본 순서 유지)
-    evs = list(events or [])
-    evs.sort(key=lambda ev_idx: _time_key(ev_idx[1], ev_idx[0]) if isinstance(ev_idx, tuple) else (0, 0, 0))  # 방어
-    # 위 sort가 꼬이지 않게 다시 안전 정렬(일반 케이스)
-    evs = sorted(evs, key=lambda ev: _time_key(ev, 0))
-
-    # ⚠️ 위에서 fallback_idx가 0으로 고정되므로, "완전 동일 시간"에서 순서 보존이 약해질 수 있음
-    # 그래서 실제 순서를 보존하려고 인덱스를 포함한 정렬을 다시 수행
+    # 시간순 정렬 + 동시간대는 원본 순서(인덱스) 유지
     indexed = list(enumerate(events or []))
     indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
     evs = [ev for _, ev in indexed]
+
 
     def _add_goal(ev: Dict[str, Any]) -> None:
         detail = _norm(ev.get("detail"))
@@ -886,44 +880,49 @@ def calc_score_from_events(
         var_elapsed = safe_int(tm.get("elapsed"))
         var_extra = safe_int(tm.get("extra"))
 
-        # 취소할 Goal 선택 규칙(휴리스틱):
-        # 1) 뒤에서부터(가장 최근) 아직 취소 안된 Goal
-        # 2) 시간이 너무 멀면 제외: 같은 elapsed 우선, 아니면 ±2분까지 허용
-        # 3) team_id가 있으면 source_team_id 또는 scoring_team_id가 일치하는 Goal 우선
-        best_idx: Optional[int] = None
+        # 보수적 취소 규칙:
+        # - var_elapsed 가 없으면 취소하지 않음(오탐 방지)
+        # - 시간 매칭은 단계적으로: 같은 elapsed -> ±1 -> (마지막 수단) ±2
+        # - 팀 정보(var_team_id)가 있으면 일치하는 goal을 우선 취소
+        if var_elapsed is None:
+            return
 
-        for i in range(len(goals) - 1, -1, -1):
-            g = goals[i]
-            if g.get("cancelled"):
-                continue
+        def _pick_cancel_idx(max_delta: int) -> Optional[int]:
+            best: Optional[int] = None
+            for i in range(len(goals) - 1, -1, -1):
+                g = goals[i]
+                if g.get("cancelled"):
+                    continue
 
-            g_el = g.get("elapsed")
-            # 시간 조건
-            time_ok = False
-            if var_elapsed is None or g_el is None:
-                time_ok = True  # 정보가 없으면 완화
-            else:
-                if g_el == var_elapsed:
-                    time_ok = True
-                elif abs(g_el - var_elapsed) <= 2:
-                    time_ok = True
-            if not time_ok:
-                continue
+                g_el = g.get("elapsed")
+                if g_el is None:
+                    continue  # 시간 없는 goal은 보수적으로 제외
 
-            # 팀 조건(가능하면 일치 우선)
-            if var_team_id is not None:
-                if (g.get("source_team_id") == var_team_id) or (g.get("scoring_team_id") == var_team_id):
-                    best_idx = i
-                    break
-                # 팀 불일치는 우선순위 낮지만, 후보로는 남겨둠
-                if best_idx is None:
-                    best_idx = i
-            else:
-                best_idx = i
-                break
+                if abs(g_el - var_elapsed) > max_delta:
+                    continue
+
+                # 팀 매칭 우선
+                if var_team_id is not None:
+                    if (g.get("source_team_id") == var_team_id) or (g.get("scoring_team_id") == var_team_id):
+                        return i
+                    # 팀 불일치는 후보로만(동일 delta 내에서 fallback)
+                    if best is None:
+                        best = i
+                else:
+                    # 팀 정보가 없으면 시간만으로 가장 최근 것을 선택
+                    return i
+
+            return best
+
+        best_idx = _pick_cancel_idx(0)   # 같은 elapsed
+        if best_idx is None:
+            best_idx = _pick_cancel_idx(1)   # ±1
+        if best_idx is None:
+            best_idx = _pick_cancel_idx(2)   # 마지막 수단 ±2
 
         if best_idx is not None:
             goals[best_idx]["cancelled"] = True
+
 
     # 메인 루프
     for ev in evs:
