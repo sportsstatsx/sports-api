@@ -72,6 +72,28 @@ def get_target_date() -> str:
         return sys.argv[1].strip()
     return now_utc().strftime("%Y-%m-%d")
 
+def get_target_dates() -> List[str]:
+    # 우선순위: ENV TARGET_DATE > CLI arg1 > 최근 N일(기본 7일)
+    env_date = (os.environ.get("TARGET_DATE") or "").strip()
+    if env_date:
+        return [env_date]
+    if len(sys.argv) >= 2 and sys.argv[1].strip():
+        return [sys.argv[1].strip()]
+
+    days = int((os.environ.get("BACKFILL_DAYS") or "7").strip())
+    if days <= 0:
+        days = 7
+
+    end = now_utc().date()
+    start = end - dt.timedelta(days=days - 1)
+    out: List[str] = []
+    cur = start
+    while cur <= end:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += dt.timedelta(days=1)
+    return out
+
+
 
 def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry: int = 4) -> Dict[str, Any]:
     url = f"{BASE_URL}{path}"
@@ -139,10 +161,55 @@ def _extract_fixture_basic(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 #  API fetchers
 # ─────────────────────────────────────
 
-def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any]]:
-    data = _safe_get("/fixtures", params={"league": league_id, "date": date_str})
+def fetch_league_seasons(league_id: int) -> List[Dict[str, Any]]:
+    data = _safe_get("/leagues", params={"id": league_id})
+    resp = data.get("response") or []
+    if not resp or not isinstance(resp, list) or not isinstance(resp[0], dict):
+        return []
+    seasons = (resp[0].get("seasons") or [])
+    return [s for s in seasons if isinstance(s, dict)]
+
+
+def pick_season_for_date(league_id: int, date_str: str) -> Optional[int]:
+    # date_str: "YYYY-MM-DD"
+    seasons = fetch_league_seasons(league_id)
+    if not seasons:
+        return None
+
+    # 1) start <= date <= end 범위 매칭 우선
+    for s in seasons:
+        start = s.get("start")
+        end = s.get("end")
+        year = s.get("year")
+        if start and end and year is not None and start <= date_str <= end:
+            try:
+                return int(year)
+            except Exception:
+                return None
+
+    # 2) 범위 매칭 실패 시 current=True 시즌으로 fallback
+    for s in seasons:
+        if s.get("current") is True and s.get("year") is not None:
+            try:
+                return int(s["year"])
+            except Exception:
+                return None
+
+    return None
+
+
+def fetch_fixtures_from_api(league_id: int, date_str: str, season: Optional[int] = None) -> List[Dict[str, Any]]:
+    if season is None:
+        season = pick_season_for_date(league_id, date_str)
+
+    params: Dict[str, Any] = {"league": league_id, "date": date_str}
+    if season is not None:
+        params["season"] = int(season)
+
+    data = _safe_get("/fixtures", params=params)
     rows = data.get("response", []) or []
     return [r for r in rows if isinstance(r, dict)]
+
 
 
 def fetch_fixture_by_id(fixture_id: int) -> Optional[Dict[str, Any]]:
@@ -471,11 +538,11 @@ def upsert_match_player_stats(fixture_id: int, players_stats: List[Dict[str, Any
 #  이미 백필된 경기인지 체크
 # ─────────────────────────────────────
 
-def is_fixture_already_backfilled(fixture_id: int) -> bool:
+def _has_any_row(table: str, fixture_id: int) -> bool:
     row = fetch_one(
-        """
+        f"""
         SELECT 1
-        FROM match_events
+        FROM {table}
         WHERE fixture_id = %s
         LIMIT 1
         """,
@@ -484,47 +551,72 @@ def is_fixture_already_backfilled(fixture_id: int) -> bool:
     return row is not None
 
 
+def has_match_events(fixture_id: int) -> bool:
+    return _has_any_row("match_events", fixture_id)
+
+
+def has_lineups(fixture_id: int) -> bool:
+    return _has_any_row("match_lineups", fixture_id)
+
+
+def has_team_stats(fixture_id: int) -> bool:
+    return _has_any_row("match_team_stats", fixture_id)
+
+
+def has_player_stats(fixture_id: int) -> bool:
+    return _has_any_row("match_player_stats", fixture_id)
+
+
+
 # ─────────────────────────────────────
 #  한 경기 상세 백필
 # ─────────────────────────────────────
 
-def backfill_postmatch_for_fixture(fixture_id: int) -> None:
-    # events
-    try:
-        events = fetch_events_from_api(fixture_id)
-    except Exception as e:
-        print(f"    ! fixture {fixture_id}: events 호출 에러: {e}", file=sys.stderr)
-        events = []
-    if events:
-        upsert_match_events(fixture_id, events)
-        upsert_match_events_raw(fixture_id, events)
+def backfill_postmatch_for_fixture(
+    fixture_id: int,
+    *,
+    do_events: bool,
+    do_lineups: bool,
+    do_team_stats: bool,
+    do_player_stats: bool,
+) -> None:
+    if do_events:
+        try:
+            events = fetch_events_from_api(fixture_id)
+        except Exception as e:
+            print(f"    ! fixture {fixture_id}: events 호출 에러: {e}", file=sys.stderr)
+            events = []
+        if events:
+            upsert_match_events(fixture_id, events)
+            upsert_match_events_raw(fixture_id, events)
 
-    # lineups
-    try:
-        lineups = fetch_lineups_from_api(fixture_id)
-    except Exception as e:
-        print(f"    ! fixture {fixture_id}: lineups 호출 에러: {e}", file=sys.stderr)
-        lineups = []
-    if lineups:
-        upsert_match_lineups(fixture_id, lineups)
+    if do_lineups:
+        try:
+            lineups = fetch_lineups_from_api(fixture_id)
+        except Exception as e:
+            print(f"    ! fixture {fixture_id}: lineups 호출 에러: {e}", file=sys.stderr)
+            lineups = []
+        if lineups:
+            upsert_match_lineups(fixture_id, lineups)
 
-    # team stats
-    try:
-        stats = fetch_team_stats_from_api(fixture_id)
-    except Exception as e:
-        print(f"    ! fixture {fixture_id}: statistics 호출 에러: {e}", file=sys.stderr)
-        stats = []
-    if stats:
-        upsert_match_team_stats(fixture_id, stats)
+    if do_team_stats:
+        try:
+            stats = fetch_team_stats_from_api(fixture_id)
+        except Exception as e:
+            print(f"    ! fixture {fixture_id}: statistics 호출 에러: {e}", file=sys.stderr)
+            stats = []
+        if stats:
+            upsert_match_team_stats(fixture_id, stats)
 
-    # player stats
-    try:
-        players_stats = fetch_player_stats_from_api(fixture_id)
-    except Exception as e:
-        print(f"    ! fixture {fixture_id}: players 호출 에러: {e}", file=sys.stderr)
-        players_stats = []
-    if players_stats:
-        upsert_match_player_stats(fixture_id, players_stats)
+    if do_player_stats:
+        try:
+            players_stats = fetch_player_stats_from_api(fixture_id)
+        except Exception as e:
+            print(f"    ! fixture {fixture_id}: players 호출 에러: {e}", file=sys.stderr)
+            players_stats = []
+        if players_stats:
+            upsert_match_player_stats(fixture_id, players_stats)
+
 
 
 # ─────────────────────────────────────
@@ -532,65 +624,84 @@ def backfill_postmatch_for_fixture(fixture_id: int) -> None:
 # ─────────────────────────────────────
 
 def main() -> None:
-    target_date = get_target_date()
+    target_dates = get_target_dates()
     live_leagues = parse_live_leagues(os.environ.get("LIVE_LEAGUES", ""))
 
     if not live_leagues:
         print("[postmatch_backfill] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
         return
 
+    force = (os.environ.get("FORCE_BACKFILL") or "").strip().lower() in ("1", "true", "yes", "y")
     today_str = now_utc().strftime("%Y-%m-%d")
-    print(f"[postmatch_backfill] date={target_date}, today={today_str}, leagues={live_leagues}")
+    print(f"[postmatch_backfill] dates={target_dates}, today={today_str}, leagues={live_leagues}, force={force}")
 
     total_new = 0
     total_skipped = 0
 
-    for lid in live_leagues:
-        try:
-            fixtures = fetch_fixtures_from_api(lid, target_date)
-            print(f"  - league {lid}: fixtures={len(fixtures)}")
+    for target_date in target_dates:
+        for lid in live_leagues:
+            try:
+                season_guess = pick_season_for_date(lid, target_date)
+                fixtures = fetch_fixtures_from_api(lid, target_date, season_guess)
+                print(f"  - date={target_date} league {lid}: season={season_guess} fixtures={len(fixtures)}")
 
-            for fx in fixtures:
-                basic = _extract_fixture_basic(fx)
-                if basic is None:
-                    continue
+                for fx in fixtures:
+                    basic = _extract_fixture_basic(fx)
+                    if basic is None:
+                        continue
+                    if basic.get("status_group") != "FINISHED":
+                        continue
 
-                if basic.get("status_group") != "FINISHED":
-                    continue
+                    fixture_id = basic["fixture_id"]
 
-                fixture_id = basic["fixture_id"]
+                    season = basic.get("season") or season_guess
+                    if season is None:
+                        continue
 
-                season = basic.get("season")
-                if season is None:
-                    # matches.season NOT NULL
-                    continue
+                    fx_full = fetch_fixture_by_id(fixture_id) or fx
 
-                # 날짜 기반 리스트 fx가 간혹 필드가 빈 경우가 있어 id로 한 번 더 보강(안전)
-                fx_full = fetch_fixture_by_id(fixture_id) or fx
+                    try:
+                        upsert_match_fixtures_raw(fixture_id, fx_full)
+                    except Exception as raw_e:
+                        print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
 
-                # /fixtures 원본 저장
-                try:
-                    upsert_match_fixtures_raw(fixture_id, fx_full)
-                except Exception as raw_e:
-                    print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+                    upsert_fixture_row(fx_full, lid, int(season))
+                    upsert_match_row(fx_full, lid, int(season))
 
-                # 기본 정보/스코어 최신화는 항상 수행
-                upsert_fixture_row(fx_full, lid, int(season))
-                upsert_match_row(fx_full, lid, int(season))
+                    need_events = force or (not has_match_events(fixture_id))
+                    need_lineups = force or (not has_lineups(fixture_id))
+                    need_team_stats = force or (not has_team_stats(fixture_id))
+                    need_player_stats = force or (not has_player_stats(fixture_id))
 
-                # 이미 match_events 있으면 postmatch는 스킵
-                if is_fixture_already_backfilled(fixture_id):
-                    total_skipped += 1
-                    continue
+                    if not (need_events or need_lineups or need_team_stats or need_player_stats):
+                        total_skipped += 1
+                        continue
 
-                print(f"    * fixture {fixture_id}: FINISHED → 상세 데이터 첫 백필")
-                backfill_postmatch_for_fixture(fixture_id)
-                total_new += 1
+                    todo = []
+                    if need_events:
+                        todo.append("events")
+                    if need_lineups:
+                        todo.append("lineups")
+                    if need_team_stats:
+                        todo.append("team_stats")
+                    if need_player_stats:
+                        todo.append("player_stats")
 
-        except Exception as e:
-            print(f"  ! league {lid} 처리 중 에러: {e}", file=sys.stderr)
+                    print(f"    * fixture {fixture_id}: backfill={'+'.join(todo)}")
+                    backfill_postmatch_for_fixture(
+                        fixture_id,
+                        do_events=need_events,
+                        do_lineups=need_lineups,
+                        do_team_stats=need_team_stats,
+                        do_player_stats=need_player_stats,
+                    )
+                    total_new += 1
+
+            except Exception as e:
+                print(f"  ! date={target_date} league {lid} 처리 중 에러: {e}", file=sys.stderr)
 
     print(f"[postmatch_backfill] 완료. 신규={total_new}, 스킵={total_skipped}")
+
 
 
 if __name__ == "__main__":
