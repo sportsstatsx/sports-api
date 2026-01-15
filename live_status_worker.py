@@ -627,8 +627,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     - 라인업 캐시가 없는 경우는 오탐 방지 위해 차단하지 않음
 
     ✅ 변경:
-    - 일부 리그/경기에서 events 항목에 id가 없을 수 있음.
-      이 경우 이벤트 내용을 기반으로 안정적인 synthetic id(음수)를 생성하여 저장한다.
+    - 일부 리그/경기에서 events 항목에 id가 없을 수 있음 → synthetic id(음수) 생성
+    - ✅ 추가: 현재 API 응답에 더 이상 없는 "synthetic Goal"은 삭제하여 유령 골 방지
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -641,11 +641,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         return x
 
     def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
-        # Card가 아니면 대상 아님
         if _norm(ev_type) != "card":
             return False
-
-        # player/team id 없으면 애매 -> 오탐 방지 위해 저장 유지
         if t_id is None or p_id is None:
             return False
 
@@ -653,7 +650,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         pb = st.get("players_by_team") or {}
         ids = pb.get(t_id)
 
-        # 라인업 정보 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
         if not isinstance(ids, set) or not ids:
             return False
 
@@ -672,11 +668,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         assist_name_: Optional[str],
         comments_: Optional[str],
     ) -> int:
-        """
-        안정적인 synthetic id 생성(음수):
-        - 동일 이벤트는 재호출/재시작에도 같은 id가 되도록 정규화 문자열을 해시한다.
-        - bigint PK 충돌 방지 위해 음수로 만든다.
-        """
         import hashlib
 
         key = "|".join(
@@ -696,7 +687,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         )
 
         digest = hashlib.sha1(key.encode("utf-8")).digest()
-        # 8바이트 -> 63bit 양수 범위로 제한 후 음수로
         h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
         if h64 == 0:
             h64 = 1
@@ -723,6 +713,9 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
                 del seen[k]
 
+    # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(유령 골 정리용)
+    current_goal_ids: List[int] = []
+
     for ev in events or []:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
@@ -744,11 +737,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         minute = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
 
-        # minute NOT NULL → 없으면 스킵(스키마 위반 방지)
         if minute is None:
             continue
 
-        # ✅ id가 없으면 synthetic id 생성
+        # id 또는 synthetic id
         ev_id = safe_int(ev.get("id"))
         if ev_id is None:
             ev_id = _synthetic_event_id(
@@ -765,6 +757,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 comments_=comments,
             )
 
+        # ✅ Goal이면 현재 Goal id 목록에 추가(정리용)
+        if _norm(ev_type) == "goal":
+            current_goal_ids.append(ev_id)
+
         # signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
         sig = (minute, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
         prev_ts = seen.get(sig)
@@ -772,7 +768,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             continue
         seen[sig] = now_ts
 
-        # substitution 관련 player_in은 현재 스키마에 있으니 자리만 유지(나중에 파싱 가능)
         player_in_id = None
         player_in_name = None
 
@@ -812,6 +807,22 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 player_in_name,
             ),
         )
+
+    # ✅ 유령 골 정리:
+    # - 현재 API 응답에 포함된 Goal id 목록에 없는 "synthetic Goal(id<0)"은 삭제
+    # - current_goal_ids가 비었으면(Goal이 하나도 없으면) 정리하지 않음(오탐 방지)
+    if current_goal_ids:
+        execute(
+            """
+            DELETE FROM match_events
+            WHERE fixture_id = %s
+              AND id < 0
+              AND LOWER(type) = 'goal'
+              AND NOT (id = ANY(%s))
+            """,
+            (fixture_id, current_goal_ids),
+        )
+
 
 
 
