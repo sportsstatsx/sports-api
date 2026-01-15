@@ -799,22 +799,30 @@ def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -
 def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], updated_at: dt.datetime) -> bool:
     """
     match_lineups PK: (fixture_id, team_id)
-    응답이 유의미하면 True 반환.
+
+    ✅ 변경:
+    - "DB에 뭔가 저장됨"이 아니라,
+      "필터에 쓸 만큼 라인업이 실제로 유의미하게 채워짐"일 때만 True 반환.
+      (대부분 startXI 11명이 들어오면 유의미하다고 판단)
 
     추가:
-    - 런타임 캐시에 (fixture_id, team_id)별 라인업 선수 id set 저장
-      -> 벤치/스태프 Card 이벤트 수집 차단에 사용
+    - 런타임 캐시에 team별 player_id set 저장(players_by_team)
+    - 라인업이 유의미하면 st["lineups_ready"]=True로 마킹(잠금 기준)
     """
     if not lineups_resp:
         return False
 
-    def _extract_player_ids(item: Dict[str, Any]) -> List[int]:
+    def _extract_player_ids_and_counts(item: Dict[str, Any]) -> Tuple[List[int], int, int]:
         out: List[int] = []
-        for key in ("startXI", "substitutes"):
-            arr = item.get(key) or []
-            if not isinstance(arr, list):
-                continue
-            for row in arr:
+
+        start_arr = item.get("startXI") or []
+        sub_arr = item.get("substitutes") or []
+
+        start_cnt = 0
+        sub_cnt = 0
+
+        if isinstance(start_arr, list):
+            for row in start_arr:
                 if not isinstance(row, dict):
                     continue
                 p = row.get("player") or {}
@@ -824,11 +832,34 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
                 if pid is None:
                     continue
                 out.append(pid)
-        # 중복 제거(순서 무관 set로 쓸 거라 uniq만)
-        return list(set(out))
+                start_cnt += 1
 
-    ok_any = False
+        if isinstance(sub_arr, list):
+            for row in sub_arr:
+                if not isinstance(row, dict):
+                    continue
+                p = row.get("player") or {}
+                if not isinstance(p, dict):
+                    continue
+                pid = safe_int(p.get("id"))
+                if pid is None:
+                    continue
+                out.append(pid)
+                sub_cnt += 1
+
+        uniq = list(set(out))
+        return uniq, start_cnt, sub_cnt
+
     updated_utc = iso_utc(updated_at)
+    ok_any_write = False
+    ready_any = False
+
+    # state 준비
+    st = _ensure_lineups_state(fixture_id)
+    pb = st.get("players_by_team")
+    if not isinstance(pb, dict):
+        pb = {}
+        st["players_by_team"] = pb
 
     for item in lineups_resp:
         team = item.get("team") or {}
@@ -849,22 +880,33 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
             """,
             (fixture_id, team_id, raw, updated_utc),
         )
-        ok_any = True
+        ok_any_write = True
 
-        # ---- 런타임 캐시 저장 ----
+        # ---- 런타임 캐시 저장 + 유의미 판단 ----
         try:
-            st = _ensure_lineups_state(fixture_id)
-            pb = st.get("players_by_team")
-            if not isinstance(pb, dict):
-                pb = {}
-                st["players_by_team"] = pb
-            ids = _extract_player_ids(item)
+            ids, start_cnt, sub_cnt = _extract_player_ids_and_counts(item)
             pb[team_id] = set(ids)
+
+            # ✅ 유의미(ready) 기준:
+            # - startXI가 11명 이상이면 거의 확정 라인업
+            # - 혹은 추출 ids가 11명 이상(공급자 포맷 차이 방어)
+            if (start_cnt >= 11) or (len(ids) >= 11):
+                ready_any = True
         except Exception:
-            # 캐시는 best-effort (DB 저장에는 영향 주지 않음)
+            # 캐시는 best-effort
             pass
 
-    return ok_any
+    # 라인업이 유의미한 상태면 state에 ready 마킹(잠금 기준으로 사용)
+    if ready_any:
+        st["lineups_ready"] = True
+
+    # DB write가 1번도 없으면 False
+    if not ok_any_write:
+        return False
+
+    # ✅ 반환은 "유의미하게 준비됨" 여부
+    return bool(ready_any)
+
 
 
 
@@ -1123,12 +1165,14 @@ def maybe_sync_lineups(
     now: dt.datetime,
 ) -> None:
     st = _ensure_lineups_state(fixture_id)
-    if st.get("success"):
+
+    # ✅ success 잠금 조건 강화:
+    # - success=True 이더라도 lineups_ready가 아니면(=불완전 라인업 가능성) 계속 시도 여지 남김
+    if st.get("success") and st.get("lineups_ready"):
         return
 
     kickoff: Optional[dt.datetime] = None
     try:
-        # date_utc 는 ISO8601 (예: 2026-01-15T12:00:00+00:00)
         kickoff = dt.datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
         if kickoff.tzinfo is None:
             kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
@@ -1139,7 +1183,18 @@ def maybe_sync_lineups(
 
     nowu = now.astimezone(dt.timezone.utc)
 
-    # 프리매치 슬롯(-60/-10): 응답이 비어도 "시도"는 마킹해서 반복 호출 방지
+    # ---- 공통: 과호출 방지 쿨다운(초) ----
+    # interval=10초라서, lineups는 20초 정도만 쉬어도 충분히 안정적
+    COOLDOWN_SEC = 20
+    now_ts = time.time()
+    last_try = float(st.get("last_try_ts") or 0.0)
+    if (now_ts - last_try) < COOLDOWN_SEC:
+        # 다만 UPCOMING 슬롯(-60/-10)은 1회성이라 쿨다운 걸리지 않게 아래에서 별도 처리
+        pass
+
+    # ─────────────────────────────────────
+    # UPCOMING: -60 / -10 슬롯은 1회만
+    # ─────────────────────────────────────
     if kickoff and status_group == "UPCOMING":
         mins = int((kickoff - nowu).total_seconds() / 60)
 
@@ -1147,11 +1202,14 @@ def maybe_sync_lineups(
         if (59 <= mins <= 61) and not st.get("slot60"):
             st["slot60"] = True
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
                     st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot60 ok={ok}")
+                print(f"      [lineups] fixture_id={fixture_id} slot60 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot60 err: {e}", file=sys.stderr)
             return
@@ -1160,29 +1218,44 @@ def maybe_sync_lineups(
         if (9 <= mins <= 11) and not st.get("slot10"):
             st["slot10"] = True
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
                     st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot10 ok={ok}")
+                print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
             return
 
         return
 
-    # 킥오프 직후(INPLAY) 재시도: elapsed<=5 동안은 빈 응답이면 계속 시도 가능
+    # ─────────────────────────────────────
+    # INPLAY: 초반에는 불완전 응답이 흔함 → elapsed<=15까지 쿨다운 두고 재시도
+    # ─────────────────────────────────────
     if status_group == "INPLAY":
-        el = elapsed if elapsed is not None else -1
-        if 0 <= el <= 5:
+        el = elapsed if elapsed is not None else 0  # elapsed None이어도 0으로 보고 1회는 시도 가능
+
+        # ✅ 기존 5분 → 15분까지 확장
+        if 0 <= el <= 15:
+            # 쿨다운 체크 (UPCOMING 슬롯과 달리 여기서는 적용)
+            last_try = float(st.get("last_try_ts") or 0.0)
+            if (time.time() - last_try) < COOLDOWN_SEC:
+                return
+
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ok={ok}")
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                if ready:
+                    st["success"] = True  # ✅ ready일 때만 잠금
+                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
+
 
 
 # ─────────────────────────────────────
