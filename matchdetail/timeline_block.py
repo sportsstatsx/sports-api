@@ -118,14 +118,18 @@ def _normalize_name_light(s: str) -> str:
 def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     """
     Kotlin TimelineType 과 거의 동일한 canonical type
-    - Var + "Goal cancelled" 는 VAR로 숨기지 말고 CANCELLED_GOAL 로 노출
     """
     t = (type_raw or "").lower().strip()
     d = (detail_raw or "").lower().strip()
 
-    # ✅ 0) VAR로 인한 골 취소를 최우선 처리
-    # DB 예: type='Var', detail='Goal cancelled'
-    if ("goal cancelled" in d) or (("var" in t or "var" in d) and ("cancel" in d) and ("goal" in d)):
+    # ✅ 0) "취소골"을 최우선으로 판별 (DB 패턴 기반)
+    # - type=Var + detail:
+    #   * Goal cancelled
+    #   * Goal Disallowed
+    #   * Goal Disallowed - offside/handball/foul ...
+    if (t == "var" or "var" in t or "var" in d) and ("goal" in d) and (
+        "cancel" in d or "disallow" in d
+    ):
         return "CANCELLED_GOAL"
 
     # ✅ 1) 패널티 실축을 최우선으로 판별
@@ -149,10 +153,7 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
     if t.startswith("subst") or t.startswith("sub"):
         return "SUB"
 
-    if ("pen" in t or "pen" in d) and ("miss" in d or "saved" in d):
-        return "PEN_MISSED"
-
-    # ✅ 3) 그 외 VAR 이벤트는 기존 정책대로 숨김 대상
+    # ✅ VAR(취소골이 아닌 VAR)은 VAR로 유지 (현재 코드에서 VAR는 숨김 처리됨)
     if "var" in t or "var" in d:
         return "VAR"
 
@@ -171,12 +172,11 @@ def _map_type(type_raw: str | None, detail_raw: str | None) -> str:
         return "YELLOW"
     if "sub" in d:
         return "SUB"
-    if "pen" in d and "miss" in d:
-        return "PEN_MISSED"
     if "var" in d:
         return "VAR"
 
     return "OTHER"
+
 
 
 
