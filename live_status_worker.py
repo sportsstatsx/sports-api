@@ -337,7 +337,10 @@ def upsert_match_row_from_fixture(
     fixtures 응답 1개(item)를 matches 테이블로 업서트.
     반환: (fixture_id, home_id, away_id, status_group, date_utc)
 
-    - 스키마 변경 없음 (matches 컬럼 그대로)
+    matches 스키마(현재 dev):
+    - home_name/away_name 없음
+    - timezone/timestamp 없음 -> fixture_timezone / fixture_timestamp 사용
+    - status NOT NULL -> status_short(없으면 'UNK')로 채움
     """
     fx = fixture_obj.get("fixture") or {}
     teams = fixture_obj.get("teams") or {}
@@ -351,8 +354,8 @@ def upsert_match_row_from_fixture(
 
     date_utc = safe_text(fx.get("date")) or ""
     referee = safe_text(fx.get("referee"))
-    timezone = safe_text(fx.get("timezone"))
-    timestamp = safe_int(fx.get("timestamp"))
+    fixture_timezone = safe_text(fx.get("timezone"))
+    fixture_timestamp = safe_int(fx.get("timestamp"))
 
     st = fx.get("status") or {}
     status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
@@ -361,13 +364,12 @@ def upsert_match_row_from_fixture(
     status_extra = safe_int(st.get("extra"))
 
     status_group = map_status_group(status_short)
+    status = status_short.strip() or "UNK"  # matches.status NOT NULL
 
     home = teams.get("home") or {}
     away = teams.get("away") or {}
     home_id = safe_int(home.get("id")) or 0
     away_id = safe_int(away.get("id")) or 0
-    home_name = safe_text(home.get("name"))
-    away_name = safe_text(away.get("name"))
 
     home_ft = safe_int(goals.get("home"))
     away_ft = safe_int(goals.get("away"))
@@ -390,19 +392,18 @@ def upsert_match_row_from_fixture(
             league_id,
             season,
             date_utc,
+            status,
             status_group,
             home_id,
             away_id,
-            home_name,
-            away_name,
             home_ft,
             away_ft,
             elapsed,
             home_ht,
             away_ht,
             referee,
-            timezone,
-            timestamp,
+            fixture_timezone,
+            fixture_timestamp,
             status_short,
             status_long,
             status_elapsed,
@@ -413,77 +414,74 @@ def upsert_match_row_from_fixture(
             league_round
         )
         VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
         )
         ON CONFLICT (fixture_id) DO UPDATE SET
-            league_id      = EXCLUDED.league_id,
-            season         = EXCLUDED.season,
-            date_utc       = EXCLUDED.date_utc,
-            status_group   = EXCLUDED.status_group,
-            home_id        = EXCLUDED.home_id,
-            away_id        = EXCLUDED.away_id,
-            home_name      = EXCLUDED.home_name,
-            away_name      = EXCLUDED.away_name,
-            home_ft        = EXCLUDED.home_ft,
-            away_ft        = EXCLUDED.away_ft,
-            elapsed        = EXCLUDED.elapsed,
-            home_ht        = EXCLUDED.home_ht,
-            away_ht        = EXCLUDED.away_ht,
-            referee        = EXCLUDED.referee,
-            timezone       = EXCLUDED.timezone,
-            timestamp      = EXCLUDED.timestamp,
-            status_short   = EXCLUDED.status_short,
-            status_long    = EXCLUDED.status_long,
-            status_elapsed = EXCLUDED.status_elapsed,
-            status_extra   = EXCLUDED.status_extra,
-            venue_id       = EXCLUDED.venue_id,
-            venue_name     = EXCLUDED.venue_name,
-            venue_city     = EXCLUDED.venue_city,
-            league_round   = EXCLUDED.league_round
+            league_id         = EXCLUDED.league_id,
+            season            = EXCLUDED.season,
+            date_utc          = EXCLUDED.date_utc,
+            status            = EXCLUDED.status,
+            status_group      = EXCLUDED.status_group,
+            home_id           = EXCLUDED.home_id,
+            away_id           = EXCLUDED.away_id,
+            home_ft           = EXCLUDED.home_ft,
+            away_ft           = EXCLUDED.away_ft,
+            elapsed           = EXCLUDED.elapsed,
+            home_ht           = EXCLUDED.home_ht,
+            away_ht           = EXCLUDED.away_ht,
+            referee           = EXCLUDED.referee,
+            fixture_timezone  = EXCLUDED.fixture_timezone,
+            fixture_timestamp = EXCLUDED.fixture_timestamp,
+            status_short      = EXCLUDED.status_short,
+            status_long       = EXCLUDED.status_long,
+            status_elapsed    = EXCLUDED.status_elapsed,
+            status_extra      = EXCLUDED.status_extra,
+            venue_id          = EXCLUDED.venue_id,
+            venue_name        = EXCLUDED.venue_name,
+            venue_city        = EXCLUDED.venue_city,
+            league_round      = EXCLUDED.league_round
         WHERE
-            matches.league_id      IS DISTINCT FROM EXCLUDED.league_id OR
-            matches.season         IS DISTINCT FROM EXCLUDED.season OR
-            matches.date_utc       IS DISTINCT FROM EXCLUDED.date_utc OR
-            matches.status_group   IS DISTINCT FROM EXCLUDED.status_group OR
-            matches.home_id        IS DISTINCT FROM EXCLUDED.home_id OR
-            matches.away_id        IS DISTINCT FROM EXCLUDED.away_id OR
-            matches.home_name      IS DISTINCT FROM EXCLUDED.home_name OR
-            matches.away_name      IS DISTINCT FROM EXCLUDED.away_name OR
-            matches.home_ft        IS DISTINCT FROM EXCLUDED.home_ft OR
-            matches.away_ft        IS DISTINCT FROM EXCLUDED.away_ft OR
-            matches.elapsed        IS DISTINCT FROM EXCLUDED.elapsed OR
-            matches.home_ht        IS DISTINCT FROM EXCLUDED.home_ht OR
-            matches.away_ht        IS DISTINCT FROM EXCLUDED.away_ht OR
-            matches.referee        IS DISTINCT FROM EXCLUDED.referee OR
-            matches.timezone       IS DISTINCT FROM EXCLUDED.timezone OR
-            matches.timestamp      IS DISTINCT FROM EXCLUDED.timestamp OR
-            matches.status_short   IS DISTINCT FROM EXCLUDED.status_short OR
-            matches.status_long    IS DISTINCT FROM EXCLUDED.status_long OR
-            matches.status_elapsed IS DISTINCT FROM EXCLUDED.status_elapsed OR
-            matches.status_extra   IS DISTINCT FROM EXCLUDED.status_extra OR
-            matches.venue_id       IS DISTINCT FROM EXCLUDED.venue_id OR
-            matches.venue_name     IS DISTINCT FROM EXCLUDED.venue_name OR
-            matches.venue_city     IS DISTINCT FROM EXCLUDED.venue_city OR
-            matches.league_round   IS DISTINCT FROM EXCLUDED.league_round
+            matches.league_id         IS DISTINCT FROM EXCLUDED.league_id OR
+            matches.season            IS DISTINCT FROM EXCLUDED.season OR
+            matches.date_utc          IS DISTINCT FROM EXCLUDED.date_utc OR
+            matches.status            IS DISTINCT FROM EXCLUDED.status OR
+            matches.status_group      IS DISTINCT FROM EXCLUDED.status_group OR
+            matches.home_id           IS DISTINCT FROM EXCLUDED.home_id OR
+            matches.away_id           IS DISTINCT FROM EXCLUDED.away_id OR
+            matches.home_ft           IS DISTINCT FROM EXCLUDED.home_ft OR
+            matches.away_ft           IS DISTINCT FROM EXCLUDED.away_ft OR
+            matches.elapsed           IS DISTINCT FROM EXCLUDED.elapsed OR
+            matches.home_ht           IS DISTINCT FROM EXCLUDED.home_ht OR
+            matches.away_ht           IS DISTINCT FROM EXCLUDED.away_ht OR
+            matches.referee           IS DISTINCT FROM EXCLUDED.referee OR
+            matches.fixture_timezone  IS DISTINCT FROM EXCLUDED.fixture_timezone OR
+            matches.fixture_timestamp IS DISTINCT FROM EXCLUDED.fixture_timestamp OR
+            matches.status_short      IS DISTINCT FROM EXCLUDED.status_short OR
+            matches.status_long       IS DISTINCT FROM EXCLUDED.status_long OR
+            matches.status_elapsed    IS DISTINCT FROM EXCLUDED.status_elapsed OR
+            matches.status_extra      IS DISTINCT FROM EXCLUDED.status_extra OR
+            matches.venue_id          IS DISTINCT FROM EXCLUDED.venue_id OR
+            matches.venue_name        IS DISTINCT FROM EXCLUDED.venue_name OR
+            matches.venue_city        IS DISTINCT FROM EXCLUDED.venue_city OR
+            matches.league_round      IS DISTINCT FROM EXCLUDED.league_round
         """,
         (
             fixture_id,
             league_id,
             season,
             date_utc,
+            status,
             status_group,
             home_id,
             away_id,
-            home_name,
-            away_name,
             home_ft,
             away_ft,
-            status_elapsed,
+            status_elapsed,  # elapsed 컬럼
             home_ht,
             away_ht,
             referee,
-            timezone,
-            timestamp,
+            fixture_timezone,
+            fixture_timestamp,
             status_short,
             status_long,
             status_elapsed,
@@ -494,7 +492,9 @@ def upsert_match_row_from_fixture(
             league_round,
         ),
     )
+
     return fixture_id, home_id, away_id, status_group, date_utc
+
 
 
 
@@ -536,30 +536,19 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    match_events PK는 id 단일.
-    - 중복 id는 DO NOTHING(기존)
-    - 추가 개선(스키마 변경 없음):
-      * 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
-      * signature 안정화:
-        - 변동성이 큰 comments는 signature에서 제외
-        - ev_type/detail은 normalize(대소문/공백/구두점 차이로 중복 판정 실패 방지)
-      * fixture 종료 시 run_once()에서 cache prune (FINISHED/OTHER)
+    match_events 스키마(현재 dev):
+      id(bigint PK), fixture_id, team_id, player_id, type, detail, minute(not null),
+      extra(default 0), assist_player_id, assist_name, player_in_id, player_in_name
+
+    - 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
+    - signature 안정화: ev_type/detail normalize(대소문/공백/구두점 차이 완화)
     """
 
     def _norm(s: Optional[str]) -> str:
-        """
-        signature용 텍스트 정규화:
-        - lower
-        - strip
-        - 공백류 collapse
-        - 구두점/특수문자 일부 제거(가벼운 normalize)
-        """
         if not s:
             return ""
         x = str(s).lower().strip()
-        # 공백 정리
         x = " ".join(x.split())
-        # 흔한 구두점 제거(너무 세게는 안 지움)
         for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
             x = x.replace(ch, "")
         return x
@@ -575,13 +564,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         seen = {}
         sig_cache[fixture_id] = seen
 
-    # 주기적으로 오래된 signature 정리(메모리 누적 방지)
+    # 오래된 signature 정리
     if (len(seen) > 800) or (now_ts - min(seen.values(), default=now_ts) > 1800):
-        cutoff = now_ts - 1800  # 30분 이상 지난 sig 제거
+        cutoff = now_ts - 1800
         for k, v in list(seen.items()):
             if v < cutoff:
                 del seen[k]
-        # 너무 크면 추가로 자르기
         if len(seen) > 1200:
             for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
                 del seen[k]
@@ -594,35 +582,32 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
         assist = ev.get("assist") or {}
+
         t_id = safe_int(team.get("id"))
         p_id = safe_int(player.get("id"))
         a_id = safe_int(assist.get("id"))
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
-        comments = safe_text(ev.get("comments"))
 
         tm = ev.get("time") or {}
-        elapsed = safe_int(tm.get("elapsed"))
+        minute = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
 
-        # --- signature dedupe (id가 바뀌어도 동일 이벤트면 스킵) ---
-        # comments는 변동성이 커서 제외하고,
-        # ev_type/detail은 normalize로 흔들림 최소화
-        sig = (elapsed, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
+        # minute NOT NULL → 없으면 스킵(스키마 위반 방지)
+        if minute is None:
+            continue
+
+        # signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
+        sig = (minute, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
         prev_ts = seen.get(sig)
         if prev_ts is not None and (now_ts - prev_ts) < 600:
-            # 10분 내 동일 signature는 중복으로 간주
             continue
         seen[sig] = now_ts
 
-        # substitution 보강 placeholder (스키마 유지)
+        # substitution 관련 player_in은 현재 스키마에 있으니 자리만 유지(나중에 파싱 가능)
         player_in_id = None
         player_in_name = None
-        ev_type_l = (ev_type or "").lower()
-        if ev_type_l == "subst" or ((detail or "") and "substitution" in (detail or "").lower()):
-            # API 제공 형태가 다양한 케이스 대비(현재는 저장만, 파싱 로직은 추후)
-            pass
 
         execute(
             """
@@ -633,18 +618,15 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 player_id,
                 type,
                 detail,
-                comments,
-                time_elapsed,
-                time_extra,
-                assist_id,
-                team_name,
-                player_name,
+                minute,
+                extra,
+                assist_player_id,
                 assist_name,
                 player_in_id,
                 player_in_name
             )
             VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
             ON CONFLICT (id) DO NOTHING
             """,
@@ -655,17 +637,15 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 p_id,
                 ev_type,
                 detail,
-                comments,
-                elapsed,
+                minute,
                 extra,
                 a_id,
-                safe_text(team.get("name")),
-                safe_text(player.get("name")),
                 safe_text(assist.get("name")),
                 player_in_id,
                 player_in_name,
             ),
         )
+
 
 
 
