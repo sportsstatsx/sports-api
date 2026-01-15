@@ -755,71 +755,200 @@ def calc_score_from_events(
     away_id: int,
 ) -> Tuple[int, int]:
     """
-    - type == "Goal" 만 카운트
-    - '골로 인정되지 않는' 케이스는 제외:
-      * 취소/무효: Cancelled, Disallowed, No Goal, Offside, VAR, Foul 등
-      * 실축 PK: Missed Penalty / miss+pen
-    - Own Goal은 반대팀 득점으로 처리
-    """
-    h = 0
-    a = 0
+    Goal + Var 이벤트를 함께 사용해서 "최종 득점"을 계산한다.
 
-    # 리그/시즌마다 표현이 달라서, "골 무효"류 키워드를 넓게 제외
-    # (너무 공격적으로 빼지 않도록, 'Goal' 이벤트인데도 골이 아닌 케이스 중심)
+    ✅ Goal 이벤트는 일단 득점 후보로 쌓는다.
+    ✅ Var 이벤트 중
+       - Goal Disallowed / Goal cancelled / No Goal  => 직전 Goal 1개를 취소 처리
+       - Goal confirmed                              => 유지(아무것도 안 함)
+    ✅ Own Goal은 반대팀 득점으로 처리 (기존 유지)
+    ✅ Missed Penalty(실축)는 득점에서 제외 (기존 유지)
+
+    주의:
+    - API-Sports 데이터에서 '취소/무효'는 Goal.detail이 아니라 Var.type으로 내려오는 케이스가 많음
+    """
+
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        return x
+
+    def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
+        tm = ev.get("time") or {}
+        el = safe_int(tm.get("elapsed"))
+        ex = safe_int(tm.get("extra"))
+        # elapsed/extra가 None이면 뒤로 밀리게 안전값
+        elv = el if el is not None else 10**9
+        exv = ex if ex is not None else 0
+        return (elv, exv, fallback_idx)
+
+    # Goal 이벤트에서 '무효/취소'로 볼만한 텍스트(Goal.detail에 실제로 붙는 경우만 처리)
     invalid_markers = (
         "cancel",        # cancelled
         "disallow",      # disallowed
         "no goal",       # no goal
-        "var",           # var
         "offside",       # offside
         "foul",          # foul
         "annul",         # annulled(드물지만)
         "null",          # nullified(드물지만)
     )
 
-    for ev in events or []:
-        ev_type = (ev.get("type") or "")
-        if str(ev_type).lower() != "goal":
-            continue
+    # 득점 후보 리스트(Var로 취소되면 cancelled=True로 마킹)
+    # 각 항목: {
+    #   "scoring_team_id": int,   # 실제 득점 팀(OG면 반대팀)
+    #   "source_team_id": int,    # 이벤트 team_id (OG면 원래 자책팀)
+    #   "elapsed": Optional[int],
+    #   "extra": Optional[int],
+    #   "cancelled": bool,
+    # }
+    goals: List[Dict[str, Any]] = []
 
-        detail = str(ev.get("detail") or "")
-        dlow = detail.lower().strip()
+    # 이벤트가 이미 시간순으로 오는 경우가 많지만, 안전하게 정렬(동시간대는 원본 순서 유지)
+    evs = list(events or [])
+    evs.sort(key=lambda ev_idx: _time_key(ev_idx[1], ev_idx[0]) if isinstance(ev_idx, tuple) else (0, 0, 0))  # 방어
+    # 위 sort가 꼬이지 않게 다시 안전 정렬(일반 케이스)
+    evs = sorted(evs, key=lambda ev: _time_key(ev, 0))
 
-        # 취소/무효 골 제외 (표현 다양성 대응)
-        if any(m in dlow for m in invalid_markers):
-            # 단, "own goal" 자체는 유효한 득점이므로 여기서 제외하지 않도록 예외 처리
-            # (own goal은 아래에서 반대팀 득점으로 처리)
-            if "own goal" not in dlow:
-                continue
+    # ⚠️ 위에서 fallback_idx가 0으로 고정되므로, "완전 동일 시간"에서 순서 보존이 약해질 수 있음
+    # 그래서 실제 순서를 보존하려고 인덱스를 포함한 정렬을 다시 수행
+    indexed = list(enumerate(events or []))
+    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
+    evs = [ev for _, ev in indexed]
 
+    def _add_goal(ev: Dict[str, Any]) -> None:
+        detail = _norm(ev.get("detail"))
         # 실축PK 제외
-        if "missed penalty" in dlow:
-            continue
-        if ("miss" in dlow) and ("pen" in dlow):
-            continue
+        if "missed penalty" in detail:
+            return
+        if ("miss" in detail) and ("pen" in detail):
+            return
+
+        # Goal.detail에 취소/무효 문구가 붙는(드문) 케이스 방어
+        if any(m in detail for m in invalid_markers) and ("own goal" not in detail):
+            return
 
         team = ev.get("team") or {}
         team_id = safe_int(team.get("id"))
         if team_id is None:
-            continue
+            return
 
-        is_og = "own goal" in dlow
+        tm = ev.get("time") or {}
+        elapsed = safe_int(tm.get("elapsed"))
+        extra = safe_int(tm.get("extra"))
 
-        # Own Goal은 반대팀 득점으로 처리
+        is_og = "own goal" in detail
+
+        # 득점 팀 결정
+        scoring_team_id = team_id
         if is_og:
             if team_id == home_id:
-                a += 1
+                scoring_team_id = away_id
             elif team_id == away_id:
-                h += 1
+                scoring_team_id = home_id
+
+        goals.append(
+            {
+                "scoring_team_id": scoring_team_id,
+                "source_team_id": team_id,
+                "elapsed": elapsed,
+                "extra": extra,
+                "cancelled": False,
+            }
+        )
+
+    def _apply_var(ev: Dict[str, Any]) -> None:
+        """
+        Var 이벤트로 직전 Goal을 취소/유지 처리
+        - Goal Disallowed / Goal cancelled / No Goal => 직전 Goal 1개 취소
+        - Goal confirmed => 유지(아무것도 안 함)
+        """
+        detail = _norm(ev.get("detail"))
+        if not detail:
+            return
+
+        is_disallow = ("goal disallowed" in detail) or ("goal cancelled" in detail) or ("no goal" in detail)
+        is_confirm = "goal confirmed" in detail
+
+        # 골 관련 var이 아니면 무시(패널티/레드카드 등)
+        if not (is_disallow or is_confirm):
+            return
+
+        # confirmed면 굳이 할 작업 없음(이미 골로 카운트되었을 것)
+        if is_confirm:
+            return
+
+        # 여기서부터는 disallow/cancel/no goal => 직전 Goal 1개 취소
+        team = ev.get("team") or {}
+        var_team_id = safe_int(team.get("id"))  # 있는 경우가 많음(네 출력에서도 team 정보가 보통 있음)
+        tm = ev.get("time") or {}
+        var_elapsed = safe_int(tm.get("elapsed"))
+        var_extra = safe_int(tm.get("extra"))
+
+        # 취소할 Goal 선택 규칙(휴리스틱):
+        # 1) 뒤에서부터(가장 최근) 아직 취소 안된 Goal
+        # 2) 시간이 너무 멀면 제외: 같은 elapsed 우선, 아니면 ±2분까지 허용
+        # 3) team_id가 있으면 source_team_id 또는 scoring_team_id가 일치하는 Goal 우선
+        best_idx: Optional[int] = None
+
+        for i in range(len(goals) - 1, -1, -1):
+            g = goals[i]
+            if g.get("cancelled"):
+                continue
+
+            g_el = g.get("elapsed")
+            # 시간 조건
+            time_ok = False
+            if var_elapsed is None or g_el is None:
+                time_ok = True  # 정보가 없으면 완화
+            else:
+                if g_el == var_elapsed:
+                    time_ok = True
+                elif abs(g_el - var_elapsed) <= 2:
+                    time_ok = True
+            if not time_ok:
+                continue
+
+            # 팀 조건(가능하면 일치 우선)
+            if var_team_id is not None:
+                if (g.get("source_team_id") == var_team_id) or (g.get("scoring_team_id") == var_team_id):
+                    best_idx = i
+                    break
+                # 팀 불일치는 우선순위 낮지만, 후보로는 남겨둠
+                if best_idx is None:
+                    best_idx = i
+            else:
+                best_idx = i
+                break
+
+        if best_idx is not None:
+            goals[best_idx]["cancelled"] = True
+
+    # 메인 루프
+    for ev in evs:
+        ev_type = _norm(ev.get("type"))
+        if ev_type == "goal":
+            _add_goal(ev)
+        elif ev_type == "var":
+            _apply_var(ev)
+        else:
             continue
 
-        # Normal/Penalty 등은 해당 team_id가 득점
-        if team_id == home_id:
+    # 최종 합계
+    h = 0
+    a = 0
+    for g in goals:
+        if g.get("cancelled"):
+            continue
+        tid = g.get("scoring_team_id")
+        if tid == home_id:
             h += 1
-        elif team_id == away_id:
+        elif tid == away_id:
             a += 1
 
     return h, a
+
 
 
 
