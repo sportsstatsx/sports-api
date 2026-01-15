@@ -29,14 +29,11 @@ BASE_URL = "https://v3.football.api-sports.io/fixtures"
 
 
 def _get_api_key() -> str:
-    key = (
-        os.environ.get("APIFOOTBALL_KEY")
-        or os.environ.get("API_KEY")
-        or ""
-    )
+    key = os.environ.get("APIFOOTBALL_KEY") or ""
     if not key:
-        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_FOOTBALL_KEY / API_KEY)")
+        raise RuntimeError("API key missing: set APIFOOTBALL_KEY")
     return key
+
 
 
 def _get_headers() -> Dict[str, str]:
@@ -168,14 +165,16 @@ def _safe_get(url: str, *, params: Dict[str, Any], timeout: int = 25, max_retry:
 
 def fetch_league_season_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
     """
-    /fixtures?league=XXX&season=YYYY 는 페이지네이션이 있을 수 있음.
-    paging.total만큼 전부 가져온다.
+    /fixtures?league=XXX&season=YYYY
+    - 환경/플랜/엔드포인트 동작에 따라 'page' 파라미터를 안 받는 경우가 있음.
+    - 그래서 1) page 없이 먼저 호출해서 데이터를 확보하고,
+      2) paging.total 이 존재하고 1보다 크면 그때만 page 기반으로 추가 수집한다.
     """
     fixtures: List[Dict[str, Any]] = []
 
-    # 1) 첫 페이지로 total 페이지 수를 확인
-    params0: Dict[str, Any] = {"league": league_id, "season": season, "page": 1}
-    data0 = _safe_get(BASE_URL, params=params0, timeout=25)
+    # 1) 우선 page 없이 호출 (page 미지원 환경 대응)
+    params_base: Dict[str, Any] = {"league": league_id, "season": season}
+    data0 = _safe_get(BASE_URL, params=params_base, timeout=25)
 
     results0 = int(data0.get("results", 0) or 0)
     if results0 == 0:
@@ -183,25 +182,39 @@ def fetch_league_season_from_api(league_id: int, season: int) -> List[Dict[str, 
         print(f"[WARN] league={league_id}, season={season} → results=0, errors={errors}")
         return []
 
-    paging = data0.get("paging") or {}
-    total_pages = int(paging.get("total", 1) or 1)
-
     rows0 = data0.get("response", []) or []
     for item in rows0:
         if isinstance(item, dict):
             fixtures.append(item)
 
-    # 2) 나머지 페이지 수집
+    # 2) paging.total 확인 (없으면 단일 응답으로 끝)
+    paging = data0.get("paging") or {}
+    total_pages = int(paging.get("total", 1) or 1)
+
+    # paging이 있고 total_pages>1이면 page를 지원하는 환경일 가능성이 높음 → 추가 페이지 수집 시도
     if total_pages > 1:
+        # 일부 환경에서는 paging.total은 주는데 page 파라미터는 거부하는 경우도 있을 수 있어
+        # 첫 추가 페이지(2) 시도 후 errors.page가 뜨면 즉시 폴백(=이미 받은 fixtures만 사용)
         for page in range(2, total_pages + 1):
             params = {"league": league_id, "season": season, "page": page}
             data = _safe_get(BASE_URL, params=params, timeout=25)
+
+            # page 파라미터를 거부하면 errors에 page가 들어오는 케이스 대응
+            errors = data.get("errors") or {}
+            if isinstance(errors, dict) and errors.get("page"):
+                print(
+                    f"[WARN] league={league_id}, season={season} → page unsupported: {errors.get('page')}. "
+                    f"Stop paging and keep first-page results only."
+                )
+                break
+
             rows = data.get("response", []) or []
             for item in rows:
                 if isinstance(item, dict):
                     fixtures.append(item)
 
     return fixtures
+
 
 
 # ─────────────────────────────────────
