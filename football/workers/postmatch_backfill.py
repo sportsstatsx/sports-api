@@ -1,131 +1,138 @@
 # postmatch_backfill.py
 #
-# 단독 실행 버전 (외부 live_fixtures_* 의존 제거)
-# - FINISHED 경기 대상: /fixtures → fixtures/matches upsert + match_fixtures_raw 저장
-# - /fixtures/events   → match_events + match_events_raw
-# - /fixtures/lineups  → match_lineups
-# - /fixtures/statistics → match_team_stats
-# - /fixtures/players  → match_player_stats
+# 역할:
+# - 특정 날짜(date=YYYY-MM-DD)의 FINISHED 경기들에 대해 "한 번만" 무거운 데이터 전체 백필
+#   * /fixtures          → fixtures/matches upsert + match_fixtures_raw 저장
+#   * /fixtures/events   → match_events / match_events_raw
+#   * /fixtures/lineups  → match_lineups
+#   * /fixtures/statistics → match_team_stats
+#   * /fixtures/players  → match_player_stats
 #
-# 환경변수:
-#   - APIFOOTBALL_KEY (또는 API_FOOTBALL_KEY / API_KEY)  : Api-Football 키
-#   - LIVE_LEAGUES    : 예) "39,140,135"
-#   - TARGET_DATE (옵션) : "YYYY-MM-DD" (없으면 UTC 오늘)
-#
-# 주의:
-# - match_events.id 가 bigserial(기본값 자동 생성)이어야 함 (기존 코드들도 동일 전제)
+# 특징:
+# - 이미 백필된 경기(match_events에 row 존재)는 스킵
+# - LIVE_LEAGUES env 에 포함된 리그만 대상
+# - 스키마 변경 없음
 
 import os
 import sys
 import json
+import time
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from db import fetch_one, execute
-
+from db import fetch_one, fetch_all, execute
 
 BASE_URL = "https://v3.football.api-sports.io"
 
 
-def _api_key() -> str:
-    return (
-        os.environ.get("APIFOOTBALL_KEY")
-        or os.environ.get("API_FOOTBALL_KEY")
+# ─────────────────────────────────────
+#  ENV / 유틸
+# ─────────────────────────────────────
+
+def _get_api_key() -> str:
+    key = (
+        os.environ.get("API_FOOTBALL_KEY")
         or os.environ.get("API_KEY")
+        or os.environ.get("FOOTBALL_API_KEY")
         or ""
     )
-
-
-def _headers() -> Dict[str, str]:
-    key = _api_key()
     if not key:
-        raise RuntimeError("APIFOOTBALL_KEY(또는 API_FOOTBALL_KEY/API_KEY) 환경변수가 비어있습니다.")
-    return {"x-apisports-key": key}
+        raise RuntimeError("API key missing: set API_FOOTBALL_KEY (or API_KEY)")
+    return key
+
+
+def _get_headers() -> Dict[str, str]:
+    return {"x-apisports-key": _get_api_key()}
 
 
 def now_utc() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def get_target_date() -> str:
-    d = (os.environ.get("TARGET_DATE") or "").strip()
-    if d:
-        return d
-    return now_utc().strftime("%Y-%m-%d")
-
-
-def parse_live_leagues(env_value: str) -> List[int]:
-    tokens: List[str] = []
-    for part in (env_value or "").replace("\n", ",").replace(" ", ",").split(","):
-        p = part.strip()
-        if p:
-            tokens.append(p)
+def parse_live_leagues(s: str) -> List[int]:
     out: List[int] = []
-    for t in tokens:
-        try:
-            out.append(int(t))
-        except ValueError:
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
             continue
+        try:
+            out.append(int(tok))
+        except ValueError:
+            print(f"[WARN] LIVE_LEAGUES token invalid: {tok!r}", file=sys.stderr)
     return sorted(set(out))
 
 
-def _status_group(status_short: str, status_long: str = "") -> str:
-    s = (status_short or "").upper()
-    l = (status_long or "").lower()
+def get_target_date() -> str:
+    # 우선순위: ENV TARGET_DATE > CLI arg1 > 오늘(UTC)
+    env_date = (os.environ.get("TARGET_DATE") or "").strip()
+    if env_date:
+        return env_date
+    if len(sys.argv) >= 2 and sys.argv[1].strip():
+        return sys.argv[1].strip()
+    return now_utc().strftime("%Y-%m-%d")
 
+
+def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry: int = 4) -> Dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    last_err: Optional[Exception] = None
+    for i in range(max_retry):
+        try:
+            resp = requests.get(url, headers=_get_headers(), params=params, timeout=timeout)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(0.7 * (i + 1))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("API response is not a dict")
+            return data
+        except Exception as e:
+            last_err = e
+            time.sleep(0.7 * (i + 1))
+            continue
+    raise RuntimeError(f"API request failed after retries: {last_err}")
+
+
+def _status_group_from_short(short: Optional[str]) -> str:
+    s = (short or "").upper()
     if s in ("FT", "AET", "PEN"):
         return "FINISHED"
     if s in ("NS", "TBD"):
-        return "UPCOMING"
-    if s in ("1H", "HT", "2H", "ET", "BT", "P", "LIVE"):
-        return "INPLAY"
-    if s in ("PST", "CANC", "ABD", "SUSP", "INT"):
-        # 필요하면 별도 그룹을 만들 수도 있지만, 기존 스키마 유지 차원에서 UNKNOWN 처리
-        return "UNKNOWN"
-    if "finished" in l:
-        return "FINISHED"
-    if "not started" in l:
-        return "UPCOMING"
-    if "in play" in l or "live" in l:
-        return "INPLAY"
-    return "UNKNOWN"
+        return "SCHEDULED"
+    if s in ("PST", "CANC", "ABD", "AWD", "WO"):
+        return "CANCELLED"
+    return "LIVE"
 
 
 def _extract_fixture_basic(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not isinstance(fx, dict):
+    fixture = fx.get("fixture") or {}
+    league = fx.get("league") or {}
+    teams = fx.get("teams") or {}
+
+    fid = fixture.get("id")
+    if fid is None:
         return None
 
-    fixture_block = fx.get("fixture") or {}
-    league_block = fx.get("league") or {}
-    status_block = fixture_block.get("status") or {}
+    status = fixture.get("status") or {}
+    status_short = status.get("short")
+    status_group = _status_group_from_short(status_short)
 
-    fixture_id = fixture_block.get("id")
-    if fixture_id is None:
-        return None
+    season = league.get("season")
+    league_id = league.get("id")
 
-    league_id = league_block.get("id")
-    season = league_block.get("season")
-
-    date_utc = fixture_block.get("date")  # ISO 문자열 (API가 주는 값 그대로 TEXT 저장)
-    status_short = status_block.get("short") or ""
-    status_long = status_block.get("long") or ""
-    elapsed = status_block.get("elapsed")
-    extra = status_block.get("extra")
+    home_id = (teams.get("home") or {}).get("id")
+    away_id = (teams.get("away") or {}).get("id")
 
     return {
-        "fixture_id": int(fixture_id),
+        "fixture_id": int(fid),
         "league_id": int(league_id) if league_id is not None else None,
         "season": int(season) if season is not None else None,
-        "date_utc": date_utc,
-        "status": status_short,
         "status_short": status_short,
-        "status_long": status_long,
-        "status_elapsed": elapsed,
-        "status_extra": extra,
-        "status_group": _status_group(status_short, status_long),
-        "elapsed": elapsed,
+        "status_group": status_group,
+        "home_id": int(home_id) if home_id is not None else None,
+        "away_id": int(away_id) if away_id is not None else None,
     }
 
 
@@ -134,52 +141,46 @@ def _extract_fixture_basic(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # ─────────────────────────────────────
 
 def fetch_fixtures_from_api(league_id: int, date_str: str) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/fixtures"
-    params = {"league": league_id, "date": date_str}
-    resp = requests.get(url, headers=_headers(), params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response") or []
+    data = _safe_get("/fixtures", params={"league": league_id, "date": date_str})
+    rows = data.get("response", []) or []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def fetch_fixture_by_id(fixture_id: int) -> Optional[Dict[str, Any]]:
+    data = _safe_get("/fixtures", params={"id": fixture_id})
+    rows = data.get("response", []) or []
+    for r in rows:
+        if isinstance(r, dict):
+            return r
+    return None
 
 
 def fetch_events_from_api(fixture_id: int) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/fixtures/events"
-    params = {"fixture": fixture_id}
-    resp = requests.get(url, headers=_headers(), params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response") or []
+    data = _safe_get("/fixtures/events", params={"fixture": fixture_id})
+    rows = data.get("response", []) or []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def fetch_lineups_from_api(fixture_id: int) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/fixtures/lineups"
-    params = {"fixture": fixture_id}
-    resp = requests.get(url, headers=_headers(), params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response") or []
+    data = _safe_get("/fixtures/lineups", params={"fixture": fixture_id})
+    rows = data.get("response", []) or []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def fetch_team_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/fixtures/statistics"
-    params = {"fixture": fixture_id}
-    resp = requests.get(url, headers=_headers(), params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response") or []
+    data = _safe_get("/fixtures/statistics", params={"fixture": fixture_id})
+    rows = data.get("response", []) or []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def fetch_player_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/fixtures/players"
-    params = {"fixture": fixture_id}
-    resp = requests.get(url, headers=_headers(), params=params, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("response") or []
+    data = _safe_get("/fixtures/players", params={"fixture": fixture_id})
+    rows = data.get("response", []) or []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 # ─────────────────────────────────────
-#  DB upserts (스키마 유지)
+#  DB upserts (스키마 그대로)
 # ─────────────────────────────────────
 
 def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any]) -> None:
@@ -198,18 +199,19 @@ def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any]) -> N
 
 
 def upsert_fixture_row(fx: Dict[str, Any], league_id: int, season: int) -> None:
-    basic = _extract_fixture_basic(fx)
-    if basic is None:
+    fixture_block = fx.get("fixture") or {}
+    fid = fixture_block.get("id")
+    if fid is None:
         return
-    fixture_id = basic["fixture_id"]
-    date_utc = basic.get("date_utc")
-    status = basic.get("status")
-    status_group = basic.get("status_group")
+
+    date_utc = fixture_block.get("date")
+    status_short = (fixture_block.get("status") or {}).get("short")
+    status_group = _status_group_from_short(status_short)
 
     execute(
         """
         INSERT INTO fixtures (fixture_id, league_id, season, date_utc, status, status_group)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (%s,%s,%s,%s,%s,%s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id     = EXCLUDED.league_id,
             season        = EXCLUDED.season,
@@ -217,85 +219,62 @@ def upsert_fixture_row(fx: Dict[str, Any], league_id: int, season: int) -> None:
             status        = EXCLUDED.status,
             status_group  = EXCLUDED.status_group
         """,
-        (fixture_id, league_id, season, date_utc, status, status_group),
+        (int(fid), int(league_id), int(season), date_utc, status_short, status_group),
     )
 
 
 def upsert_match_row(fx: Dict[str, Any], league_id: int, season: int) -> None:
-    basic = _extract_fixture_basic(fx)
-    if basic is None:
+    fixture_block = fx.get("fixture") or {}
+    teams_block = fx.get("teams") or {}
+    goals_block = fx.get("goals") or {}
+    score_block = fx.get("score") or {}
+
+    fid = fixture_block.get("id")
+    if fid is None:
         return
 
-    fixture_id = basic["fixture_id"]
-    date_utc = basic.get("date_utc")
-    status_short = basic.get("status_short") or ""
-    status_group = basic.get("status_group") or "UNKNOWN"
-    elapsed = basic.get("elapsed")
+    date_utc = fixture_block.get("date")
+    st = fixture_block.get("status") or {}
+    status_short = st.get("short")
+    status_long = st.get("long")
+    status_elapsed = st.get("elapsed")
+    status_extra = st.get("extra")
+    status_group = _status_group_from_short(status_short)
 
-    teams_block = fx.get("teams") or {}
-    home_team = teams_block.get("home") or {}
-    away_team = teams_block.get("away") or {}
-    home_id = home_team.get("id")
-    away_id = away_team.get("id")
+    home_id = (teams_block.get("home") or {}).get("id")
+    away_id = (teams_block.get("away") or {}).get("id")
     if home_id is None or away_id is None:
         return
 
-    goals_block = fx.get("goals") or {}
     home_ft = goals_block.get("home")
     away_ft = goals_block.get("away")
 
-    fixture_block = fx.get("fixture") or {}
-    league_block = fx.get("league") or {}
-    status_block = fixture_block.get("status") or {}
-    venue_block = fixture_block.get("venue") or {}
-    score_block = fx.get("score") or {}
-    ht_block = score_block.get("halftime") or {}
+    ht = score_block.get("halftime") or {}
+    home_ht = ht.get("home")
+    away_ht = ht.get("away")
+
+    elapsed = status_elapsed
 
     referee = fixture_block.get("referee")
     fixture_timezone = fixture_block.get("timezone")
     fixture_timestamp = fixture_block.get("timestamp")
+    venue = fixture_block.get("venue") or {}
+    venue_id = venue.get("id")
+    venue_name = venue.get("name")
+    venue_city = venue.get("city")
 
-    status_long = status_block.get("long")
-    status_elapsed = status_block.get("elapsed")
-    status_extra = status_block.get("extra")
+    league_round = (fx.get("league") or {}).get("round")
 
-    home_ht = ht_block.get("home")
-    away_ht = ht_block.get("away")
-
-    venue_id = venue_block.get("id")
-    venue_name = venue_block.get("name")
-    venue_city = venue_block.get("city")
-
-    league_round = league_block.get("round")
-
-    # matches 스키마: 기존 컬럼들 그대로 유지 (너가 뽑아준 matches 컬럼 목록 기준)
     execute(
         """
         INSERT INTO matches (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status,
-            status_group,
-            home_id,
-            away_id,
-            home_ft,
-            away_ft,
-            elapsed,
-            home_ht,
-            away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round
+            fixture_id, league_id, season, date_utc, status, status_group,
+            home_id, away_id,
+            home_ft, away_ft, elapsed,
+            home_ht, away_ht,
+            referee, fixture_timezone, fixture_timestamp,
+            status_short, status_long, status_elapsed, status_extra,
+            venue_id, venue_name, venue_city, league_round
         )
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (fixture_id) DO UPDATE SET
@@ -324,30 +303,13 @@ def upsert_match_row(fx: Dict[str, Any], league_id: int, season: int) -> None:
             league_round = EXCLUDED.league_round
         """,
         (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status_short,
-            status_group,
-            int(home_id),
-            int(away_id),
-            home_ft,
-            away_ft,
-            elapsed,
-            home_ht,
-            away_ht,
-            referee,
-            fixture_timezone,
-            fixture_timestamp,
-            status_short,
-            status_long,
-            status_elapsed,
-            status_extra,
-            venue_id,
-            venue_name,
-            venue_city,
-            league_round,
+            int(fid), int(league_id), int(season), date_utc, status_short, status_group,
+            int(home_id), int(away_id),
+            home_ft, away_ft, elapsed,
+            home_ht, away_ht,
+            referee, fixture_timezone, fixture_timestamp,
+            status_short, status_long, status_elapsed, status_extra,
+            venue_id, venue_name, venue_city, league_round,
         ),
     )
 
@@ -365,7 +327,7 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
-    # postmatch 백필은 "최종본"이 목적이므로, 한 경기 이벤트는 통째로 덮어쓰기
+    # postmatch는 최종본 목적 → fixture 단위 통째 덮어쓰기
     execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
 
     for ev in events:
@@ -386,11 +348,11 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         minute = time_block.get("elapsed")
         extra = time_block.get("extra")
 
-        # 스키마: minute NOT NULL
+        # minute NOT NULL
         if minute is None:
             continue
 
-        # 교체(Subst)면, 들어온 선수는 assist 쪽에 실려오는 경우가 많아서 미러링
+        # Subst: 들어온 선수는 assist쪽에 실리는 경우가 많음
         player_in_id = None
         player_in_name = None
         if str(type_).lower() == "subst":
@@ -483,8 +445,6 @@ def upsert_match_team_stats(fixture_id: int, stats: List[Dict[str, Any]]) -> Non
 
 
 def upsert_match_player_stats(fixture_id: int, players_stats: List[Dict[str, Any]]) -> None:
-    # 기존 구현과 동일: fixture 단위로 통째로 갱신(DELETE 후 PK별 INSERT/UPSERT)
-    # (schema: fixture_id + player_id PK) :contentReference[oaicite:3]{index=3}
     execute("DELETE FROM match_player_stats WHERE fixture_id = %s", (fixture_id,))
 
     for team_block in players_stats:
@@ -525,6 +485,10 @@ def is_fixture_already_backfilled(fixture_id: int) -> bool:
     return row is not None
 
 
+# ─────────────────────────────────────
+#  한 경기 상세 백필
+# ─────────────────────────────────────
+
 def backfill_postmatch_for_fixture(fixture_id: int) -> None:
     # events
     try:
@@ -564,6 +528,10 @@ def backfill_postmatch_for_fixture(fixture_id: int) -> None:
         upsert_match_player_stats(fixture_id, players_stats)
 
 
+# ─────────────────────────────────────
+#  엔트리
+# ─────────────────────────────────────
+
 def main() -> None:
     target_date = get_target_date()
     live_leagues = parse_live_leagues(os.environ.get("LIVE_LEAGUES", ""))
@@ -592,21 +560,24 @@ def main() -> None:
                     continue
 
                 fixture_id = basic["fixture_id"]
-                league_id = lid
+
                 season = basic.get("season")
                 if season is None:
-                    # season이 없으면 스키마상 matches.season NOT NULL이라 저장 불가
+                    # matches.season NOT NULL
                     continue
 
-                # /fixtures 원본 저장 (match_fixtures_raw)
+                # 날짜 기반 리스트 fx가 간혹 필드가 빈 경우가 있어 id로 한 번 더 보강(안전)
+                fx_full = fetch_fixture_by_id(fixture_id) or fx
+
+                # /fixtures 원본 저장
                 try:
-                    upsert_match_fixtures_raw(fixture_id, fx)
+                    upsert_match_fixtures_raw(fixture_id, fx_full)
                 except Exception as raw_e:
                     print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
 
                 # 기본 정보/스코어 최신화는 항상 수행
-                upsert_fixture_row(fx, league_id, int(season))
-                upsert_match_row(fx, league_id, int(season))
+                upsert_fixture_row(fx_full, lid, int(season))
+                upsert_match_row(fx_full, lid, int(season))
 
                 # 이미 match_events 있으면 postmatch는 스킵
                 if is_fixture_already_backfilled(fixture_id):
