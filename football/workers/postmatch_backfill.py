@@ -84,14 +84,18 @@ def get_target_dates() -> List[str]:
     if days <= 0:
         days = 7
 
-    end = now_utc().date()
+    # ✅ 크론 기준 "오늘"을 KST 기준으로 계산 (UTC 기준 하루 밀림 방지)
+    kst = dt.timezone(dt.timedelta(hours=9))
+    end = now_utc().astimezone(kst).date()
     start = end - dt.timedelta(days=days - 1)
+
     out: List[str] = []
     cur = start
     while cur <= end:
         out.append(cur.strftime("%Y-%m-%d"))
         cur += dt.timedelta(days=1)
     return out
+
 
 
 
@@ -108,12 +112,21 @@ def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry
             data = resp.json()
             if not isinstance(data, dict):
                 raise RuntimeError("API response is not a dict")
+
+            # ✅ 200 OK라도 errors가 차있을 수 있음(예: season required)
+            errs = data.get("errors")
+            if isinstance(errs, dict) and errs:
+                print(f"[WARN] API errors on {path} params={params}: {errs}", file=sys.stderr)
+            elif isinstance(errs, list) and len(errs) > 0:
+                print(f"[WARN] API errors on {path} params={params}: {errs}", file=sys.stderr)
+
             return data
         except Exception as e:
             last_err = e
             time.sleep(0.7 * (i + 1))
             continue
     raise RuntimeError(f"API request failed after retries: {last_err}")
+
 
 
 def _status_group_from_short(short: Optional[str]) -> str:
@@ -202,13 +215,17 @@ def fetch_fixtures_from_api(league_id: int, date_str: str, season: Optional[int]
     if season is None:
         season = pick_season_for_date(league_id, date_str)
 
-    params: Dict[str, Any] = {"league": league_id, "date": date_str}
+    # ✅ date 필터가 timezone 영향을 받으니 반드시 포함
+    tz = (os.environ.get("API_TZ") or "Asia/Seoul").strip()
+
+    params: Dict[str, Any] = {"league": league_id, "date": date_str, "timezone": tz}
     if season is not None:
         params["season"] = int(season)
 
     data = _safe_get("/fixtures", params=params)
     rows = data.get("response", []) or []
     return [r for r in rows if isinstance(r, dict)]
+
 
 
 
