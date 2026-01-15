@@ -78,6 +78,10 @@ from hockey.leaguedetail.hockey_leaguedetail_routes import hockey_leaguedetail_b
 import traceback
 import sys
 
+import logging
+log = logging.getLogger("sportsstatsx-api")
+
+
 
 # ─────────────────────────────────────────
 # 기본 설정
@@ -1672,6 +1676,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
