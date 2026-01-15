@@ -28,7 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from db import execute  # 프로젝트 기존 db 래퍼 사용 (execute(sql, params_tuple))
+from db import execute, fetch_all  # execute + schema 조회용 fetch_all 사용
+
 
 
 # ─────────────────────────────────────
@@ -293,6 +294,45 @@ def infer_season_candidates(date_str: str) -> List[int]:
     return [y, y - 1, y + 1]
 
 
+def _get_table_columns(table_name: str) -> List[str]:
+    """
+    public.<table_name> 컬럼 목록을 런타임에 조회해서 캐시한다.
+    - 스키마 변경 없이, '있는 컬럼만' 동적으로 업서트하기 위한 기반.
+    """
+    if not hasattr(_get_table_columns, "_cache"):
+        _get_table_columns._cache = {}  # type: ignore[attr-defined]
+
+    cache: Dict[str, List[str]] = _get_table_columns._cache  # type: ignore[attr-defined]
+    if table_name in cache:
+        return cache[table_name]
+
+    rows = fetch_all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s
+        ORDER BY ordinal_position
+        """,
+        (table_name,),
+    )
+
+    cols: List[str] = []
+    # db 래퍼가 dict/list/tuple 어떤 형태로 주든 최대한 흡수
+    for r in rows or []:
+        if isinstance(r, dict):
+            v = r.get("column_name")
+        elif isinstance(r, (list, tuple)) and len(r) >= 1:
+            v = r[0]
+        else:
+            v = None
+        if v:
+            cols.append(str(v))
+
+    cache[table_name] = cols
+    return cols
+
+
+
 # ─────────────────────────────────────
 # DB Upsert
 # ─────────────────────────────────────
@@ -337,9 +377,14 @@ def upsert_match_row_from_fixture(
     fixtures 응답 1개(item)를 matches 테이블로 업서트.
     반환: (fixture_id, home_id, away_id, status_group, date_utc)
 
-    ✅ 현재 dev에서 실제로 없는 컬럼(home_name 등) 때문에 워커가 계속 죽는 상황을 막기 위해,
-    ✅ matches 업서트는 "핵심 컬럼"만 사용한다. (스키마 변경 없음)
+    핵심 변경:
+    - matches 테이블 컬럼 목록을 런타임에 조회해서(_get_table_columns),
+      "DB에 실제로 존재하는 컬럼만" 대상으로 INSERT/UPDATE SQL을 동적으로 생성한다.
+    - /fixtures 응답에서 만들 수 있는 값들은 최대한 많이 준비해두고,
+      그 중 matches에 존재하는 컬럼만 골라서 채운다.
+    - 스키마에 없는 컬럼을 건드려서 워커가 죽는 문제를 원천 차단.
     """
+
     fx = fixture_obj.get("fixture") or {}
     teams = fixture_obj.get("teams") or {}
     goals = fixture_obj.get("goals") or {}
@@ -357,86 +402,170 @@ def upsert_match_row_from_fixture(
     status_elapsed = safe_int(st.get("elapsed"))
 
     status_group = map_status_group(status_short)
-    status = status_short.strip() or "UNK"  # matches.status NOT NULL
+    status = status_short.strip() or "UNK"  # (matches.status가 NOT NULL인 경우 대비)
 
-    home = teams.get("home") or {}
-    away = teams.get("away") or {}
+    home = (teams.get("home") or {}) if isinstance(teams, dict) else {}
+    away = (teams.get("away") or {}) if isinstance(teams, dict) else {}
     home_id = safe_int(home.get("id")) or 0
     away_id = safe_int(away.get("id")) or 0
 
-    home_ft = safe_int(goals.get("home"))
-    away_ft = safe_int(goals.get("away"))
+    home_ft = safe_int(goals.get("home")) if isinstance(goals, dict) else None
+    away_ft = safe_int(goals.get("away")) if isinstance(goals, dict) else None
 
     ht = (score.get("halftime") or {}) if isinstance(score, dict) else {}
+    ft = (score.get("fulltime") or {}) if isinstance(score, dict) else {}
+    et = (score.get("extratime") or {}) if isinstance(score, dict) else {}
+    pn = (score.get("penalty") or {}) if isinstance(score, dict) else {}
+
     home_ht = safe_int(ht.get("home"))
     away_ht = safe_int(ht.get("away"))
 
-    # ✅ matches: dev 스키마에서 확실히 있는 "핵심 컬럼"만 업서트
+    # 참고: 스키마에 있을 수도 있는 추가 스코어들(있으면 채움)
+    home_ft_score = safe_int(ft.get("home"))
+    away_ft_score = safe_int(ft.get("away"))
+    home_et = safe_int(et.get("home"))
+    away_et = safe_int(et.get("away"))
+    home_pen = safe_int(pn.get("home"))
+    away_pen = safe_int(pn.get("away"))
+
+    # venue/referee (있으면 채움)
+    venue = fx.get("venue") or {}
+    referee = safe_text(fx.get("referee"))
+
+    venue_id = safe_int(venue.get("id")) if isinstance(venue, dict) else None
+    venue_name = safe_text(venue.get("name")) if isinstance(venue, dict) else None
+    venue_city = safe_text(venue.get("city")) if isinstance(venue, dict) else None
+
+    # team names/logos/winner (스키마에 있을 때만 들어가도록 후보 준비)
+    home_name = safe_text(home.get("name"))
+    away_name = safe_text(away.get("name"))
+    home_logo = safe_text(home.get("logo"))
+    away_logo = safe_text(away.get("logo"))
+    home_winner = home.get("winner") if isinstance(home, dict) else None
+    away_winner = away.get("winner") if isinstance(away, dict) else None
+
+    # league fields (스키마에 있을 때만)
+    league_name = safe_text(league.get("name")) if isinstance(league, dict) else None
+    league_country = safe_text(league.get("country")) if isinstance(league, dict) else None
+    league_round = safe_text(league.get("round")) if isinstance(league, dict) else None
+
+    # ---- DB 컬럼에 맞춰 "후보 값"을 넉넉히 준비 ----
+    # (여기 키들이 matches에 실제로 존재하면 자동으로 INSERT/UPDATE에 포함됨)
+    candidates: Dict[str, Any] = {
+        # 거의 확실히 있을 핵심
+        "fixture_id": fixture_id,
+        "league_id": league_id,
+        "season": season,
+        "date_utc": date_utc,
+        "status": status,
+        "status_group": status_group,
+        "home_id": home_id,
+        "away_id": away_id,
+        "home_ft": home_ft,
+        "away_ft": away_ft,
+        "elapsed": status_elapsed,
+        "home_ht": home_ht,
+        "away_ht": away_ht,
+
+        # 스키마에 있을 가능성이 높은 확장(있으면 자동 채움)
+        "referee": referee,
+        "venue_id": venue_id,
+        "venue_name": venue_name,
+        "venue_city": venue_city,
+
+        "home_name": home_name,
+        "away_name": away_name,
+        "home_logo": home_logo,
+        "away_logo": away_logo,
+        "home_winner": home_winner,
+        "away_winner": away_winner,
+
+        "league_name": league_name,
+        "league_country": league_country,
+        "league_round": league_round,
+
+        # 다양한 스키마 케이스 대응 (컬럼명이 이렇게 존재하면 채워짐)
+        "home_fulltime": home_ft_score,
+        "away_fulltime": away_ft_score,
+        "home_et": home_et,
+        "away_et": away_et,
+        "home_pen": home_pen,
+        "away_pen": away_pen,
+
+        # 혹시 score_* 형태 스키마인 경우
+        "home_ft_score": home_ft_score,
+        "away_ft_score": away_ft_score,
+        "home_ht_score": home_ht,
+        "away_ht_score": away_ht,
+        "home_et_score": home_et,
+        "away_et_score": away_et,
+        "home_pen_score": home_pen,
+        "away_pen_score": away_pen,
+    }
+
+    # ---- matches 실제 컬럼과 교집합만 사용 ----
+    cols = _get_table_columns("matches")
+    colset = set(cols)
+
+    # fixture_id는 반드시 포함(충돌키/PK)
+    if "fixture_id" not in colset:
+        raise RuntimeError("matches table has no fixture_id column")
+
+    # 실제로 INSERT/UPDATE에 쓸 컬럼만 추림(컬럼 존재 + 후보 키 존재)
+    use_cols: List[str] = []
+    for k in cols:
+        if k in candidates:
+            use_cols.append(k)
+
+    # 안전: fixture_id는 무조건 포함되게
+    if "fixture_id" not in use_cols:
+        use_cols.insert(0, "fixture_id")
+
+    # INSERT 컬럼/값
+    insert_cols_sql = ",\n            ".join(use_cols)
+    insert_vals_sql = ",".join(["%s"] * len(use_cols))
+    insert_params = tuple(candidates.get(c) for c in use_cols)
+
+    # UPDATE 컬럼(=fixture_id 제외)
+    upd_cols = [c for c in use_cols if c != "fixture_id"]
+
+    # 업데이트할 게 없으면(극단 케이스) insert만 시도
+    if not upd_cols:
+        execute(
+            f"""
+            INSERT INTO matches (
+                {insert_cols_sql}
+            )
+            VALUES (
+                {insert_vals_sql}
+            )
+            ON CONFLICT (fixture_id) DO NOTHING
+            """,
+            insert_params,
+        )
+        return fixture_id, home_id, away_id, status_group, date_utc
+
+    update_set_sql = ",\n            ".join([f"{c} = EXCLUDED.{c}" for c in upd_cols])
+    where_diff_sql = " OR\n            ".join([f"matches.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in upd_cols])
+
     execute(
-        """
+        f"""
         INSERT INTO matches (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status,
-            status_group,
-            home_id,
-            away_id,
-            home_ft,
-            away_ft,
-            elapsed,
-            home_ht,
-            away_ht
+            {insert_cols_sql}
         )
         VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            {insert_vals_sql}
         )
         ON CONFLICT (fixture_id) DO UPDATE SET
-            league_id    = EXCLUDED.league_id,
-            season       = EXCLUDED.season,
-            date_utc     = EXCLUDED.date_utc,
-            status       = EXCLUDED.status,
-            status_group = EXCLUDED.status_group,
-            home_id      = EXCLUDED.home_id,
-            away_id      = EXCLUDED.away_id,
-            home_ft         = EXCLUDED.home_ft,
-            away_ft      = EXCLUDED.away_ft,
-            elapsed      = EXCLUDED.elapsed,
-            home_ht      = EXCLUDED.home_ht,
-            away_ht      = EXCLUDED.away_ht
+            {update_set_sql}
         WHERE
-            matches.league_id    IS DISTINCT FROM EXCLUDED.league_id OR
-            matches.season       IS DISTINCT FROM EXCLUDED.season OR
-            matches.date_utc     IS DISTINCT FROM EXCLUDED.date_utc OR
-            matches.status       IS DISTINCT FROM EXCLUDED.status OR
-            matches.status_group IS DISTINCT FROM EXCLUDED.status_group OR
-            matches.home_id      IS DISTINCT FROM EXCLUDED.home_id OR
-            matches.away_id      IS DISTINCT FROM EXCLUDED.away_id OR
-            matches.home_ft      IS DISTINCT FROM EXCLUDED.home_ft OR
-            matches.away_ft      IS DISTINCT FROM EXCLUDED.away_ft OR
-            matches.elapsed      IS DISTINCT FROM EXCLUDED.elapsed OR
-            matches.home_ht      IS DISTINCT FROM EXCLUDED.home_ht OR
-            matches.away_ht      IS DISTINCT FROM EXCLUDED.away_ht
+            {where_diff_sql}
         """,
-        (
-            fixture_id,
-            league_id,
-            season,
-            date_utc,
-            status,
-            status_group,
-            home_id,
-            away_id,
-            home_ft,
-            away_ft,
-            status_elapsed,  # elapsed 컬럼
-            home_ht,
-            away_ht,
-        ),
+        insert_params,
     )
 
     return fixture_id, home_id, away_id, status_group, date_utc
+
 
 
 
