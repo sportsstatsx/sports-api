@@ -27,16 +27,15 @@ BASE_URL = "https://v3.football.api-sports.io/fixtures"
 #  ENV / 유틸
 # ─────────────────────────────────────
 
+
 def _get_api_key() -> str:
-    # 너 프로젝트에서 쓰는 키 이름들이 섞여있을 수 있어서 여러 후보를 체크
     key = (
-        os.environ.get("API_FOOTBALL_KEY")
+        os.environ.get("APIFOOTBALL_KEY")
         or os.environ.get("API_KEY")
-        or os.environ.get("FOOTBALL_API_KEY")
         or ""
     )
     if not key:
-        raise RuntimeError("API key missing: set API_FOOTBALL_KEY (or API_KEY)")
+        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_KEY)")
     return key
 
 
