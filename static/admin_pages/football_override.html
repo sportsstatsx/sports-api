@@ -114,9 +114,12 @@ th, td{
       transition: background .12s ease, border-color .12s ease;
     }
     .subcard:hover{
-      background:var(--panel2);
+      /* 다크에서 hover 시 “하얗게” 튀는 케이스 방지: 배경은 유지하고 테두리만 강조 */
       border-color:var(--border2);
+      background:var(--panel);
     }
+
+
 
     .subcard h3 { margin:0 0 10px 0; font-size:14px; }
     .mini { font-size:12px; color:var(--muted); }
@@ -378,59 +381,61 @@ pre{
   <div style="flex:1 1 220px;">
     <label class="muted">Status Group</label>
 
-    <!-- ✅ 드롭다운 + 직접타이핑 -->
-    <input
-      id="qeStatusGroup"
-      list="qeStatusGroupList"
-      placeholder="(keep) 또는 직접 입력"
-      autocomplete="off"
-      inputmode="latin"
-    />
-    <datalist id="qeStatusGroupList">
-      <option value="UPCOMING"></option>
-      <option value="INPLAY"></option>
-      <option value="FINISHED"></option>
-      <option value="PST"></option>
-      <option value="SUSP"></option>
-      <option value="CANC"></option>
-      <option value="TBD"></option>
-    </datalist>
+    <!-- ✅ 프리셋 드롭다운(클릭하면 항상 선택지 표시) + 직접 입력(input)은 기존 id 유지 -->
+    <div class="row" style="gap:8px;">
+      <div style="flex:0 0 170px;">
+        <select id="qeStatusGroupPreset">
+          <option value="">(preset)</option>
+          <option value="UPCOMING">UPCOMING</option>
+          <option value="INPLAY">INPLAY</option>
+          <option value="FINISHED">FINISHED</option>
+          <option value="PST">PST</option>
+          <option value="SUSP">SUSP</option>
+          <option value="CANC">CANC</option>
+          <option value="TBD">TBD</option>
+        </select>
+      </div>
+      <div style="flex:1 1 auto;">
+        <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+      </div>
+    </div>
   </div>
 
   <div style="flex:1 1 220px;">
     <label class="muted">Status</label>
 
-    <!-- ✅ 드롭다운 + 직접타이핑 -->
-    <input
-      id="qeStatus"
-      list="qeStatusList"
-      placeholder="(keep) 또는 직접 입력"
-      autocomplete="off"
-      inputmode="latin"
-    />
-    <datalist id="qeStatusList">
-      <!-- API-Football에서 흔한 코드들 + 네가 쓰던 것들 -->
-      <option value="NS"></option>
-      <option value="1H"></option>
-      <option value="HT"></option>
-      <option value="2H"></option>
-      <option value="ET"></option>
-      <option value="BT"></option>
-      <option value="P"></option>
-      <option value="FT"></option>
-      <option value="AET"></option>
-      <option value="PEN"></option>
-      <option value="SUSP"></option>
-      <option value="INT"></option>
-      <option value="PST"></option>
-      <option value="CANC"></option>
-      <option value="ABD"></option>
-      <option value="AWD"></option>
-      <option value="WO"></option>
-      <option value="LIVE"></option>
-    </datalist>
+    <!-- ✅ 프리셋 드롭다운 + 직접 입력(input)은 기존 id 유지 -->
+    <div class="row" style="gap:8px;">
+      <div style="flex:0 0 170px;">
+        <select id="qeStatusPreset">
+          <option value="">(preset)</option>
+          <option value="NS">NS</option>
+          <option value="1H">1H</option>
+          <option value="HT">HT</option>
+          <option value="2H">2H</option>
+          <option value="ET">ET</option>
+          <option value="BT">BT</option>
+          <option value="P">P</option>
+          <option value="FT">FT</option>
+          <option value="AET">AET</option>
+          <option value="PEN">PEN</option>
+          <option value="SUSP">SUSP</option>
+          <option value="INT">INT</option>
+          <option value="PST">PST</option>
+          <option value="CANC">CANC</option>
+          <option value="ABD">ABD</option>
+          <option value="AWD">AWD</option>
+          <option value="WO">WO</option>
+          <option value="LIVE">LIVE</option>
+        </select>
+      </div>
+      <div style="flex:1 1 auto;">
+        <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+      </div>
+    </div>
   </div>
 </div>
+
 
 
 
@@ -772,6 +777,9 @@ pre{
     document.getElementById("qeElapsed").value = (f.elapsed ?? "") === null ? "" : (f.elapsed ?? "");
     document.getElementById("qeStatusGroup").value = f.status_group ?? "";
     document.getElementById("qeStatus").value = f.status ?? "";
+    document.getElementById("qeStatusGroupPreset").value = (f.status_group ?? "").toUpperCase();
+    document.getElementById("qeStatusPreset").value = (f.status ?? "").toUpperCase();
+
 
     document.getElementById("qeHomeFt").value = (f.home?.ft ?? "") === null ? "" : (f.home?.ft ?? "");
     document.getElementById("qeAwayFt").value = (f.away?.ft ?? "") === null ? "" : (f.away?.ft ?? "");
@@ -1107,6 +1115,29 @@ pre{
     }
   }
 
+    // ✅ 프리셋 select → input 값 자동 반영(기존 JS는 input(id=qeStatusGroup/qeStatus)만 읽으므로 안전)
+  (function(){
+    const sgPreset = document.getElementById("qeStatusGroupPreset");
+    const stPreset = document.getElementById("qeStatusPreset");
+    const sgInput  = document.getElementById("qeStatusGroup");
+    const stInput  = document.getElementById("qeStatus");
+
+    if (sgPreset && sgInput) {
+      sgPreset.addEventListener("change", () => { sgInput.value = sgPreset.value || ""; });
+    }
+    if (stPreset && stInput) {
+      stPreset.addEventListener("change", () => { stInput.value = stPreset.value || ""; });
+    }
+
+    const up = (el) => {
+      if (!el) return;
+      el.addEventListener("blur", () => { el.value = String(el.value || "").trim().toUpperCase(); });
+    };
+    up(sgInput);
+    up(stInput);
+  })();
+
+
   function applyQuickEditToPatch(opts = {}) {
     const silent = (opts && opts.silent === true);
     const onlyIfChanged = (opts && opts.onlyIfChanged === true);
@@ -1121,7 +1152,13 @@ pre{
     const cur = selectedFixture || {};
 
     const normStr = (x) => (x == null ? "" : String(x)).trim();
+    const normUpper = (x) => {
+      const s = normStr(x);
+      return s === "" ? "" : s.toUpperCase();
+    };
+
     const sameStr = (a, b) => normStr(a) === normStr(b);
+    const sameUpper = (a, b) => normUpper(a) === normUpper(b);
 
     const normNum = (x) => {
       const s = String(x ?? "").trim();
@@ -1145,16 +1182,19 @@ pre{
     const r  = normStr(document.getElementById("qeRound").value);
     const sl = normStr(document.getElementById("qeStatusLong").value);
     const el = normNum(document.getElementById("qeElapsed").value);
-    const sg = normStr(document.getElementById("qeStatusGroup").value);
-    const st = normStr(document.getElementById("qeStatus").value);
+
+    // ✅ StatusGroup/Status는 blur 이벤트에 의존하지 말고 여기서 안전하게 대문자 정규화
+    const sg = normUpper(document.getElementById("qeStatusGroup").value);
+    const st = normUpper(document.getElementById("qeStatus").value);
 
     if (!sameStr(v,  cur.venue_name))   p["venue_name"] = v;
     if (!sameStr(r,  cur.league_round)) p["league_round"] = r;
     if (!sameStr(sl, cur.status_long))  p["status_long"] = sl;
     if (!sameNum(el, cur.elapsed))      p["elapsed"] = el;
 
-    if (!sameStr(sg, cur.status_group)) p["status_group"] = sg;
-    if (!sameStr(st, cur.status))       p["status"] = st;
+    // ✅ 비교도 대문자 기준으로 수행(대소문자 차이로 쓸데없는 diff/patch 방지)
+    if (!sameUpper(sg, cur.status_group)) p["status_group"] = sg;
+    if (!sameUpper(st, cur.status))       p["status"] = st;
 
     const hft = normNum(document.getElementById("qeHomeFt").value);
     const aft = normNum(document.getElementById("qeAwayFt").value);
@@ -1191,6 +1231,7 @@ pre{
     updateComparisonViews();
     return true;
   }
+
 
 
   // ─────────────────────────────────────
@@ -1282,8 +1323,11 @@ pre{
 
       if (Array.isArray(obj)) {
         const sc = evtScoreArray(obj);
-        if (sc >= 8) {
-          const p = path || "(root_array)";
+
+        // ✅ (root_array) 후보는 UI에 노출하지 않음
+        // 이유: upsertOverride()가 patch JSON을 object만 허용(배열은 저장 실패) → 불일치/혼란 방지
+        if (sc >= 8 && path) {
+          const p = path;
           if (!seen.has(p)) {
             seen.add(p);
             out.push({
@@ -1294,6 +1338,7 @@ pre{
             });
           }
         }
+
         // 배열 내부도 탐색(객체면)
         for (let i=0;i<Math.min(obj.length, 30);i++) {
           const v = obj[i];
@@ -1314,6 +1359,7 @@ pre{
     out.sort((a,b) => b.score - a.score);
     return out.slice(0, 12);
   }
+
 
   function evtRefreshPathSelect() {
     const sel = document.getElementById("evtPath");
@@ -1798,6 +1844,7 @@ pre{
 
   loadFixtures();
 </script>
+  
   
 
   <script>
