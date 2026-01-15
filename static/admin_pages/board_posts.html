@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Board Posts</title>
+  <style>
+    /* ─────────────────────────────────────
+       Base layout (match existing admin pages vibe)
+       ───────────────────────────────────── */
+    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+    .muted { color: var(--muted); font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+    .card { border:1px solid var(--border); border-radius:12px; padding:14px; background:var(--panel); box-shadow: var(--shadow); }
+    .card h2 { margin:0 0 10px 0; font-size: 16px; }
+    .grid { display:grid; grid-template-columns: 0.9fr 1.1fr; gap:12px; align-items:start; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+
+    input, textarea, button, select { font-size: 14px; }
+    input, textarea, select {
+      width: 100%; box-sizing:border-box; padding:10px; border-radius:10px; border:1px solid var(--border);
+      background:var(--panel); color:var(--text);
+    }
+    textarea { min-height: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    button { padding:10px 12px; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text); cursor:pointer; }
+    button:hover { background:var(--panel2); border-color:var(--border2); }
+    button.primary { border-color: var(--text); }
+    button.danger { border-color: var(--danger); color: var(--danger); }
+    button.soft { opacity:0.9; }
+
+    .listWrap { max-height: 660px; overflow:auto; border:1px solid var(--border2); border-radius:12px; background:var(--panel); }
+    .item {
+      padding:10px 12px; border-bottom:1px solid var(--border2); cursor:pointer;
+      display:flex; gap:10px; align-items:flex-start;
+    }
+    .item:hover { background:var(--panel2); }
+    .item.sel { background: rgba(74, 144, 226, 0.12); }
+    .right { margin-left:auto; text-align:right; }
+
+    .badge { display:inline-block; padding:2px 8px; border:1px solid var(--border2); border-radius:999px; font-size:12px; color:var(--muted); background:transparent; }
+    .badge.pin { border-color: var(--text); color: var(--text); }
+    .badge.pub { border-color: var(--ok); color: var(--ok); }
+    .badge.draft { opacity:0.8; }
+    .badge.hid { border-color: var(--danger); color: var(--danger); }
+
+    .small { font-size:12px; }
+    .k { font-weight:600; }
+
+    .sep { height: 10px; }
+    .two { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    @media (max-width: 1100px) { .two { grid-template-columns: 1fr; } }
+
+    .chips { display:flex; gap:8px; flex-wrap:wrap; }
+    .chip { display:flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid var(--border2); border-radius:999px; background:transparent; font-size:12px; color:var(--text); }
+    .chip input { width:auto; margin:0; padding:0; }
+
+    pre {
+      margin:0; padding:10px; background:var(--panel2); border:1px solid var(--border2); border-radius:12px;
+      max-height: 220px; overflow:auto; color:var(--text);
+    }
+
+    /* ─────────────────────────────────────
+       Theme (shared)
+       ───────────────────────────────────── */
+    :root{
+      --bg:#ffffff;
+      --panel:#ffffff;
+      --panel2:#fafafa;
+      --text:#111214;
+      --muted:#666;
+      --border:#ddd;
+      --border2:#eee;
+      --danger:#d33;
+      --ok:#0a7;
+      --shadow: 0 10px 30px rgba(16,17,20,0.06);
+    }
+    html[data-theme="dark"]{
+      --bg:#0b0c0f;
+      --panel:#12141a;
+      --panel2:#0f1116;
+      --text:#f1f3f5;
+      --muted:#9aa3ad;
+      --border:rgba(241,243,245,0.14);
+      --border2:rgba(241,243,245,0.10);
+      --danger:#ff6b6b;
+      --ok:#53e0b2;
+      --shadow: 0 14px 40px rgba(0,0,0,0.35);
+    }
+    body{ background:var(--bg) !important; color:var(--text) !important; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">Board Posts</h1>
+      <div class="muted">
+        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+        · <button class="soft" style="padding:6px 10px;" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
+      </div>
+    </div>
+    <div class="muted" id="statusLine"></div>
+  </div>
+
+  <div class="grid" style="margin-top:14px;">
+    <!-- LEFT: list -->
+    <div class="card">
+      <h2>Posts</h2>
+
+      <div class="row">
+        <div style="min-width:170px; flex:0 0 170px;">
+          <label class="muted">Status</label>
+          <select id="qStatus">
+            <option value="">(all)</option>
+            <option value="draft">draft</option>
+            <option value="published">published</option>
+            <option value="hidden">hidden</option>
+          </select>
+        </div>
+
+        <div style="min-width:170px; flex:0 0 170px;">
+          <label class="muted">Category</label>
+          <select id="qCategory">
+            <option value="">(all)</option>
+            <option value="notice">notice</option>
+            <option value="ops">ops</option>
+            <option value="analysis">analysis</option>
+          </select>
+        </div>
+
+        <div style="min-width:170px; flex:0 0 170px;">
+          <label class="muted">Sport</label>
+          <select id="qSport">
+            <option value="">(all)</option>
+            <option value="football">football</option>
+            <option value="hockey">hockey</option>
+          </select>
+        </div>
+
+        <div style="flex:1 1 220px; min-width:220px;">
+          <label class="muted">Search (title/summary)</label>
+          <input id="qText" placeholder="예: Arsenal / 공지 / injury"/>
+        </div>
+
+        <div style="flex:0 0 140px;">
+          <button class="primary" style="width:100%;" onclick="loadPosts()">불러오기</button>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="row">
+        <div style="flex:1 1 220px; min-width:220px;">
+          <label class="muted">Fixture Key (optional)</label>
+          <input id="qFixtureKey" placeholder="예: football: 123456 / hockey: 2025-01-01-XYZ"/>
+        </div>
+        <div style="flex:0 0 140px;">
+          <button style="width:100%;" onclick="newPost()">+ 새 글</button>
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top:10px;" id="listHint"></div>
+
+      <div class="listWrap" style="margin-top:10px;">
+        <div id="postList"></div>
+      </div>
+    </div>
+
+    <!-- RIGHT: editor -->
+    <div class="card">
+      <h2>Editor</h2>
+
+      <div class="row">
+        <div style="flex:0 0 140px;">
+          <label class="muted">ID</label>
+          <input id="pId" disabled placeholder="(new)"/>
+        </div>
+
+        <div style="flex:1 1 180px; min-width:180px;">
+          <label class="muted">Category</label>
+          <select id="pCategory">
+            <option value="analysis">analysis</option>
+            <option value="notice">notice</option>
+            <option value="ops">ops</option>
+          </select>
+        </div>
+
+        <div style="flex:1 1 180px; min-width:180px;">
+          <label class="muted">Status</label>
+          <select id="pStatus">
+            <option value="draft">draft</option>
+            <option value="published">published</option>
+            <option value="hidden">hidden</option>
+          </select>
+        </div>
+
+        <div style="flex:1 1 180px; min-width:180px;">
+          <label class="muted">Pin level</label>
+          <select id="pPin">
+            <option value="0">0 (일반)</option>
+            <option value="1">1 (고정)</option>
+            <option value="2">2 (공지/운영 최상단)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="two">
+        <div>
+          <label class="muted">Sport (optional)</label>
+          <select id="pSport">
+            <option value="">(none)</option>
+            <option value="football">football</option>
+            <option value="hockey">hockey</option>
+          </select>
+        </div>
+        <div>
+          <label class="muted">Fixture Key (optional)</label>
+          <input id="pFixtureKey" placeholder="예: 123456"/>
+        </div>
+
+        <div>
+          <label class="muted">Publish at (optional)</label>
+          <input id="pPublishAt" type="datetime-local"/>
+        </div>
+        <div>
+          <label class="muted">Pin until (optional)</label>
+          <input id="pPinUntil" type="datetime-local"/>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <div>
+        <label class="muted">Title</label>
+        <input id="pTitle" placeholder="제목"/>
+      </div>
+
+      <div class="sep"></div>
+
+      <div>
+        <label class="muted">Summary (list에 보일 짧은 요약)</label>
+        <input id="pSummary" placeholder="요약(선택)"/>
+      </div>
+
+      <div class="sep"></div>
+
+      <div>
+        <label class="muted">Content (Markdown)</label>
+        <textarea id="pContent" placeholder="# 제목&#10;&#10;내용..."></textarea>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="two">
+        <div>
+          <label class="muted">Target Langs (비우면 전세계)</label>
+          <div class="chips" style="margin-top:6px;">
+            <label class="chip"><input type="checkbox" value="en" class="langChk">en</label>
+            <label class="chip"><input type="checkbox" value="es" class="langChk">es</label>
+            <label class="chip"><input type="checkbox" value="ko" class="langChk">ko</label>
+            <label class="chip"><input type="checkbox" value="ja" class="langChk">ja</label>
+            <label class="chip"><input type="checkbox" value="zh" class="langChk">zh</label>
+          </div>
+          <div class="muted small" style="margin-top:6px;">예: 영어 글이면 en만 체크</div>
+        </div>
+
+        <div>
+          <label class="muted">Target Countries (CSV, 비우면 전세계)</label>
+          <input id="pTargetCountries" placeholder="예: KR,JP,US"/>
+          <div class="muted small" style="margin-top:6px;">국가 한정 노출이 필요할 때만 사용</div>
+        </div>
+
+        <div>
+          <label class="muted">Block Countries (CSV, 비우면 차단 없음)</label>
+          <input id="pBlockCountries" placeholder="예: KR"/>
+          <div class="muted small" style="margin-top:6px;">특정 국가만 차단하고 싶을 때</div>
+        </div>
+
+        <div>
+          <label class="muted">(옵션) Snapshot JSON / Filters JSON</label>
+          <button onclick="toggleJsonPane()" style="width:100%;">JSON 패널 열기/닫기</button>
+        </div>
+      </div>
+
+      <div id="jsonPane" style="display:none; margin-top:10px;">
+        <div class="two">
+          <div>
+            <label class="muted">filters_json</label>
+            <textarea id="pFiltersJson" style="min-height:160px;" placeholder="{}"></textarea>
+          </div>
+          <div>
+            <label class="muted">snapshot_json</label>
+            <textarea id="pSnapshotJson" style="min-height:160px;" placeholder="{}"></textarea>
+          </div>
+        </div>
+        <div class="muted small" style="margin-top:6px;">
+          지금 단계에서는 수동으로 넣어도 되고, 다음 단계에서 “insights/aipredictions 패널” 붙이면 자동 저장되게 만들 수 있어요.
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="row" style="align-items:center;">
+        <button class="primary" onclick="savePost()">저장(Upsert)</button>
+        <button class="danger" onclick="deletePost()">삭제</button>
+        <button onclick="reloadSelected()">새로고침</button>
+        <div class="muted" id="saveHint" style="margin-left:auto;"></div>
+      </div>
+
+      <div class="sep"></div>
+      <div class="muted small">Debug</div>
+      <pre class="mono" id="debugBox">{}</pre>
+    </div>
+  </div>
+
+<script>
+  // ─────────────────────────────────────
+  // Shared helpers (token/adminPath/api)
+  // ─────────────────────────────────────
+  const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
+  document.getElementById("adminPathText").textContent = "/" + adminPath;
+
+  const tokenKey = "SSX_ADMIN_TOKEN";
+  const themeKey = "SSX_ADMIN_THEME";
+
+  let selectedId = null;
+  let cachedRows = [];
+
+  function setStatusLine(msg) {
+    document.getElementById("statusLine").textContent = msg || "";
+  }
+
+  function setSaveHint(msg) {
+    document.getElementById("saveHint").textContent = msg || "";
+  }
+
+  function logoutToken() {
+    localStorage.removeItem(tokenKey);
+    alert("토큰을 삭제했습니다. 다음 admin API 호출 시 다시 입력합니다.");
+  }
+
+  function adminHeaders() {
+    const t = localStorage.getItem(tokenKey) || "";
+    return {
+      "Content-Type": "application/json",
+      "X-Admin-Token": t,
+    };
+  }
+
+  function ensureToken() {
+    let t = localStorage.getItem(tokenKey);
+    if (!t) {
+      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
+      if (t) localStorage.setItem(tokenKey, t);
+    }
+    return t;
+  }
+
+  function adminUrl(path) {
+    return "/" + adminPath + path;
+  }
+
+  async function api(path, opt={}) {
+    ensureToken();
+    const res = await fetch(path, {
+      ...opt,
+      headers: { ...(opt.headers||{}), ...adminHeaders() },
+    });
+    const txt = await res.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+    return { status: res.status, data };
+  }
+
+  // ─────────────────────────────────────
+  // Theme sync (admin.html -> iframe)
+  // ─────────────────────────────────────
+  function resolveInitialTheme() {
+    const saved = localStorage.getItem(themeKey);
+    if (saved === "light" || saved === "dark") return saved;
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return prefersDark ? "dark" : "light";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+  }
+
+  applyTheme(resolveInitialTheme());
+
+  window.addEventListener("message", (ev) => {
+    const d = ev.data || {};
+    if (d && d.type === "ssx_theme" && (d.theme === "light" || d.theme === "dark")) {
+      localStorage.setItem(themeKey, d.theme);
+      applyTheme(d.theme);
+    }
+  });
+
+  // ─────────────────────────────────────
+  // UI helpers
+  // ─────────────────────────────────────
+  function csvToArrUpper(s) {
+    const v = (s || "").trim();
+    if (!v) return [];
+    return v.split(",").map(x => x.trim()).filter(Boolean).map(x => x.toUpperCase());
+  }
+
+  function arrToCsv(arr) {
+    if (!Array.isArray(arr) || !arr.length) return "";
+    return arr.join(",");
+  }
+
+  function getSelectedLangs() {
+    const xs = [];
+    document.querySelectorAll(".langChk").forEach(ch => {
+      if (ch.checked) xs.push(String(ch.value || "").trim().toLowerCase());
+    });
+    return xs.filter(Boolean);
+  }
+
+  function setSelectedLangs(arr) {
+    const m = new Set((arr || []).map(x => String(x||"").toLowerCase()));
+    document.querySelectorAll(".langChk").forEach(ch => {
+      const v = String(ch.value || "").toLowerCase();
+      ch.checked = m.has(v);
+    });
+  }
+
+  function toIsoOrNull(datetimeLocalValue) {
+    const v = (datetimeLocalValue || "").trim();
+    if (!v) return null;
+    // datetime-local은 로컬 시간으로 파싱됨
+    const d = new Date(v);
+    if (Number.isNaN(d.getTime())) return null;
+    return d.toISOString();
+  }
+
+  function isoToDatetimeLocal(isoStr) {
+    const s = (isoStr || "").trim();
+    if (!s) return "";
+    const d = new Date(s);
+    if (Number.isNaN(d.getTime())) return "";
+    const pad = (n) => String(n).padStart(2, "0");
+    const yyyy = d.getFullYear();
+    const mm = pad(d.getMonth()+1);
+    const dd = pad(d.getDate());
+    const hh = pad(d.getHours());
+    const mi = pad(d.getMinutes());
+    return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+  }
+
+  function toggleJsonPane() {
+    const pane = document.getElementById("jsonPane");
+    const on = (pane.style.display !== "none");
+    pane.style.display = on ? "none" : "block";
+  }
+
+  function setDebug(obj) {
+    document.getElementById("debugBox").textContent = JSON.stringify(obj || {}, null, 2);
+  }
+
+  // ─────────────────────────────────────
+  // List / Select
+  // ─────────────────────────────────────
+  function renderList() {
+    const list = document.getElementById("postList");
+    list.innerHTML = "";
+
+    const rows = cachedRows || [];
+    for (const r of rows) {
+      const div = document.createElement("div");
+      div.className = "item" + (String(r.id) === String(selectedId) ? " sel" : "");
+      div.onclick = () => selectPost(r.id);
+
+      const status = String(r.status || "");
+      const cat = String(r.category || "");
+      const pin = Number(r.pin_level || 0);
+
+      const badges = [];
+      if (status === "published") badges.push(`<span class="badge pub mono">PUB</span>`);
+      else if (status === "hidden") badges.push(`<span class="badge hid mono">HID</span>`);
+      else badges.push(`<span class="badge draft mono">DRAFT</span>`);
+
+      badges.push(`<span class="badge mono">${cat}</span>`);
+      if (pin > 0) badges.push(`<span class="badge pin mono">PIN ${pin}</span>`);
+
+      const sport = (r.sport ? String(r.sport) : "");
+      const fx = (r.fixture_key ? String(r.fixture_key) : "");
+      const sub = [sport, fx].filter(Boolean).join(" · ");
+
+      const when = r.publish_at ? isoToDatetimeLocal(r.publish_at).replace("T", " ") : "";
+
+      div.innerHTML = `
+        <div>
+          <div class="small muted mono">#${r.id} ${when ? ("· " + when) : ""}</div>
+          <div class="k">${escapeHtml(r.title || "(no title)")}</div>
+          <div class="small muted">${escapeHtml(sub)}</div>
+        </div>
+        <div class="right">
+          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges.join(" ")}</div>
+        </div>
+      `;
+
+      list.appendChild(div);
+    }
+
+    document.getElementById("listHint").textContent = `rows: ${rows.length}`;
+  }
+
+  function escapeHtml(s) {
+    const x = String(s ?? "");
+    return x
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  async function loadPosts() {
+    const qs = new URLSearchParams();
+    const st = (document.getElementById("qStatus").value || "").trim();
+    const cat = (document.getElementById("qCategory").value || "").trim();
+    const sp = (document.getElementById("qSport").value || "").trim();
+    const q = (document.getElementById("qText").value || "").trim();
+    const fx = (document.getElementById("qFixtureKey").value || "").trim();
+
+    if (st) qs.set("status", st);
+    if (cat) qs.set("category", cat);
+    if (sp) qs.set("sport", sp);
+    if (q) qs.set("q", q);
+    if (fx) qs.set("fixture_key", fx);
+
+    qs.set("limit", "200");
+    qs.set("offset", "0");
+
+    setStatusLine("불러오는 중...");
+    const r = await api(adminUrl("/api/board/posts?" + qs.toString()), { method: "GET" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setStatusLine("");
+      alert("로드 실패: " + JSON.stringify(r.data));
+      return;
+    }
+
+    cachedRows = r.data.rows || [];
+    setStatusLine("");
+    renderList();
+
+    // 선택 유지
+    if (selectedId) {
+      const exists = cachedRows.find(x => String(x.id) === String(selectedId));
+      if (exists) {
+        // keep selection highlight only; do not auto-fetch
+      } else {
+        selectedId = null;
+      }
+      renderList();
+    }
+  }
+
+  async function selectPost(id) {
+    if (!id) return;
+    selectedId = String(id);
+    renderList();
+
+    setStatusLine("불러오는 중: #" + id);
+    const r = await api(adminUrl("/api/board/posts/" + id), { method: "GET" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setStatusLine("");
+      alert("불러오기 실패: " + JSON.stringify(r.data));
+      return;
+    }
+
+    fillEditor(r.data.row || {});
+    setStatusLine("");
+  }
+
+  function clearEditor() {
+    selectedId = null;
+    document.getElementById("pId").value = "";
+    document.getElementById("pCategory").value = "analysis";
+    document.getElementById("pStatus").value = "draft";
+    document.getElementById("pPin").value = "0";
+    document.getElementById("pSport").value = "";
+    document.getElementById("pFixtureKey").value = "";
+    document.getElementById("pPublishAt").value = "";
+    document.getElementById("pPinUntil").value = "";
+    document.getElementById("pTitle").value = "";
+    document.getElementById("pSummary").value = "";
+    document.getElementById("pContent").value = "";
+    setSelectedLangs([]);
+    document.getElementById("pTargetCountries").value = "";
+    document.getElementById("pBlockCountries").value = "";
+    document.getElementById("pFiltersJson").value = "{}";
+    document.getElementById("pSnapshotJson").value = "{}";
+    renderList();
+  }
+
+  function newPost() {
+    clearEditor();
+    setSaveHint("새 글 작성 중");
+  }
+
+  function fillEditor(row) {
+    selectedId = String(row.id ?? "");
+    document.getElementById("pId").value = selectedId;
+
+    document.getElementById("pCategory").value = (row.category || "analysis");
+    document.getElementById("pStatus").value = (row.status || "draft");
+    document.getElementById("pPin").value = String(row.pin_level ?? 0);
+
+    document.getElementById("pSport").value = (row.sport || "");
+    document.getElementById("pFixtureKey").value = (row.fixture_key || "");
+
+    document.getElementById("pPublishAt").value = isoToDatetimeLocal(row.publish_at || "");
+    document.getElementById("pPinUntil").value = isoToDatetimeLocal(row.pin_until || "");
+
+    document.getElementById("pTitle").value = (row.title || "");
+    document.getElementById("pSummary").value = (row.summary || "");
+    document.getElementById("pContent").value = (row.content_md || "");
+
+    setSelectedLangs(row.target_langs || []);
+    document.getElementById("pTargetCountries").value = arrToCsv(row.target_countries || []);
+    document.getElementById("pBlockCountries").value = arrToCsv(row.block_countries || []);
+
+    // json fields (may be string or object)
+    try {
+      const fj = row.filters_json ?? {};
+      document.getElementById("pFiltersJson").value = (typeof fj === "string") ? fj : JSON.stringify(fj, null, 2);
+    } catch (e) {
+      document.getElementById("pFiltersJson").value = "{}";
+    }
+    try {
+      const sj = row.snapshot_json ?? {};
+      document.getElementById("pSnapshotJson").value = (typeof sj === "string") ? sj : JSON.stringify(sj, null, 2);
+    } catch (e) {
+      document.getElementById("pSnapshotJson").value = "{}";
+    }
+
+    setSaveHint("편집 중: #" + selectedId);
+    renderList();
+  }
+
+  async function reloadSelected() {
+    if (!selectedId) return alert("선택된 글이 없습니다.");
+    await selectPost(selectedId);
+  }
+
+  // ─────────────────────────────────────
+  // Save / Delete
+  // ─────────────────────────────────────
+  function buildPayload() {
+    const title = (document.getElementById("pTitle").value || "").trim();
+    const content = (document.getElementById("pContent").value || "").trim();
+
+    const filtersStr = (document.getElementById("pFiltersJson").value || "").trim() || "{}";
+    const snapshotStr = (document.getElementById("pSnapshotJson").value || "").trim() || "{}";
+
+    let filtersObj = {};
+    let snapshotObj = {};
+    try { filtersObj = JSON.parse(filtersStr); } catch (e) { throw new Error("filters_json JSON 파싱 실패"); }
+    try { snapshotObj = JSON.parse(snapshotStr); } catch (e) { throw new Error("snapshot_json JSON 파싱 실패"); }
+
+    return {
+      category: (document.getElementById("pCategory").value || "analysis"),
+      status: (document.getElementById("pStatus").value || "draft"),
+      pin_level: Number(document.getElementById("pPin").value || 0),
+
+      sport: (document.getElementById("pSport").value || "").trim() || null,
+      fixture_key: (document.getElementById("pFixtureKey").value || "").trim() || null,
+
+      title,
+      summary: (document.getElementById("pSummary").value || "").trim(),
+      content_md: content,
+
+      publish_at: toIsoOrNull(document.getElementById("pPublishAt").value),
+      pin_until: toIsoOrNull(document.getElementById("pPinUntil").value),
+
+      target_langs: getSelectedLangs(),
+      target_countries: csvToArrUpper(document.getElementById("pTargetCountries").value),
+      block_countries: csvToArrUpper(document.getElementById("pBlockCountries").value),
+
+      filters_json: filtersObj,
+      snapshot_json: snapshotObj,
+    };
+  }
+
+  async function savePost() {
+    let payload = null;
+    try {
+      payload = buildPayload();
+    } catch (e) {
+      return alert(String(e.message || e));
+    }
+
+    if (!payload.title) return alert("title은 필수입니다.");
+    if (!payload.content_md) return alert("content_md는 필수입니다.");
+
+    // published인데 publish_at 없으면 지금으로 자동 세팅(편의)
+    if (payload.status === "published" && !payload.publish_at) {
+      payload.publish_at = new Date().toISOString();
+      document.getElementById("pPublishAt").value = isoToDatetimeLocal(payload.publish_at);
+    }
+
+    const isNew = !selectedId;
+    const ok = confirm(isNew ? "새 글을 저장할까요?" : ("글을 저장(업데이트)할까요? (#" + selectedId + ")"));
+    if (!ok) return;
+
+    setSaveHint("저장 중...");
+    const path = isNew
+      ? adminUrl("/api/board/posts")
+      : adminUrl("/api/board/posts/" + selectedId);
+
+    const method = isNew ? "POST" : "PUT";
+
+    const r = await api(path, {
+      method,
+      body: JSON.stringify(payload),
+    });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setSaveHint("");
+      alert("저장 실패: " + JSON.stringify(r.data));
+      return;
+    }
+
+    // 새 글이면 id를 반환받아서 선택
+    if (isNew && r.data.id != null) {
+      selectedId = String(r.data.id);
+      document.getElementById("pId").value = selectedId;
+      setSaveHint("저장 완료: #" + selectedId);
+      await loadPosts();
+      await selectPost(selectedId);
+    } else {
+      setSaveHint("저장 완료");
+      await loadPosts();
+      if (selectedId) await selectPost(selectedId);
+    }
+  }
+
+  async function deletePost() {
+    if (!selectedId) return alert("삭제할 글을 먼저 선택하세요.");
+    const ok = confirm("정말 삭제할까요? (#" + selectedId + ")");
+    if (!ok) return;
+
+    setSaveHint("삭제 중...");
+    const r = await api(adminUrl("/api/board/posts/" + selectedId), { method: "DELETE" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setSaveHint("");
+      alert("삭제 실패: " + JSON.stringify(r.data));
+      return;
+    }
+
+    setSaveHint("삭제 완료");
+    clearEditor();
+    await loadPosts();
+  }
+
+  // 초기 로드
+  loadPosts();
+</script>
+</body>
+</html>

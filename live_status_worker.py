@@ -551,7 +551,53 @@ def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any], fetc
 
 
 def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> None:
-    raw = json.dumps(events, ensure_ascii=False, separators=(",", ":"))
+    """
+    추가:
+    - 벤치/스태프 Card 이벤트는 raw에도 저장하지 않음(수집 차단)
+    - 라인업 캐시가 없는 경우(초반/미수집)는 오탐 방지 위해 필터 적용하지 않음
+    """
+
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        return x
+
+    def _is_bench_staff_card(ev: Dict[str, Any]) -> bool:
+        # Card가 아니면 대상 아님
+        ev_type = _norm(safe_text(ev.get("type")))
+        if ev_type != "card":
+            return False
+
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+
+        # player_id가 없으면 애매 -> 오탐 방지 위해 저장 유지
+        if p_id is None or t_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        # 라인업 정보가 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        # 라인업에 없는 player_id인 Card => 벤치/스태프 카드로 간주하여 차단
+        return p_id not in ids
+
+    filtered: List[Dict[str, Any]] = []
+    for ev in events or []:
+        if _is_bench_staff_card(ev):
+            continue
+        filtered.append(ev)
+
+    raw = json.dumps(filtered, ensure_ascii=False, separators=(",", ":"))
     execute(
         """
         INSERT INTO match_events_raw (fixture_id, data_json)
@@ -566,6 +612,7 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 
 
+
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
     match_events 스키마(현재 dev):
@@ -574,6 +621,14 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
     - 공급자가 동일 이벤트를 다른 id로 재발급하는 케이스 대비: in-memory signature dedupe
     - signature 안정화: ev_type/detail normalize(대소문/공백/구두점 차이 완화)
+
+    추가:
+    - 벤치/스태프 Card 이벤트(라인업에 없는 player_id)는 수집(INSERT) 차단
+    - 라인업 캐시가 없는 경우는 오탐 방지 위해 차단하지 않음
+
+    ✅ 변경:
+    - 일부 리그/경기에서 events 항목에 id가 없을 수 있음.
+      이 경우 이벤트 내용을 기반으로 안정적인 synthetic id(음수)를 생성하여 저장한다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -584,6 +639,68 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
             x = x.replace(ch, "")
         return x
+
+    def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
+        # Card가 아니면 대상 아님
+        if _norm(ev_type) != "card":
+            return False
+
+        # player/team id 없으면 애매 -> 오탐 방지 위해 저장 유지
+        if t_id is None or p_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        # 라인업 정보 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        return p_id not in ids
+
+    def _synthetic_event_id(
+        fixture_id_: int,
+        minute_: int,
+        extra_: Optional[int],
+        t_id_: Optional[int],
+        p_id_: Optional[int],
+        a_id_: Optional[int],
+        ev_type_: Optional[str],
+        detail_: Optional[str],
+        player_name_: Optional[str],
+        assist_name_: Optional[str],
+        comments_: Optional[str],
+    ) -> int:
+        """
+        안정적인 synthetic id 생성(음수):
+        - 동일 이벤트는 재호출/재시작에도 같은 id가 되도록 정규화 문자열을 해시한다.
+        - bigint PK 충돌 방지 위해 음수로 만든다.
+        """
+        import hashlib
+
+        key = "|".join(
+            [
+                str(fixture_id_),
+                str(minute_),
+                str(extra_ or 0),
+                str(t_id_ or 0),
+                str(p_id_ or 0),
+                str(a_id_ or 0),
+                _norm(ev_type_),
+                _norm(detail_),
+                _norm(player_name_),
+                _norm(assist_name_),
+                _norm(comments_),
+            ]
+        )
+
+        digest = hashlib.sha1(key.encode("utf-8")).digest()
+        # 8바이트 -> 63bit 양수 범위로 제한 후 음수로
+        h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+        if h64 == 0:
+            h64 = 1
+        return -h64
 
     # fixture 단위 signature cache: {fixture_id: {sig_tuple: last_seen_ts}}
     if not hasattr(upsert_match_events, "_sig_cache"):
@@ -607,10 +724,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 del seen[k]
 
     for ev in events or []:
-        ev_id = safe_int(ev.get("id"))
-        if ev_id is None:
-            continue
-
         team = ev.get("team") or {}
         player = ev.get("player") or {}
         assist = ev.get("assist") or {}
@@ -621,6 +734,11 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
+        comments = safe_text(ev.get("comments"))
+
+        # ---- 벤치/스태프 Card 차단 ----
+        if _is_bench_staff_card(t_id, p_id, ev_type):
+            continue
 
         tm = ev.get("time") or {}
         minute = safe_int(tm.get("elapsed"))
@@ -629,6 +747,23 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         # minute NOT NULL → 없으면 스킵(스키마 위반 방지)
         if minute is None:
             continue
+
+        # ✅ id가 없으면 synthetic id 생성
+        ev_id = safe_int(ev.get("id"))
+        if ev_id is None:
+            ev_id = _synthetic_event_id(
+                fixture_id_=fixture_id,
+                minute_=minute,
+                extra_=extra,
+                t_id_=t_id,
+                p_id_=p_id,
+                a_id_=a_id,
+                ev_type_=ev_type,
+                detail_=detail,
+                player_name_=safe_text(player.get("name")),
+                assist_name_=safe_text(assist.get("name")),
+                comments_=comments,
+            )
 
         # signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
         sig = (minute, extra, _norm(ev_type), _norm(detail), t_id, p_id, a_id)
@@ -684,6 +819,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
 
 
+
+
 def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -> None:
     """
     /fixtures/statistics response:
@@ -724,13 +861,67 @@ def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -
 def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], updated_at: dt.datetime) -> bool:
     """
     match_lineups PK: (fixture_id, team_id)
-    응답이 유의미하면 True 반환.
+
+    ✅ 변경:
+    - "DB에 뭔가 저장됨"이 아니라,
+      "필터에 쓸 만큼 라인업이 실제로 유의미하게 채워짐"일 때만 True 반환.
+      (대부분 startXI 11명이 들어오면 유의미하다고 판단)
+
+    추가:
+    - 런타임 캐시에 team별 player_id set 저장(players_by_team)
+    - 라인업이 유의미하면 st["lineups_ready"]=True로 마킹(잠금 기준)
     """
     if not lineups_resp:
         return False
 
-    ok_any = False
+    def _extract_player_ids_and_counts(item: Dict[str, Any]) -> Tuple[List[int], int, int]:
+        out: List[int] = []
+
+        start_arr = item.get("startXI") or []
+        sub_arr = item.get("substitutes") or []
+
+        start_cnt = 0
+        sub_cnt = 0
+
+        if isinstance(start_arr, list):
+            for row in start_arr:
+                if not isinstance(row, dict):
+                    continue
+                p = row.get("player") or {}
+                if not isinstance(p, dict):
+                    continue
+                pid = safe_int(p.get("id"))
+                if pid is None:
+                    continue
+                out.append(pid)
+                start_cnt += 1
+
+        if isinstance(sub_arr, list):
+            for row in sub_arr:
+                if not isinstance(row, dict):
+                    continue
+                p = row.get("player") or {}
+                if not isinstance(p, dict):
+                    continue
+                pid = safe_int(p.get("id"))
+                if pid is None:
+                    continue
+                out.append(pid)
+                sub_cnt += 1
+
+        uniq = list(set(out))
+        return uniq, start_cnt, sub_cnt
+
     updated_utc = iso_utc(updated_at)
+    ok_any_write = False
+    ready_any = False
+
+    # state 준비
+    st = _ensure_lineups_state(fixture_id)
+    pb = st.get("players_by_team")
+    if not isinstance(pb, dict):
+        pb = {}
+        st["players_by_team"] = pb
 
     for item in lineups_resp:
         team = item.get("team") or {}
@@ -751,9 +942,34 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
             """,
             (fixture_id, team_id, raw, updated_utc),
         )
-        ok_any = True
+        ok_any_write = True
 
-    return ok_any
+        # ---- 런타임 캐시 저장 + 유의미 판단 ----
+        try:
+            ids, start_cnt, sub_cnt = _extract_player_ids_and_counts(item)
+            pb[team_id] = set(ids)
+
+            # ✅ 유의미(ready) 기준:
+            # - startXI가 11명 이상이면 거의 확정 라인업
+            # - 혹은 추출 ids가 11명 이상(공급자 포맷 차이 방어)
+            if (start_cnt >= 11) or (len(ids) >= 11):
+                ready_any = True
+        except Exception:
+            # 캐시는 best-effort
+            pass
+
+    # 라인업이 유의미한 상태면 state에 ready 마킹(잠금 기준으로 사용)
+    if ready_any:
+        st["lineups_ready"] = True
+
+    # DB write가 1번도 없으면 False
+    if not ok_any_write:
+        return False
+
+    # ✅ 반환은 "유의미하게 준비됨" 여부
+    return bool(ready_any)
+
+
 
 
 
@@ -1011,12 +1227,14 @@ def maybe_sync_lineups(
     now: dt.datetime,
 ) -> None:
     st = _ensure_lineups_state(fixture_id)
-    if st.get("success"):
+
+    # ✅ success 잠금 조건 강화:
+    # - success=True 이더라도 lineups_ready가 아니면(=불완전 라인업 가능성) 계속 시도 여지 남김
+    if st.get("success") and st.get("lineups_ready"):
         return
 
     kickoff: Optional[dt.datetime] = None
     try:
-        # date_utc 는 ISO8601 (예: 2026-01-15T12:00:00+00:00)
         kickoff = dt.datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
         if kickoff.tzinfo is None:
             kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
@@ -1027,7 +1245,18 @@ def maybe_sync_lineups(
 
     nowu = now.astimezone(dt.timezone.utc)
 
-    # 프리매치 슬롯(-60/-10): 응답이 비어도 "시도"는 마킹해서 반복 호출 방지
+    # ---- 공통: 과호출 방지 쿨다운(초) ----
+    # interval=10초라서, lineups는 20초 정도만 쉬어도 충분히 안정적
+    COOLDOWN_SEC = 20
+    now_ts = time.time()
+    last_try = float(st.get("last_try_ts") or 0.0)
+    if (now_ts - last_try) < COOLDOWN_SEC:
+        # 다만 UPCOMING 슬롯(-60/-10)은 1회성이라 쿨다운 걸리지 않게 아래에서 별도 처리
+        pass
+
+    # ─────────────────────────────────────
+    # UPCOMING: -60 / -10 슬롯은 1회만
+    # ─────────────────────────────────────
     if kickoff and status_group == "UPCOMING":
         mins = int((kickoff - nowu).total_seconds() / 60)
 
@@ -1035,11 +1264,14 @@ def maybe_sync_lineups(
         if (59 <= mins <= 61) and not st.get("slot60"):
             st["slot60"] = True
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
                     st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot60 ok={ok}")
+                print(f"      [lineups] fixture_id={fixture_id} slot60 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot60 err: {e}", file=sys.stderr)
             return
@@ -1048,29 +1280,44 @@ def maybe_sync_lineups(
         if (9 <= mins <= 11) and not st.get("slot10"):
             st["slot10"] = True
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
                     st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot10 ok={ok}")
+                print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
             return
 
         return
 
-    # 킥오프 직후(INPLAY) 재시도: elapsed<=5 동안은 빈 응답이면 계속 시도 가능
+    # ─────────────────────────────────────
+    # INPLAY: 초반에는 불완전 응답이 흔함 → elapsed<=15까지 쿨다운 두고 재시도
+    # ─────────────────────────────────────
     if status_group == "INPLAY":
-        el = elapsed if elapsed is not None else -1
-        if 0 <= el <= 5:
+        el = elapsed if elapsed is not None else 0  # elapsed None이어도 0으로 보고 1회는 시도 가능
+
+        # ✅ 기존 5분 → 15분까지 확장
+        if 0 <= el <= 15:
+            # 쿨다운 체크 (UPCOMING 슬롯과 달리 여기서는 적용)
+            last_try = float(st.get("last_try_ts") or 0.0)
+            if (time.time() - last_try) < COOLDOWN_SEC:
+                return
+
             try:
+                st["last_try_ts"] = time.time()
                 resp = fetch_lineups(session, fixture_id)
-                ok = upsert_match_lineups(fixture_id, resp, nowu)
-                if ok:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ok={ok}")
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                if ready:
+                    st["success"] = True  # ✅ ready일 때만 잠금
+                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
+
 
 
 # ─────────────────────────────────────
