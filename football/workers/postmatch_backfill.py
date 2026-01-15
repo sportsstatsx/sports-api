@@ -33,13 +33,12 @@ BASE_URL = "https://v3.football.api-sports.io"
 
 def _get_api_key() -> str:
     key = (
-        os.environ.get("API_FOOTBALL_KEY")
+        os.environ.get("APIFOOTBALL_KEY")
         or os.environ.get("API_KEY")
-        or os.environ.get("FOOTBALL_API_KEY")
         or ""
     )
     if not key:
-        raise RuntimeError("API key missing: set API_FOOTBALL_KEY (or API_KEY)")
+        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_KEY)")
     return key
 
 
