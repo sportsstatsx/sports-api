@@ -1492,6 +1492,10 @@ def admin_board_create_post():
         xs = xs or []
         return [str(x).strip().lower() for x in xs if str(x).strip()]
 
+    # ✅ psycopg3 dict adapt 이슈 방지: jsonb 컬럼은 문자열(JSON)로 전달
+    filters_obj = body.get("filters_json") or {}
+    snapshot_obj = body.get("snapshot_json") or {}
+
     row = {
         "sport": (body.get("sport") or None),
         "fixture_key": (body.get("fixture_key") or None),
@@ -1502,11 +1506,9 @@ def admin_board_create_post():
         "status": (body.get("status") or "draft"),
         "pin_level": int(body.get("pin_level") or 0),
         "pin_until": body.get("pin_until") or None,
-        "filters_json": body.get("filters_json") or {},
-        "snapshot_json": body.get("snapshot_json") or {},
+        "filters_json": json.dumps(filters_obj, ensure_ascii=False),
+        "snapshot_json": json.dumps(snapshot_obj, ensure_ascii=False),
         "publish_at": body.get("publish_at") or None,
-
-        # ✅ 선택A: 언어권만
         "target_langs": arr_lower(body.get("target_langs")),
     }
 
@@ -1554,6 +1556,7 @@ def admin_board_create_post():
     except Exception as e:
         print(f"[admin board create] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 
@@ -1666,6 +1669,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
