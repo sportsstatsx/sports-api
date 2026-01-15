@@ -1214,11 +1214,12 @@ def calc_score_from_events(
     ✅ Var 이벤트 중
        - Goal Disallowed / Goal cancelled / No Goal  => 직전 Goal 1개를 취소 처리
        - Goal confirmed                              => 유지(아무것도 안 함)
-    ✅ Own Goal은 반대팀 득점으로 처리 (기존 유지)
     ✅ Missed Penalty(실축)는 득점에서 제외 (기존 유지)
 
-    주의:
-    - API-Sports 데이터에서 '취소/무효'는 Goal.detail이 아니라 Var.type으로 내려오는 케이스가 많음
+    🔥 중요(너의 최신 파이프라인 기준):
+    - upsert_match_events()에서 Own Goal(team_id)을 이미 "득점 인정팀(benefit team)" 기준으로 정규화해 저장한다.
+    - 따라서 여기서는 Own Goal을 반대팀으로 뒤집으면 "2중 flip"이 발생해서 스코어가 반대로 깨진다.
+    - 결론: calc_score_from_events()에서는 OG를 뒤집지 않고, team_id 그대로 득점팀으로 계산한다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -1232,40 +1233,29 @@ def calc_score_from_events(
         tm = ev.get("time") or {}
         el = safe_int(tm.get("elapsed"))
         ex = safe_int(tm.get("extra"))
-        # elapsed/extra가 None이면 뒤로 밀리게 안전값
         elv = el if el is not None else 10**9
         exv = ex if ex is not None else 0
         return (elv, exv, fallback_idx)
 
-    # Goal 이벤트에서 '무효/취소'로 볼만한 텍스트(Goal.detail에 실제로 붙는 경우만 처리)
     invalid_markers = (
-        "cancel",        # cancelled
-        "disallow",      # disallowed
-        "no goal",       # no goal
-        "offside",       # offside
-        "foul",          # foul
-        "annul",         # annulled(드물지만)
-        "null",          # nullified(드물지만)
+        "cancel",
+        "disallow",
+        "no goal",
+        "offside",
+        "foul",
+        "annul",
+        "null",
     )
 
-    # 득점 후보 리스트(Var로 취소되면 cancelled=True로 마킹)
-    # 각 항목: {
-    #   "scoring_team_id": int,   # 실제 득점 팀(OG면 반대팀)
-    #   "source_team_id": int,    # 이벤트 team_id (OG면 원래 자책팀)
-    #   "elapsed": Optional[int],
-    #   "extra": Optional[int],
-    #   "cancelled": bool,
-    # }
     goals: List[Dict[str, Any]] = []
 
-    # 시간순 정렬 + 동시간대는 원본 순서(인덱스) 유지
     indexed = list(enumerate(events or []))
     indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
     evs = [ev for _, ev in indexed]
 
-
     def _add_goal(ev: Dict[str, Any]) -> None:
         detail = _norm(ev.get("detail"))
+
         # 실축PK 제외
         if "missed penalty" in detail:
             return
@@ -1285,15 +1275,9 @@ def calc_score_from_events(
         elapsed = safe_int(tm.get("elapsed"))
         extra = safe_int(tm.get("extra"))
 
-        is_og = "own goal" in detail
-
-        # 득점 팀 결정
+        # ✅ 핵심: OG 포함 모든 Goal은 team_id 그대로 득점팀으로 처리
+        # (OG flip은 upsert_match_events()에서 이미 정규화된 파이프라인)
         scoring_team_id = team_id
-        if is_og:
-            if team_id == home_id:
-                scoring_team_id = away_id
-            elif team_id == away_id:
-                scoring_team_id = home_id
 
         goals.append(
             {
@@ -1306,11 +1290,6 @@ def calc_score_from_events(
         )
 
     def _apply_var(ev: Dict[str, Any]) -> None:
-        """
-        Var 이벤트로 직전 Goal을 취소/유지 처리
-        - Goal Disallowed / Goal cancelled / No Goal => 직전 Goal 1개 취소
-        - Goal confirmed => 유지(아무것도 안 함)
-        """
         detail = _norm(ev.get("detail"))
         if not detail:
             return
@@ -1318,25 +1297,16 @@ def calc_score_from_events(
         is_disallow = ("goal disallowed" in detail) or ("goal cancelled" in detail) or ("no goal" in detail)
         is_confirm = "goal confirmed" in detail
 
-        # 골 관련 var이 아니면 무시(패널티/레드카드 등)
         if not (is_disallow or is_confirm):
             return
-
-        # confirmed면 굳이 할 작업 없음(이미 골로 카운트되었을 것)
         if is_confirm:
             return
 
-        # 여기서부터는 disallow/cancel/no goal => 직전 Goal 1개 취소
         team = ev.get("team") or {}
-        var_team_id = safe_int(team.get("id"))  # 있는 경우가 많음(네 출력에서도 team 정보가 보통 있음)
+        var_team_id = safe_int(team.get("id"))
         tm = ev.get("time") or {}
         var_elapsed = safe_int(tm.get("elapsed"))
-        var_extra = safe_int(tm.get("extra"))
 
-        # 보수적 취소 규칙:
-        # - var_elapsed 가 없으면 취소하지 않음(오탐 방지)
-        # - 시간 매칭은 단계적으로: 같은 elapsed -> ±1 -> (마지막 수단) ±2
-        # - 팀 정보(var_team_id)가 있으면 일치하는 goal을 우선 취소
         if var_elapsed is None:
             return
 
@@ -1349,45 +1319,37 @@ def calc_score_from_events(
 
                 g_el = g.get("elapsed")
                 if g_el is None:
-                    continue  # 시간 없는 goal은 보수적으로 제외
+                    continue
 
                 if abs(g_el - var_elapsed) > max_delta:
                     continue
 
-                # 팀 매칭 우선
                 if var_team_id is not None:
                     if (g.get("source_team_id") == var_team_id) or (g.get("scoring_team_id") == var_team_id):
                         return i
-                    # 팀 불일치는 후보로만(동일 delta 내에서 fallback)
                     if best is None:
                         best = i
                 else:
-                    # 팀 정보가 없으면 시간만으로 가장 최근 것을 선택
                     return i
 
             return best
 
-        best_idx = _pick_cancel_idx(0)   # 같은 elapsed
+        best_idx = _pick_cancel_idx(0)
         if best_idx is None:
-            best_idx = _pick_cancel_idx(1)   # ±1
+            best_idx = _pick_cancel_idx(1)
         if best_idx is None:
-            best_idx = _pick_cancel_idx(2)   # 마지막 수단 ±2
+            best_idx = _pick_cancel_idx(2)
 
         if best_idx is not None:
             goals[best_idx]["cancelled"] = True
 
-
-    # 메인 루프
     for ev in evs:
         ev_type = _norm(ev.get("type"))
         if ev_type == "goal":
             _add_goal(ev)
         elif ev_type == "var":
             _apply_var(ev)
-        else:
-            continue
 
-    # 최종 합계
     h = 0
     a = 0
     for g in goals:
@@ -1400,6 +1362,7 @@ def calc_score_from_events(
             a += 1
 
     return h, a
+
 
 
 
