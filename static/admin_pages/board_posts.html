@@ -365,7 +365,144 @@ select option {
       border-right: 1px solid var(--line);
     }
 
+    /* ─────────────────────────────────────
+       Fixture Picker Modal (Board)
+       ───────────────────────────────────── */
+    .fxRow {
+      display:flex;
+      gap: 8px;
+      align-items:center;
+    }
+    .fxRow input {
+      flex: 1;
+      min-width: 0;
+    }
+    .fxRow .btn {
+      width: auto;
+      flex: 0 0 auto;
+      white-space: nowrap;
+    }
+
+    .modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+      z-index: 9999;
+    }
+    .modalCard {
+      width: min(980px, 96vw);
+      max-height: min(86vh, 860px);
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      border: 1px solid var(--line);
+      border-radius: var(--radius2);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      display:flex;
+      flex-direction: column;
+    }
+    .modalTop {
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,255,255,0.02);
+    }
+    .modalTitle {
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+    }
+    .modalBody {
+      padding: 14px;
+      overflow: auto;
+    }
+
+    .fxControls {
+      display:grid;
+      grid-template-columns: 180px 200px 1fr 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+    @media (max-width: 860px) {
+      .fxControls { grid-template-columns: 1fr 1fr; }
+    }
+    .fxControls .col { gap: 6px; }
+
+    .fxList {
+      margin-top: 12px;
+      display:flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 520px;
+      overflow: auto;
+      padding-right: 6px;
+    }
+    .fxItem {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.02);
+      cursor: pointer;
+      display:flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }
+    .fxItem:hover { border-color: rgba(255,255,255,0.25); }
+    .fxLeft {
+      min-width: 0;
+      flex: 1;
+    }
+    .fxMeta {
+      font-size: 12px;
+      color: var(--muted);
+      display:flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .fxTitle {
+      margin-top: 6px;
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fxRight {
+      display:flex;
+      align-items:center;
+      gap: 10px;
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .fxScore {
+      font-size: 14px;
+      font-weight: 900;
+      color: var(--text);
+      letter-spacing: 0.5px;
+    }
+    .fxPill {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line2);
+      background: rgba(255,255,255,0.03);
+      color: var(--muted);
+    }
+
   </style>
+
 </head>
 <body>
   <div class="topbar">
@@ -486,8 +623,12 @@ select option {
           </div>
           <div class="col" style="min-width: 240px; flex:1;">
             <label>Fixture Key (optional)</label>
-            <input id="pFixtureKey" placeholder="예: 123456" />
+            <div class="fxRow">
+              <input id="pFixtureKey" placeholder="예: 123456" />
+              <button class="btn small" type="button" onclick="openFixturePicker()">선택</button>
+            </div>
           </div>
+
         </div>
 
         <div class="row" style="margin-top: 10px;">
@@ -570,8 +711,58 @@ select option {
   </div>
 </div>
 
+<!-- ✅ Fixture Picker Modal -->
+<div id="fixtureModal" class="modal" aria-hidden="true">
+  <div class="modalCard" role="dialog" aria-modal="true">
+    <div class="modalTop">
+      <div class="modalTitle">Fixtures Browser</div>
+      <div class="row" style="margin:0;">
+        <button class="btn small" type="button" onclick="closeFixturePicker()">닫기</button>
+      </div>
+    </div>
+
+    <div class="modalBody">
+      <div class="fxControls">
+        <div class="col">
+          <label>Date</label>
+          <input id="fxDate" type="date" />
+        </div>
+
+        <div class="col">
+          <label>Timezone</label>
+          <select id="fxTz">
+            <option value="Asia/Seoul">Asia/Seoul</option>
+            <option value="UTC">UTC</option>
+            <option value="Europe/London">Europe/London</option>
+            <option value="Europe/Paris">Europe/Paris</option>
+            <option value="America/New_York">America/New_York</option>
+          </select>
+        </div>
+
+        <div class="col">
+          <label>League IDs (comma, optional)</label>
+          <input id="fxLeagueIds" placeholder="예: 39,140,78" />
+        </div>
+
+        <div class="col">
+          <label>Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Arsenal / LaLiga" />
+        </div>
+
+        <div class="col">
+          <label>&nbsp;</label>
+          <button class="btn" type="button" onclick="loadFixtureBrowser()">불러오기</button>
+        </div>
+      </div>
+
+      <div class="subtle" id="fxStatus" style="margin-top:10px;"></div>
+      <div class="fxList" id="fxList"></div>
+    </div>
+  </div>
+</div>
 
 <script>
+
   // ─────────────────────────────────────
   // Helpers
   // ─────────────────────────────────────
@@ -1136,6 +1327,181 @@ async function deletePostById(id) {
       renderMatchPreview(fx);
     }, 350);
   }
+
+  // ─────────────────────────────────────
+  // Fixture Picker Modal (Fixtures Browser)
+  // ─────────────────────────────────────
+  let _fxModalTimer = null;
+  let _fxRows = [];
+
+  function showFixtureModal() {
+    const m = $("fixtureModal");
+    if (!m) return;
+    m.style.display = "flex";
+    m.setAttribute("aria-hidden", "false");
+  }
+
+  function hideFixtureModal() {
+    const m = $("fixtureModal");
+    if (!m) return;
+    m.style.display = "none";
+    m.setAttribute("aria-hidden", "true");
+  }
+
+  function todayYmdLocal() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
+  function fxSetStatus(msg) {
+    const el = $("fxStatus");
+    if (el) el.textContent = msg || "";
+  }
+
+  function fxPick(obj, keys, fallback = "") {
+    for (const k of keys) {
+      if (obj && obj[k] != null && String(obj[k]).trim() !== "") return obj[k];
+    }
+    return fallback;
+  }
+
+  function openFixturePicker() {
+    // sport 선택이 비어있으면 football로 기본
+    if (!getEditorSport()) $("pSport").value = "football";
+
+    // 기본값 세팅
+    if ($("fxDate") && !$("fxDate").value) $("fxDate").value = todayYmdLocal();
+    if ($("fxTz") && !$("fxTz").value) $("fxTz").value = "Asia/Seoul";
+
+    fxSetStatus("");
+    $("fxList").innerHTML = "";
+    showFixtureModal();
+
+    // 바로 로드
+    loadFixtureBrowser();
+  }
+
+  function closeFixturePicker() {
+    hideFixtureModal();
+  }
+
+  // 모달 바깥 클릭하면 닫기
+  (function wireModalOutsideClose() {
+    const m = $("fixtureModal");
+    if (!m) return;
+    m.addEventListener("click", (ev) => {
+      if (ev.target === m) closeFixturePicker();
+    });
+    window.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && m.style.display !== "none") closeFixturePicker();
+    });
+  })();
+
+  async function fetchFixtureBrowserRows() {
+    const sport = (getEditorSport() || "football").toLowerCase();
+    const date = ($("fxDate").value || "").trim();
+    const tz = ($("fxTz").value || "Asia/Seoul").trim();
+    const leagueIds = ($("fxLeagueIds").value || "").trim();
+    const search = ($("fxSearch").value || "").trim();
+
+    // ✅ 여기 엔드포인트는 서버에 이미 있는 "fixtures browser" API로 맞춰야 함
+    // - football override에서 쓰는 browse API가 있을 확률이 높아서 기본값을 아래로 둠.
+    // - 만약 404 뜨면, override 페이지에서 쓰는 엔드포인트로 여기만 바꾸면 끝.
+    const path = (sport === "hockey")
+      ? "/api/hockey/fixtures/browse"
+      : "/api/football/fixtures/browse";
+
+    const qs = new URLSearchParams();
+    if (date) qs.set("date", date);
+    if (tz) qs.set("timezone", tz);
+    if (leagueIds) qs.set("league_ids", leagueIds);
+    if (search) qs.set("q", search);
+
+    const r = await api(adminUrl(path + "?" + qs.toString()), { method: "GET" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      const err = r.data ? JSON.stringify(r.data) : ("HTTP " + r.status);
+      throw new Error("fixtures browse 실패: " + err);
+    }
+
+    // rows 배열 이름은 서버마다 다를 수 있어 fallback 처리
+    const rows = r.data.rows || r.data.fixtures || r.data.data || [];
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  function renderFixtureBrowserList(rows) {
+    const box = $("fxList");
+    box.innerHTML = "";
+
+    _fxRows = rows || [];
+    fxSetStatus("rows: " + _fxRows.length + " (클릭하면 Fixture Key에 자동 입력)");
+
+    for (const r of _fxRows) {
+      // 최대한 관대한 매핑 (서버 필드명이 다를 수 있으니)
+      const fixtureId = String(fxPick(r, ["fixture_id", "fixtureId", "id", "fixture"], ""));
+      const league = String(fxPick(r, ["league_name", "league", "leagueName", "competition"], ""));
+      const kickoff = String(fxPick(r, ["kickoff", "kickoff_utc", "date_utc", "date", "time"], ""));
+      const home = String(fxPick(r, ["home_name", "home", "homeTeam", "home_team"], ""));
+      const away = String(fxPick(r, ["away_name", "away", "awayTeam", "away_team"], ""));
+      const status = String(fxPick(r, ["status", "short_status", "state"], "OTHER"));
+
+      const hg = fxPick(r, ["home_goals", "homeGoals", "goals_home", "home_score"], null);
+      const ag = fxPick(r, ["away_goals", "awayGoals", "goals_away", "away_score"], null);
+      const scoreTxt = (hg != null && ag != null) ? `${hg} : ${ag}` : "- : -";
+
+      const div = document.createElement("div");
+      div.className = "fxItem";
+      div.innerHTML = `
+        <div class="fxLeft">
+          <div class="fxMeta">
+            <span class="fxPill">${escapeHtml(status)}</span>
+            <span class="fxPill">#${escapeHtml(fixtureId)}</span>
+            ${league ? `<span>${escapeHtml(league)}</span>` : ""}
+            ${kickoff ? `<span>· ${escapeHtml(String(kickoff).slice(0, 16).replace("T"," "))}</span>` : ""}
+          </div>
+          <div class="fxTitle" title="${escapeHtml(home + " vs " + away)}">
+            ${escapeHtml(home)} <span style="opacity:.6;font-weight:800;">vs</span> ${escapeHtml(away)}
+          </div>
+        </div>
+        <div class="fxRight">
+          <div class="fxScore">${escapeHtml(scoreTxt)}</div>
+          <div style="opacity:.75;">선택</div>
+        </div>
+      `;
+
+      div.onclick = () => {
+        if (!fixtureId) return alert("fixture_id를 찾을 수 없습니다. 서버 응답 필드 확인 필요");
+        $("pFixtureKey").value = fixtureId;
+
+        // 선택한 순간 프리뷰/스냅샷 로직 재시도
+        scheduleFixturePreviewRefresh();
+
+        closeFixturePicker();
+      };
+
+      box.appendChild(div);
+    }
+  }
+
+  async function loadFixtureBrowser() {
+    fxSetStatus("불러오는 중...");
+    $("fxList").innerHTML = "";
+    try {
+      const rows = await fetchFixtureBrowserRows();
+      renderFixtureBrowserList(rows);
+    } catch (e) {
+      fxSetStatus("");
+      alert(String(e.message || e));
+    }
+  }
+
+  function scheduleFixtureBrowserReload() {
+    if (_fxModalTimer) clearTimeout(_fxModalTimer);
+    _fxModalTimer = setTimeout(() => loadFixtureBrowser(), 350);
+  }
+
   
 
   async function savePost() {
@@ -1233,8 +1599,15 @@ async function deletePostById(id) {
   $("pFixtureKey").addEventListener("input", () => scheduleFixturePreviewRefresh());
   $("pSnapshotJson").addEventListener("input", () => renderMatchPreviewFromSnapshot());
 
+  // ✅ Fixture Browser inputs -> debounce reload
+  $("fxDate").addEventListener("change", () => scheduleFixtureBrowserReload());
+  $("fxTz").addEventListener("change", () => scheduleFixtureBrowserReload());
+  $("fxLeagueIds").addEventListener("input", () => scheduleFixtureBrowserReload());
+  $("fxSearch").addEventListener("input", () => scheduleFixtureBrowserReload());
+
   renderLangBox();
   loadPosts();
+
 
 </script>
 </body>
