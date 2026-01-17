@@ -1011,7 +1011,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                   AND me.player_id = cur.player_id
                   AND translate(
                         lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
-                        '"`.,:;!?()[]{}|',
+                        '''"`.,:;!?()[]{}|',
                         ''
                       ) = cur.detail_norm
                 """,
@@ -1054,7 +1054,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
               )
               AND translate(
                     lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
-                    '"`.,:;!?()[]{}|',
+                    '''"`.,:;!?()[]{}|',
                     ''
                   ) = 'red card'
             """,
@@ -1092,7 +1092,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
               AND me.team_id = cur.team_id
               AND translate(
                     lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
-                    '"`.,:;!?()[]{}|',
+                    '''"`.,:;!?()[]{}|',
                     ''
                   ) = cur.detail_norm
               AND (
@@ -1112,7 +1112,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                       AND m2.team_id = cur.team_id
                       AND translate(
                             lower(regexp_replace(coalesce(m2.detail,''), '\s+', ' ', 'g')),
-                            '"`.,:;!?()[]{}|',
+                            '''"`.,:;!?()[]{}|',
                             ''
                           ) = cur.detail_norm
                       AND (
@@ -1130,6 +1130,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 fixture_id,
             ),
         )
+
 
 
 
@@ -1813,10 +1814,16 @@ def run_once() -> None:
             if g in ("FINISHED", "OTHER"):
                 LAST_STATS_SYNC.pop(fid, None)
                 LINEUPS_STATE.pop(fid, None)
+
                 # upsert_match_events signature cache 제거
                 sig_cache = getattr(upsert_match_events, "_sig_cache", None)
                 if isinstance(sig_cache, dict):
                     sig_cache.pop(fid, None)
+
+                # ✅ goal miss cache 제거 (누락됐던 부분)
+                goal_miss_cache = getattr(upsert_match_events, "_goal_miss_cache", None)
+                if isinstance(goal_miss_cache, dict):
+                    goal_miss_cache.pop(fid, None)
 
         # 아주 오래된 LINEUPS_STATE도 정리(혹시 오늘/어제 범위를 벗어났을 때)
         if len(LINEUPS_STATE) > 3000:
@@ -1827,6 +1834,7 @@ def run_once() -> None:
         pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+
 
 
 
