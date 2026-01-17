@@ -1595,13 +1595,11 @@ def run_once() -> None:
         ensure_event_dedupe_tables()
         run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
 
-    # ✅ (NEW) FINISHED full-fetch 1회 실행 상태(런타임)
-    # - key: fixture_id -> ts(실행 시각)
-    # - 프로세스 재시작 시에는 초기화(=재실행 가능)되지만,
-    #   같은 프로세스에서는 "fixture별 1회만" 보장
-    if not hasattr(run_once, "_postmatch_done"):
-        run_once._postmatch_done = {}  # type: ignore[attr-defined]
-    post_done: Dict[int, float] = run_once._postmatch_done  # type: ignore[attr-defined]
+    # ✅ (NEW) FINISHED postmatch schedule 상태(런타임)
+    # post_state[fixture_id] = {"ft_seen_ts": float, "did_60": bool, "did_30m": bool, "last_run_ts": float}
+    if not hasattr(run_once, "_postmatch_state"):
+        run_once._postmatch_state = {}  # type: ignore[attr-defined]
+    post_state: Dict[int, Dict[str, Any]] = run_once._postmatch_state  # type: ignore[attr-defined]
 
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1626,23 +1624,27 @@ def run_once() -> None:
         run_once._fixtures_cache = {}  # type: ignore[attr-defined]
     fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
 
-    # TTL (초) - 스키마 변경 없이 호출만 줄임
+    # TTL (초)
     SEASON_TTL = 60 * 60      # 시즌 확정 캐시 60분
     NOFIX_TTL = 60 * 10       # 그 날짜 경기 없음 캐시 10분
 
     now_ts = time.time()
+
     # 만료 엔트리 정리
     for k, v in list(fc.items()):
         if float(v.get("exp") or 0) < now_ts:
             del fc[k]
 
-    # ✅ (NEW) post_done 오래된 항목 prune (메모리 누수 방지)
-    # - 오늘/어제 범위만 보니까 48시간이면 충분
+    # ✅ (NEW) post_state 오래된 항목 prune (메모리 누수 방지)
+    # - 6시간 지난 fixture는 상태 제거
     try:
-        cutoff = now_ts - (48 * 60 * 60)
-        for fid, ts in list(post_done.items()):
-            if float(ts) < cutoff:
-                del post_done[fid]
+        cutoff = now_ts - (6 * 60 * 60)
+        for fid, st in list(post_state.items()):
+            ft_seen = float((st or {}).get("ft_seen_ts") or 0.0)
+            last_run = float((st or {}).get("last_run_ts") or 0.0)
+            base = max(ft_seen, last_run)
+            if base and base < cutoff:
+                del post_state[fid]
     except Exception:
         pass
 
@@ -1652,9 +1654,10 @@ def run_once() -> None:
     # 이번 run에서 본 fixture들의 상태(캐시 prune에 사용)
     fixture_groups: Dict[int, str] = {}
 
-    # ✅ (NEW) FINISHED full-fetch 실행 함수(내부로 묶어서 외부 함수 추가 없이 run_once만 교체)
+    # ─────────────────────────────────────
+    # ✅ (NEW) FINISHED full-fetch 실행 헬퍼
+    # ─────────────────────────────────────
     def _update_score_any_status(fixture_id: int, home_goals: int, away_goals: int) -> None:
-        # FINISHED에서도 최종 스코어가 다르면 정정
         execute(
             """
             UPDATE matches
@@ -1669,64 +1672,92 @@ def run_once() -> None:
             (home_goals, away_goals, fixture_id, home_goals, away_goals),
         )
 
-    def _postmatch_full_fetch_once(
+    def _postmatch_full_fetch(
         fixture_id: int,
         home_id: int,
         away_id: int,
         item: Dict[str, Any],
-        sg: str,
-        date_utc: str,
+        tag: str,
     ) -> None:
-        # FINISHED에만 적용 + fixture별 1회만
-        if sg != "FINISHED":
-            return
-        if fixture_id in post_done:
-            return
-
-        # (선택) 공급자 정리시간 30~90초 후가 더 안정적인 경우가 있음
-        # - 여기서는 즉시 1회만 수행(원하면 delay 넣어줄 수 있음)
-
+        """
+        FINISHED에 대해 확정 데이터 1회 수집
+        - events raw 저장 + match_events 수렴
+        - events 기반 스코어 최종 정정(FT에서도 허용)
+        - stats 최종 저장(쿨다운 무시)
+        - lineups_ready 아니면 1회 보강 시도
+        """
         try:
-            # 1) events 원본 저장 + match_events 수렴
             events = fetch_events(s, fixture_id)
             upsert_match_events_raw(fixture_id, events)
             upsert_match_events(fixture_id, events)
 
-            # 2) 최종 스코어 정정(FT에서도 허용)
             goals_obj = (item.get("goals") or {})
             hint_h = safe_int(goals_obj.get("home"))
             hint_a = safe_int(goals_obj.get("away"))
             h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
             _update_score_any_status(fixture_id, h, a)
 
-            print(f"      [postmatch/events] fixture_id={fixture_id} goals(final)={h}:{a} events={len(events)}")
+            print(f"      [{tag}/events] fixture_id={fixture_id} goals={h}:{a} events={len(events)}")
         except Exception as e:
-            print(f"      [postmatch/events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+            print(f"      [{tag}/events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
         try:
-            # 3) stats 최종 저장(쿨다운 무시하고 1회 확정)
             stats = fetch_team_stats(s, fixture_id)
             upsert_match_team_stats(fixture_id, stats)
             LAST_STATS_SYNC[fixture_id] = time.time()
-            print(f"      [postmatch/stats] fixture_id={fixture_id} updated(final)")
+            print(f"      [{tag}/stats] fixture_id={fixture_id} updated")
         except Exception as e:
-            print(f"      [postmatch/stats] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+            print(f"      [{tag}/stats] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
         try:
-            # 4) (선택) lineups가 아직 유의미하게 준비 안 됐으면 1회 더 시도
             st = _ensure_lineups_state(fixture_id)
             if not st.get("lineups_ready"):
                 resp = fetch_lineups(s, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, now_utc())
                 if ready:
                     st["success"] = True
-                print(f"      [postmatch/lineups] fixture_id={fixture_id} ready={ready}")
+                print(f"      [{tag}/lineups] fixture_id={fixture_id} ready={ready}")
         except Exception as e:
-            print(f"      [postmatch/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+            print(f"      [{tag}/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
-        # ✅ 완료 마킹(마지막에)
-        post_done[fixture_id] = time.time()
+    def _schedule_postmatch_if_needed(
+        fixture_id: int,
+        home_id: int,
+        away_id: int,
+        item: Dict[str, Any],
+    ) -> None:
+        """
+        FT를 '처음 본 시각' 기준으로:
+        - +60초: 1회
+        - +30분: 1회
+        """
+        st = post_state.get(fixture_id)
+        if not isinstance(st, dict):
+            st = {"ft_seen_ts": now_ts, "did_60": False, "did_30m": False, "last_run_ts": 0.0}
+            post_state[fixture_id] = st
 
+        # ft_seen_ts가 없으면 지금으로 세팅
+        if not st.get("ft_seen_ts"):
+            st["ft_seen_ts"] = now_ts
+
+        ft_seen_ts = float(st.get("ft_seen_ts") or now_ts)
+        age = now_ts - ft_seen_ts
+
+        # 60초 후 1회
+        if (age >= 60.0) and (not bool(st.get("did_60"))):
+            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+60s")
+            st["did_60"] = True
+            st["last_run_ts"] = time.time()
+
+        # 30분 후 1회
+        if (age >= 1800.0) and (not bool(st.get("did_30m"))):
+            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+30m")
+            st["did_30m"] = True
+            st["last_run_ts"] = time.time()
+
+    # ─────────────────────────────────────
+    # 메인 루프
+    # ─────────────────────────────────────
     for date_str in dates:
         for lid in league_ids:
             fixtures: List[Dict[str, Any]] = []
@@ -1736,7 +1767,6 @@ def run_once() -> None:
             cached = fc.get(cache_key)
             if cached and float(cached.get("exp") or 0) >= now_ts:
                 if cached.get("no") is True:
-                    # 최근에 '그 날짜 경기 없음'으로 판정된 리그/날짜는 잠시 스킵
                     continue
                 cached_season = cached.get("season")
                 if isinstance(cached_season, int):
@@ -1746,14 +1776,11 @@ def run_once() -> None:
                             fixtures = rows
                             used_season = cached_season
                         else:
-                            # 캐시 시즌에서 빈 결과면 캐시를 무효화하고 후보를 다시 탐색
                             fc.pop(cache_key, None)
                     except Exception as e:
-                        # 캐시 시즌 호출 실패 시 후보 탐색으로 fallback
                         fc.pop(cache_key, None)
                         print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
-            # 캐시 미스/무효일 때: 시즌 후보를 돌려서 "응답이 있는 시즌"을 선택
             if used_season is None:
                 for season in infer_season_candidates(date_str):
                     try:
@@ -1761,16 +1788,13 @@ def run_once() -> None:
                         if rows:
                             fixtures = rows
                             used_season = season
-                            # 시즌 캐시
                             fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
                             break
                     except Exception as e:
-                        # 시즌 시도 중 오류는 다음 후보로
                         last = str(e)
                         print(f"  [fixtures] league={lid} date={date_str} season={season} err: {last}", file=sys.stderr)
 
             if used_season is None:
-                # 결과가 없는 건 흔함(그 날짜에 경기 없음) → 짧게 캐시
                 fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
                 continue
 
@@ -1779,19 +1803,16 @@ def run_once() -> None:
 
             for item in fixtures:
                 try:
-                    # matches / fixtures / raw upsert
                     fx = item.get("fixture") or {}
                     fid = safe_int(fx.get("id"))
                     if fid is None:
                         continue
 
-                    st = fx.get("status") or {}
-                    # (7) short/code 통일
-                    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
+                    st0 = fx.get("status") or {}
+                    status_short = safe_text(st0.get("short")) or safe_text(st0.get("code")) or ""
                     status_group = map_status_group(status_short)
                     fixture_groups[fid] = status_group
 
-                    # fixtures 테이블(요약)
                     upsert_fixture_row(
                         fixture_id=fid,
                         league_id=lid,
@@ -1801,35 +1822,24 @@ def run_once() -> None:
                         status_group=status_group,
                     )
 
-                    # matches 테이블(상세)
                     fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
                         item, league_id=lid, season=used_season
                     )
 
-                    # raw 저장(match_fixtures_raw)
                     try:
                         upsert_match_fixtures_raw(fixture_id, item, fetched_at)
                     except Exception as raw_err:
                         print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
 
-                    # lineups 정책 적용(UPCOMING도 여기서)
                     try:
                         elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
                         maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
-                    # ✅ (NEW) FINISHED면 fixture별 1회 full-fetch
-                    # - INPLAY처럼 매틱 돌리지 않고, 종료 직후 한 번만 확정 데이터 수집
+                    # ✅ FINISHED: 스케줄(60초 + 30분)만 돌린다 (즉시 full fetch X)
                     if sg == "FINISHED":
-                        _postmatch_full_fetch_once(
-                            fixture_id=fixture_id,
-                            home_id=home_id,
-                            away_id=away_id,
-                            item=item,
-                            sg=sg,
-                            date_utc=date_utc,
-                        )
+                        _schedule_postmatch_if_needed(fixture_id, home_id, away_id, item)
                         continue
 
                     # INPLAY 처리
@@ -1844,13 +1854,11 @@ def run_once() -> None:
                         upsert_match_events_raw(fixture_id, events)
                         upsert_match_events(fixture_id, events)
 
-                        # 이벤트 기반 스코어 계산(정교화) - OG/VAR/실축PK 처리 유지
                         goals_obj = (item.get("goals") or {})
                         hint_h = safe_int(goals_obj.get("home"))
                         hint_a = safe_int(goals_obj.get("away"))
 
                         h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-
                         update_live_score_if_needed(fixture_id, sg, h, a)
 
                         print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
@@ -1873,26 +1881,23 @@ def run_once() -> None:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
 
     # ─────────────────────────────────────
-    # (6) 런타임 캐시 prune (메모리 누적 방지) + (NEW) DB dedupe prune
+    # (6) 런타임 캐시 prune (메모리 누적 방지) + DB dedupe prune
     # ─────────────────────────────────────
     finished_ids: List[int] = []
     try:
-        # FINISHED/OTHER는 더 이상 필요 없으므로 캐시 제거
         for fid, g in list(fixture_groups.items()):
             if g in ("FINISHED", "OTHER"):
                 finished_ids.append(int(fid))
-
                 LAST_STATS_SYNC.pop(fid, None)
                 LINEUPS_STATE.pop(fid, None)
 
-        # 아주 오래된 LINEUPS_STATE도 정리(혹시 오늘/어제 범위를 벗어났을 때)
         if len(LINEUPS_STATE) > 3000:
             for fid in list(LINEUPS_STATE.keys())[: len(LINEUPS_STATE) - 2000]:
                 LINEUPS_STATE.pop(fid, None)
     except Exception:
         pass
 
-    # ✅ (선택3) FINISHED/OTHER fixture의 dedupe 상태/맵 prune
+    # ✅ FINISHED/OTHER fixture의 dedupe 상태/맵 prune (기존 정책 유지)
     try:
         if finished_ids:
             prune_event_dedupe_for_fixtures(finished_ids)
@@ -1906,6 +1911,7 @@ def run_once() -> None:
         pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+
 
 
 
