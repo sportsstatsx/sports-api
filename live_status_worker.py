@@ -1595,6 +1595,14 @@ def run_once() -> None:
         ensure_event_dedupe_tables()
         run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
 
+    # ✅ (NEW) FINISHED full-fetch 1회 실행 상태(런타임)
+    # - key: fixture_id -> ts(실행 시각)
+    # - 프로세스 재시작 시에는 초기화(=재실행 가능)되지만,
+    #   같은 프로세스에서는 "fixture별 1회만" 보장
+    if not hasattr(run_once, "_postmatch_done"):
+        run_once._postmatch_done = {}  # type: ignore[attr-defined]
+    post_done: Dict[int, float] = run_once._postmatch_done  # type: ignore[attr-defined]
+
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
         return
@@ -1628,11 +1636,96 @@ def run_once() -> None:
         if float(v.get("exp") or 0) < now_ts:
             del fc[k]
 
+    # ✅ (NEW) post_done 오래된 항목 prune (메모리 누수 방지)
+    # - 오늘/어제 범위만 보니까 48시간이면 충분
+    try:
+        cutoff = now_ts - (48 * 60 * 60)
+        for fid, ts in list(post_done.items()):
+            if float(ts) < cutoff:
+                del post_done[fid]
+    except Exception:
+        pass
+
     total_fixtures = 0
     total_inplay = 0
 
     # 이번 run에서 본 fixture들의 상태(캐시 prune에 사용)
     fixture_groups: Dict[int, str] = {}
+
+    # ✅ (NEW) FINISHED full-fetch 실행 함수(내부로 묶어서 외부 함수 추가 없이 run_once만 교체)
+    def _update_score_any_status(fixture_id: int, home_goals: int, away_goals: int) -> None:
+        # FINISHED에서도 최종 스코어가 다르면 정정
+        execute(
+            """
+            UPDATE matches
+            SET home_ft = %s,
+                away_ft = %s
+            WHERE fixture_id = %s
+              AND (
+                  matches.home_ft IS DISTINCT FROM %s OR
+                  matches.away_ft IS DISTINCT FROM %s
+              )
+            """,
+            (home_goals, away_goals, fixture_id, home_goals, away_goals),
+        )
+
+    def _postmatch_full_fetch_once(
+        fixture_id: int,
+        home_id: int,
+        away_id: int,
+        item: Dict[str, Any],
+        sg: str,
+        date_utc: str,
+    ) -> None:
+        # FINISHED에만 적용 + fixture별 1회만
+        if sg != "FINISHED":
+            return
+        if fixture_id in post_done:
+            return
+
+        # (선택) 공급자 정리시간 30~90초 후가 더 안정적인 경우가 있음
+        # - 여기서는 즉시 1회만 수행(원하면 delay 넣어줄 수 있음)
+
+        try:
+            # 1) events 원본 저장 + match_events 수렴
+            events = fetch_events(s, fixture_id)
+            upsert_match_events_raw(fixture_id, events)
+            upsert_match_events(fixture_id, events)
+
+            # 2) 최종 스코어 정정(FT에서도 허용)
+            goals_obj = (item.get("goals") or {})
+            hint_h = safe_int(goals_obj.get("home"))
+            hint_a = safe_int(goals_obj.get("away"))
+            h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
+            _update_score_any_status(fixture_id, h, a)
+
+            print(f"      [postmatch/events] fixture_id={fixture_id} goals(final)={h}:{a} events={len(events)}")
+        except Exception as e:
+            print(f"      [postmatch/events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+
+        try:
+            # 3) stats 최종 저장(쿨다운 무시하고 1회 확정)
+            stats = fetch_team_stats(s, fixture_id)
+            upsert_match_team_stats(fixture_id, stats)
+            LAST_STATS_SYNC[fixture_id] = time.time()
+            print(f"      [postmatch/stats] fixture_id={fixture_id} updated(final)")
+        except Exception as e:
+            print(f"      [postmatch/stats] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+
+        try:
+            # 4) (선택) lineups가 아직 유의미하게 준비 안 됐으면 1회 더 시도
+            st = _ensure_lineups_state(fixture_id)
+            if not st.get("lineups_ready"):
+                resp = fetch_lineups(s, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, now_utc())
+                if ready:
+                    st["success"] = True
+                print(f"      [postmatch/lineups] fixture_id={fixture_id} ready={ready}")
+        except Exception as e:
+            print(f"      [postmatch/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+
+        # ✅ 완료 마킹(마지막에)
+        post_done[fixture_id] = time.time()
 
     for date_str in dates:
         for lid in league_ids:
@@ -1726,6 +1819,19 @@ def run_once() -> None:
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
+                    # ✅ (NEW) FINISHED면 fixture별 1회 full-fetch
+                    # - INPLAY처럼 매틱 돌리지 않고, 종료 직후 한 번만 확정 데이터 수집
+                    if sg == "FINISHED":
+                        _postmatch_full_fetch_once(
+                            fixture_id=fixture_id,
+                            home_id=home_id,
+                            away_id=away_id,
+                            item=item,
+                            sg=sg,
+                            date_utc=date_utc,
+                        )
+                        continue
+
                     # INPLAY 처리
                     if sg != "INPLAY":
                         continue
@@ -1800,6 +1906,7 @@ def run_once() -> None:
         pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+
 
 
 
