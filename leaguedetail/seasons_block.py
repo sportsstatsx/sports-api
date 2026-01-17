@@ -104,26 +104,62 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
 
 def resolve_season_for_league(league_id: int, season: Optional[int]) -> Optional[int]:
     """
-    쿼리에서 season이 안 넘어오면, 해당 리그의 최신 시즌을 골라주는 헬퍼.
-    쿼리에서 season이 있으면 그대로 사용.
+    A안(근본해결):
+    - season 쿼리가 있으면 그대로 사용
+    - 없으면 "완료(FINISHED) 경기 수가 충분한 시즌" 중 최신 시즌을 기본으로 선택
+      -> 시즌이 막 시작해서 완료 경기가 0~몇 경기면, 자동으로 이전 시즌으로 폴백
     """
     if season is not None:
         return season
 
+    # ✅ 임계치: 이 값 미만이면 "시즌이 아직 제대로 시작 안함"으로 보고 이전 시즌을 우선
+    MIN_FINISHED = 5
+
     try:
         rows = fetch_all(
             """
-            SELECT MAX(season) AS max_season
+            SELECT
+                season,
+                COUNT(*) AS total_cnt,
+                SUM(
+                    CASE
+                        WHEN COALESCE(status_group, '') = 'FINISHED'
+                          OR COALESCE(status, '') IN ('FT', 'AET', 'PEN')
+                          OR COALESCE(status_short, '') IN ('FT', 'AET', 'PEN')
+                        THEN 1 ELSE 0
+                    END
+                ) AS finished_cnt,
+                MAX(date_utc::timestamptz) AS max_dt
             FROM matches
             WHERE league_id = %s
+            GROUP BY season
+            ORDER BY season DESC
             """,
             (league_id,),
         )
-        if rows:
-            max_season = rows[0].get("max_season")
-            if max_season is not None:
-                return int(max_season)
+
+        if not rows:
+            return None
+
+        # 1) "finished_cnt >= MIN_FINISHED" 인 시즌 중 최신 season 선택
+        for r in rows:
+            s = r.get("season")
+            if s is None:
+                continue
+            try:
+                finished_cnt = int(r.get("finished_cnt") or 0)
+            except (TypeError, ValueError):
+                finished_cnt = 0
+
+            if finished_cnt >= MIN_FINISHED:
+                return int(s)
+
+        # 2) 그런 시즌이 하나도 없으면 (리그 자체가 데이터 적거나 시즌 전체가 진행중)
+        #    그냥 최신 season으로 폴백
+        max_season = rows[0].get("season")
+        return int(max_season) if max_season is not None else None
+
     except Exception as e:
         print(f"[resolve_season_for_league] ERROR league_id={league_id}: {e}")
+        return None
 
-    return None
