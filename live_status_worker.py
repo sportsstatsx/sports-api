@@ -656,14 +656,17 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    (하키식으로 변경) 이벤트 저장을 canonical_key 기준으로 "UPDATE 수렴"시킨다.
+    (하키식) canonical_key 기준으로 UPDATE 수렴.
 
-    핵심:
-    - canonical_key 생성 (player_id가 나중에 채워져도 동일 사건으로 수렴하도록 설계)
-    - match_event_key_map에서 (fixture_id, canonical_key) -> 대표 event_id 조회
-    - 있으면: match_events 해당 id row를 UPDATE(빈 값만 채움)
-    - 없으면: INSERT 후 key_map 등록
-    - match_event_states.seen_keys는 운영/프룬/디버그 용도로 tick마다 합쳐서 저장
+    ✅ 핵심 수정(Goal 중복 증식 방지):
+    - 기존: goal key에 player_name(pname)을 직접 포함 → pname 변동으로 키가 계속 바뀌어 중복 INSERT 발생
+    - 변경: goal은 prefix(G|fid|min|extra|team|kind|) 아래에서
+            1) pid 있으면 pid:123
+            2) 없고 name 있으면 name:john doe
+            3) 둘 다 없으면 seq:1 (같은 prefix 내 기존 매핑 수 기반)
+          로 canonical_key를 결정한다.
+    - 또한 seq로 잡힌 사건이 나중에 pid/name 정보를 얻으면,
+      같은 event_id로 pid/name 키를 추가 매핑하여 앞으로 안정적으로 수렴시킨다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -677,12 +680,9 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
     def _safe_name(x: Any) -> str:
         s = safe_text(x) or ""
-        s = _norm(s)
-        return s
+        return _norm(s)
 
     def _goal_kind(detail_norm: str) -> str:
-        # OG/PK 판정은 현재 코드(스코어 반영)에서 정상 동작 중이므로,
-        # 이벤트 저장에서도 같은 표기 체계를 존중(문구 기반)
         if "own goal" in detail_norm:
             return "OG"
         if "pen" in detail_norm and ("goal" in detail_norm or "penalty" in detail_norm):
@@ -726,10 +726,18 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         return p_id not in ids
 
+    def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
+        tm = ev.get("time") or {}
+        el = safe_int(tm.get("elapsed"))
+        ex = safe_int(tm.get("extra"))
+        elv = el if el is not None else 10**9
+        exv = ex if ex is not None else 0
+        return (elv, exv, fallback_idx)
+
     # fixture별 seen_keys(운영/프룬/디버그)
     seen_keys_in_tick: List[str] = []
 
-    # ✅ Second Yellow가 있는 경우 같은 키의 Red Card는 스킵(레드 2장 표시 방지) 유지
+    # ✅ Second Yellow가 있는 경우 같은 키의 Red Card는 스킵(레드 2장 표시 방지)
     second_yellow_keys: set = set()
     for ev in events or []:
         tm = ev.get("time") or {}
@@ -753,7 +761,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         if detail_norm == "second yellow card":
             second_yellow_keys.add((int(minute), int(extra0), int(t_id), int(p_id)))
 
-    for ev in events or []:
+    # ✅ 입력 이벤트를 시간순으로 정렬(순번/탐색 안정성)
+    indexed = list(enumerate(events or []))
+    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
+    evs = [ev for _, ev in indexed]
+
+    for ev in evs:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
         assist = ev.get("assist") or {}
@@ -764,7 +777,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
-        comments = safe_text(ev.get("comments"))
+        # comments = safe_text(ev.get("comments"))  # 현재 match_events 컬럼에 저장 안 하므로 미사용
 
         # ---- 벤치/스태프 Card 차단 (기존 정책 유지) ----
         if _is_bench_staff_card(t_id, p_id, ev_type):
@@ -779,69 +792,167 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         ev_type_norm = _norm(ev_type)
         detail_norm = _norm(detail)
 
-        # ✅ Second Yellow가 있으면 같은 키의 Red Card는 스킵(레드 2장 표시 방지) 유지
+        # ✅ Second Yellow가 있으면 같은 키의 Red Card는 스킵(레드 2장 표시 방지)
         if ev_type_norm == "card" and t_id is not None and p_id is not None:
             k = (int(minute), int(extra0), int(t_id), int(p_id))
             if (detail_norm == "red card") and (k in second_yellow_keys):
                 continue
 
-        # ---- substitution 매핑(P5 유지): player=OUT / assist=IN ----
+        # ---- substitution 매핑: player=OUT / assist=IN ----
         player_in_id = None
         player_in_name = None
         if ev_type_norm in ("subst", "substitution", "sub"):
             player_in_id = a_id
             player_in_name = safe_text(assist.get("name"))
 
-        # ---- canonical_key 생성(핵심) ----
-        # player_id가 나중에 채워져도 같은 사건으로 수렴하도록:
-        # - goal은 player_id를 키에서 제외(대신 player_name 기반으로 안정화)
-        # - card/subst는 가능하면 player_name(없으면 id) 사용
         pname = _safe_name((player.get("name") if isinstance(player, dict) else None))
         aname = _safe_name((assist.get("name") if isinstance(assist, dict) else None))
 
         canonical_key = ""
+
+        # ─────────────────────────────────────────────
+        # ✅ GOAL: prefix 아래에서 pid/name/seq로 "수렴"
+        # ─────────────────────────────────────────────
         if ev_type_norm == "goal":
             kind = _goal_kind(detail_norm)
-            # goal: player_id는 제외(늦게 채워져도 수렴), player_name은 안정 discriminator로 사용
-            canonical_key = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|{pname}"
+            prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
+
+            # 기존 prefix 매핑 후보 조회
+            rows = fetch_one(
+                """
+                SELECT COALESCE(json_agg(json_build_object('k', canonical_key, 'id', event_id)), '[]'::json) AS arr
+                FROM match_event_key_map
+                WHERE fixture_id=%s AND canonical_key LIKE %s
+                """,
+                (fixture_id, prefix + "%"),
+            )
+
+            existing: List[Dict[str, Any]] = []
+            try:
+                if isinstance(rows, dict) and rows.get("arr") is not None:
+                    # db.fetch_one이 json을 파이썬 객체로 주거나 문자열로 줄 수 있어 방어
+                    arr = rows.get("arr")
+                    if isinstance(arr, str):
+                        existing = json.loads(arr)
+                    elif isinstance(arr, list):
+                        existing = arr
+                    else:
+                        existing = []
+            except Exception:
+                existing = []
+
+            # existing를 dict로 (canonical_key -> event_id)
+            ex_map: Dict[str, int] = {}
+            for r in existing:
+                if not isinstance(r, dict):
+                    continue
+                k = safe_text(r.get("k"))
+                eid = safe_int(r.get("id"))
+                if k and eid is not None:
+                    ex_map[k] = int(eid)
+
+            want_pid_key = (prefix + f"pid:{int(p_id)}") if p_id is not None else ""
+            want_name_key = (prefix + f"name:{pname}") if pname else ""
+
+            chosen_event_id: Optional[int] = None
+
+            # 1) pid 매칭 최우선
+            if want_pid_key and want_pid_key in ex_map:
+                canonical_key = want_pid_key
+                chosen_event_id = ex_map[want_pid_key]
+            # 2) name 매칭
+            elif want_name_key and want_name_key in ex_map:
+                canonical_key = want_name_key
+                chosen_event_id = ex_map[want_name_key]
+            # 3) prefix 아래 매핑이 1개면 그걸 사용(불명확하지만 중복 증식 방지)
+            elif len(ex_map) == 1:
+                only_k = next(iter(ex_map.keys()))
+                canonical_key = only_k
+                chosen_event_id = ex_map[only_k]
+            else:
+                # 4) 신규: pid 있으면 pid키로, 없고 name 있으면 name키로, 둘 다 없으면 seq
+                if want_pid_key:
+                    canonical_key = want_pid_key
+                elif want_name_key:
+                    canonical_key = want_name_key
+                else:
+                    # seq는 기존 prefix 매핑 개수 기반 (1부터)
+                    seq_n = len(ex_map) + 1
+                    canonical_key = prefix + f"seq:{seq_n}"
+
+            seen_keys_in_tick.append(canonical_key)
+
+            mapped_event_id = chosen_event_id
+
+        # ─────────────────────────────────────────────
+        # CARD / SUB / VAR / 기타: 기존 방식 유지
+        # ─────────────────────────────────────────────
         elif ev_type_norm == "card":
             ck = _card_kind(detail_norm)
-            # card: player_id가 있으면 함께 쓰되, 없을 때도 수렴하게 name도 포함
             canonical_key = f"C|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ck}|{int(p_id or 0)}|{pname}"
+            seen_keys_in_tick.append(canonical_key)
+
+            mapped = fetch_one(
+                """
+                SELECT event_id
+                FROM match_event_key_map
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+            mapped_event_id = safe_int(mapped.get("event_id")) if isinstance(mapped, dict) else None
+
         elif ev_type_norm in ("subst", "substitution", "sub"):
             canonical_key = f"S|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{int(p_id or 0)}|{pname}|{int(player_in_id or 0)}|{_safe_name(player_in_name)}"
+            seen_keys_in_tick.append(canonical_key)
+
+            mapped = fetch_one(
+                """
+                SELECT event_id
+                FROM match_event_key_map
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+            mapped_event_id = safe_int(mapped.get("event_id")) if isinstance(mapped, dict) else None
+
         elif ev_type_norm == "var":
             canonical_key = f"V|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{detail_norm}"
-        else:
-            # fallback: 너무 많은 필드(assist/comments 등)는 중복 원인이 될 수 있어 최소화
-            canonical_key = f"E|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ev_type_norm}|{detail_norm}|{pname}|{aname}"
+            seen_keys_in_tick.append(canonical_key)
 
-        seen_keys_in_tick.append(canonical_key)
+            mapped = fetch_one(
+                """
+                SELECT event_id
+                FROM match_event_key_map
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+            mapped_event_id = safe_int(mapped.get("event_id")) if isinstance(mapped, dict) else None
+
+        else:
+            canonical_key = f"E|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ev_type_norm}|{detail_norm}|{pname}|{aname}"
+            seen_keys_in_tick.append(canonical_key)
+
+            mapped = fetch_one(
+                """
+                SELECT event_id
+                FROM match_event_key_map
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+            mapped_event_id = safe_int(mapped.get("event_id")) if isinstance(mapped, dict) else None
 
         # ---- 대표 event_id 결정: key_map 우선 ----
-        mapped = fetch_one(
-            """
-            SELECT event_id
-            FROM match_event_key_map
-            WHERE fixture_id=%s AND canonical_key=%s
-            """,
-            (fixture_id, canonical_key),
-        )
-
-        mapped_event_id: Optional[int] = None
-        if isinstance(mapped, dict):
-            mapped_event_id = safe_int(mapped.get("event_id"))
-
         incoming_id = safe_int(ev.get("id"))
+
         if mapped_event_id is not None:
             ev_id_used = mapped_event_id
         else:
             ev_id_used = incoming_id if incoming_id is not None else _synthetic_id_from_key(canonical_key)
 
         # ---- match_events INSERT/UPDATE 수렴 ----
-        # 규칙:
-        # - NULL/빈 값만 새 값으로 채움
-        # - 기존 값이 있으면 유지(덮어쓰지 않음)
         execute(
             """
             INSERT INTO match_events (
@@ -897,7 +1008,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         )
 
         # ---- key_map upsert (event_id는 최초 값을 유지) ----
-        # mapped가 없던 경우에만 등록 시도
         if mapped_event_id is None:
             execute(
                 """
@@ -908,10 +1018,49 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 """,
                 (fixture_id, canonical_key, ev_id_used),
             )
+        else:
+            # 이미 매핑이 있었으면 updated_at만 터치(운영상 도움)
+            execute(
+                """
+                UPDATE match_event_key_map
+                SET updated_at = now()
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+
+        # ✅ GOAL: seq로 잡힌 사건에 pid/name이 생기면 "같은 event_id로 키 추가" (업그레이드)
+        if ev_type_norm == "goal":
+            # canonical_key가 seq:* 이고, 이제 pid/name을 알게 되면 추가 매핑 시도
+            if "|seq:" in canonical_key:
+                # prefix 재구성
+                kind = _goal_kind(detail_norm)
+                prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
+                if p_id is not None:
+                    better = prefix + f"pid:{int(p_id)}"
+                    execute(
+                        """
+                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                        VALUES (%s, %s, %s, now(), now())
+                        ON CONFLICT (fixture_id, canonical_key)
+                        DO UPDATE SET updated_at = now()
+                        """,
+                        (fixture_id, better, ev_id_used),
+                    )
+                if pname:
+                    better = prefix + f"name:{pname}"
+                    execute(
+                        """
+                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                        VALUES (%s, %s, %s, now(), now())
+                        ON CONFLICT (fixture_id, canonical_key)
+                        DO UPDATE SET updated_at = now()
+                        """,
+                        (fixture_id, better, ev_id_used),
+                    )
 
     # ---- match_event_states 갱신(운영/프룬/디버그) ----
     if seen_keys_in_tick:
-        # DISTINCT merge: 기존 배열 + 이번 배열을 합친 뒤 unique로 재구성
         execute(
             """
             INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
@@ -926,7 +1075,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             (fixture_id, seen_keys_in_tick),
         )
     else:
-        # 이벤트가 비어도 updated_at은 찍어두면 프룬에 도움이 됨
         execute(
             """
             INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
@@ -935,6 +1083,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             """,
             (fixture_id,),
         )
+
 
 
 
