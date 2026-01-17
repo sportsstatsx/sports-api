@@ -121,6 +121,65 @@ def build_insights_filter_meta(
         "last_n": last_n,
     }
 
+def _resolve_default_team_season_for_league(
+    *,
+    team_id: int,
+    league_id: int,
+    min_finished: int = 5,
+) -> Optional[int]:
+    """
+    A안(근본해결):
+    - team_season_stats / matches 를 함께 보고,
+      "해당 팀이 해당 리그에서 완료(FINISHED) 경기 수가 충분한 시즌" 중
+      가장 최신 season을 기본 시즌으로 선택한다.
+    - 시즌이 막 시작해서 완료 경기가 거의 없으면 자동으로 이전 시즌으로 폴백.
+    """
+    try:
+        rows = fetch_all(
+            """
+            WITH seasons AS (
+                SELECT DISTINCT season
+                FROM team_season_stats
+                WHERE league_id = %s
+                  AND team_id   = %s
+            ),
+            finished AS (
+                SELECT
+                    m.season,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(m.status_group, '') = 'FINISHED'
+                              OR COALESCE(m.status, '') IN ('FT', 'AET', 'PEN')
+                              OR COALESCE(m.status_short, '') IN ('FT', 'AET', 'PEN')
+                            THEN 1 ELSE 0
+                        END
+                    ) AS finished_cnt
+                FROM matches m
+                WHERE m.league_id = %s
+                  AND (m.home_id = %s OR m.away_id = %s)
+                GROUP BY m.season
+            )
+            SELECT
+                s.season,
+                COALESCE(f.finished_cnt, 0) AS finished_cnt
+            FROM seasons s
+            LEFT JOIN finished f
+              ON f.season = s.season
+            ORDER BY
+                (COALESCE(f.finished_cnt, 0) >= %s) DESC,
+                s.season DESC
+            LIMIT 1
+            """,
+            (league_id, team_id, league_id, team_id, team_id, int(min_finished)),
+        )
+        if not rows:
+            return None
+        s = rows[0].get("season")
+        return int(s) if s is not None else None
+    except Exception:
+        return None
+
+
 
 def _get_team_competitions_for_season(
     team_id: int,
@@ -508,6 +567,17 @@ def get_team_season_stats(
     """
     params: list[Any] = [league_id, team_id]
 
+    # ✅ A안: season 미지정이면 '완료 경기 수가 충분한 시즌'을 기본으로 확정
+    if season is None:
+        resolved = _resolve_default_team_season_for_league(
+            team_id=team_id,
+            league_id=league_id,
+            min_finished=5,
+        )
+        if resolved is not None:
+            season = resolved
+
+
     # season 이 지정되면 해당 시즌만 필터링
     if season is not None:
         where_clause += "\n          AND season   = %s"
@@ -664,6 +734,17 @@ def get_team_insights_overall_with_filters(
     filters_meta = build_insights_filter_meta(comp, last_n)
     comp_norm = filters_meta.get("competition", "All")
     last_n_int = filters_meta.get("last_n", 0)
+
+    # ✅ A안: Insights에서도 season 미지정이면 기본 시즌을 확정(팀/리그 기준)
+    if season is None:
+        resolved = _resolve_default_team_season_for_league(
+            team_id=team_id,
+            league_id=league_id,
+            min_finished=5,
+        )
+        if resolved is not None:
+            season = resolved
+
 
     # 2) 시즌 전체 기준 기본 데이터 로드
     base = get_team_season_stats(
