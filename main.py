@@ -1372,6 +1372,96 @@ def board_post_detail(post_id: int):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.get(f"/{ADMIN_PATH}/api/fixture_meta")
+@require_admin
+def admin_fixture_meta():
+    """
+    A안: admin UI에서 analysis 글 작성 시, (sport, fixture_key)로 팀/리그 메타를 받아
+    snapshot_json에 자동 저장하기 위한 최소 메타 API
+
+    GET /{ADMIN_PATH}/api/fixture_meta?sport=football&fixture_key=1379184
+    """
+    sport = (request.args.get("sport") or "").strip().lower()
+    fixture_key = (request.args.get("fixture_key") or "").strip()
+
+    if not sport or not fixture_key:
+        return jsonify({"ok": False, "error": "sport_and_fixture_key_required"}), 400
+
+    # 현재는 football만 지원 (hockey는 필요 시 같은 방식으로 확장)
+    if sport != "football":
+        return jsonify({"ok": False, "error": "sport_not_supported_yet"}), 400
+
+    try:
+        fixture_id = int(fixture_key)
+    except Exception:
+        return jsonify({"ok": False, "error": "fixture_key_must_be_int_for_football"}), 400
+
+    sql = """
+    SELECT
+      m.fixture_id,
+      m.league_id,
+      m.season,
+      m.date_utc,
+
+      ht.id   AS home_team_id,
+      ht.name AS home_name,
+      ht.logo AS home_logo,
+
+      at.id   AS away_team_id,
+      at.name AS away_name,
+      at.logo AS away_logo,
+
+      l.name  AS league_name,
+      l.logo  AS league_logo
+    FROM matches m
+    JOIN teams ht ON ht.id = m.home_id
+    JOIN teams at ON at.id = m.away_id
+    LEFT JOIN leagues l ON l.id = m.league_id
+    WHERE m.fixture_id = %s
+    LIMIT 1
+    """
+
+    row = fetch_one(sql, (fixture_id,))
+    if not row:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+
+    def _to_iso(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        try:
+            # timestamptz -> UTC ISO
+            vv = v
+            if getattr(vv, "tzinfo", None) is None:
+                vv = vv.replace(tzinfo=timezone.utc)
+            return vv.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return str(v)
+
+    fixture = {
+        "league": {
+            "id": row.get("league_id"),
+            "name": row.get("league_name") or "",
+            "logo": row.get("league_logo") or "",
+        },
+        "season": row.get("season"),
+        "kickoff_utc": _to_iso(row.get("date_utc")),
+        "home": {
+            "id": row.get("home_team_id"),
+            "name": row.get("home_name") or "",
+            "logo": row.get("home_logo") or "",
+        },
+        "away": {
+            "id": row.get("away_team_id"),
+            "name": row.get("away_name") or "",
+            "logo": row.get("away_logo") or "",
+        },
+    }
+
+    return jsonify({"ok": True, "fixture": fixture})
+
+
 
 # ─────────────────────────────────────
 # Board APIs (admin)
@@ -1676,6 +1766,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
