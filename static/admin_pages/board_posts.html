@@ -88,12 +88,21 @@
       color: var(--muted);
     }
 
-    .wrap {
-      display: grid;
-      grid-template-columns: 420px 1fr;
-      gap: 14px;
-      align-items: start;
+    /* ✅ 이제 화면 전환형이라 wrap grid는 사용 안함 */
+    .wrap { display:none; }
+
+    /* 목록 아이템 안의 액션 버튼 */
+    .item .metaRight {
+      display:flex;
+      align-items:center;
+      gap: 8px;
     }
+    .item .actions {
+      display:flex;
+      gap: 6px;
+      align-items:center;
+    }
+
 
     .card {
       background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
@@ -312,191 +321,195 @@
     </div>
   </div>
 
-  <div class="wrap">
-    <!-- Left: List -->
-    <div class="card">
-      <h2>Posts</h2>
-      <div class="body">
-        <div class="row">
-          <div class="col" style="min-width: 110px; flex:1">
-            <label>Status</label>
-            <select id="qStatus">
-              <option value="">(all)</option>
-              <option value="draft">draft</option>
-              <option value="published">published</option>
-              <option value="hidden">hidden</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 120px; flex:1">
-            <label>Category</label>
-            <select id="qCategory">
-              <option value="">(all)</option>
-              <option value="notice">notice</option>
-              <option value="ops">ops</option>
-              <option value="analysis">analysis</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 120px; flex:1">
-            <label>Sport</label>
-            <select id="qSport">
-              <option value="">(all)</option>
-              <option value="football">football</option>
-              <option value="hockey">hockey</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 170px; flex:2">
-            <label>Search (title/summary)</label>
-            <input id="qText" placeholder="예: Arsenal / 공지 / injury" />
-          </div>
+  <!-- ✅ 게시판 형태: List View / Editor View -->
+<div id="listView">
+  <div class="card">
+    <h2>Posts</h2>
+    <div class="body">
+      <div class="row">
+        <div class="col" style="min-width: 110px; flex:1">
+          <label>Status</label>
+          <select id="qStatus">
+            <option value="">(all)</option>
+            <option value="draft">draft</option>
+            <option value="published">published</option>
+            <option value="hidden">hidden</option>
+          </select>
         </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>Fixture Key (optional)</label>
-            <input id="qFixtureKey" placeholder="예: football:123456 / hockey:2025-01-01-XYZ" />
-          </div>
-          <div class="col" style="min-width: 110px;">
-            <label>&nbsp;</label>
-            <button class="btn" onclick="loadPosts()">불러오기</button>
-          </div>
+        <div class="col" style="min-width: 120px; flex:1">
+          <label>Category</label>
+          <select id="qCategory">
+            <option value="">(all)</option>
+            <option value="notice">notice</option>
+            <option value="ops">ops</option>
+            <option value="analysis">analysis</option>
+          </select>
         </div>
-
-        <div class="subtle" id="listHint"></div>
-        <div class="list" id="list"></div>
+        <div class="col" style="min-width: 120px; flex:1">
+          <label>Sport</label>
+          <select id="qSport">
+            <option value="">(all)</option>
+            <option value="football">football</option>
+            <option value="hockey">hockey</option>
+          </select>
+        </div>
+        <div class="col" style="min-width: 170px; flex:2">
+          <label>Search (title/summary)</label>
+          <input id="qText" placeholder="예: Arsenal / 공지 / injury" />
+        </div>
       </div>
-    </div>
 
-    <!-- Right: Editor -->
-    <div class="card">
-      <h2>Editor</h2>
-      <div class="body">
-        <div class="row">
-          <div class="col" style="min-width: 100px;">
-            <label>ID</label>
-            <input id="pId" disabled placeholder="(new)" />
-          </div>
-          <div class="col" style="min-width: 140px; flex:1;">
-            <label>Category</label>
-            <select id="pCategory">
-              <option value="analysis">analysis</option>
-              <option value="notice">notice</option>
-              <option value="ops">ops</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 140px; flex:1;">
-            <label>Status</label>
-            <select id="pStatus">
-              <option value="draft">draft</option>
-              <option value="published">published</option>
-              <option value="hidden">hidden</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 160px; flex:1;">
-            <label>Pin level</label>
-            <select id="pPin">
-              <option value="0">0 (일반)</option>
-              <option value="1">1 (고정)</option>
-              <option value="2">2 (공지/운영 최상단)</option>
-            </select>
-          </div>
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>Fixture Key (optional)</label>
+          <input id="qFixtureKey" placeholder="예: football:123456 / hockey:2025-01-01-XYZ" />
         </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="min-width: 200px; flex:1;">
-            <label>Sport (optional)</label>
-            <select id="pSport">
-              <option value="">(none)</option>
-              <option value="football">football</option>
-              <option value="hockey">hockey</option>
-            </select>
-          </div>
-          <div class="col" style="min-width: 240px; flex:1;">
-            <label>Fixture Key (optional)</label>
-            <input id="pFixtureKey" placeholder="예: 123456" />
-          </div>
+        <div class="col" style="min-width: 110px;">
+          <label>&nbsp;</label>
+          <button class="btn" onclick="loadPosts()">불러오기</button>
         </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="min-width: 220px; flex:1;">
-            <label>Publish at (optional)</label>
-            <input id="pPublishAt" type="datetime-local" />
-          </div>
-          <div class="col" style="min-width: 220px; flex:1;">
-            <label>Pin until (optional)</label>
-            <input id="pPinUntil" type="datetime-local" />
-          </div>
-        </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>Title</label>
-            <input id="pTitle" placeholder="제목" />
-          </div>
-        </div>
-
-        <!-- ✅ analysis + (sport, fixture_key) 입력 시 제목 아래 매치카드 프리뷰 (스코어 없음) -->
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <div id="matchPreview" class="matchPreview" style="display:none;"></div>
-          </div>
-        </div>
-
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>Summary (list에 뽑힐 짧은 요약)</label>
-            <input id="pSummary" placeholder="요약(선택)" />
-          </div>
-        </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>Content (Markdown)</label>
-            <textarea id="pContent" placeholder="# 제목&#10;&#10;내용..."></textarea>
-          </div>
-        </div>
-
-        <!-- 언어권만 사용 -->
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>Target Langs (비우면 전세계)</label>
-            <div class="langs" id="langBox"></div>
-            <div class="subtle">예: 영어 글이면 <b>en</b>만 체크. 비우면 모든 언어권에 노출.</div>
-          </div>
-        </div>
-
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="flex: 1;">
-            <label>(옵션) Snapshot JSON / Filters JSON</label>
-            <button class="btn small" onclick="toggleJsonPanel()">JSON 패널 열기/닫기</button>
-          </div>
-        </div>
-
-        <div id="jsonPanel" style="display:none; margin-top: 10px;">
-          <div class="split">
-            <div class="col">
-              <label>Filters JSON</label>
-              <textarea id="pFiltersJson" style="min-height:140px;">{}</textarea>
-            </div>
-            <div class="col">
-              <label>Snapshot JSON</label>
-              <textarea id="pSnapshotJson" style="min-height:140px;">{}</textarea>
-            </div>
-          </div>
-        </div>
-
-        <div class="row" style="margin-top: 12px;">
-          <button class="btn primary" onclick="savePost()">저장(Upsert)</button>
-          <button class="btn danger" onclick="deletePost()">삭제</button>
-          <button class="btn" onclick="reloadSelected()">새로고침</button>
-          <div class="hint" id="saveHint" style="margin-left:auto;"></div>
-        </div>
-
-        <div class="subtle">Debug</div>
-        <div class="mono" id="debugBox">{}</div>
       </div>
+
+      <div class="subtle" id="listHint"></div>
+      <div class="list" id="list"></div>
     </div>
   </div>
+</div>
+
+<div id="editorView" style="display:none;">
+  <div class="card">
+    <h2 style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+      <span>Editor</span>
+      <button class="btn small" onclick="backToList()">← 목록</button>
+    </h2>
+
+    <div class="body">
+      <!-- ✅ 여기부터는 너 기존 Editor 내용 그대로 유지 -->
+      <div class="row">
+        <div class="col" style="min-width: 100px;">
+          <label>ID</label>
+          <input id="pId" disabled placeholder="(new)" />
+        </div>
+        <div class="col" style="min-width: 140px; flex:1;">
+          <label>Category</label>
+          <select id="pCategory">
+            <option value="analysis">analysis</option>
+            <option value="notice">notice</option>
+            <option value="ops">ops</option>
+          </select>
+        </div>
+        <div class="col" style="min-width: 140px; flex:1;">
+          <label>Status</label>
+          <select id="pStatus">
+            <option value="draft">draft</option>
+            <option value="published">published</option>
+            <option value="hidden">hidden</option>
+          </select>
+        </div>
+        <div class="col" style="min-width: 160px; flex:1;">
+          <label>Pin level</label>
+          <select id="pPin">
+            <option value="0">0 (일반)</option>
+            <option value="1">1 (고정)</option>
+            <option value="2">2 (공지/운영 최상단)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="min-width: 200px; flex:1;">
+          <label>Sport (optional)</label>
+          <select id="pSport">
+            <option value="">(none)</option>
+            <option value="football">football</option>
+            <option value="hockey">hockey</option>
+          </select>
+        </div>
+        <div class="col" style="min-width: 240px; flex:1;">
+          <label>Fixture Key (optional)</label>
+          <input id="pFixtureKey" placeholder="예: 123456" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="min-width: 220px; flex:1;">
+          <label>Publish at (optional)</label>
+          <input id="pPublishAt" type="datetime-local" />
+        </div>
+        <div class="col" style="min-width: 220px; flex:1;">
+          <label>Pin until (optional)</label>
+          <input id="pPinUntil" type="datetime-local" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>Title</label>
+          <input id="pTitle" placeholder="제목" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <div id="matchPreview" class="matchPreview" style="display:none;"></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>Summary (list에 뽑힐 짧은 요약)</label>
+          <input id="pSummary" placeholder="요약(선택)" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>Content (Markdown)</label>
+          <textarea id="pContent" placeholder="# 제목&#10;&#10;내용..."></textarea>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>Target Langs (비우면 전세계)</label>
+          <div class="langs" id="langBox"></div>
+          <div class="subtle">예: 영어 글이면 <b>en</b>만 체크. 비우면 모든 언어권에 노출.</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 10px;">
+        <div class="col" style="flex: 1;">
+          <label>(옵션) Snapshot JSON / Filters JSON</label>
+          <button class="btn small" onclick="toggleJsonPanel()">JSON 패널 열기/닫기</button>
+        </div>
+      </div>
+
+      <div id="jsonPanel" style="display:none; margin-top: 10px;">
+        <div class="split">
+          <div class="col">
+            <label>Filters JSON</label>
+            <textarea id="pFiltersJson" style="min-height:140px;">{}</textarea>
+          </div>
+          <div class="col">
+            <label>Snapshot JSON</label>
+            <textarea id="pSnapshotJson" style="min-height:140px;">{}</textarea>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 12px;">
+        <button class="btn primary" onclick="savePost()">저장(Upsert)</button>
+        <button class="btn danger" onclick="deletePost()">삭제</button>
+        <button class="btn" onclick="reloadSelected()">새로고침</button>
+        <div class="hint" id="saveHint" style="margin-left:auto;"></div>
+      </div>
+
+      <div class="subtle">Debug</div>
+      <div class="mono" id="debugBox">{}</div>
+    </div>
+  </div>
+</div>
+
 
 <script>
   // ─────────────────────────────────────
@@ -566,6 +579,25 @@
     return { status: res.status, data };
   }
 
+function showListView() {
+  $("listView").style.display = "block";
+  $("editorView").style.display = "none";
+}
+
+function showEditorView() {
+  $("listView").style.display = "none";
+  $("editorView").style.display = "block";
+}
+
+function backToList() {
+  renderLangBox();
+  showListView();
+  setSaveHint("");
+  // 목록 최신화는 선택 (원하면 유지)
+  loadPosts();
+}
+
+
 
   // ─────────────────────────────────────
   // Lang chips
@@ -608,35 +640,60 @@
   // List render
   // ─────────────────────────────────────
   function renderList() {
-    const list = $("list");
-    list.innerHTML = "";
+  const list = $("list");
+  list.innerHTML = "";
 
-    const rows = cachedRows || [];
-    setStatusLine("rows: " + rows.length);
+  const rows = cachedRows || [];
+  setStatusLine("rows: " + rows.length);
 
-    for (const r of rows) {
-      const div = document.createElement("div");
-      div.className = "item" + (String(r.id) === String(selectedId) ? " active" : "");
-      const badges = [];
+  for (const r of rows) {
+    const div = document.createElement("div");
+    div.className = "item" + (String(r.id) === String(selectedId) ? " active" : "");
 
-      if (r.status === "published") badges.push(`<span class="badge pub">PUB</span>`);
-      badges.push(`<span class="badge cat">${escapeHtml(r.category || "")}</span>`);
-      if ((r.pin_level || 0) > 0) badges.push(`<span class="badge pin">PIN ${escapeHtml(String(r.pin_level))}</span>`);
+    const badges = [];
+    if (r.status === "published") badges.push(`<span class="badge pub">PUB</span>`);
+    badges.push(`<span class="badge cat">${escapeHtml(r.category || "")}</span>`);
+    if ((r.pin_level || 0) > 0) badges.push(`<span class="badge pin">PIN ${escapeHtml(String(r.pin_level))}</span>`);
 
-      const tlangs = (r.target_langs || []);
-      if (tlangs.length > 0) badges.push(`<span class="badge">langs: ${escapeHtml(tlangs.join(","))}</span>`);
+    const tlangs = (r.target_langs || []);
+    if (tlangs.length > 0) badges.push(`<span class="badge">langs: ${escapeHtml(tlangs.join(","))}</span>`);
 
-      div.innerHTML = `
-        <div class="meta">
-          <div>#${escapeHtml(r.id)} · ${escapeHtml((r.publish_at || r.created_at || "").slice(0, 16))}</div>
+    div.innerHTML = `
+      <div class="meta">
+        <div>#${escapeHtml(r.id)} · ${escapeHtml((r.publish_at || r.created_at || "").slice(0, 16))}</div>
+
+        <div class="metaRight">
           <div class="badges">${badges.join("")}</div>
+          <div class="actions">
+            <button class="btn small" data-act="edit">수정</button>
+            <button class="btn small danger" data-act="del">삭제</button>
+          </div>
         </div>
-        <div class="title">${escapeHtml(r.title || "")}</div>
-      `;
-      div.onclick = () => selectPost(r.id);
-      list.appendChild(div);
-    }
+      </div>
+
+      <div class="title">${escapeHtml(r.title || "")}</div>
+    `;
+
+    // 아이템 클릭: 그냥 선택만 (원하면 edit로 바로 보내도 됨)
+    div.onclick = () => {
+      selectedId = String(r.id);
+      renderList();
+    };
+
+    // 액션 버튼 이벤트 (버블링 막기)
+    div.querySelector('[data-act="edit"]').onclick = (ev) => {
+      ev.stopPropagation();
+      selectPost(r.id, { openEditor: true });
+    };
+    div.querySelector('[data-act="del"]').onclick = (ev) => {
+      ev.stopPropagation();
+      deletePostById(r.id);
+    };
+
+    list.appendChild(div);
   }
+}
+
 
   // ─────────────────────────────────────
   // Load / Select
@@ -679,24 +736,28 @@
     }
   }
 
-  async function selectPost(id) {
-    if (!id) return;
-    selectedId = String(id);
-    renderList();
+  async function selectPost(id, opts) {
+  if (!id) return;
+  selectedId = String(id);
+  renderList();
 
-    setStatusLine("불러오는 중: #" + id);
-    const r = await api(adminUrl("/api/board/posts/" + id), { method: "GET" });
-    setDebug(r);
+  setStatusLine("불러오는 중: #" + id);
+  const r = await api(adminUrl("/api/board/posts/" + id), { method: "GET" });
+  setDebug(r);
 
-    if (r.status >= 400 || !r.data || !r.data.ok) {
-      setStatusLine("");
-      alert("불러오기 실패: " + JSON.stringify(r.data));
-      return;
-    }
-
-    fillEditor(r.data.row || {});
+  if (r.status >= 400 || !r.data || !r.data.ok) {
     setStatusLine("");
+    alert("불러오기 실패: " + JSON.stringify(r.data));
+    return;
   }
+
+  fillEditor(r.data.row || {});
+  setStatusLine("");
+
+  const openEditor = !opts ? true : (opts.openEditor !== false);
+  if (openEditor) showEditorView();
+}
+
 
   function clearEditor() {
     selectedId = null;
@@ -723,9 +784,11 @@
 
 
   function newPost() {
-    clearEditor();
-    setSaveHint("새 글 작성 중");
-  }
+  clearEditor();
+  setSaveHint("새 글 작성 중");
+  showEditorView();
+}
+
 
   function fillEditor(row) {
     selectedId = String(row.id ?? "");
@@ -772,6 +835,29 @@
     if (!selectedId) return alert("선택된 글이 없습니다.");
     await selectPost(selectedId);
   }
+
+async function deletePostById(id) {
+  const targetId = String(id || "").trim();
+  if (!targetId) return;
+
+  const ok = confirm("정말 삭제할까요? (#" + targetId + ")");
+  if (!ok) return;
+
+  setStatusLine("삭제 중: #" + targetId);
+  const r = await api(adminUrl("/api/board/posts/" + targetId), { method: "DELETE" });
+  setDebug(r);
+
+  if (r.status >= 400 || !r.data || !r.data.ok) {
+    setStatusLine("");
+    alert("삭제 실패: " + JSON.stringify(r.data));
+    return;
+  }
+
+  setStatusLine("");
+  if (selectedId === targetId) selectedId = null;
+  await loadPosts();
+}
+
 
   // ─────────────────────────────────────
   // Save / Delete
