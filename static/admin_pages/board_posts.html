@@ -112,17 +112,19 @@
       overflow: hidden;
     }
 
-    /* ✅ Editor 화면에서만: 카드 폭을 모바일 폭처럼 제한 */
-    #editorView .card {
-      max-width: 460px;
-      margin: 0 auto;
-    }
+    /* ✅ Editor 폭은 .editorNarrow(420px)에서만 제어 (카드 max-width 제한 제거) */
+
 
     /* (선택) Content 작성칸을 monospace 대신 일반 폰트로 */
     #pContent {
       font-family: var(--sans);
       line-height: 1.6;
+
+      /* ✅ 긴 단어/URL이 모바일에서 레이아웃 튀는 것 방지 */
+      word-break: break-word;
+      overflow-wrap: anywhere;
     }
+
 
 
 
@@ -138,6 +140,27 @@
     .card .body {
       padding: 14px;
     }
+
+    /* ✅ Editor 폭을 모바일 본문 느낌으로 제한 (대략 320~420px) */
+    .editorNarrow {
+      width: 100%;
+      max-width: 420px;   /* 폰 느낌 상한 */
+      margin: 0 auto;     /* 가운데 정렬 */
+    }
+
+    /* Editor 안 입력들은 폭 100% 유지 */
+    .editorNarrow input,
+    .editorNarrow select,
+    .editorNarrow textarea {
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    /* Content 텍스트는 '폰에서 보이는 줄바꿈' 느낌: 가로 리사이즈 금지 */
+    .editorNarrow textarea#pContent {
+      resize: vertical;   /* 이미 vertical이지만 확실히 */
+    }
+
 
     .row { display:flex; gap:10px; flex-wrap: wrap; align-items: center; }
     .col { display:flex; flex-direction: column; gap: 6px; }
@@ -398,128 +421,130 @@
     </h2>
 
     <div class="body">
-      <!-- ✅ 여기부터는 너 기존 Editor 내용 그대로 유지 -->
-      <div class="row">
-        <div class="col" style="min-width: 100px;">
-          <label>ID</label>
-          <input id="pId" disabled placeholder="(new)" />
-        </div>
-        <div class="col" style="min-width: 140px; flex:1;">
-          <label>Category</label>
-          <select id="pCategory">
-            <option value="analysis">analysis</option>
-            <option value="notice">notice</option>
-            <option value="ops">ops</option>
-          </select>
-        </div>
-        <div class="col" style="min-width: 140px; flex:1;">
-          <label>Status</label>
-          <select id="pStatus">
-            <option value="draft">draft</option>
-            <option value="published">published</option>
-            <option value="hidden">hidden</option>
-          </select>
-        </div>
-        <div class="col" style="min-width: 160px; flex:1;">
-          <label>Pin level</label>
-          <select id="pPin">
-            <option value="0">0 (일반)</option>
-            <option value="1">1 (고정)</option>
-            <option value="2">2 (공지/운영 최상단)</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="min-width: 200px; flex:1;">
-          <label>Sport (optional)</label>
-          <select id="pSport">
-            <option value="">(none)</option>
-            <option value="football">football</option>
-            <option value="hockey">hockey</option>
-          </select>
-        </div>
-        <div class="col" style="min-width: 240px; flex:1;">
-          <label>Fixture Key (optional)</label>
-          <input id="pFixtureKey" placeholder="예: 123456" />
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="min-width: 220px; flex:1;">
-          <label>Publish at (optional)</label>
-          <input id="pPublishAt" type="datetime-local" />
-        </div>
-        <div class="col" style="min-width: 220px; flex:1;">
-          <label>Pin until (optional)</label>
-          <input id="pPinUntil" type="datetime-local" />
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <label>Title</label>
-          <input id="pTitle" placeholder="제목" />
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <div id="matchPreview" class="matchPreview" style="display:none;"></div>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <label>Summary (list에 뽑힐 짧은 요약)</label>
-          <input id="pSummary" placeholder="요약(선택)" />
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <label>Content (Markdown)</label>
-          <textarea id="pContent" placeholder="# 제목&#10;&#10;내용..."></textarea>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <label>Target Langs (비우면 전세계)</label>
-          <div class="langs" id="langBox"></div>
-          <div class="subtle">예: 영어 글이면 <b>en</b>만 체크. 비우면 모든 언어권에 노출.</div>
-        </div>
-      </div>
-
-      <div class="row" style="margin-top: 10px;">
-        <div class="col" style="flex: 1;">
-          <label>(옵션) Snapshot JSON / Filters JSON</label>
-          <button class="btn small" onclick="toggleJsonPanel()">JSON 패널 열기/닫기</button>
-        </div>
-      </div>
-
-      <div id="jsonPanel" style="display:none; margin-top: 10px;">
-        <div class="split">
-          <div class="col">
-            <label>Filters JSON</label>
-            <textarea id="pFiltersJson" style="min-height:140px;">{}</textarea>
+      <div class="editorNarrow">
+        <!-- ✅ 여기부터는 너 기존 Editor 내용 그대로 유지 -->
+        <div class="row">
+          <div class="col" style="min-width: 100px;">
+            <label>ID</label>
+            <input id="pId" disabled placeholder="(new)" />
           </div>
-          <div class="col">
-            <label>Snapshot JSON</label>
-            <textarea id="pSnapshotJson" style="min-height:140px;">{}</textarea>
+          <div class="col" style="min-width: 140px; flex:1;">
+            <label>Category</label>
+            <select id="pCategory">
+              <option value="analysis">analysis</option>
+              <option value="notice">notice</option>
+              <option value="ops">ops</option>
+            </select>
+          </div>
+          <div class="col" style="min-width: 140px; flex:1;">
+            <label>Status</label>
+            <select id="pStatus">
+              <option value="draft">draft</option>
+              <option value="published">published</option>
+              <option value="hidden">hidden</option>
+            </select>
+          </div>
+          <div class="col" style="min-width: 160px; flex:1;">
+            <label>Pin level</label>
+            <select id="pPin">
+              <option value="0">0 (일반)</option>
+              <option value="1">1 (고정)</option>
+              <option value="2">2 (공지/운영 최상단)</option>
+            </select>
           </div>
         </div>
-      </div>
 
-      <div class="row" style="margin-top: 12px;">
-        <button class="btn primary" onclick="savePost()">저장(Upsert)</button>
-        <button class="btn danger" onclick="deletePost()">삭제</button>
-        <button class="btn" onclick="reloadSelected()">새로고침</button>
-        <div class="hint" id="saveHint" style="margin-left:auto;"></div>
-      </div>
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="min-width: 200px; flex:1;">
+            <label>Sport (optional)</label>
+            <select id="pSport">
+              <option value="">(none)</option>
+              <option value="football">football</option>
+              <option value="hockey">hockey</option>
+            </select>
+          </div>
+          <div class="col" style="min-width: 240px; flex:1;">
+            <label>Fixture Key (optional)</label>
+            <input id="pFixtureKey" placeholder="예: 123456" />
+          </div>
+        </div>
 
-      <div class="subtle">Debug</div>
-      <div class="mono" id="debugBox">{}</div>
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="min-width: 220px; flex:1;">
+            <label>Publish at (optional)</label>
+            <input id="pPublishAt" type="datetime-local" />
+          </div>
+          <div class="col" style="min-width: 220px; flex:1;">
+            <label>Pin until (optional)</label>
+            <input id="pPinUntil" type="datetime-local" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <label>Title</label>
+            <input id="pTitle" placeholder="제목" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <div id="matchPreview" class="matchPreview" style="display:none;"></div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <label>Summary (list에 뽑힐 짧은 요약)</label>
+            <input id="pSummary" placeholder="요약(선택)" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <label>Content (Markdown)</label>
+            <textarea id="pContent" placeholder="# 제목&#10;&#10;내용..."></textarea>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <label>Target Langs (비우면 전세계)</label>
+            <div class="langs" id="langBox"></div>
+            <div class="subtle">예: 영어 글이면 <b>en</b>만 체크. 비우면 모든 언어권에 노출.</div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <label>(옵션) Snapshot JSON / Filters JSON</label>
+            <button class="btn small" onclick="toggleJsonPanel()">JSON 패널 열기/닫기</button>
+          </div>
+        </div>
+
+        <div id="jsonPanel" style="display:none; margin-top: 10px;">
+          <div class="split">
+            <div class="col">
+              <label>Filters JSON</label>
+              <textarea id="pFiltersJson" style="min-height:140px;">{}</textarea>
+            </div>
+            <div class="col">
+              <label>Snapshot JSON</label>
+              <textarea id="pSnapshotJson" style="min-height:140px;">{}</textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top: 12px;">
+          <button class="btn primary" onclick="savePost()">저장(Upsert)</button>
+          <button class="btn danger" onclick="deletePost()">삭제</button>
+          <button class="btn" onclick="reloadSelected()">새로고침</button>
+          <div class="hint" id="saveHint" style="margin-left:auto;"></div>
+        </div>
+
+        <div class="subtle">Debug</div>
+        <div class="mono" id="debugBox">{}</div>
+      </div>
     </div>
   </div>
 </div>
