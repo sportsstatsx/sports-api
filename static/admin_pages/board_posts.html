@@ -60,6 +60,27 @@
       --shadow: 0 10px 40px rgba(0,0,0,0.35);
     }
 
+    /* ✅ 네이티브 폼 컨트롤(select/option 등) 테마를 브라우저에 힌트 */
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* ✅ select/option 기본 배경 하얗게 뜨는 것 최대한 방지 */
+select {
+  background: rgba(0,0,0,0.15);
+  color: var(--text);
+}
+:root[data-theme="light"] select {
+  background: rgba(255,255,255,0.85);
+  color: var(--text);
+}
+
+/* 일부 브라우저에서 option 배경이 강제로 하얗게 뜨는 경우 완화 */
+select option {
+  background: var(--panel);
+  color: var(--text);
+}
+
+
 
     body {
       margin: 0;
@@ -559,8 +580,11 @@
   let selectedId = null;
 
   function adminUrl(path) {
-    return location.pathname.replace(/\\/pages\\/.+$/, "") + path;
-  }
+  // 예: /admin19900731/pages/board.html  ->  /admin19900731
+  const base = location.pathname.replace(/\/pages\/[^\/]+$/, "");
+  return base + path;
+}
+
 
   function $(id) { return document.getElementById(id); }
 
@@ -601,22 +625,26 @@
   }
 
   async function api(url, opts) {
-    // admin.html 과 호환: SSX_ADMIN_TOKEN 우선, 구버전 adminToken은 fallback
-    const token =
-      localStorage.getItem("SSX_ADMIN_TOKEN") ||
-      localStorage.getItem("adminToken") ||
-      "";
+  const token =
+    localStorage.getItem("SSX_ADMIN_TOKEN") ||
+    localStorage.getItem("adminToken") ||
+    "";
 
-    const headers = Object.assign({
-      "Content-Type": "application/json",
-      "X-Admin-Token": token,
-    }, (opts && opts.headers) || {});
+  const headers = Object.assign({
+    "Content-Type": "application/json",
+    "X-Admin-Token": token,
+  }, (opts && opts.headers) || {});
 
+  try {
     const res = await fetch(url, Object.assign({}, opts || {}, { headers }));
     let data = null;
     try { data = await res.json(); } catch(e) {}
     return { status: res.status, data };
+  } catch (e) {
+    return { status: 0, data: { ok: false, error: String(e) } };
   }
+}
+
 
 function showListView() {
   $("listView").style.display = "block";
