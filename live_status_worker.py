@@ -552,58 +552,11 @@ def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any], fetc
 
 def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    추가:
-    - 벤치/스태프 Card 이벤트는 raw에도 저장하지 않음(수집 차단)
-    - ✅ 단, "라인업이 확정(lineups_ready)"된 경우에만 벤치/스태프 필터 적용
-      (초반/불완전 라인업에서 정상 카드까지 오탐 차단되는 문제 방지)
+    ✅ 확정(P1):
+    - match_events_raw는 API 원본(/fixtures/events response)을 "무조건 그대로" 저장한다.
+    - 벤치/스태프 필터/중복 제거/정정 처리 등 "해석"은 match_events 쪽에서만 수행한다.
     """
-
-    def _norm(s: Optional[str]) -> str:
-        if not s:
-            return ""
-        x = str(s).lower().strip()
-        x = " ".join(x.split())
-        return x
-
-    def _is_bench_staff_card(ev: Dict[str, Any]) -> bool:
-        # Card가 아니면 대상 아님
-        ev_type = _norm(safe_text(ev.get("type")))
-        if ev_type != "card":
-            return False
-
-        team = ev.get("team") or {}
-        player = ev.get("player") or {}
-
-        t_id = safe_int(team.get("id"))
-        p_id = safe_int(player.get("id"))
-
-        # player_id가 없으면 애매 -> 오탐 방지 위해 저장 유지
-        if p_id is None or t_id is None:
-            return False
-
-        st = LINEUPS_STATE.get(fixture_id) or {}
-
-        # ✅ 라인업이 확정되기 전에는 "벤치/스태프" 판정 자체를 하지 않음
-        if not st.get("lineups_ready"):
-            return False
-
-        pb = st.get("players_by_team") or {}
-        ids = pb.get(t_id)
-
-        # 라인업 셋이 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
-        if not isinstance(ids, set) or not ids:
-            return False
-
-        # 라인업에 없는 player_id인 Card => 벤치/스태프 카드로 간주하여 차단
-        return p_id not in ids
-
-    filtered: List[Dict[str, Any]] = []
-    for ev in events or []:
-        if _is_bench_staff_card(ev):
-            continue
-        filtered.append(ev)
-
-    raw = json.dumps(filtered, ensure_ascii=False, separators=(",", ":"))
+    raw = json.dumps(events or [], ensure_ascii=False, separators=(",", ":"))
     execute(
         """
         INSERT INTO match_events_raw (fixture_id, data_json)
@@ -620,25 +573,22 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 
 
+
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
     match_events 스키마(현재 dev):
       id(bigint PK), fixture_id, team_id, player_id, type, detail, minute(not null),
       extra(default 0), assist_player_id, assist_name, player_in_id, player_in_name
 
-    변경 포인트(스키마 변경 없음):
-    1) ✅ 벤치/스태프 Card 차단은 lineups_ready=True 일 때만 적용(초반 오탐 방지)
-    2) ✅ 레드카드 2장 표기 방지:
-       - 같은 퇴장에 대해 'Second Yellow card' + 'Red Card'가 같이 오는 케이스에서
-         Second Yellow가 있으면 같은 분/extra/팀/선수의 Red Card는 스킵 + DB에서도 삭제
-       - 공급자가 같은 카드를 id만 바꿔서 재발급하는 케이스는 "카드 시그니처"로 dedupe + DB 정리
-    3) ✅ signature dedupe 안정화:
-       - extra는 None/0 흔들려서 extra0=coalesce로 통일
-       - 카드 dedupe에서 assist_id 변동으로 중복 생성되는 문제 방지 위해 sig에서 a_id 제외
-    4) ✅ A안 적용:
-       - synthetic Goal "즉시 삭제" 제거
-       - Goal이 API 응답에서 N회(기본 3회) 연속 누락될 때만 synthetic goal 삭제
-       - 이번 응답에서 Goal이 0개면(API 흔들림 가능) miss_count 증가/삭제 모두 스킵
+    ✅ 적용(P1~P7 중 이 파일 범위):
+    - P1: raw는 무필터(= upsert_match_events_raw에서 처리)
+    - P2: 벤치/스태프 Card 필터는 match_events에 넣을 때만 + lineups_ready=True일 때만
+    - P3: signature dedupe 표준화(extra0 통일, 카드에서 assist 흔들림 제외)
+    - P4: 스코어는 calc_score_from_events 단일 경로(별도 함수에서 처리)
+    - P5: Substitution 저장(player_out=player, player_in=assist → player_in_id/name에 매핑)
+    - P7: Card 중복은 DB에서 1개만 남기기
+          (1) 동일 minute 중복 정리
+          (2) Yellow Card가 같은 선수/팀으로 ±1분 흔들리며 중복 생성된 케이스도 1개만 남김
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -741,20 +691,21 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
                 del seen[k]
 
-    # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(참고용)
-    current_goal_ids: List[int] = []
-
     # ✅ A안용: 이번 fetch에서 본 Goal signature 모음(누락 카운트 갱신/삭제 판단용)
     # goal_sig: (minute, extra0, team_id, player_id, detail_norm)
     current_goal_sigs: set = set()
 
-    # ✅ 이번 fetch에서 "player_id 확정된 Card" 시그니처 모음(카드 중복 정리용)
+    # ✅ 이번 fetch에서 "player_id 확정된 Card" 시그니처(동일 minute) 모음(카드 중복 정리용)
     #   (minute, extra0, team_id, detail_norm, player_id)
     current_cards_min: List[int] = []
     current_cards_extra: List[int] = []
     current_cards_team: List[int] = []
     current_cards_detail: List[str] = []
     current_cards_player: List[int] = []
+
+    # ✅ Yellow Card "±1분 흔들림" 정리용 (P7)
+    # key: (extra0, team_id, player_id, 'yellow card') -> minutes(list)
+    yellow_key_minutes: Dict[Tuple[int, int, int, str], List[int]] = {}
 
     # ✅ Second Yellow가 있는 경우 같은 키의 Red Card는 제거(레드 2장 표시 방지)
     # key: (minute, extra0, team_id, player_id)
@@ -802,7 +753,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         detail = safe_text(ev.get("detail"))
         comments = safe_text(ev.get("comments"))
 
-        # ---- 벤치/스태프 Card 차단 ----
+        # ---- 벤치/스태프 Card 차단 (P2) ----
         if _is_bench_staff_card(t_id, p_id, ev_type):
             continue
 
@@ -847,14 +798,13 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 comments_=comments,
             )
 
-        # ✅ Goal이면 현재 Goal id 목록 + signature에 추가
+        # ✅ Goal signature (A안) (P3)
         if ev_type_norm == "goal":
-            current_goal_ids.append(ev_id)
             if t_id is not None and p_id is not None:
                 gsig = (int(minute), int(extra0), int(t_id), int(p_id), detail_norm)
                 current_goal_sigs.add(gsig)
 
-        # ✅ Card인데 player_id가 확정된 경우만 "정리 기준"으로 저장
+        # ✅ Card "동일 minute" 중복 정리 기준 모음 (P3/P7-1)
         if ev_type_norm == "card":
             if t_id is not None and detail is not None and p_id is not None:
                 current_cards_min.append(int(minute))
@@ -863,7 +813,13 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 current_cards_detail.append(detail_norm)
                 current_cards_player.append(int(p_id))
 
-        # ✅ signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
+            # ✅ Yellow Card "±1분 흔들림" 정리 기준 모음 (P7-2)
+            # - second yellow/red는 건드리지 않고, "yellow card"만 정리 대상으로 수집
+            if t_id is not None and p_id is not None and detail_norm == "yellow card":
+                yk = (int(extra0), int(t_id), int(p_id), "yellow card")
+                yellow_key_minutes.setdefault(yk, []).append(int(minute))
+
+        # ✅ signature dedupe (id가 바뀌어도 동일 이벤트면 스킵) (P3)
         # - extra는 extra0로 통일(None/0 흔들림 방지)
         # - a_id는 카드에서 흔들려 중복을 만들 수 있어 제외
         sig = (int(minute), int(extra0), ev_type_norm, detail_norm, t_id, p_id)
@@ -872,8 +828,14 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             continue
         seen[sig] = now_ts
 
+        # ✅ 교체(Subst) 이벤트 매핑 (P5)
+        # API-Sports: type이 'subst'로 오는 케이스가 많고,
+        # player는 OUT, assist는 IN으로 쓰이는 패턴이 일반적이다.
         player_in_id = None
         player_in_name = None
+        if ev_type_norm in ("subst", "substitution", "sub"):
+            player_in_id = a_id
+            player_in_name = safe_text(assist.get("name"))
 
         execute(
             """
@@ -904,7 +866,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 ev_type,
                 detail,
                 minute,
-                extra0,  # ✅ DB에는 int로
+                extra0,
                 a_id,
                 safe_text(assist.get("name")),
                 player_in_id,
@@ -912,7 +874,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             ),
         )
 
-    # ✅ A안: synthetic goal 삭제는 "N회 연속 누락"에서만 수행
+    # ✅ A안: synthetic goal 삭제는 "N회 연속 누락"에서만 수행 (P3)
     # - 이번 응답에서 Goal이 0개면(API 흔들림 가능) miss_count 증가/삭제 모두 스킵(안전)
     if current_goal_sigs:
         miss_map = goal_miss_cache.get(fixture_id)
@@ -931,7 +893,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 if ts < cutoff:
                     del miss_map[k]
             if len(miss_map) > 500:
-                # 그래도 크면 일부만 남김(오래된 것부터)
                 items = []
                 for k, v in miss_map.items():
                     try:
@@ -968,7 +929,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             except Exception:
                 miss_cnt = 0
             if miss_cnt >= GOAL_MISS_THRESHOLD:
-                # sig_k = (minute, extra0, team_id, player_id, detail_norm)
                 try:
                     m, ex0, tid, pid, dnorm = sig_k  # type: ignore[misc]
                     to_delete.append((int(m), int(ex0), int(tid), int(pid), str(dnorm)))
@@ -1025,11 +985,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 ),
             )
 
-            # 삭제 확정된 sig는 miss_map에서 제거(반복 삭제/메모리 누적 방지)
             for m, ex0, tid, pid, dnorm in to_delete:
                 miss_map.pop((m, ex0, tid, pid, dnorm), None)
 
-    # ✅ Second Yellow가 확정된 경우 같은 키의 Red Card는 DB에서도 제거(레드 2장 방지)
+    # ✅ Second Yellow가 확정된 경우 같은 키의 Red Card는 DB에서도 제거(레드 2장 방지) (P3)
     if second_yellow_min:
         execute(
             r"""
@@ -1067,9 +1026,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             ),
         )
 
-    # ✅ 카드 중복 정리(보수적 + 실효):
-    # - "player_id 확정된 Card" 시그니처가 현재 응답에 존재하면,
-    #   DB에 동일 시그니처로 중복된 card row(positive/negative id 모두 포함)를 1개만 남기고 정리한다.
+    # ✅ 카드 중복 정리(동일 minute) (P7-1)
+    # - 동일 minute/extra0/team/player/detail_norm 으로 여러 row가 있으면 1개만 남김
     # - 남길 id 우선순위: (양수 id 최소값) 우선, 없으면 (음수 id 중 가장 큰 값=0에 가까운 값)
     if current_cards_min:
         execute(
@@ -1130,6 +1088,61 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 fixture_id,
             ),
         )
+
+    # ✅ Yellow Card "±1분 흔들림" 중복 정리 (P7-2)
+    # - 같은 team/player의 Yellow Card가 18/19처럼 1분 차로 중복 생성되면 "현재 응답 기준 1개"만 남김
+    # - 현재 응답에서 같은 키로 여러 분이 있으면(드묾) 가장 큰 minute만 남김
+    if yellow_key_minutes:
+        keep_min: List[int] = []
+        keep_extra: List[int] = []
+        keep_team: List[int] = []
+        keep_player: List[int] = []
+
+        for (ex0, tid, pid, _), mins in yellow_key_minutes.items():
+            if not mins:
+                continue
+            # 현재 응답에서 여러 minute이면 가장 큰 minute을 정답으로
+            km = max(int(x) for x in mins)
+            keep_min.append(int(km))
+            keep_extra.append(int(ex0))
+            keep_team.append(int(tid))
+            keep_player.append(int(pid))
+
+        if keep_min:
+            execute(
+                r"""
+                DELETE FROM match_events me
+                USING (
+                  SELECT *
+                  FROM unnest(
+                    %s::int[],
+                    %s::int[],
+                    %s::int[],
+                    %s::int[]
+                  ) AS t(keep_minute, extra0, team_id, player_id)
+                ) cur
+                WHERE me.fixture_id = %s
+                  AND LOWER(me.type) = 'card'
+                  AND translate(
+                        lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
+                        '''"`.,:;!?()[]{}|',
+                        ''
+                      ) = 'yellow card'
+                  AND me.team_id = cur.team_id
+                  AND me.player_id = cur.player_id
+                  AND COALESCE(me.extra, 0) = cur.extra0
+                  AND me.minute <> cur.keep_minute
+                  AND abs(me.minute - cur.keep_minute) <= 1
+                """,
+                (
+                    keep_min,
+                    keep_extra,
+                    keep_team,
+                    keep_player,
+                    fixture_id,
+                ),
+            )
+
 
 
 
