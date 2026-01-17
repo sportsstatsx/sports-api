@@ -2,11 +2,13 @@
 #
 # 목표:
 # - 이 파일 1개만으로 라이브 업데이트가 돌아가게 단순화
-# - DB 스키마 변경 없음 (기존 테이블/컬럼/PK는 그대로)
+# - DB 기존 스키마 변경 없음 (기존 테이블/컬럼/PK/타입 유지)
+#   * 단, dedupe/state용 "추가 테이블 생성"은 허용 (기존 코드 정책 유지)
 # - /fixtures 기반 상태/스코어 업데이트 + 원본 raw 저장(match_fixtures_raw)
 # - INPLAY 경기: /events 저장 + events 기반 스코어 "정교 보정"(취소골/실축PK 제외, OG 반영)
 # - INPLAY 경기: /statistics 60초 쿨다운
 # - lineups: 프리매치(-60/-10 슬롯 1회씩) + 킥오프 직후(elapsed<=15) 재시도 정책
+# - FINISHED: 즉시 full fetch 하지 않고, FT 최초 관측 시각 기준 +60초 / +30분에 1회씩 확정 수집
 #
 # 사용 테이블/PK (확인 완료):
 # - fixtures(fixture_id PK)
@@ -17,8 +19,10 @@
 # - match_lineups(fixture_id, team_id PK)
 # - match_team_stats(fixture_id, team_id, name PK)
 # - match_player_stats는 라이브에서 미사용(스키마 유지)
-
-from __future__ import annotations
+#
+# (추가 테이블 - 기존 스키마 변경 없이 테이블 추가만)
+# - match_event_states (fixture_id PK)
+# - match_event_key_map ((fixture_id, canonical_key) PK)
 
 import os
 import sys
@@ -26,7 +30,6 @@ import time
 import json
 import traceback
 import datetime as dt
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -35,79 +38,31 @@ from db import execute, fetch_one
 
 
 # ─────────────────────────────────────
-# Config / Constants
+# ENV / 상수
 # ─────────────────────────────────────
 
-BASE = "https://v3.football.api-sports.io"
-UA = "SportsStatsX-LiveWorker/2.0"
+API_KEY = os.environ.get("APIFOOTBALL_KEY") or os.environ.get("API_FOOTBALL_KEY")
+LIVE_LEAGUES_ENV = os.environ.get("LIVE_LEAGUES", "")
+INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "10"))
 
+BASE = "https://v3.football.api-sports.io"
+UA = "SportsStatsX-LiveWorker/1.0"
+
+STATS_INTERVAL_SEC = 60
 REQ_TIMEOUT = 12
 REQ_RETRIES = 2
 
-STATS_INTERVAL_SEC = 60  # stats 쿨다운
 
-# 런타임 캐시(프로세스 메모리)
-LAST_STATS_SYNC: Dict[int, float] = {}         # fixture_id -> last ts
-LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> state
+# ─────────────────────────────────────
+# 런타임 캐시 (메모리)
+# ─────────────────────────────────────
 
-
-@dataclass
-class Config:
-    api_key: str
-    live_leagues_env: str
-    interval_sec: int
-
-    # rate limit
-    rate_limit_per_min: float
-    rate_limit_burst: float
-
-    # fixtures 캐시
-    season_ttl_sec: int
-    nofix_ttl_sec: int
-
-    # postmatch 스케줄
-    postmatch_prune_after_sec: int
-
-    # lineups
-    lineups_cooldown_sec: int
-
-    # dedupe
-    # - "tables": match_event_key_map/state 사용(기존 네 코드 방식)
-    # - "off": 테이블 생성/사용 안 함(권장X, 중복 수렴 품질 떨어짐)
-    event_dedupe_mode: str
-
-
-def load_config() -> Config:
-    api_key = (os.environ.get("APIFOOTBALL_KEY") or os.environ.get("API_FOOTBALL_KEY") or "").strip()
-    live_leagues_env = os.environ.get("LIVE_LEAGUES", "")
-    interval_sec = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "10"))
-
-    def _f(name: str, default: str) -> float:
-        try:
-            return float(os.environ.get(name, default) or default)
-        except Exception:
-            return float(default)
-
-    mode = (os.environ.get("EVENT_DEDUPE_MODE", "tables") or "tables").strip().lower()
-    if mode not in ("tables", "off"):
-        mode = "tables"
-
-    return Config(
-        api_key=api_key,
-        live_leagues_env=live_leagues_env,
-        interval_sec=interval_sec,
-        rate_limit_per_min=_f("RATE_LIMIT_PER_MIN", "0"),
-        rate_limit_burst=_f("RATE_LIMIT_BURST", "0"),
-        season_ttl_sec=60 * 60,          # 60분
-        nofix_ttl_sec=60 * 10,           # 10분
-        postmatch_prune_after_sec=6 * 60 * 60,  # 6시간
-        lineups_cooldown_sec=20,
-        event_dedupe_mode=mode,
-    )
+LAST_STATS_SYNC: Dict[int, float] = {}          # fixture_id -> last ts
+LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}   # fixture_id -> state dict
 
 
 # ─────────────────────────────────────
-# Utilities
+# 유틸
 # ─────────────────────────────────────
 
 def now_utc() -> dt.datetime:
@@ -150,7 +105,7 @@ def parse_live_leagues(env: str) -> List[int]:
             out.append(int(part))
         except ValueError:
             continue
-    # dedupe (stable)
+    # 중복 제거(순서 유지)
     seen = set()
     uniq: List[int] = []
     for x in out:
@@ -163,8 +118,8 @@ def parse_live_leagues(env: str) -> List[int]:
 
 def target_dates_for_live() -> List[str]:
     """
-    기본은 UTC 오늘.
-    UTC 00~03시는 어제 경기(자정 넘어가는 경기)가 INPLAY/FT로 남아있을 가능성이 높음
+    기본 UTC 오늘.
+    UTC 00~03시는 자정 넘어가는 경기 누락 방지 위해 UTC 어제도 같이 조회.
     """
     now = now_utc()
     today = now.date()
@@ -174,17 +129,13 @@ def target_dates_for_live() -> List[str]:
     return dates
 
 
-def infer_season_candidates(date_str: str) -> List[int]:
-    y = int(date_str[:4])
-    return [y, y - 1, y + 1]
-
-
 def map_status_group(short_code: Optional[str]) -> str:
     code = (short_code or "").upper().strip()
 
     if code in ("NS", "TBD"):
         return "UPCOMING"
 
+    # INPLAY (HT 포함)
     if code in ("1H", "2H", "ET", "P", "BT", "INT", "LIVE", "HT"):
         return "INPLAY"
 
@@ -197,23 +148,54 @@ def map_status_group(short_code: Optional[str]) -> str:
     return "OTHER"
 
 
+def infer_season_candidates(date_str: str) -> List[int]:
+    y = int(date_str[:4])
+    return [y, y - 1, y + 1]
+
+
 # ─────────────────────────────────────
-# Rate Limiter (token bucket)
+# HTTP (API-Sports)
 # ─────────────────────────────────────
 
-class RateLimiter:
-    def __init__(self, per_min: float, burst: float) -> None:
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "x-apisports-key": API_KEY or "",
+            "Accept": "application/json",
+            "User-Agent": UA,
+        }
+    )
+    return s
+
+
+class _TokenBucket:
+    def __init__(self) -> None:
+        try:
+            per_min = float(os.environ.get("RATE_LIMIT_PER_MIN", "0") or "0")
+        except Exception:
+            per_min = 0.0
+        try:
+            burst = float(os.environ.get("RATE_LIMIT_BURST", "0") or "0")
+        except Exception:
+            burst = 0.0
+
         self.rate = (per_min / 60.0) if per_min > 0 else 0.0
-        self.max_tokens = burst if burst > 0 else (max(1.0, self.rate * 5) if self.rate > 0 else 0.0)
-        self.tokens = float(self.max_tokens)
+        if self.rate > 0:
+            self.max_tokens = burst if burst > 0 else max(1.0, self.rate * 5)
+        else:
+            self.max_tokens = 0.0
+
+        self.tokens = self.max_tokens
         self.ts = time.time()
 
     def acquire(self) -> None:
         if self.rate <= 0 or self.max_tokens <= 0:
-            return  # unlimited
+            return
 
         now_ts = time.time()
         elapsed = max(0.0, now_ts - self.ts)
+
         self.tokens = min(self.max_tokens, self.tokens + elapsed * self.rate)
         self.ts = now_ts
 
@@ -233,73 +215,59 @@ class RateLimiter:
         self.tokens = max(0.0, self.tokens - 1.0)
 
 
-# ─────────────────────────────────────
-# API Client
-# ─────────────────────────────────────
+_RL = _TokenBucket()
 
-class ApiClient:
-    def __init__(self, api_key: str, rl: RateLimiter) -> None:
-        self.api_key = api_key
-        self.rl = rl
-        self.sess = requests.Session()
-        self.sess.headers.update(
-            {
-                "x-apisports-key": api_key,
-                "Accept": "application/json",
-                "User-Agent": UA,
-            }
-        )
 
-    def get(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        url = f"{BASE}{path}"
-        last_err: Optional[Exception] = None
+def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{BASE}{path}"
+    last_err: Optional[Exception] = None
 
-        for _ in range(REQ_RETRIES + 1):
-            try:
-                self.rl.acquire()
-                r = self.sess.get(url, params=params, timeout=REQ_TIMEOUT)
+    for _ in range(REQ_RETRIES + 1):
+        try:
+            _RL.acquire()
+            r = session.get(url, params=params, timeout=REQ_TIMEOUT)
 
-                if r.status_code == 429:
-                    retry_after = r.headers.get("Retry-After")
-                    try:
-                        wait = int(retry_after) if retry_after else 1
-                    except Exception:
-                        wait = 1
-                    time.sleep(max(1, min(wait, 60)))
-                    raise requests.HTTPError("429 Too Many Requests", response=r)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = int(retry_after) if retry_after else 1
+                except Exception:
+                    wait = 1
+                time.sleep(max(1, min(wait, 60)))
+                raise requests.HTTPError("429 Too Many Requests", response=r)
 
-                r.raise_for_status()
-                data = r.json()
-                return data if isinstance(data, dict) else {}
-            except Exception as e:
-                last_err = e
-                time.sleep(0.4)
+            r.raise_for_status()
+            data = r.json()
+            return data
+        except Exception as e:
+            last_err = e
+            time.sleep(0.4)
 
-        raise last_err  # type: ignore
+    raise last_err  # type: ignore
 
-    def fixtures(self, league_id: int, date_str: str, season: int) -> List[Dict[str, Any]]:
-        data = self.get("/fixtures", {"league": league_id, "date": date_str, "season": season})
-        resp = data.get("response") if isinstance(data, dict) else None
-        return resp if isinstance(resp, list) else []
 
-    def events(self, fixture_id: int) -> List[Dict[str, Any]]:
-        data = self.get("/fixtures/events", {"fixture": fixture_id})
-        resp = data.get("response") if isinstance(data, dict) else None
-        return resp if isinstance(resp, list) else []
+def fetch_fixtures(session: requests.Session, league_id: int, date_str: str, season: int) -> List[Dict[str, Any]]:
+    data = api_get(session, "/fixtures", {"league": league_id, "date": date_str, "season": season})
+    return (data.get("response") or []) if isinstance(data, dict) else []
 
-    def statistics(self, fixture_id: int) -> List[Dict[str, Any]]:
-        data = self.get("/fixtures/statistics", {"fixture": fixture_id})
-        resp = data.get("response") if isinstance(data, dict) else None
-        return resp if isinstance(resp, list) else []
 
-    def lineups(self, fixture_id: int) -> List[Dict[str, Any]]:
-        data = self.get("/fixtures/lineups", {"fixture": fixture_id})
-        resp = data.get("response") if isinstance(data, dict) else None
-        return resp if isinstance(resp, list) else []
+def fetch_events(session: requests.Session, fixture_id: int) -> List[Dict[str, Any]]:
+    data = api_get(session, "/fixtures/events", {"fixture": fixture_id})
+    return (data.get("response") or []) if isinstance(data, dict) else []
+
+
+def fetch_team_stats(session: requests.Session, fixture_id: int) -> List[Dict[str, Any]]:
+    data = api_get(session, "/fixtures/statistics", {"fixture": fixture_id})
+    return (data.get("response") or []) if isinstance(data, dict) else []
+
+
+def fetch_lineups(session: requests.Session, fixture_id: int) -> List[Dict[str, Any]]:
+    data = api_get(session, "/fixtures/lineups", {"fixture": fixture_id})
+    return (data.get("response") or []) if isinstance(data, dict) else []
 
 
 # ─────────────────────────────────────
-# DB: event dedupe tables (optional)
+# DB Dedupe Tables (추가 테이블 생성)
 # ─────────────────────────────────────
 
 def ensure_event_dedupe_tables() -> None:
@@ -312,6 +280,7 @@ def ensure_event_dedupe_tables() -> None:
         );
         """
     )
+
     execute(
         """
         CREATE TABLE IF NOT EXISTS match_event_key_map (
@@ -324,6 +293,7 @@ def ensure_event_dedupe_tables() -> None:
         );
         """
     )
+
     execute(
         "CREATE INDEX IF NOT EXISTS idx_match_event_key_map_event "
         "ON match_event_key_map (fixture_id, event_id);"
@@ -362,7 +332,7 @@ def prune_event_dedupe_older_than(days: int = 3) -> None:
 
 
 # ─────────────────────────────────────
-# DB Upserts: fixtures/matches/raw/stats/lineups
+# DB Upsert: fixtures / matches / raw
 # ─────────────────────────────────────
 
 def upsert_fixture_row(
@@ -597,6 +567,407 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
     )
 
 
+# ─────────────────────────────────────
+# 이벤트 dedupe/수렴 (핵심 리팩토링)
+# - 기존 코드 문제: Goal 처리마다 DB LIKE 조회 → 부하/지연/누락/중복 가능성 증가
+# - 개선: fixture별 key_map을 1회 로드 → 메모리에서 결정 → DB write는 upsert만
+# - Card/Sub도 "pid 우선, name은 fallback"으로 키 흔들림 최소화
+# ─────────────────────────────────────
+
+def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
+            x = x.replace(ch, "")
+        return x
+
+    def _goal_kind(detail_norm: str) -> str:
+        if "own goal" in detail_norm:
+            return "OG"
+        if "pen" in detail_norm and ("goal" in detail_norm or "penalty" in detail_norm):
+            return "P"
+        return "N"
+
+    def _card_kind(detail_norm: str) -> str:
+        if detail_norm == "second yellow card":
+            return "SY"
+        if detail_norm == "red card":
+            return "R"
+        if detail_norm == "yellow card":
+            return "Y"
+        return detail_norm or "C"
+
+    def _synthetic_id_from_key(key: str) -> int:
+        import hashlib
+        digest = hashlib.sha1(key.encode("utf-8")).digest()
+        h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+        if h64 == 0:
+            h64 = 1
+        return -h64
+
+    def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
+        tm = ev.get("time") or {}
+        el = safe_int(tm.get("elapsed"))
+        ex = safe_int(tm.get("extra"))
+        elv = el if el is not None else 10**9
+        exv = ex if ex is not None else 0
+        return (elv, exv, fallback_idx)
+
+    def _safe_name(x: Any) -> str:
+        return _norm(safe_text(x) or "")
+
+    def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
+        if _norm(ev_type) != "card":
+            return False
+        if t_id is None or p_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+        if not st.get("lineups_ready"):
+            return False
+
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        return p_id not in ids
+
+    # fixture별 key_map을 "1회 로드"
+    km_row = fetch_one(
+        """
+        SELECT COALESCE(json_agg(json_build_object('k', canonical_key, 'id', event_id)), '[]'::json) AS arr
+        FROM match_event_key_map
+        WHERE fixture_id=%s
+        """,
+        (fixture_id,),
+    )
+    km_list: List[Dict[str, Any]] = []
+    try:
+        if isinstance(km_row, dict) and km_row.get("arr") is not None:
+            arr = km_row.get("arr")
+            if isinstance(arr, str):
+                km_list = json.loads(arr)
+            elif isinstance(arr, list):
+                km_list = arr
+    except Exception:
+        km_list = []
+
+    key_to_id: Dict[str, int] = {}
+    for r in km_list:
+        if not isinstance(r, dict):
+            continue
+        k = safe_text(r.get("k"))
+        eid = safe_int(r.get("id"))
+        if k and eid is not None:
+            key_to_id[k] = int(eid)
+
+    # Second Yellow 존재 시 같은 키의 Red를 스킵
+    second_yellow_keys: set = set()
+    for ev in events or []:
+        tm = ev.get("time") or {}
+        minute = safe_int(tm.get("elapsed"))
+        if minute is None:
+            continue
+        extra0 = int(safe_int(tm.get("extra")) or 0)
+
+        ev_type_norm = _norm(safe_text(ev.get("type")))
+        if ev_type_norm != "card":
+            continue
+
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+        if t_id is None or p_id is None:
+            continue
+
+        detail_norm = _norm(safe_text(ev.get("detail")))
+        if detail_norm == "second yellow card":
+            second_yellow_keys.add((int(minute), int(extra0), int(t_id), int(p_id)))
+
+    # 시간순 정렬
+    indexed = list(enumerate(events or []))
+    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
+    evs = [ev for _, ev in indexed]
+
+    seen_keys_in_tick: List[str] = []
+    local_goal_prefix_seq: Dict[str, int] = {}  # prefix -> next seq number (memory)
+
+    for ev in evs:
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+        assist = ev.get("assist") or {}
+
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+        a_id = safe_int(assist.get("id"))
+
+        ev_type = safe_text(ev.get("type"))
+        detail = safe_text(ev.get("detail"))
+
+        # bench/staff 카드 차단
+        if _is_bench_staff_card(t_id, p_id, ev_type):
+            continue
+
+        tm = ev.get("time") or {}
+        minute = safe_int(tm.get("elapsed"))
+        extra0 = int(safe_int(tm.get("extra")) or 0)
+        if minute is None:
+            continue
+
+        ev_type_norm = _norm(ev_type)
+        detail_norm = _norm(detail)
+
+        # Second Yellow가 있으면 동일키 Red는 스킵
+        if ev_type_norm == "card" and t_id is not None and p_id is not None:
+            k = (int(minute), int(extra0), int(t_id), int(p_id))
+            if (detail_norm == "red card") and (k in second_yellow_keys):
+                continue
+
+        pname = _safe_name((player.get("name") if isinstance(player, dict) else None))
+        aname = _safe_name((assist.get("name") if isinstance(assist, dict) else None))
+
+        # substitution: player=OUT / assist=IN
+        player_in_id = None
+        player_in_name = None
+        if ev_type_norm in ("subst", "substitution", "sub"):
+            player_in_id = a_id
+            player_in_name = safe_text(assist.get("name"))
+
+        canonical_key = ""
+
+        # ─────────────────────────────────────────────
+        # GOAL: prefix 아래 pid/name/seq로 수렴 (DB LIKE 조회 제거)
+        # ─────────────────────────────────────────────
+        if ev_type_norm == "goal":
+            kind = _goal_kind(detail_norm)
+            prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
+
+            want_pid_key = (prefix + f"pid:{int(p_id)}") if p_id is not None else ""
+            want_name_key = (prefix + f"name:{pname}") if pname else ""
+
+            # 1) pid 매칭
+            if want_pid_key and want_pid_key in key_to_id:
+                canonical_key = want_pid_key
+                mapped_event_id = key_to_id[want_pid_key]
+            # 2) name 매칭
+            elif want_name_key and want_name_key in key_to_id:
+                canonical_key = want_name_key
+                mapped_event_id = key_to_id[want_name_key]
+            else:
+                # 3) prefix 아래 기존 키가 1개뿐이면 그걸 사용
+                prefix_keys = [k for k in key_to_id.keys() if k.startswith(prefix)]
+                if len(prefix_keys) == 1:
+                    canonical_key = prefix_keys[0]
+                    mapped_event_id = key_to_id[canonical_key]
+                else:
+                    # 4) 신규 생성
+                    if want_pid_key:
+                        canonical_key = want_pid_key
+                    elif want_name_key:
+                        canonical_key = want_name_key
+                    else:
+                        # seq는 prefix별로 메모리에서 관리 (기존 prefix_keys 수 + 1 기반)
+                        if prefix not in local_goal_prefix_seq:
+                            local_goal_prefix_seq[prefix] = len(prefix_keys) + 1
+                        seq_n = local_goal_prefix_seq[prefix]
+                        local_goal_prefix_seq[prefix] = seq_n + 1
+                        canonical_key = prefix + f"seq:{seq_n}"
+                    mapped_event_id = None
+
+            seen_keys_in_tick.append(canonical_key)
+
+        # ─────────────────────────────────────────────
+        # CARD: pid 우선 / name fallback
+        # ─────────────────────────────────────────────
+        elif ev_type_norm == "card":
+            ck = _card_kind(detail_norm)
+            if p_id is not None:
+                canonical_key = f"C|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ck}|pid:{int(p_id)}"
+            else:
+                canonical_key = f"C|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ck}|name:{pname}"
+            seen_keys_in_tick.append(canonical_key)
+            mapped_event_id = key_to_id.get(canonical_key)
+
+        # ─────────────────────────────────────────────
+        # SUB: out pid/in pid 우선, name fallback
+        # ─────────────────────────────────────────────
+        elif ev_type_norm in ("subst", "substitution", "sub"):
+            out_part = f"pid:{int(p_id)}" if p_id is not None else f"name:{pname}"
+            in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else f"name:{_safe_name(player_in_name)}"
+            canonical_key = f"S|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|out:{out_part}|in:{in_part}"
+            seen_keys_in_tick.append(canonical_key)
+            mapped_event_id = key_to_id.get(canonical_key)
+
+        # ─────────────────────────────────────────────
+        # VAR: minute/extra/team/detail 기반
+        # ─────────────────────────────────────────────
+        elif ev_type_norm == "var":
+            canonical_key = f"V|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{detail_norm}"
+            seen_keys_in_tick.append(canonical_key)
+            mapped_event_id = key_to_id.get(canonical_key)
+
+        # ─────────────────────────────────────────────
+        # 기타: type/detail/time/team + player/assist는 pid 우선
+        # ─────────────────────────────────────────────
+        else:
+            p_part = f"pid:{int(p_id)}" if p_id is not None else f"name:{pname}"
+            a_part = f"pid:{int(a_id)}" if a_id is not None else f"name:{aname}"
+            canonical_key = f"E|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ev_type_norm}|{detail_norm}|p:{p_part}|a:{a_part}"
+            seen_keys_in_tick.append(canonical_key)
+            mapped_event_id = key_to_id.get(canonical_key)
+
+        incoming_id = safe_int(ev.get("id"))
+
+        if mapped_event_id is not None:
+            ev_id_used = int(mapped_event_id)
+        else:
+            ev_id_used = incoming_id if incoming_id is not None else _synthetic_id_from_key(canonical_key)
+
+        # match_events upsert (id 기반 수렴)
+        execute(
+            """
+            INSERT INTO match_events (
+                id,
+                fixture_id,
+                team_id,
+                player_id,
+                type,
+                detail,
+                minute,
+                extra,
+                assist_player_id,
+                assist_name,
+                player_in_id,
+                player_in_name
+            )
+            VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                fixture_id = COALESCE(match_events.fixture_id, EXCLUDED.fixture_id),
+                team_id    = COALESCE(match_events.team_id, EXCLUDED.team_id),
+                player_id  = COALESCE(match_events.player_id, EXCLUDED.player_id),
+                minute     = COALESCE(match_events.minute, EXCLUDED.minute),
+                extra      = COALESCE(match_events.extra, EXCLUDED.extra),
+
+                type = CASE
+                         WHEN match_events.type IS NULL OR match_events.type = '' THEN EXCLUDED.type
+                         ELSE match_events.type
+                       END,
+                detail = CASE
+                           WHEN match_events.detail IS NULL OR match_events.detail = '' THEN EXCLUDED.detail
+                           ELSE match_events.detail
+                         END,
+
+                assist_player_id = COALESCE(match_events.assist_player_id, EXCLUDED.assist_player_id),
+                assist_name      = COALESCE(match_events.assist_name, EXCLUDED.assist_name),
+                player_in_id     = COALESCE(match_events.player_in_id, EXCLUDED.player_in_id),
+                player_in_name   = COALESCE(match_events.player_in_name, EXCLUDED.player_in_name)
+            """,
+            (
+                ev_id_used,
+                fixture_id,
+                t_id,
+                p_id,
+                ev_type,
+                detail,
+                minute,
+                extra0,
+                a_id,
+                safe_text(assist.get("name")),
+                player_in_id,
+                player_in_name,
+            ),
+        )
+
+        # key_map upsert
+        if canonical_key not in key_to_id:
+            execute(
+                """
+                INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                VALUES (%s, %s, %s, now(), now())
+                ON CONFLICT (fixture_id, canonical_key)
+                DO UPDATE SET updated_at = now()
+                """,
+                (fixture_id, canonical_key, ev_id_used),
+            )
+            key_to_id[canonical_key] = ev_id_used
+        else:
+            execute(
+                """
+                UPDATE match_event_key_map
+                SET updated_at = now()
+                WHERE fixture_id=%s AND canonical_key=%s
+                """,
+                (fixture_id, canonical_key),
+            )
+
+        # GOAL: seq로 잡힌 사건이 pid/name 생기면 같은 event_id로 키 추가 (업그레이드)
+        if ev_type_norm == "goal" and "|seq:" in canonical_key:
+            kind = _goal_kind(detail_norm)
+            prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
+            if p_id is not None:
+                better = prefix + f"pid:{int(p_id)}"
+                if better not in key_to_id:
+                    execute(
+                        """
+                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                        VALUES (%s, %s, %s, now(), now())
+                        ON CONFLICT (fixture_id, canonical_key)
+                        DO UPDATE SET updated_at = now()
+                        """,
+                        (fixture_id, better, ev_id_used),
+                    )
+                    key_to_id[better] = ev_id_used
+            if pname:
+                better = prefix + f"name:{pname}"
+                if better not in key_to_id:
+                    execute(
+                        """
+                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                        VALUES (%s, %s, %s, now(), now())
+                        ON CONFLICT (fixture_id, canonical_key)
+                        DO UPDATE SET updated_at = now()
+                        """,
+                        (fixture_id, better, ev_id_used),
+                    )
+                    key_to_id[better] = ev_id_used
+
+    # match_event_states 갱신
+    if seen_keys_in_tick:
+        execute(
+            """
+            INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
+            VALUES (%s, %s::text[], now())
+            ON CONFLICT (fixture_id) DO UPDATE SET
+              seen_keys = (
+                SELECT array_agg(DISTINCT x)
+                FROM unnest(match_event_states.seen_keys || EXCLUDED.seen_keys) AS x
+              ),
+              updated_at = now()
+            """,
+            (fixture_id, seen_keys_in_tick),
+        )
+    else:
+        execute(
+            """
+            INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
+            VALUES (%s, '{}'::text[], now())
+            ON CONFLICT (fixture_id) DO UPDATE SET updated_at = now()
+            """,
+            (fixture_id,),
+        )
+
+
+# ─────────────────────────────────────
+# Team stats / lineups
+# ─────────────────────────────────────
+
 def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -> None:
     for team_block in stats_resp or []:
         team = team_block.get("team") or {}
@@ -628,7 +999,14 @@ def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -
 def _ensure_lineups_state(fixture_id: int) -> Dict[str, Any]:
     st = LINEUPS_STATE.get(fixture_id)
     if not st:
-        st = {"slot60": False, "slot10": False, "success": False, "lineups_ready": False, "last_try_ts": 0.0, "players_by_team": {}}
+        st = {
+            "slot60": False,
+            "slot10": False,
+            "success": False,
+            "lineups_ready": False,
+            "players_by_team": {},
+            "last_try_ts": 0.0,
+        }
         LINEUPS_STATE[fixture_id] = st
     return st
 
@@ -721,17 +1099,16 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
 
 
 def maybe_sync_lineups(
-    api: ApiClient,
+    session: requests.Session,
     fixture_id: int,
     date_utc: str,
     status_group: str,
     elapsed: Optional[int],
     now: dt.datetime,
-    cooldown_sec: int,
 ) -> None:
     st = _ensure_lineups_state(fixture_id)
 
-    # success + ready면 잠금
+    # success + ready면 완전 잠금
     if st.get("success") and st.get("lineups_ready"):
         return
 
@@ -746,12 +1123,12 @@ def maybe_sync_lineups(
         kickoff = None
 
     nowu = now.astimezone(dt.timezone.utc)
+
+    COOLDOWN_SEC = 20
     now_ts = time.time()
     last_try = float(st.get("last_try_ts") or 0.0)
 
-    # UPCOMING 슬롯은 1회성이므로 cooldown 강제하지 않음(아래에서 slot 플래그로 제어)
-    # INPLAY 재시도는 cooldown 적용
-
+    # UPCOMING -60 / -10 (1회성)
     if kickoff and status_group == "UPCOMING":
         mins = int((kickoff - nowu).total_seconds() / 60)
 
@@ -759,7 +1136,7 @@ def maybe_sync_lineups(
             st["slot60"] = True
             try:
                 st["last_try_ts"] = time.time()
-                resp = api.lineups(fixture_id)
+                resp = fetch_lineups(session, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, nowu)
                 if ready:
                     st["success"] = True
@@ -772,7 +1149,7 @@ def maybe_sync_lineups(
             st["slot10"] = True
             try:
                 st["last_try_ts"] = time.time()
-                resp = api.lineups(fixture_id)
+                resp = fetch_lineups(session, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, nowu)
                 if ready:
                     st["success"] = True
@@ -783,14 +1160,15 @@ def maybe_sync_lineups(
 
         return
 
+    # INPLAY: 초반 재시도 (elapsed<=15)
     if status_group == "INPLAY":
         el = elapsed if elapsed is not None else 0
         if 0 <= el <= 15:
-            if (time.time() - last_try) < cooldown_sec:
+            if (now_ts - last_try) < COOLDOWN_SEC:
                 return
             try:
                 st["last_try_ts"] = time.time()
-                resp = api.lineups(fixture_id)
+                resp = fetch_lineups(session, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, nowu)
                 if ready:
                     st["success"] = True
@@ -800,422 +1178,7 @@ def maybe_sync_lineups(
 
 
 # ─────────────────────────────────────
-# Events: dedupe + upsert (DB-call 최소화 버전)
-# ─────────────────────────────────────
-
-def _norm_key(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    x = str(s).lower().strip()
-    x = " ".join(x.split())
-    for ch in ("'", '"', "`", ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", "|"):
-        x = x.replace(ch, "")
-    return x
-
-
-def _goal_kind(detail_norm: str) -> str:
-    if "own goal" in detail_norm:
-        return "OG"
-    if "pen" in detail_norm and ("goal" in detail_norm or "penalty" in detail_norm):
-        return "P"
-    return "N"
-
-
-def _card_kind(detail_norm: str) -> str:
-    if detail_norm == "second yellow card":
-        return "SY"
-    if detail_norm == "red card":
-        return "R"
-    if detail_norm == "yellow card":
-        return "Y"
-    return detail_norm or "C"
-
-
-def _synthetic_id_from_key(key: str) -> int:
-    import hashlib
-    digest = hashlib.sha1(key.encode("utf-8")).digest()
-    h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
-    if h64 == 0:
-        h64 = 1
-    return -h64
-
-
-def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
-    tm = ev.get("time") or {}
-    el = safe_int(tm.get("elapsed"))
-    ex = safe_int(tm.get("extra"))
-    elv = el if el is not None else 10**9
-    exv = ex if ex is not None else 0
-    return (elv, exv, fallback_idx)
-
-
-def _is_bench_staff_card(fixture_id: int, t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
-    if _norm_key(ev_type) != "card":
-        return False
-    if t_id is None or p_id is None:
-        return False
-
-    st = LINEUPS_STATE.get(fixture_id) or {}
-
-    # 라인업 준비 전에는 벤치/스탭 판단 안 함(오탐 방지)
-    if not st.get("lineups_ready"):
-        return False
-
-    pb = st.get("players_by_team") or {}
-    ids = pb.get(t_id)
-
-    if not isinstance(ids, set) or not ids:
-        return False
-
-    return p_id not in ids
-
-
-class EventDedupeCache:
-    """
-    fixture_id 단위로 key_map을 "1번만" 로드해서
-    이벤트마다 DB 조회하던 병목을 제거.
-    """
-    def __init__(self, fixture_id: int, enabled: bool) -> None:
-        self.fixture_id = fixture_id
-        self.enabled = enabled
-        self.map: Dict[str, int] = {}  # canonical_key -> event_id
-
-    def load(self) -> None:
-        if not self.enabled:
-            self.map = {}
-            return
-        row = fetch_one(
-            """
-            SELECT COALESCE(json_agg(json_build_object('k', canonical_key, 'id', event_id)), '[]'::json) AS arr
-            FROM match_event_key_map
-            WHERE fixture_id=%s
-            """,
-            (self.fixture_id,),
-        )
-        arr: Any = []
-        try:
-            if isinstance(row, dict):
-                arr = row.get("arr")
-            if isinstance(arr, str):
-                arr = json.loads(arr)
-            if not isinstance(arr, list):
-                arr = []
-        except Exception:
-            arr = []
-
-        m: Dict[str, int] = {}
-        for r in arr:
-            if not isinstance(r, dict):
-                continue
-            k = safe_text(r.get("k"))
-            eid = safe_int(r.get("id"))
-            if k and eid is not None:
-                m[k] = int(eid)
-        self.map = m
-
-    def get(self, canonical_key: str) -> Optional[int]:
-        return self.map.get(canonical_key)
-
-    def put(self, canonical_key: str, event_id: int) -> None:
-        self.map[canonical_key] = int(event_id)
-
-    def keys_with_prefix(self, prefix: str) -> Dict[str, int]:
-        # events가 많아도 보통 수백 이하라 prefix scan은 충분히 빠름
-        out: Dict[str, int] = {}
-        for k, v in self.map.items():
-            if k.startswith(prefix):
-                out[k] = v
-        return out
-
-
-def upsert_match_events(
-    fixture_id: int,
-    events: List[Dict[str, Any]],
-    dedupe_mode: str,
-) -> None:
-    """
-    - dedupe_mode="tables": match_event_key_map 기반으로 canonical_key -> event_id 수렴
-    - dedupe_mode="off": key_map을 쓰지 않고 incoming_id 또는 synthetic_id로만 넣음(권장X)
-    """
-    dedupe_enabled = (dedupe_mode == "tables")
-    cache = EventDedupeCache(fixture_id, enabled=dedupe_enabled)
-    cache.load()
-
-    seen_keys_in_tick: List[str] = []
-
-    # Second Yellow 있으면 같은 키의 Red Card 스킵(중복 레드 표시 방지)
-    second_yellow_keys: set = set()
-    for ev in events or []:
-        tm = ev.get("time") or {}
-        minute = safe_int(tm.get("elapsed"))
-        if minute is None:
-            continue
-        extra0 = int(safe_int(tm.get("extra")) or 0)
-
-        ev_type_norm = _norm_key(safe_text(ev.get("type")))
-        if ev_type_norm != "card":
-            continue
-
-        team = ev.get("team") or {}
-        player = ev.get("player") or {}
-        t_id = safe_int(team.get("id"))
-        p_id = safe_int(player.get("id"))
-        if t_id is None or p_id is None:
-            continue
-
-        detail_norm = _norm_key(safe_text(ev.get("detail")))
-        if detail_norm == "second yellow card":
-            second_yellow_keys.add((int(minute), int(extra0), int(t_id), int(p_id)))
-
-    indexed = list(enumerate(events or []))
-    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
-    evs = [ev for _, ev in indexed]
-
-    for ev in evs:
-        team = ev.get("team") or {}
-        player = ev.get("player") or {}
-        assist = ev.get("assist") or {}
-
-        t_id = safe_int(team.get("id"))
-        p_id = safe_int(player.get("id"))
-        a_id = safe_int(assist.get("id"))
-
-        ev_type = safe_text(ev.get("type"))
-        detail = safe_text(ev.get("detail"))
-
-        # bench/staff card 차단
-        if _is_bench_staff_card(fixture_id, t_id, p_id, ev_type):
-            continue
-
-        tm = ev.get("time") or {}
-        minute = safe_int(tm.get("elapsed"))
-        extra0 = int(safe_int(tm.get("extra")) or 0)
-        if minute is None:
-            continue
-
-        ev_type_norm = _norm_key(ev_type)
-        detail_norm = _norm_key(detail)
-
-        # second yellow 있으면 red 스킵
-        if ev_type_norm == "card" and t_id is not None and p_id is not None:
-            k = (int(minute), int(extra0), int(t_id), int(p_id))
-            if (detail_norm == "red card") and (k in second_yellow_keys):
-                continue
-
-        # substitution 매핑: player=OUT / assist=IN
-        player_in_id = None
-        player_in_name = None
-        if ev_type_norm in ("subst", "substitution", "sub"):
-            player_in_id = a_id
-            player_in_name = safe_text(assist.get("name"))
-
-        pname = _norm_key((player.get("name") if isinstance(player, dict) else None))
-        aname = _norm_key((assist.get("name") if isinstance(assist, dict) else None))
-
-        canonical_key = ""
-        mapped_event_id: Optional[int] = None
-
-        if ev_type_norm == "goal":
-            kind = _goal_kind(detail_norm)
-            prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
-
-            ex_map = cache.keys_with_prefix(prefix)
-
-            want_pid_key = (prefix + f"pid:{int(p_id)}") if p_id is not None else ""
-            want_name_key = (prefix + f"name:{pname}") if pname else ""
-
-            chosen_event_id: Optional[int] = None
-
-            if want_pid_key and want_pid_key in ex_map:
-                canonical_key = want_pid_key
-                chosen_event_id = ex_map[want_pid_key]
-            elif want_name_key and want_name_key in ex_map:
-                canonical_key = want_name_key
-                chosen_event_id = ex_map[want_name_key]
-            elif len(ex_map) == 1:
-                only_k = next(iter(ex_map.keys()))
-                canonical_key = only_k
-                chosen_event_id = ex_map[only_k]
-            else:
-                if want_pid_key:
-                    canonical_key = want_pid_key
-                elif want_name_key:
-                    canonical_key = want_name_key
-                else:
-                    seq_n = len(ex_map) + 1
-                    canonical_key = prefix + f"seq:{seq_n}"
-
-            seen_keys_in_tick.append(canonical_key)
-            mapped_event_id = chosen_event_id
-
-        elif ev_type_norm == "card":
-            ck = _card_kind(detail_norm)
-            canonical_key = f"C|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ck}|{int(p_id or 0)}|{pname}"
-            seen_keys_in_tick.append(canonical_key)
-            mapped_event_id = cache.get(canonical_key)
-
-        elif ev_type_norm in ("subst", "substitution", "sub"):
-            canonical_key = f"S|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{int(p_id or 0)}|{pname}|{int(player_in_id or 0)}|{_norm_key(player_in_name)}"
-            seen_keys_in_tick.append(canonical_key)
-            mapped_event_id = cache.get(canonical_key)
-
-        elif ev_type_norm == "var":
-            canonical_key = f"V|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{detail_norm}"
-            seen_keys_in_tick.append(canonical_key)
-            mapped_event_id = cache.get(canonical_key)
-
-        else:
-            canonical_key = f"E|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{ev_type_norm}|{detail_norm}|{pname}|{aname}"
-            seen_keys_in_tick.append(canonical_key)
-            mapped_event_id = cache.get(canonical_key)
-
-        incoming_id = safe_int(ev.get("id"))
-
-        if dedupe_enabled:
-            if mapped_event_id is not None:
-                ev_id_used = mapped_event_id
-            else:
-                ev_id_used = incoming_id if incoming_id is not None else _synthetic_id_from_key(canonical_key)
-        else:
-            # 테이블 dedupe OFF: incoming_id 우선, 없으면 synthetic
-            ev_id_used = incoming_id if incoming_id is not None else _synthetic_id_from_key(canonical_key)
-
-        # match_events upsert
-        execute(
-            """
-            INSERT INTO match_events (
-                id,
-                fixture_id,
-                team_id,
-                player_id,
-                type,
-                detail,
-                minute,
-                extra,
-                assist_player_id,
-                assist_name,
-                player_in_id,
-                player_in_name
-            )
-            VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                fixture_id = COALESCE(match_events.fixture_id, EXCLUDED.fixture_id),
-                team_id    = COALESCE(match_events.team_id, EXCLUDED.team_id),
-                player_id  = COALESCE(match_events.player_id, EXCLUDED.player_id),
-
-                type = CASE
-                         WHEN match_events.type IS NULL OR match_events.type = '' THEN EXCLUDED.type
-                         ELSE match_events.type
-                       END,
-                detail = CASE
-                           WHEN match_events.detail IS NULL OR match_events.detail = '' THEN EXCLUDED.detail
-                           ELSE match_events.detail
-                         END,
-
-                assist_player_id = COALESCE(match_events.assist_player_id, EXCLUDED.assist_player_id),
-                assist_name      = COALESCE(match_events.assist_name, EXCLUDED.assist_name),
-                player_in_id     = COALESCE(match_events.player_in_id, EXCLUDED.player_in_id),
-                player_in_name   = COALESCE(match_events.player_in_name, EXCLUDED.player_in_name)
-            """,
-            (
-                ev_id_used,
-                fixture_id,
-                t_id,
-                p_id,
-                ev_type,
-                detail,
-                minute,
-                extra0,
-                a_id,
-                safe_text(assist.get("name")),
-                player_in_id,
-                player_in_name,
-            ),
-        )
-
-        # key_map update (tables mode)
-        if dedupe_enabled:
-            if mapped_event_id is None:
-                execute(
-                    """
-                    INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-                    VALUES (%s, %s, %s, now(), now())
-                    ON CONFLICT (fixture_id, canonical_key)
-                    DO UPDATE SET updated_at = now()
-                    """,
-                    (fixture_id, canonical_key, ev_id_used),
-                )
-                cache.put(canonical_key, ev_id_used)
-            else:
-                execute(
-                    """
-                    UPDATE match_event_key_map
-                    SET updated_at = now()
-                    WHERE fixture_id=%s AND canonical_key=%s
-                    """,
-                    (fixture_id, canonical_key),
-                )
-
-            # GOAL: seq -> pid/name 업그레이드 매핑
-            if ev_type_norm == "goal" and ("|seq:" in canonical_key):
-                kind = _goal_kind(detail_norm)
-                prefix = f"G|{fixture_id}|{minute}|{extra0}|{int(t_id or 0)}|{kind}|"
-                if p_id is not None:
-                    better = prefix + f"pid:{int(p_id)}"
-                    execute(
-                        """
-                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-                        VALUES (%s, %s, %s, now(), now())
-                        ON CONFLICT (fixture_id, canonical_key)
-                        DO UPDATE SET updated_at = now()
-                        """,
-                        (fixture_id, better, ev_id_used),
-                    )
-                    cache.put(better, ev_id_used)
-                if pname:
-                    better = prefix + f"name:{pname}"
-                    execute(
-                        """
-                        INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-                        VALUES (%s, %s, %s, now(), now())
-                        ON CONFLICT (fixture_id, canonical_key)
-                        DO UPDATE SET updated_at = now()
-                        """,
-                        (fixture_id, better, ev_id_used),
-                    )
-                    cache.put(better, ev_id_used)
-
-    # states update (tables mode)
-    if dedupe_enabled:
-        if seen_keys_in_tick:
-            execute(
-                """
-                INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
-                VALUES (%s, %s::text[], now())
-                ON CONFLICT (fixture_id) DO UPDATE SET
-                  seen_keys = (
-                    SELECT array_agg(DISTINCT x)
-                    FROM unnest(match_event_states.seen_keys || EXCLUDED.seen_keys) AS x
-                  ),
-                  updated_at = now()
-                """,
-                (fixture_id, seen_keys_in_tick),
-            )
-        else:
-            execute(
-                """
-                INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
-                VALUES (%s, '{}'::text[], now())
-                ON CONFLICT (fixture_id) DO UPDATE SET updated_at = now()
-                """,
-                (fixture_id,),
-            )
-
-
-# ─────────────────────────────────────
-# Score: events 기반 보정
+# 이벤트 기반 스코어 보정
 # ─────────────────────────────────────
 
 def calc_score_from_events(
@@ -1225,15 +1188,22 @@ def calc_score_from_events(
     hint_home_ft: Optional[int] = None,
     hint_away_ft: Optional[int] = None,
 ) -> Tuple[int, int]:
-    def _n(s: Optional[str]) -> str:
+    def _norm(s: Optional[str]) -> str:
         if not s:
             return ""
         x = str(s).lower().strip()
         x = " ".join(x.split())
         return x
 
-    invalid_markers = ("cancel", "disallow", "no goal", "offside", "foul", "annul", "null")
+    def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
+        tm = ev.get("time") or {}
+        el = safe_int(tm.get("elapsed"))
+        ex = safe_int(tm.get("extra"))
+        elv = el if el is not None else 10**9
+        exv = ex if ex is not None else 0
+        return (elv, exv, fallback_idx)
 
+    invalid_markers = ("cancel", "disallow", "no goal", "offside", "foul", "annul", "null")
     goals: List[Dict[str, Any]] = []
 
     indexed = list(enumerate(events or []))
@@ -1241,15 +1211,13 @@ def calc_score_from_events(
     evs = [ev for _, ev in indexed]
 
     def _add_goal(ev: Dict[str, Any]) -> None:
-        detail = _n(ev.get("detail"))
+        detail = _norm(ev.get("detail"))
 
-        # missed penalty 제외
         if "missed penalty" in detail:
             return
         if ("miss" in detail) and ("pen" in detail):
             return
 
-        # Goal.detail에 무효 문구가 붙는 케이스 방어 (OG는 예외)
         if any(m in detail for m in invalid_markers) and ("own goal" not in detail):
             return
 
@@ -1275,7 +1243,7 @@ def calc_score_from_events(
         )
 
     def _apply_var(ev: Dict[str, Any]) -> None:
-        detail = _n(ev.get("detail"))
+        detail = _norm(ev.get("detail"))
         if not detail:
             return
 
@@ -1304,6 +1272,7 @@ def calc_score_from_events(
                     continue
                 if abs(g_el - var_elapsed) > max_delta:
                     continue
+
                 if var_team_id is not None:
                     if g.get("team_id") == var_team_id:
                         return i
@@ -1323,7 +1292,7 @@ def calc_score_from_events(
             goals[best_idx]["cancelled"] = True
 
     for ev in evs:
-        ev_type = _n(ev.get("type"))
+        ev_type = _norm(ev.get("type"))
         if ev_type == "goal":
             _add_goal(ev)
         elif ev_type == "var":
@@ -1364,7 +1333,7 @@ def calc_score_from_events(
     return h0, a0
 
 
-def update_score_inplay_only(fixture_id: int, status_group: str, home_goals: int, away_goals: int) -> None:
+def update_live_score_if_needed(fixture_id: int, status_group: str, home_goals: int, away_goals: int) -> None:
     if status_group != "INPLAY":
         return
     execute(
@@ -1382,122 +1351,102 @@ def update_score_inplay_only(fixture_id: int, status_group: str, home_goals: int
     )
 
 
-def update_score_any_status(fixture_id: int, home_goals: int, away_goals: int) -> None:
-    execute(
-        """
-        UPDATE matches
-        SET home_ft = %s,
-            away_ft = %s
-        WHERE fixture_id = %s
-          AND (
-              matches.home_ft IS DISTINCT FROM %s OR
-              matches.away_ft IS DISTINCT FROM %s
-          )
-        """,
-        (home_goals, away_goals, fixture_id, home_goals, away_goals),
-    )
-
-
 # ─────────────────────────────────────
-# Fixture cache (league/date -> season/no)
+# 메인 1회 실행
 # ─────────────────────────────────────
 
-class FixturesCache:
-    def __init__(self) -> None:
-        # key: (league_id, date_str) -> {"season": int|None, "no": bool, "exp": float}
-        self._m: Dict[Tuple[int, str], Dict[str, Any]] = {}
+def run_once() -> None:
+    if not hasattr(run_once, "_dedupe_tables_ok"):
+        ensure_event_dedupe_tables()
+        run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
 
-    def prune(self, now_ts: float) -> None:
-        for k, v in list(self._m.items()):
-            if float(v.get("exp") or 0) < now_ts:
-                del self._m[k]
+    if not hasattr(run_once, "_postmatch_state"):
+        run_once._postmatch_state = {}  # type: ignore[attr-defined]
+    post_state: Dict[int, Dict[str, Any]] = run_once._postmatch_state  # type: ignore[attr-defined]
 
-    def get(self, key: Tuple[int, str]) -> Optional[Dict[str, Any]]:
-        return self._m.get(key)
+    if not API_KEY:
+        print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        return
 
-    def set(self, key: Tuple[int, str], season: Optional[int], no: bool, exp: float) -> None:
-        self._m[key] = {"season": season, "no": bool(no), "exp": float(exp)}
+    league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
+    if not league_ids:
+        print("[live_status_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
+        return
 
-    def pop(self, key: Tuple[int, str]) -> None:
-        self._m.pop(key, None)
+    dates = target_dates_for_live()
+    now = now_utc()
+    fetched_at = now
 
+    s = _session()
 
-# ─────────────────────────────────────
-# Postmatch scheduler (runtime)
-# ─────────────────────────────────────
+    # fixtures 캐시
+    if not hasattr(run_once, "_fixtures_cache"):
+        run_once._fixtures_cache = {}  # type: ignore[attr-defined]
+    fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
 
-class PostMatchScheduler:
-    def __init__(self) -> None:
-        # fixture_id -> {"ft_seen_ts": float, "did_60": bool, "did_30m": bool, "last_run_ts": float}
-        self.state: Dict[int, Dict[str, Any]] = {}
+    SEASON_TTL = 60 * 60
+    NOFIX_TTL = 60 * 10
+    now_ts = time.time()
 
-    def prune(self, now_ts: float, prune_after_sec: int) -> None:
-        cutoff = now_ts - float(prune_after_sec)
-        for fid, st in list(self.state.items()):
+    for k, v in list(fc.items()):
+        if float(v.get("exp") or 0) < now_ts:
+            del fc[k]
+
+    # post_state prune
+    try:
+        cutoff = now_ts - (6 * 60 * 60)
+        for fid, st in list(post_state.items()):
             ft_seen = float((st or {}).get("ft_seen_ts") or 0.0)
             last_run = float((st or {}).get("last_run_ts") or 0.0)
             base = max(ft_seen, last_run)
             if base and base < cutoff:
-                del self.state[fid]
+                del post_state[fid]
+    except Exception:
+        pass
 
-    def schedule_if_needed(
-        self,
-        api: ApiClient,
-        fixture_id: int,
-        home_id: int,
-        away_id: int,
-        item: Dict[str, Any],
-        now_ts: float,
-        dedupe_mode: str,
-    ) -> None:
-        st = self.state.get(fixture_id)
-        if not isinstance(st, dict):
-            st = {"ft_seen_ts": now_ts, "did_60": False, "did_30m": False, "last_run_ts": 0.0}
-            self.state[fixture_id] = st
+    total_fixtures = 0
+    total_inplay = 0
+    fixture_groups: Dict[int, str] = {}
 
-        if not st.get("ft_seen_ts"):
-            st["ft_seen_ts"] = now_ts
+    def _update_score_any_status(fixture_id: int, home_goals: int, away_goals: int) -> None:
+        execute(
+            """
+            UPDATE matches
+            SET home_ft = %s,
+                away_ft = %s
+            WHERE fixture_id = %s
+              AND (
+                  matches.home_ft IS DISTINCT FROM %s OR
+                  matches.away_ft IS DISTINCT FROM %s
+              )
+            """,
+            (home_goals, away_goals, fixture_id, home_goals, away_goals),
+        )
 
-        ft_seen_ts = float(st.get("ft_seen_ts") or now_ts)
-        age = now_ts - ft_seen_ts
-
-        if (age >= 60.0) and (not bool(st.get("did_60"))):
-            self._full_fetch(api, fixture_id, home_id, away_id, item, "postmatch+60s", dedupe_mode)
-            st["did_60"] = True
-            st["last_run_ts"] = time.time()
-
-        if (age >= 1800.0) and (not bool(st.get("did_30m"))):
-            self._full_fetch(api, fixture_id, home_id, away_id, item, "postmatch+30m", dedupe_mode)
-            st["did_30m"] = True
-            st["last_run_ts"] = time.time()
-
-    def _full_fetch(
-        self,
-        api: ApiClient,
+    def _postmatch_full_fetch(
         fixture_id: int,
         home_id: int,
         away_id: int,
         item: Dict[str, Any],
         tag: str,
-        dedupe_mode: str,
     ) -> None:
         try:
-            events = api.events(fixture_id)
+            events = fetch_events(s, fixture_id)
             upsert_match_events_raw(fixture_id, events)
-            upsert_match_events(fixture_id, events, dedupe_mode)
+            upsert_match_events(fixture_id, events)
 
             goals_obj = (item.get("goals") or {})
             hint_h = safe_int(goals_obj.get("home"))
             hint_a = safe_int(goals_obj.get("away"))
             h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-            update_score_any_status(fixture_id, h, a)
+            _update_score_any_status(fixture_id, h, a)
 
             print(f"      [{tag}/events] fixture_id={fixture_id} goals={h}:{a} events={len(events)}")
         except Exception as e:
             print(f"      [{tag}/events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
         try:
-            stats = api.statistics(fixture_id)
+            stats = fetch_team_stats(s, fixture_id)
             upsert_match_team_stats(fixture_id, stats)
             LAST_STATS_SYNC[fixture_id] = time.time()
             print(f"      [{tag}/stats] fixture_id={fixture_id} updated")
@@ -1507,7 +1456,7 @@ class PostMatchScheduler:
         try:
             st = _ensure_lineups_state(fixture_id)
             if not st.get("lineups_ready"):
-                resp = api.lineups(fixture_id)
+                resp = fetch_lineups(s, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, now_utc())
                 if ready:
                     st["success"] = True
@@ -1515,53 +1464,32 @@ class PostMatchScheduler:
         except Exception as e:
             print(f"      [{tag}/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
+    def _schedule_postmatch_if_needed(
+        fixture_id: int,
+        home_id: int,
+        away_id: int,
+        item: Dict[str, Any],
+    ) -> None:
+        st = post_state.get(fixture_id)
+        if not isinstance(st, dict):
+            st = {"ft_seen_ts": now_ts, "did_60": False, "did_30m": False, "last_run_ts": 0.0}
+            post_state[fixture_id] = st
 
-# ─────────────────────────────────────
-# Main run_once
-# ─────────────────────────────────────
+        if not st.get("ft_seen_ts"):
+            st["ft_seen_ts"] = now_ts
 
-def run_once() -> None:
-    cfg = load_config()
+        ft_seen_ts = float(st.get("ft_seen_ts") or now_ts)
+        age = now_ts - ft_seen_ts
 
-    if not cfg.api_key:
-        print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
-        return
+        if (age >= 60.0) and (not bool(st.get("did_60"))):
+            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+60s")
+            st["did_60"] = True
+            st["last_run_ts"] = time.time()
 
-    league_ids = parse_live_leagues(cfg.live_leagues_env)
-    if not league_ids:
-        print("[live_status_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
-        return
-
-    # dedupe tables ensure (tables 모드일 때만)
-    if cfg.event_dedupe_mode == "tables":
-        if not hasattr(run_once, "_dedupe_tables_ok"):
-            ensure_event_dedupe_tables()
-            run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
-
-    # runtime singletons
-    if not hasattr(run_once, "_fixtures_cache"):
-        run_once._fixtures_cache = FixturesCache()  # type: ignore[attr-defined]
-    fc: FixturesCache = run_once._fixtures_cache  # type: ignore[attr-defined]
-
-    if not hasattr(run_once, "_postmatch"):
-        run_once._postmatch = PostMatchScheduler()  # type: ignore[attr-defined]
-    postmatch: PostMatchScheduler = run_once._postmatch  # type: ignore[attr-defined]
-
-    rl = RateLimiter(cfg.rate_limit_per_min, cfg.rate_limit_burst)
-    api = ApiClient(cfg.api_key, rl)
-
-    dates = target_dates_for_live()
-    now = now_utc()
-    fetched_at = now
-    now_ts = time.time()
-
-    fc.prune(now_ts)
-    postmatch.prune(now_ts, cfg.postmatch_prune_after_sec)
-
-    total_fixtures = 0
-    total_inplay = 0
-
-    fixture_groups: Dict[int, str] = {}
+        if (age >= 1800.0) and (not bool(st.get("did_30m"))):
+            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+30m")
+            st["did_30m"] = True
+            st["last_run_ts"] = time.time()
 
     for date_str in dates:
         for lid in league_ids:
@@ -1577,30 +1505,30 @@ def run_once() -> None:
                 cached_season = cached.get("season")
                 if isinstance(cached_season, int):
                     try:
-                        rows = api.fixtures(lid, date_str, cached_season)
+                        rows = fetch_fixtures(s, lid, date_str, cached_season)
                         if rows:
                             fixtures = rows
                             used_season = cached_season
                         else:
-                            fc.pop(cache_key)
+                            fc.pop(cache_key, None)
                     except Exception as e:
-                        fc.pop(cache_key)
+                        fc.pop(cache_key, None)
                         print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
             if used_season is None:
                 for season in infer_season_candidates(date_str):
                     try:
-                        rows = api.fixtures(lid, date_str, season)
+                        rows = fetch_fixtures(s, lid, date_str, season)
                         if rows:
                             fixtures = rows
                             used_season = season
-                            fc.set(cache_key, season=season, no=False, exp=now_ts + cfg.season_ttl_sec)
+                            fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
                             break
                     except Exception as e:
                         print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
 
             if used_season is None:
-                fc.set(cache_key, season=None, no=True, exp=now_ts + cfg.nofix_ttl_sec)
+                fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
                 continue
 
             total_fixtures += len(fixtures)
@@ -1636,49 +1564,47 @@ def run_once() -> None:
                     except Exception as raw_err:
                         print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
 
+                    # 라인업 정책(순서 유지)
                     try:
                         elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
-                        maybe_sync_lineups(
-                            api, fixture_id, date_utc, sg, elapsed, now, cooldown_sec=cfg.lineups_cooldown_sec
-                        )
+                        maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
-                    # FINISHED: postmatch schedule만
+                    # FINISHED: 즉시 full fetch X, 스케줄만
                     if sg == "FINISHED":
-                        postmatch.schedule_if_needed(
-                            api, fixture_id, home_id, away_id, item, now_ts=now_ts, dedupe_mode=cfg.event_dedupe_mode
-                        )
+                        _schedule_postmatch_if_needed(fixture_id, home_id, away_id, item)
                         continue
 
+                    # INPLAY 아니면 skip
                     if sg != "INPLAY":
                         continue
 
                     total_inplay += 1
 
-                    # events + score
+                    # 1) events raw 저장 + match_events 수렴 + 스코어 보정 (순서 유지)
                     try:
-                        events = api.events(fixture_id)
+                        events = fetch_events(s, fixture_id)
                         upsert_match_events_raw(fixture_id, events)
-                        upsert_match_events(fixture_id, events, cfg.event_dedupe_mode)
+                        upsert_match_events(fixture_id, events)
 
                         goals_obj = (item.get("goals") or {})
                         hint_h = safe_int(goals_obj.get("home"))
                         hint_a = safe_int(goals_obj.get("away"))
 
                         h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-                        update_score_inplay_only(fixture_id, sg, h, a)
+                        update_live_score_if_needed(fixture_id, sg, h, a)
 
                         print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
                     except Exception as ev_err:
                         print(f"      [events] fixture_id={fixture_id} err: {ev_err}", file=sys.stderr)
 
-                    # stats (cooldown)
+                    # 2) stats (60초 쿨다운)
                     try:
                         now_ts2 = time.time()
                         last_ts = LAST_STATS_SYNC.get(fixture_id)
                         if (last_ts is None) or ((now_ts2 - last_ts) >= STATS_INTERVAL_SEC):
-                            stats = api.statistics(fixture_id)
+                            stats = fetch_team_stats(s, fixture_id)
                             upsert_match_team_stats(fixture_id, stats)
                             LAST_STATS_SYNC[fixture_id] = now_ts2
                             print(f"      [stats] fixture_id={fixture_id} updated")
@@ -1688,9 +1614,7 @@ def run_once() -> None:
                 except Exception as e:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
 
-    # ─────────────────────────────────────
-    # runtime cache prune + dedupe prune
-    # ─────────────────────────────────────
+    # 캐시 prune + dedupe prune
     finished_ids: List[int] = []
     try:
         for fid, g in list(fixture_groups.items()):
@@ -1705,35 +1629,32 @@ def run_once() -> None:
     except Exception:
         pass
 
-    # tables mode일 때만 prune
-    if cfg.event_dedupe_mode == "tables":
-        try:
-            if finished_ids:
-                prune_event_dedupe_for_fixtures(finished_ids)
-        except Exception:
-            pass
+    try:
+        if finished_ids:
+            prune_event_dedupe_for_fixtures(finished_ids)
+    except Exception:
+        pass
 
-        try:
-            prune_event_dedupe_older_than(days=3)
-        except Exception:
-            pass
+    try:
+        prune_event_dedupe_older_than(days=3)
+    except Exception:
+        pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
 
 
 # ─────────────────────────────────────
-# Loop
+# 루프
 # ─────────────────────────────────────
 
 def loop() -> None:
-    cfg = load_config()
-    print(f"[live_status_worker] start (interval={cfg.interval_sec}s)")
+    print(f"[live_status_worker] start (interval={INTERVAL_SEC}s)")
     while True:
         try:
             run_once()
         except Exception:
             traceback.print_exc()
-        time.sleep(cfg.interval_sec)
+        time.sleep(INTERVAL_SEC)
 
 
 if __name__ == "__main__":
