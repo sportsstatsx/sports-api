@@ -53,8 +53,6 @@ REQ_TIMEOUT = 12
 REQ_RETRIES = 2
 
 # 이벤트 시간 보정 허용 범위(분)
-# - minute/extra가 최초엔 틀렸다가 다음 틱에 정정되는 경우가 흔함
-# - 너무 큰 점프는 데이터 오염 가능성이 있으니 제한
 EVENT_MINUTE_CORR_ALLOW = 10
 
 
@@ -578,13 +576,12 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    ✅ 설계 원칙
-    1) 시간(minute/extra)은 공급자 정정으로 흔들릴 수 있으므로 '식별자'에 강결합하지 않는다.
-       - StrictKey: minute/extra 포함(추적용)
-       - StableKey: minute을 5분 버킷으로만 사용 + 나머지는 내용 기반(수렴용)
-    2) match_events UPSERT에서 minute/extra/type/detail을 고정하지 않는다.
-       - 작은 보정(<= EVENT_MINUTE_CORR_ALLOW)은 업데이트 허용
-    3) Goal/Card/Sub 모두 seq→pid/name 업그레이드 지원
+    ✅ 리팩토링 핵심 (타임라인 2배 근절)
+    - match_event_key_map은 'event_id당 1개 키'만 유지한다.
+      -> API incoming id가 있으면 canonical_key = ID|fixture|incoming_id
+      -> incoming id가 없을 때만 StableKey를 사용(합성 id)
+    - 기존처럼 StableKey/StrictKey를 동시에 저장하면
+      event_id당 key가 2개 이상이 되어, key_map join 기반 타임라인에서 2배 노출이 발생한다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -631,12 +628,14 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         exv = ex if ex is not None else 0
         return (elv, exv, fallback_idx)
 
-    def _minute_bucket5(minute: Optional[int]) -> int:
+    def _minute_bucket10(minute: Optional[int]) -> int:
+        # 5분 버킷은 minute 보정(+/-10)에서 버킷 이동이 잦아서 키 흔들림이 생길 수 있음
+        # 10분 버킷으로 완화
         if minute is None:
-            return 999  # unknown bucket
+            return 999
         if minute < 0:
             return 0
-        return int(minute // 5)
+        return int(minute // 10)
 
     def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
         if _norm(ev_type) != "card":
@@ -708,10 +707,63 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
     evs = [ev for _, ev in indexed]
 
-    # ───────────── Stable occurrence 카운터(같은 stable_base 안에서 n:1,2...) ─────────────
+    # ───────────── Stable occurrence 카운터 (incoming_id 없는 경우에만 의미있음) ─────────────
     stable_count: Dict[str, int] = {}
 
     seen_keys_in_tick: List[str] = []
+
+    def _set_primary_key(event_id: int, primary_key: str) -> None:
+        if not primary_key:
+            return
+
+        # primary_key -> event_id upsert
+        if primary_key not in key_to_id:
+            execute(
+                """
+                INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+                VALUES (%s, %s, %s, now(), now())
+                ON CONFLICT (fixture_id, canonical_key)
+                DO UPDATE SET event_id = EXCLUDED.event_id, updated_at = now()
+                """,
+                (fixture_id, primary_key, event_id),
+            )
+            key_to_id[primary_key] = event_id
+        else:
+            if int(key_to_id[primary_key]) != int(event_id):
+                execute(
+                    """
+                    UPDATE match_event_key_map
+                    SET event_id=%s, updated_at=now()
+                    WHERE fixture_id=%s AND canonical_key=%s
+                    """,
+                    (event_id, fixture_id, primary_key),
+                )
+                key_to_id[primary_key] = event_id
+            else:
+                execute(
+                    """
+                    UPDATE match_event_key_map
+                    SET updated_at = now()
+                    WHERE fixture_id=%s AND canonical_key=%s
+                    """,
+                    (fixture_id, primary_key),
+                )
+
+        # ★ event_id 당 1개 키만 유지 (타임라인 2배 방지)
+        execute(
+            """
+            DELETE FROM match_event_key_map
+            WHERE fixture_id=%s
+              AND event_id=%s
+              AND canonical_key <> %s
+            """,
+            (fixture_id, event_id, primary_key),
+        )
+
+        # 메모리 dict도 같이 정리
+        for k, vid in list(key_to_id.items()):
+            if int(vid) == int(event_id) and k != primary_key:
+                del key_to_id[k]
 
     for ev in evs:
         team = ev.get("team") or {}
@@ -733,7 +785,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         minute = safe_int(tm.get("elapsed"))
         extra0 = int(safe_int(tm.get("extra")) or 0)
         if minute is None:
-            # minute이 없으면, 타임라인/UI에서도 무의미하고 매핑도 불안정하니 스킵
             continue
 
         ev_type_norm = _norm(ev_type)
@@ -755,63 +806,53 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             player_in_id = a_id
             player_in_name = safe_text(assist.get("name"))
 
-        # ───────────── key 생성 ─────────────
-        mb = _minute_bucket5(minute)  # stable minute bucket
-        strict_key = ""
-        stable_base = ""
-
-        if ev_type_norm == "goal":
-            kind = _goal_kind(detail_norm)
-            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
-            # Stable: bucket5 + team + kind + scorer(가능한 경우)
-            stable_base = f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
-            strict_key = f"Gx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{kind}|{who}"
-
-        elif ev_type_norm == "card":
-            ck = _card_kind(detail_norm)
-            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
-            stable_base = f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
-            strict_key = f"Cx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{ck}|{who}"
-
-        elif ev_type_norm in ("subst", "substitution", "sub"):
-            out_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "out:unk")
-            in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else (f"name:{_safe_name(player_in_name)}" if player_in_name else "in:unk")
-            stable_base = f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
-            strict_key = f"Sx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
-
-        elif ev_type_norm == "var":
-            stable_base = f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
-            strict_key = f"Vx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{detail_norm or 'var'}"
-
-        else:
-            p_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "p:unk")
-            a_part = f"pid:{int(a_id)}" if a_id is not None else (f"name:{aname}" if aname else "a:unk")
-            stable_base = f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
-            strict_key = f"Ex|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
-
-        # occurrence(n) 부여(동일 stable_base가 여러 번이면 n:1,2,...)
-        n = stable_count.get(stable_base, 0) + 1
-        stable_count[stable_base] = n
-        stable_key = f"{stable_base}|n:{n}"
-
-        # 매핑 우선순위:
-        # 1) StableKey (시간 흔들려도 동일)
-        # 2) StrictKey (혹시 stable이 실패할 때)
-        mapped_event_id = key_to_id.get(stable_key)
-        if mapped_event_id is None:
-            mapped_event_id = key_to_id.get(strict_key)
-
         incoming_id = safe_int(ev.get("id"))
 
-        if mapped_event_id is not None:
-            ev_id_used = int(mapped_event_id)
+        # ───────────── primary key 결정 (핵심: event_id당 1개 키) ─────────────
+        # 1) incoming_id 있으면 무조건 ID 기반 키 사용 (가장 안정적, 흔들림 없음)
+        # 2) incoming_id 없으면 StableKey(버킷+내용+n) 사용
+        primary_key = ""
+        ev_id_used: int
+
+        if incoming_id is not None:
+            ev_id_used = int(incoming_id)
+            primary_key = f"ID|{fixture_id}|{ev_id_used}"
         else:
-            ev_id_used = incoming_id if incoming_id is not None else _synthetic_id_from_key(stable_key)
+            mb = _minute_bucket10(minute)
 
-        # 기록(상태용)
-        seen_keys_in_tick.append(stable_key)
+            if ev_type_norm == "goal":
+                kind = _goal_kind(detail_norm)
+                who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+                stable_base = f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
+            elif ev_type_norm == "card":
+                ck = _card_kind(detail_norm)
+                who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+                stable_base = f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
+            elif ev_type_norm in ("subst", "substitution", "sub"):
+                out_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "out:unk")
+                in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else (f"name:{_safe_name(player_in_name)}" if player_in_name else "in:unk")
+                stable_base = f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
+            elif ev_type_norm == "var":
+                stable_base = f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
+            else:
+                p_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "p:unk")
+                a_part = f"pid:{int(a_id)}" if a_id is not None else (f"name:{aname}" if aname else "a:unk")
+                stable_base = f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
 
-        # ───────────── match_events UPSERT (minute/extra를 고정하지 않고 보정 허용) ─────────────
+            n = stable_count.get(stable_base, 0) + 1
+            stable_count[stable_base] = n
+            primary_key = f"{stable_base}|n:{n}"
+
+            mapped = key_to_id.get(primary_key)
+            if mapped is not None:
+                ev_id_used = int(mapped)
+            else:
+                ev_id_used = _synthetic_id_from_key(primary_key)
+
+        # 상태 기록(상태용)
+        seen_keys_in_tick.append(primary_key)
+
+        # ───────────── match_events UPSERT (minute/extra 보정 허용) ─────────────
         execute(
             """
             INSERT INTO match_events (
@@ -907,79 +948,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             ),
         )
 
-        # ───────────── key_map 저장: StableKey/StrictKey 둘 다 같은 event_id로 연결 ─────────────
-        def _upsert_key(k: str) -> None:
-            if not k:
-                return
-            if k not in key_to_id:
-                execute(
-                    """
-                    INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-                    VALUES (%s, %s, %s, now(), now())
-                    ON CONFLICT (fixture_id, canonical_key)
-                    DO UPDATE SET event_id = EXCLUDED.event_id, updated_at = now()
-                    """,
-                    (fixture_id, k, ev_id_used),
-                )
-                key_to_id[k] = ev_id_used
-            else:
-                # 혹시 과거에 잘못된 매핑이 들어갔을 경우를 대비해 event_id도 맞춰줌
-                if int(key_to_id[k]) != int(ev_id_used):
-                    execute(
-                        """
-                        UPDATE match_event_key_map
-                        SET event_id=%s, updated_at=now()
-                        WHERE fixture_id=%s AND canonical_key=%s
-                        """,
-                        (ev_id_used, fixture_id, k),
-                    )
-                    key_to_id[k] = ev_id_used
-                else:
-                    execute(
-                        """
-                        UPDATE match_event_key_map
-                        SET updated_at = now()
-                        WHERE fixture_id=%s AND canonical_key=%s
-                        """,
-                        (fixture_id, k),
-                    )
-
-        _upsert_key(stable_key)
-        _upsert_key(strict_key)
-
-        # ───────────── 업그레이드: who:unk(=초기 정보 부족) -> pid/name 확보 시 같은 event_id로 보강 키 추가 ─────────────
-        # (Goal/Card/Sub 모두 동일 로직 적용)
-        if "who:unk" in stable_key or "out:unk" in stable_key or "in:unk" in stable_key or "p:unk" in stable_key:
-            # 현재 이벤트에서 pid/name이 확보된 형태의 stable_base/strict_key를 다시 만들어서 맵에 추가
-            # 단, 안정성 위해 minute bucket은 동일(bmb) 유지, occurrence n도 동일 사용
-            # (이미 stable_key가 n을 가지고 있으니 그걸 그대로 사용)
-            try:
-                n_suffix = f"|n:{n}"
-                # stable_base 재조립(간단히: 기존 stable_base를 기반으로, pid/name이 있는 who로 바꿀 수 있는 경우만)
-                # 여기서는 타입별로 확실히 개선 가능한 케이스만 처리한다.
-                if ev_type_norm in ("goal", "card"):
-                    who2 = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else None)
-                    if who2:
-                        if ev_type_norm == "goal":
-                            kind = _goal_kind(detail_norm)
-                            stable_base2 = f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who2}"
-                            strict2 = f"Gx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{kind}|{who2}"
-                        else:
-                            ck = _card_kind(detail_norm)
-                            stable_base2 = f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who2}"
-                            strict2 = f"Cx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|{ck}|{who2}"
-                        _upsert_key(stable_base2 + n_suffix)
-                        _upsert_key(strict2)
-                elif ev_type_norm in ("subst", "substitution", "sub"):
-                    out2 = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else None)
-                    in2 = f"pid:{int(player_in_id)}" if player_in_id is not None else (f"name:{_safe_name(player_in_name)}" if player_in_name else None)
-                    if out2 and in2:
-                        stable_base2 = f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out2}|in:{in2}"
-                        strict2 = f"Sx|{fixture_id}|m{minute}|e{extra0}|t{int(t_id or 0)}|out:{out2}|in:{in2}"
-                        _upsert_key(stable_base2 + n_suffix)
-                        _upsert_key(strict2)
-            except Exception:
-                pass
+        # ───────────── key_map 저장 (event_id 당 1개 키만 유지) ─────────────
+        _set_primary_key(ev_id_used, primary_key)
 
     # ───────────── match_event_states 갱신 ─────────────
     if seen_keys_in_tick:
