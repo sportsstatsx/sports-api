@@ -1463,6 +1463,13 @@ def run_once(fcm: FCMClient | None = None) -> None:
 def run_forever(interval_seconds: int = 10) -> None:
     """
     Worker 모드: interval_seconds 간격으로 run_once 를 반복 실행.
+
+    ✅ 개선:
+    - 워커 재시작(재배포) 직후 1회, "부트스트랩"으로
+      match_notification_state(상태/포인터/단계 플래그)를 현재 시점으로 맞추고
+      알림은 보내지 않는다.
+    - 이렇게 하면 재배포 순간의 단계/골/VAR "알림 폭탄"이 사라지고,
+      그 다음 루프부터는 정상적으로 "새 이벤트"만 알림이 간다.
     """
     fcm = FCMClient()
     log.info(
@@ -1470,14 +1477,113 @@ def run_forever(interval_seconds: int = 10) -> None:
         interval_seconds,
     )
 
+    # --------------------------
+    # ✅ BOOTSTRAP (재시작 1회)
+    # --------------------------
+    try:
+        matches = get_subscribed_matches()
+        if matches:
+            log.info("Bootstrap: syncing notification state for %s subscribed matches (no notifications).", len(matches))
+
+        for match_id in matches:
+            current_raw = load_current_match_state(match_id)
+            if not current_raw:
+                continue
+
+            # state row 보장 + last_status/last_goals/last_red = 현재로 맞춤
+            save_state(current_raw)
+
+            # 포인터를 현재 MAX로 당겨서 과거 Goal/VAR를 new로 읽지 않게
+            gx = fetch_one(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Goal'
+                """,
+                (match_id,),
+            )
+            max_goal_id = int(gx["max_id"] or 0) if gx else 0
+
+            vx = fetch_one(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Var'
+                  AND detail ILIKE 'Goal Disallowed%%'
+                """,
+                (match_id,),
+            )
+            max_dis_id = int(vx["max_id"] or 0) if vx else 0
+
+            # 단계 플래그를 "현재 상태 기준"으로 잠가서
+            # 재시작 직후 kickoff/ht/2h/ft/et/pen 단계 알림이 튀지 않게
+            st = (current_raw.status or "").strip()
+            rank = STATUS_ORDER.get(st, 0)
+
+            kickoff_sent = (st not in ("", "NS", "TBD")) and (rank >= 10 or st == "LIVE")
+            halftime_sent = rank >= 20
+            secondhalf_sent = rank >= 30
+            extra_time_start_sent = rank >= 40
+            extra_time_end_sent = rank >= 60  # AET(60) 이상이면 ET 종료는 이미 지난 상태
+            penalties_start_sent = rank >= 50  # P(50) / PEN(70)
+            penalties_end_sent = rank >= 80     # FT/AET면 승부차기도 이미 끝났다고 간주(FT에서만 true 의미)
+            fulltime_sent = rank >= 80
+
+            execute(
+                """
+                UPDATE match_notification_state
+                SET
+                  last_goal_event_id = %s,
+                  last_goal_disallowed_event_id = %s,
+                  last_goal_home_goals = %s,
+                  last_goal_away_goals = %s,
+
+                  kickoff_sent = %s,
+                  halftime_sent = %s,
+                  secondhalf_sent = %s,
+                  extra_time_start_sent = %s,
+                  extra_time_end_sent = %s,
+                  penalties_start_sent = %s,
+                  penalties_end_sent = %s,
+                  fulltime_sent = %s,
+
+                  updated_at = NOW()
+                WHERE match_id = %s
+                """,
+                (
+                    max_goal_id,
+                    max_dis_id,
+                    int(current_raw.home_goals),
+                    int(current_raw.away_goals),
+
+                    bool(kickoff_sent),
+                    bool(halftime_sent),
+                    bool(secondhalf_sent),
+                    bool(extra_time_start_sent),
+                    bool(extra_time_end_sent),
+                    bool(penalties_start_sent),
+                    bool(penalties_end_sent),
+                    bool(fulltime_sent),
+
+                    match_id,
+                ),
+            )
+    except Exception:
+        log.exception("Bootstrap failed (will continue normal loop)")
+
+    # --------------------------
+    # NORMAL LOOP
+    # --------------------------
     while True:
         try:
             run_once(fcm)
         except Exception:
-            # 에러가 나도 워커가 죽지 않도록 로그만 찍고 다음 루프로 진행
             log.exception("Error while processing matches in worker loop")
 
         time.sleep(interval_seconds)
+
 
 
 if __name__ == "__main__":
