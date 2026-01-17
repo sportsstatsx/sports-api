@@ -130,14 +130,25 @@ def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry
 
 
 def _status_group_from_short(short: Optional[str]) -> str:
-    s = (short or "").upper()
+    s = (short or "").upper().strip()
+
     if s in ("FT", "AET", "PEN"):
         return "FINISHED"
+
+    # 라이브 워커와 동일하게 맞춤
     if s in ("NS", "TBD"):
-        return "SCHEDULED"
-    if s in ("PST", "CANC", "ABD", "AWD", "WO"):
-        return "CANCELLED"
-    return "LIVE"
+        return "UPCOMING"
+
+    # INPLAY(HT 포함)
+    if s in ("1H", "2H", "ET", "P", "BT", "INT", "LIVE", "HT"):
+        return "INPLAY"
+
+    # 연기/취소/중단 등
+    if s in ("PST", "CANC", "ABD", "AWD", "WO", "SUSP"):
+        return "OTHER"
+
+    return "OTHER"
+
 
 
 def _extract_fixture_basic(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -666,15 +677,15 @@ def main() -> None:
                     basic = _extract_fixture_basic(fx)
                     if basic is None:
                         continue
-                    if basic.get("status_group") != "FINISHED":
-                        continue
 
                     fixture_id = basic["fixture_id"]
+                    sg = (basic.get("status_group") or "").strip()
 
                     season = basic.get("season") or season_guess
                     if season is None:
                         continue
 
+                    # ✅ 모든 상태(NS/INPLAY/FINISHED 포함)에서 fixtures/matches/raw는 항상 업서트
                     fx_full = fetch_fixture_by_id(fixture_id) or fx
 
                     try:
@@ -685,6 +696,10 @@ def main() -> None:
                     upsert_fixture_row(fx_full, lid, int(season))
                     upsert_match_row(fx_full, lid, int(season))
 
+                    # ✅ 무거운 백필은 FINISHED만 (기존 정책 유지)
+                    if sg != "FINISHED":
+                        continue
+
                     need_events = force or (not has_match_events(fixture_id))
                     need_lineups = force or (not has_lineups(fixture_id))
                     need_team_stats = force or (not has_team_stats(fixture_id))
@@ -693,6 +708,7 @@ def main() -> None:
                     if not (need_events or need_lineups or need_team_stats or need_player_stats):
                         total_skipped += 1
                         continue
+
 
                     todo = []
                     if need_events:
