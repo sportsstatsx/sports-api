@@ -110,6 +110,8 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         season_champions = enriched_champions
 
     # 4) 최종 번들
+    ctx_opts = standings_block.get("context_options", {}) if isinstance(standings_block, dict) else {}
+
     return {
         "league_id": league_id,
         "season": resolved_season,
@@ -122,8 +124,8 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "season_champions": season_champions,
 
         # 🔥 NEW — Standings의 컨텍스트 옵션을 리그디테일 번들로 직접 flatten
-        "standingsConferences": standings_block.get("context_options", {}).get("conferences", []),
-        "standingsGroups": standings_block.get("context_options", {}).get("groups", []),
+        "standingsConferences": (ctx_opts.get("conferences", []) or []),
+        "standingsGroups": (ctx_opts.get("groups", []) or []),
 
         # 기존 블록 유지
         "results_block": results_block,
@@ -131,4 +133,5 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "standings_block": standings_block,
         "seasons_block": seasons_block,
     }
+
 
