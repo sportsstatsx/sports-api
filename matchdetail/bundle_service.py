@@ -115,8 +115,42 @@ def get_match_detail_bundle(
         league_id=league_id,
         season=season,
     )
+
+    # ✅ 근본 해결: season/league_id가 틀려도 fixture_id 기준으로 1회 자동 보정(fallback)
+    # - 앱/클라이언트가 이전 시즌(예: 2025)을 보내도, DB에 실제 시즌(예: 2026)이 있으면 그걸로 재시도
+    # - 이 로직은 "특정 리그"가 아니라 모든 리그/시즌 전환 케이스에 공통 적용됨
     if header is None:
-        return None
+        row = fetch_one(
+            "SELECT league_id, season FROM matches WHERE fixture_id = %s",
+            (fixture_id,),
+        )
+        if not row:
+            row = fetch_one(
+                "SELECT league_id, season FROM fixtures WHERE fixture_id = %s",
+                (fixture_id,),
+            )
+
+        if row:
+            real_league_id = row.get("league_id")
+            real_season = row.get("season")
+
+            if (
+                isinstance(real_league_id, int)
+                and isinstance(real_season, int)
+                and (real_league_id != league_id or real_season != season)
+            ):
+                header = build_header_block(
+                    fixture_id=fixture_id,
+                    league_id=real_league_id,
+                    season=real_season,
+                )
+                # 이후 로직에서도 header와 일치하도록 값 동기화
+                league_id = real_league_id
+                season = real_season
+
+        if header is None:
+            return None
+
 
     # filters 오버라이드(앱에서 내려준 comp/last_n 우선)
     header_filters = header.get("filters") or {}
