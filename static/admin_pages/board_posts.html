@@ -112,6 +112,20 @@
       overflow: hidden;
     }
 
+    /* ✅ Editor 화면에서만: 카드 폭을 모바일 폭처럼 제한 */
+    #editorView .card {
+      max-width: 460px;
+      margin: 0 auto;
+    }
+
+    /* (선택) Content 작성칸을 monospace 대신 일반 폰트로 */
+    #pContent {
+      font-family: var(--sans);
+      line-height: 1.6;
+    }
+
+
+
     .card h2 {
       margin: 0;
       padding: 12px 14px;
@@ -590,12 +604,11 @@ function showEditorView() {
 }
 
 function backToList() {
-  renderLangBox();
   showListView();
   setSaveHint("");
-  // 목록 최신화는 선택 (원하면 유지)
   loadPosts();
 }
+
 
 
 
