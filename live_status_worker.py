@@ -302,6 +302,26 @@ def ensure_event_dedupe_tables() -> None:
         "ON match_event_key_map (fixture_id, event_id);"
     )
 
+    # ✅ 재시작/상태유실에도 FINISHED postmatch가 재실행되지 않도록 DB에 상태 저장
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_postmatch_states (
+          fixture_id BIGINT PRIMARY KEY,
+          ft_seen_at TIMESTAMPTZ NOT NULL,
+          did_60 BOOLEAN NOT NULL DEFAULT FALSE,
+          did_30m BOOLEAN NOT NULL DEFAULT FALSE,
+          last_run_at TIMESTAMPTZ,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
+    )
+
+    execute(
+        "CREATE INDEX IF NOT EXISTS idx_match_postmatch_states_updated "
+        "ON match_postmatch_states (updated_at);"
+    )
+
+
 
 def prune_event_dedupe_for_fixtures(fixture_ids: List[int]) -> None:
     if not fixture_ids:
@@ -1373,9 +1393,6 @@ def run_once() -> None:
         ensure_event_dedupe_tables()
         run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
 
-    if not hasattr(run_once, "_postmatch_state"):
-        run_once._postmatch_state = {}  # type: ignore[attr-defined]
-    post_state: Dict[int, Dict[str, Any]] = run_once._postmatch_state  # type: ignore[attr-defined]
 
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1405,17 +1422,6 @@ def run_once() -> None:
         if float(v.get("exp") or 0) < now_ts:
             del fc[k]
 
-    # post_state prune
-    try:
-        cutoff = now_ts - (6 * 60 * 60)
-        for fid, st in list(post_state.items()):
-            ft_seen = float((st or {}).get("ft_seen_ts") or 0.0)
-            last_run = float((st or {}).get("last_run_ts") or 0.0)
-            base = max(ft_seen, last_run)
-            if base and base < cutoff:
-                del post_state[fid]
-    except Exception:
-        pass
 
     total_fixtures = 0
     total_inplay = 0
@@ -1477,32 +1483,148 @@ def run_once() -> None:
         except Exception as e:
             print(f"      [{tag}/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
+    def _postmatch_already_done_in_db(fixture_id: int) -> bool:
+        # ✅ 백필/수동복구로 이미 postmatch 데이터가 있으면 live worker가 다시 손대지 않게 스킵
+        row = fetch_one(
+            """
+            SELECT
+              EXISTS (SELECT 1 FROM match_team_stats WHERE fixture_id=%s) AS has_stats,
+              EXISTS (SELECT 1 FROM match_events_raw  WHERE fixture_id=%s) AS has_events_raw
+            """,
+            (fixture_id, fixture_id),
+        )
+        if isinstance(row, dict):
+            return bool(row.get("has_stats")) and bool(row.get("has_events_raw"))
+        return False
+
+    def _get_post_state(fixture_id: int) -> Optional[Dict[str, Any]]:
+        row = fetch_one(
+            """
+            SELECT
+              fixture_id,
+              ft_seen_at,
+              did_60,
+              did_30m,
+              last_run_at
+            FROM match_postmatch_states
+            WHERE fixture_id=%s
+            """,
+            (fixture_id,),
+        )
+        return row if isinstance(row, dict) else None
+
+    def _ensure_post_state(fixture_id: int, now_dt: dt.datetime) -> Dict[str, Any]:
+        st = _get_post_state(fixture_id)
+        if st:
+            return st
+
+        # 새로 FINISHED를 본 케이스: ft_seen_at을 지금으로 기록
+        execute(
+            """
+            INSERT INTO match_postmatch_states (fixture_id, ft_seen_at, did_60, did_30m, last_run_at, updated_at)
+            VALUES (%s, %s, FALSE, FALSE, NULL, now())
+            ON CONFLICT (fixture_id) DO NOTHING
+            """,
+            (fixture_id, now_dt),
+        )
+        st2 = _get_post_state(fixture_id)
+        return st2 if st2 else {"fixture_id": fixture_id, "ft_seen_at": now_dt, "did_60": False, "did_30m": False, "last_run_at": None}
+
+    def _mark_post_done(fixture_id: int, *, did_60: bool, did_30m: bool) -> None:
+        execute(
+            """
+            UPDATE match_postmatch_states
+            SET did_60=%s,
+                did_30m=%s,
+                last_run_at=now(),
+                updated_at=now()
+            WHERE fixture_id=%s
+            """,
+            (did_60, did_30m, fixture_id),
+        )
+
     def _schedule_postmatch_if_needed(
         fixture_id: int,
         home_id: int,
         away_id: int,
         item: Dict[str, Any],
     ) -> None:
-        st = post_state.get(fixture_id)
-        if not isinstance(st, dict):
-            st = {"ft_seen_ts": now_ts, "did_60": False, "did_30m": False, "last_run_ts": 0.0}
-            post_state[fixture_id] = st
+        now_dt = now_utc()
 
-        if not st.get("ft_seen_ts"):
-            st["ft_seen_ts"] = now_ts
+        # ✅ 이미 백필로 복구된 경기면 postmatch 재수집 스킵 + 상태를 done으로 박아버림
+        if _postmatch_already_done_in_db(fixture_id):
+            st0 = _get_post_state(fixture_id)
+            if not st0:
+                execute(
+                    """
+                    INSERT INTO match_postmatch_states (fixture_id, ft_seen_at, did_60, did_30m, last_run_at, updated_at)
+                    VALUES (%s, %s, TRUE, TRUE, now(), now())
+                    ON CONFLICT (fixture_id) DO UPDATE SET
+                      did_60=TRUE, did_30m=TRUE, last_run_at=now(), updated_at=now()
+                    """,
+                    (fixture_id, now_dt),
+                )
+            else:
+                _mark_post_done(fixture_id, did_60=True, did_30m=True)
+            return
 
-        ft_seen_ts = float(st.get("ft_seen_ts") or now_ts)
-        age = now_ts - ft_seen_ts
+        st = _ensure_post_state(fixture_id, now_dt)
 
-        if (age >= 60.0) and (not bool(st.get("did_60"))):
+        ft_seen_at = st.get("ft_seen_at")
+        if isinstance(ft_seen_at, str):
+            try:
+                ft_seen_at_dt = dt.datetime.fromisoformat(ft_seen_at.replace("Z", "+00:00"))
+            except Exception:
+                ft_seen_at_dt = now_dt
+        elif isinstance(ft_seen_at, dt.datetime):
+            ft_seen_at_dt = ft_seen_at
+        else:
+            ft_seen_at_dt = now_dt
+
+        if ft_seen_at_dt.tzinfo is None:
+            ft_seen_at_dt = ft_seen_at_dt.replace(tzinfo=dt.timezone.utc)
+        else:
+            ft_seen_at_dt = ft_seen_at_dt.astimezone(dt.timezone.utc)
+
+        age_sec = (now_dt.astimezone(dt.timezone.utc) - ft_seen_at_dt).total_seconds()
+
+        did_60 = bool(st.get("did_60"))
+        did_30m = bool(st.get("did_30m"))
+
+        if (age_sec >= 60.0) and (not did_60):
             _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+60s")
-            st["did_60"] = True
-            st["last_run_ts"] = time.time()
+            execute(
+                """
+                UPDATE match_postmatch_states
+                SET did_60=TRUE, last_run_at=now(), updated_at=now()
+                WHERE fixture_id=%s
+                """,
+                (fixture_id,),
+            )
+            did_60 = True
 
-        if (age >= 1800.0) and (not bool(st.get("did_30m"))):
+        if (age_sec >= 1800.0) and (not did_30m):
             _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+30m")
-            st["did_30m"] = True
-            st["last_run_ts"] = time.time()
+            execute(
+                """
+                UPDATE match_postmatch_states
+                SET did_30m=TRUE, last_run_at=now(), updated_at=now()
+                WHERE fixture_id=%s
+                """,
+                (fixture_id,),
+            )
+            did_30m = True
+
+        if did_60 or did_30m:
+            execute(
+                """
+                UPDATE match_postmatch_states
+                SET updated_at=now()
+                WHERE fixture_id=%s
+                """,
+                (fixture_id,),
+            )
+
 
     for date_str in dates:
         for lid in league_ids:
@@ -1642,11 +1764,10 @@ def run_once() -> None:
     except Exception:
         pass
 
-    try:
-        if finished_ids:
-            prune_event_dedupe_for_fixtures(finished_ids)
-    except Exception:
-        pass
+    # ✅ FINISHED에서 key_map/state를 즉시 삭제하면
+    #    incoming_id 없는 이벤트가 synthetic_id로 재생성되며 "추가 삽입"이 발생할 수 있음(타임라인 중복).
+    #    아래의 prune_event_dedupe_older_than(days=3)만으로 충분.
+
 
     try:
         prune_event_dedupe_older_than(days=3)
