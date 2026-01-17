@@ -938,6 +938,74 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         log.info("match_id=%s current state not found, skip", match_id)
         return
 
+    # ✅ (핵심) 종료된 경기면: 알림 로직을 아예 타지 않게 막고,
+    # 포인터/플래그를 "현재 시점"으로 정리해서 재배포/재시작 때 폭탄을 방지한다.
+    if (current_raw.status or "") in ("FT", "AET"):
+        # state row 없으면 생성 (ON CONFLICT라 있어도 안전)
+        save_state(current_raw)
+
+        # 현재 DB 기준 MAX 포인터로 당겨서 "과거 골/VAR"가 new로 읽히는 걸 막음
+        gx = fetch_one(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Goal'
+            """,
+            (match_id,),
+        )
+        max_goal_id = int(gx["max_id"] or 0) if gx else 0
+
+        vx = fetch_one(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Var'
+              AND detail ILIKE 'Goal Disallowed%%'
+            """,
+            (match_id,),
+        )
+        max_dis_id = int(vx["max_id"] or 0) if vx else 0
+
+        # 종료된 경기는 단계성 알림도 더 이상 필요 없으니 전부 TRUE로 잠금
+        # (컬럼은 네 테이블 스크린샷 기준)
+        execute(
+            """
+            UPDATE match_notification_state
+            SET
+              kickoff_sent = TRUE,
+              kickoff_10m_sent = TRUE,
+              halftime_sent = TRUE,
+              secondhalf_sent = TRUE,
+              fulltime_sent = TRUE,
+              extra_time_start_sent = TRUE,
+              extra_time_halftime_sent = TRUE,
+              extra_time_secondhalf_sent = TRUE,
+              extra_time_end_sent = TRUE,
+              penalties_start_sent = TRUE,
+              penalties_end_sent = TRUE,
+
+              last_goal_event_id = %s,
+              last_goal_disallowed_event_id = %s,
+              last_goal_home_goals = %s,
+              last_goal_away_goals = %s,
+
+              updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (
+                max_goal_id,
+                max_dis_id,
+                int(current_raw.home_goals),
+                int(current_raw.away_goals),
+                match_id,
+            ),
+        )
+
+        # ✅ 종료된 경기에서는 어떤 알림도 보내지 않음
+        return
+
     last = load_last_state(match_id)
 
     # state row 존재 확인
@@ -984,8 +1052,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         )
 
         # ✅ Goal 포인터/누적 스코어 초기화(필수)
-        # - 과거 골 알림 폭탄 방지
-        # - 누적은 현재(타임라인 규칙 계산된) 스코어로 셋업
         gx = fetch_one(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id
@@ -1086,9 +1152,8 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 last_goal_id = ev_id
                 continue
 
-            # ❌ 실축 PK/무효성 goal은 득점 알림 트리거에서 제외(타임라인 규칙과 동일한 방향)
+            # ❌ 실축 PK 제외
             if ("missed penalty" in dlow) or (("miss" in dlow) and ("pen" in dlow)):
-                # 포인터는 진전(스팸 방지)
                 execute(
                     """
                     UPDATE match_notification_state
@@ -1101,7 +1166,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 last_goal_id = ev_id
                 continue
 
-            # ✅ (중요) 전송 성공/실패와 무관하게 포인터 먼저 진전 (무한 스팸 방지)
+            # ✅ 포인터 먼저 진전
             execute(
                 """
                 UPDATE match_notification_state
@@ -1125,7 +1190,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     elif int(team_id) == int(away_id):
                         inc_away = True
                 else:
-                    # OG: team_id가 홈이면 원정 +1, 원정이면 홈 +1
                     if int(team_id) == int(home_id):
                         inc_away = True
                     elif int(team_id) == int(away_id):
@@ -1138,12 +1202,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 g_home += 1
             elif inc_away:
                 g_away += 1
-            else:
-                # 팀 판정이 애매하면 스코어 누적은 건드리지 않고,
-                # 알림은 중립 "Goal!"로 나가게 둔다(본문은 현재 score_line)
-                pass
 
-            # 누적 스코어 저장(다음 골의 old/new 기준)
             execute(
                 """
                 UPDATE match_notification_state
@@ -1159,11 +1218,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             if not tokens:
                 continue
 
-            # goal minute string (이 이벤트 기준)
-            if extra_min:
-                goal_minute_str = f"{minute}+{extra_min}'"
-            else:
-                goal_minute_str = f"{minute}'"
+            goal_minute_str = f"{minute}+{extra_min}'" if extra_min else f"{minute}'"
 
             extra_payload = {
                 "event_id": ev_id,
@@ -1174,8 +1229,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 "goal_team_id": team_id,
             }
 
-            # build_message는 MatchState의 home_goals/away_goals를 본문에 쓰므로,
-            # 여기서는 "알림 누적 스코어"를 MatchState에 반영해서 전달한다.
             score_state = MatchState(
                 match_id=current.match_id,
                 status=current.status,
@@ -1196,7 +1249,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     resp = fcm.send_to_tokens(batch, title, body, data)
                     log.info("Sent score notification for match %s to %s devices: %s", match_id, len(batch), resp)
                 except Exception:
-                    # 포인터/누적은 이미 저장했으니 무한 재전송은 없음
                     log.exception("Failed to send score notification for match %s (event_id=%s)", match_id, ev_id)
                     break
 
@@ -1231,10 +1283,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     detail = str(ev.get("detail") or "")
                     team_id = ev.get("team_id")
 
-                    if extra_min:
-                        minute_str = f"{minute}+{extra_min}'"
-                    else:
-                        minute_str = f"{minute}'"
+                    minute_str = f"{minute}+{extra_min}'" if extra_min else f"{minute}'"
 
                     reason = None
                     if " - " in detail:
@@ -1273,7 +1322,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     if not tokens:
                         continue
 
-                    # VAR는 "최신 실제 스코어"를 보여줘야 하므로 current_raw(이미 이벤트 기반)를 그대로 사용
                     title, body = build_message("goal_disallowed", current_raw, extra_payload, labels)
                     data: Dict[str, Any] = {"match_id": match_id, "event_type": "goal_disallowed"}
                     data.update(extra_payload)
@@ -1292,9 +1340,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     except Exception:
         log.exception("Error while processing goal_disallowed for match %s", match_id)
 
-    # ✅ (추가) VAR 처리 후 누적 스코어를 "현재 실제 스코어"로 리셋
-    # - VAR로 골이 취소되면 g_home/g_away(증가만 하는 누적)가 실제와 어긋날 수 있음
-    # - 다음 득점 알림의 old/new 비교 정확도 확보
     if var_processed_ok:
         try:
             execute(
@@ -1391,6 +1436,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
 
     save_state(current)
+
 
 
 
