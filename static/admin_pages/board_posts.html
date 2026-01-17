@@ -38,6 +38,29 @@
       }
     }
 
+    /* ✅ admin.html의 ssx_theme 메시지로 강제 테마 적용 */
+    :root[data-theme="light"] {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --panel2: #ffffff;
+      --text: #0b0d10;
+      --muted: rgba(11, 13, 16, 0.6);
+      --line: rgba(11, 13, 16, 0.12);
+      --line2: rgba(11, 13, 16, 0.16);
+      --shadow: 0 10px 40px rgba(10,20,30,0.10);
+    }
+    :root[data-theme="dark"] {
+      --bg: #0b0d10;
+      --panel: #11141a;
+      --panel2: #0f1218;
+      --text: #e6e9ef;
+      --muted: rgba(230, 233, 239, 0.7);
+      --line: rgba(230, 233, 239, 0.12);
+      --line2: rgba(230, 233, 239, 0.18);
+      --shadow: 0 10px 40px rgba(0,0,0,0.35);
+    }
+
+
     body {
       margin: 0;
       padding: 18px;
@@ -218,6 +241,63 @@
       user-select: none;
     }
     .chip input { width:auto; margin:0; }
+    /* ─────────────────────────────────────
+       Match Preview (Title 아래 매치카드)
+       ───────────────────────────────────── */
+    .matchPreview {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: rgba(255,255,255,0.02);
+    }
+    .matchPreview .mpTop {
+      display:flex;
+      align-items:center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .matchPreview .mpRow {
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .matchPreview .team {
+      display:flex;
+      align-items:center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .matchPreview .team.right { flex-direction: row-reverse; }
+    .matchPreview .logo {
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,0.15);
+      object-fit: cover;
+      flex: 0 0 auto;
+    }
+    .matchPreview .name {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 240px;
+    }
+    .matchPreview .vs {
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.8px;
+      padding: 0 6px;
+      border-left: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+    }
+
   </style>
 </head>
 <body>
@@ -354,6 +434,14 @@
           </div>
         </div>
 
+        <!-- ✅ analysis + (sport, fixture_key) 입력 시 제목 아래 매치카드 프리뷰 (스코어 없음) -->
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="flex: 1;">
+            <div id="matchPreview" class="matchPreview" style="display:none;"></div>
+          </div>
+        </div>
+
+
         <div class="row" style="margin-top: 10px;">
           <div class="col" style="flex: 1;">
             <label>Summary (list에 뽑힐 짧은 요약)</label>
@@ -461,16 +549,23 @@
   }
 
   async function api(url, opts) {
-    const token = localStorage.getItem("adminToken") || "";
+    // admin.html 과 호환: SSX_ADMIN_TOKEN 우선, 구버전 adminToken은 fallback
+    const token =
+      localStorage.getItem("SSX_ADMIN_TOKEN") ||
+      localStorage.getItem("adminToken") ||
+      "";
+
     const headers = Object.assign({
       "Content-Type": "application/json",
       "X-Admin-Token": token,
     }, (opts && opts.headers) || {});
+
     const res = await fetch(url, Object.assign({}, opts || {}, { headers }));
     let data = null;
     try { data = await res.json(); } catch(e) {}
     return { status: res.status, data };
   }
+
 
   // ─────────────────────────────────────
   // Lang chips
@@ -619,8 +714,13 @@
     setSelectedLangs([]);
     $("pFiltersJson").value = "{}";
     $("pSnapshotJson").value = "{}";
+
+    // ✅ 매치 프리뷰 숨김
+    hideMatchPreview();
+
     renderList();
   }
+
 
   function newPost() {
     clearEditor();
@@ -660,9 +760,13 @@
       $("pSnapshotJson").value = "{}";
     }
 
+    // ✅ 스냅샷 기반 프리뷰 렌더 (없으면 숨김)
+    renderMatchPreviewFromSnapshot();
+
     setSaveHint("편집 중: #" + selectedId);
     renderList();
   }
+
 
   async function reloadSelected() {
     if (!selectedId) return alert("선택된 글이 없습니다.");
@@ -707,6 +811,181 @@
     };
   }
 
+  // ─────────────────────────────────────
+  // Theme sync (from admin.html iframe postMessage)
+  // ─────────────────────────────────────
+  function applyTheme(theme) {
+    if (theme !== "light" && theme !== "dark") return;
+    document.documentElement.dataset.theme = theme;
+  }
+
+  function onThemeMessage(ev) {
+    const d = ev && ev.data;
+    if (!d || d.type !== "ssx_theme") return;
+    applyTheme(d.theme);
+  }
+
+  // ─────────────────────────────────────
+  // Match preview + fixture snapshot (A안: /api/fixture_meta)
+  // ─────────────────────────────────────
+  let _fixtureMetaTimer = null;
+
+  function getEditorCategory() { return ($("pCategory").value || "analysis").trim(); }
+  function getEditorSport() { return ($("pSport").value || "").trim().toLowerCase(); }
+  function getEditorFixtureKey() { return ($("pFixtureKey").value || "").trim(); }
+
+  function hideMatchPreview() {
+    const box = $("matchPreview");
+    if (!box) return;
+    box.style.display = "none";
+    box.innerHTML = "";
+  }
+
+  function readSnapshotObj() {
+    const raw = ($("pSnapshotJson").value || "").trim() || "{}";
+    try { return JSON.parse(raw); } catch(e) { return {}; }
+  }
+
+  function writeSnapshotObj(obj) {
+    $("pSnapshotJson").value = JSON.stringify(obj || {}, null, 2);
+  }
+
+  function snapshotHasFixtureFor(sport, fixtureKey, snapshotObj) {
+    const s = snapshotObj || {};
+    const f = s.fixture || null;
+    if (!f) return false;
+    if ((f.sport || "") !== sport) return false;
+    if (String(f.fixture_key || f.fixture_id || "") !== String(fixtureKey)) return false;
+    if (!f.home || !f.away) return false;
+    if (!f.home.name || !f.away.name) return false;
+    if (!f.home.logo || !f.away.logo) return false;
+    return true;
+  }
+
+  function renderMatchPreview(fixture) {
+    const box = $("matchPreview");
+    if (!box) return;
+
+    if (!fixture || !fixture.home || !fixture.away) {
+      hideMatchPreview();
+      return;
+    }
+
+    const leagueName = fixture.league && fixture.league.name ? fixture.league.name : "";
+    const kickoff = fixture.kickoff_utc ? String(fixture.kickoff_utc).slice(0, 16).replace("T", " ") : "";
+    const top = (leagueName || kickoff)
+      ? `<div class="mpTop">${escapeHtml(leagueName)}${leagueName && kickoff ? " · " : ""}${escapeHtml(kickoff)}</div>`
+      : "";
+
+    box.innerHTML = `
+      ${top}
+      <div class="mpRow">
+        <div class="team left">
+          <img class="logo" src="${escapeHtml(fixture.home.logo)}" alt="H" />
+          <div class="name" title="${escapeHtml(fixture.home.name)}">${escapeHtml(fixture.home.name)}</div>
+        </div>
+        <div class="vs">VS</div>
+        <div class="team right">
+          <img class="logo" src="${escapeHtml(fixture.away.logo)}" alt="A" />
+          <div class="name" title="${escapeHtml(fixture.away.name)}">${escapeHtml(fixture.away.name)}</div>
+        </div>
+      </div>
+    `;
+    box.style.display = "block";
+  }
+
+  function renderMatchPreviewFromSnapshot() {
+    // analysis에서만 보여주고, 아니면 숨김
+    if (getEditorCategory() !== "analysis") return hideMatchPreview();
+
+    const sport = getEditorSport();
+    const fixtureKey = getEditorFixtureKey();
+    if (!sport || !fixtureKey) return hideMatchPreview();
+
+    const snap = readSnapshotObj();
+    if (!snapshotHasFixtureFor(sport, fixtureKey, snap)) return hideMatchPreview();
+    renderMatchPreview(snap.fixture);
+  }
+
+  async function fetchFixtureMeta(sport, fixtureKey) {
+    const qs = new URLSearchParams();
+    qs.set("sport", sport);
+    qs.set("fixture_key", fixtureKey);
+
+    const r = await api(adminUrl("/api/fixture_meta?" + qs.toString()), { method: "GET" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      return null;
+    }
+    return r.data.fixture || null;
+  }
+
+  function buildSnapshotFromMeta(sport, fixtureKey, fx) {
+    // fx는 서버가 내려주는 fixture 객체 그대로 저장
+    return {
+      fixture: Object.assign({}, fx, {
+        sport,
+        fixture_key: fixtureKey,
+      })
+    };
+  }
+
+  async function ensureFixtureSnapshot(payload) {
+    // analysis + sport + fixture_key일 때만
+    if (!payload || payload.category !== "analysis") return payload;
+    if (!payload.sport || !payload.fixture_key) return payload;
+
+    const sport = String(payload.sport).toLowerCase();
+    const fixtureKey = String(payload.fixture_key);
+
+    const snap = payload.snapshot_json || {};
+    if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
+      renderMatchPreview(snap.fixture);
+      return payload;
+    }
+
+    const fx = await fetchFixtureMeta(sport, fixtureKey);
+    if (!fx) throw new Error("fixture_meta not found");
+
+    const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+    payload.snapshot_json = newSnap;
+
+    // textarea 동기화 + 프리뷰 렌더
+    writeSnapshotObj(newSnap);
+    renderMatchPreview(fx);
+
+    return payload;
+  }
+
+  function scheduleFixturePreviewRefresh() {
+    if (_fixtureMetaTimer) clearTimeout(_fixtureMetaTimer);
+    _fixtureMetaTimer = setTimeout(async () => {
+      // category/sport/fixtureKey 조건 맞을 때만 시도
+      if (getEditorCategory() !== "analysis") return hideMatchPreview();
+
+      const sport = getEditorSport();
+      const fixtureKey = getEditorFixtureKey();
+      if (!sport || !fixtureKey) return hideMatchPreview();
+
+      // snapshot이 이미 맞으면 그걸로 표시
+      const snap = readSnapshotObj();
+      if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
+        renderMatchPreview(snap.fixture);
+        return;
+      }
+
+      // 아직 없으면 서버에서 가져와서 snapshot 채워주고 프리뷰 표시
+      const fx = await fetchFixtureMeta(sport, fixtureKey);
+      if (!fx) return hideMatchPreview();
+
+      const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+      writeSnapshotObj(newSnap);
+      renderMatchPreview(fx);
+    }, 350);
+  }
+  
+
   async function savePost() {
     let payload = null;
     try {
@@ -717,6 +996,13 @@
 
     if (!payload.title) return alert("title은 필수입니다.");
     if (!payload.content_md) return alert("content_md는 필수입니다.");
+
+    // ✅ analysis 글 + (sport, fixture_key) 있으면 저장 전에 snapshot_json 자동 채움
+    try {
+      payload = await ensureFixtureSnapshot(payload);
+    } catch (e) {
+      return alert("매치 메타 로드 실패: " + String(e.message || e));
+    }
 
     if (payload.status === "published" && !payload.publish_at) {
       payload.publish_at = new Date().toISOString();
@@ -759,6 +1045,7 @@
     }
   }
 
+
   async function deletePost() {
     if (!selectedId) return alert("삭제할 글을 먼저 선택하세요.");
     const ok = confirm("정말 삭제할까요? (#" + selectedId + ")");
@@ -781,8 +1068,22 @@
 
   // Init
   $("pathHint").textContent = location.pathname;
+
+  // ✅ admin.html -> iframe 테마 동기화
+  window.addEventListener("message", onThemeMessage);
+
+  // ✅ 입력 변화 시 프리뷰 자동 갱신(디바운스)
+  $("pCategory").addEventListener("change", () => {
+    renderMatchPreviewFromSnapshot();
+    scheduleFixturePreviewRefresh();
+  });
+  $("pSport").addEventListener("change", () => scheduleFixturePreviewRefresh());
+  $("pFixtureKey").addEventListener("input", () => scheduleFixturePreviewRefresh());
+  $("pSnapshotJson").addEventListener("input", () => renderMatchPreviewFromSnapshot());
+
   renderLangBox();
   loadPosts();
+
 </script>
 </body>
 </html>
