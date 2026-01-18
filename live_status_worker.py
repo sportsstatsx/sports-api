@@ -849,12 +849,19 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    ✅ 리팩토링 핵심 (타임라인 2배 근절)
-    - match_event_key_map은 'event_id당 1개 키'만 유지한다.
-      -> API incoming id가 있으면 canonical_key = ID|fixture|incoming_id
-      -> incoming id가 없을 때만 StableKey를 사용(합성 id)
-    - 기존처럼 StableKey/StrictKey를 동시에 저장하면
-      event_id당 key가 2개 이상이 되어, key_map join 기반 타임라인에서 2배 노출이 발생한다.
+    ✅ 중복/타임라인 붕괴 근본 해결 (확정판)
+
+    핵심 원인:
+      - incoming_id(양수)가 나중에 생기면 기존 synthetic(음수)와 PK가 달라져 "새 row"가 추가됨
+      - StableKey가 tick 내 순서(n)에 의존하면 순서가 바뀌는 순간 키가 흔들려 새 synthetic가 또 생성됨
+
+    해결:
+      1) event_id(PK)는 절대 incoming_id로 갈아타지 않는다.
+         -> 항상 stable_key 기반(우리 쪽 안정 ID)로 수렴한다.
+      2) n(occurrence)은 "시간 정렬" 기준으로 결정하고,
+         DB에 이미 있던 stable_base|n:*가 있으면 우선 재사용한다.
+      3) 과거에 남아있는 ID|... 키는 stable 키로 자동 마이그레이션한다(키 1개 정책 유지).
+      4) 이미 DB에 쌓여있는 "incoming_id row"가 stable id와 중복이면 실시간으로 제거한다.
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -902,8 +909,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         return (elv, exv, fallback_idx)
 
     def _minute_bucket10(minute: Optional[int]) -> int:
-        # 5분 버킷은 minute 보정(+/-10)에서 버킷 이동이 잦아서 키 흔들림이 생길 수 있음
-        # 10분 버킷으로 완화
         if minute is None:
             return 999
         if minute < 0:
@@ -954,6 +959,24 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         if k and eid is not None:
             key_to_id[k] = int(eid)
 
+    # ───────────── stable_base -> existing n 목록(재사용용) ─────────────
+    base_to_existing_ns: Dict[str, List[int]] = {}
+    for k in list(key_to_id.keys()):
+        if "|n:" not in k:
+            continue
+        base, nstr = k.rsplit("|n:", 1)
+        try:
+            n = int(nstr)
+        except Exception:
+            continue
+        arr = base_to_existing_ns.get(base)
+        if arr is None:
+            base_to_existing_ns[base] = [n]
+        else:
+            arr.append(n)
+    for b, arr in base_to_existing_ns.items():
+        arr.sort()
+
     # ───────────── Second Yellow 존재 시 같은 대상/근처 Red 스킵 ─────────────
     second_yellow_keys: set = set()
     for ev in events or []:
@@ -980,10 +1003,13 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
     evs = [ev for _, ev in indexed]
 
-    # ───────────── Stable occurrence 카운터 (incoming_id 없는 경우에만 의미있음) ─────────────
-    stable_count: Dict[str, int] = {}
-
     seen_keys_in_tick: List[str] = []
+
+    # stable_base별로 tick 안에서 몇 번째 등장인지
+    base_seen_count: Dict[str, int] = {}
+
+    # stable_base별로 이번 tick에서 사용한 n(중복 매핑 방지)
+    base_used_n: Dict[str, set] = {}
 
     def _set_primary_key(event_id: int, primary_key: str) -> None:
         if not primary_key:
@@ -1038,6 +1064,44 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             if int(vid) == int(event_id) and k != primary_key:
                 del key_to_id[k]
 
+    def _build_stable_base(
+        ev_type_norm: str,
+        detail_norm: str,
+        minute: int,
+        t_id: Optional[int],
+        p_id: Optional[int],
+        a_id: Optional[int],
+        pname: str,
+        aname: str,
+        player_in_id: Optional[int],
+        player_in_name: Optional[str],
+    ) -> str:
+        mb = _minute_bucket10(minute)
+
+        if ev_type_norm == "goal":
+            kind = _goal_kind(detail_norm)
+            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+            return f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
+
+        if ev_type_norm == "card":
+            ck = _card_kind(detail_norm)
+            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+            return f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
+
+        if ev_type_norm in ("subst", "substitution", "sub"):
+            out_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "out:unk")
+            in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else (
+                f"name:{_safe_name(player_in_name)}" if player_in_name else "in:unk"
+            )
+            return f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
+
+        if ev_type_norm == "var":
+            return f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
+
+        p_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "p:unk")
+        a_part = f"pid:{int(a_id)}" if a_id is not None else (f"name:{aname}" if aname else "a:unk")
+        return f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
+
     for ev in evs:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
@@ -1065,8 +1129,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         # Second Yellow가 있으면 동일키 Red 스킵
         if ev_type_norm == "card" and t_id is not None and p_id is not None:
-            k = (int(minute), int(extra0), int(t_id), int(p_id))
-            if (detail_norm == "red card") and (k in second_yellow_keys):
+            ksy = (int(minute), int(extra0), int(t_id), int(p_id))
+            if (detail_norm == "red card") and (ksy in second_yellow_keys):
                 continue
 
         pname = _safe_name((player.get("name") if isinstance(player, dict) else None))
@@ -1080,47 +1144,78 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             player_in_name = safe_text(assist.get("name"))
 
         incoming_id = safe_int(ev.get("id"))
+        id_key = f"ID|{fixture_id}|{int(incoming_id)}" if incoming_id is not None else ""
 
-        # ───────────── primary key 결정 (핵심: event_id당 1개 키) ─────────────
-        # 1) incoming_id 있으면 무조건 ID 기반 키 사용 (가장 안정적, 흔들림 없음)
-        # 2) incoming_id 없으면 StableKey(버킷+내용+n) 사용
-        primary_key = ""
-        ev_id_used: int
+        # ───────────── stable_base 생성(항상) ─────────────
+        stable_base = _build_stable_base(
+            ev_type_norm=ev_type_norm,
+            detail_norm=detail_norm,
+            minute=int(minute),
+            t_id=t_id,
+            p_id=p_id,
+            a_id=a_id,
+            pname=pname,
+            aname=aname,
+            player_in_id=player_in_id,
+            player_in_name=player_in_name,
+        )
 
-        if incoming_id is not None:
-            ev_id_used = int(incoming_id)
-            primary_key = f"ID|{fixture_id}|{ev_id_used}"
-        else:
-            mb = _minute_bucket10(minute)
+        # ───────────── n(occurrence) 결정: 시간순으로 + DB 기존 n 재사용 ─────────────
+        base_seen_count[stable_base] = base_seen_count.get(stable_base, 0) + 1
+        desired_n = int(base_seen_count[stable_base])
 
-            if ev_type_norm == "goal":
-                kind = _goal_kind(detail_norm)
-                who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
-                stable_base = f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
-            elif ev_type_norm == "card":
-                ck = _card_kind(detail_norm)
-                who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
-                stable_base = f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
-            elif ev_type_norm in ("subst", "substitution", "sub"):
-                out_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "out:unk")
-                in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else (f"name:{_safe_name(player_in_name)}" if player_in_name else "in:unk")
-                stable_base = f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
-            elif ev_type_norm == "var":
-                stable_base = f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
+        used_set = base_used_n.get(stable_base)
+        if used_set is None:
+            used_set = set()
+            base_used_n[stable_base] = used_set
+
+        chosen_key = ""
+        chosen_event_id: Optional[int] = None
+
+        # (1) 가장 우선: desired_n 키가 이미 있으면 그대로
+        k_desired = f"{stable_base}|n:{desired_n}"
+        if k_desired in key_to_id and desired_n not in used_set:
+            chosen_key = k_desired
+            chosen_event_id = int(key_to_id[k_desired])
+            used_set.add(desired_n)
+
+        # (2) 과거 ID|... 키가 남아있으면(예전 시스템) 그 event_id를 가져와 stable 키로 마이그레이션
+        if chosen_event_id is None and id_key and (id_key in key_to_id):
+            chosen_event_id = int(key_to_id[id_key])
+            # stable 키로 고정(키 1개 정책 유지)
+            # 우선 desired_n이 비어있으면 거기로, 아니면 기존 n 중 빈 곳으로
+            if desired_n not in used_set:
+                chosen_key = k_desired
+                used_set.add(desired_n)
             else:
-                p_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "p:unk")
-                a_part = f"pid:{int(a_id)}" if a_id is not None else (f"name:{aname}" if aname else "a:unk")
-                stable_base = f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
+                # 빈 n 찾기
+                nn = desired_n
+                while nn in used_set:
+                    nn += 1
+                chosen_key = f"{stable_base}|n:{nn}"
+                used_set.add(nn)
 
-            n = stable_count.get(stable_base, 0) + 1
-            stable_count[stable_base] = n
-            primary_key = f"{stable_base}|n:{n}"
+        # (3) DB에 이미 존재하던 n들이 있으면 그 중 아직 안 쓴 n으로 매칭(순서 흔들림 완화)
+        if chosen_event_id is None:
+            existing_ns = base_to_existing_ns.get(stable_base) or []
+            for n in existing_ns:
+                if n in used_set:
+                    continue
+                kk = f"{stable_base}|n:{int(n)}"
+                if kk in key_to_id:
+                    chosen_key = kk
+                    chosen_event_id = int(key_to_id[kk])
+                    used_set.add(int(n))
+                    break
 
-            mapped = key_to_id.get(primary_key)
-            if mapped is not None:
-                ev_id_used = int(mapped)
-            else:
-                ev_id_used = _synthetic_id_from_key(primary_key)
+        # (4) 여기까지 못 찾으면 새 이벤트: desired_n 키로 synthetic 생성
+        if chosen_event_id is None:
+            chosen_key = k_desired
+            chosen_event_id = _synthetic_id_from_key(chosen_key)
+            used_set.add(desired_n)
+
+        ev_id_used = int(chosen_event_id)
+        primary_key = chosen_key
 
         # 상태 기록(상태용)
         seen_keys_in_tick.append(primary_key)
@@ -1224,6 +1319,39 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         # ───────────── key_map 저장 (event_id 당 1개 키만 유지) ─────────────
         _set_primary_key(ev_id_used, primary_key)
 
+        # ───────────── 과거/기존 중복 정리 (실시간 수렴) ─────────────
+        # 1) 과거에 ID|... 키가 남아있으면(예전 방식) 제거 (마이그레이션 완료)
+        if id_key:
+            try:
+                execute(
+                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s AND event_id<>%s",
+                    (fixture_id, id_key, ev_id_used),
+                )
+                execute(
+                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s",
+                    (fixture_id, id_key),
+                )
+                key_to_id.pop(id_key, None)
+            except Exception:
+                pass
+
+        # 2) incoming_id row가 따로 생긴(양수) 중복이면 제거
+        if incoming_id is not None and int(incoming_id) != int(ev_id_used):
+            try:
+                execute(
+                    "DELETE FROM match_events WHERE id=%s AND fixture_id=%s",
+                    (int(incoming_id), fixture_id),
+                )
+            except Exception:
+                pass
+            try:
+                execute(
+                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND event_id=%s",
+                    (fixture_id, int(incoming_id)),
+                )
+            except Exception:
+                pass
+
     # ───────────── match_event_states 갱신 ─────────────
     if seen_keys_in_tick:
         execute(
@@ -1248,6 +1376,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             """,
             (fixture_id,),
         )
+
 
 
 # ─────────────────────────────────────
