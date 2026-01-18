@@ -1722,8 +1722,8 @@ def admin_match_snapshot():
     # ✅ 여기서 실제 블록 생성(지연 import로 앱 전체 부팅 리스크 최소화)
     try:
         # 너 프로젝트 구조에 맞게 import 경로가 맞아야 함
-        from services.matchdetail.insights_block import build_insights_overall_block
-        from services.matchdetail.ai_predictions_block import build_ai_predictions_block
+        from matchdetail.insights_block import build_insights_overall_block
+        from matchdetail.ai_predictions_block import build_ai_predictions_block
     except Exception as e:
         _admin_log(
             event_type="match_snapshot_import_fail",
@@ -2098,6 +2098,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
