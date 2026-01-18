@@ -55,6 +55,29 @@ REQ_RETRIES = 2
 # 이벤트 시간 보정 허용 범위(분)
 EVENT_MINUTE_CORR_ALLOW = 10
 
+# events 폴링 쿨다운(초) - INPLAY에서 /fixtures/events 과다 호출 방지
+EVENTS_INTERVAL_SEC = int(os.environ.get("LIVE_EVENTS_INTERVAL_SEC", "20"))
+
+# fixtures 폴링 쿨다운(초) - /fixtures 리그×날짜 매틱 호출 방지
+FIXTURES_POLL_INTERVAL_SEC = int(os.environ.get("LIVE_FIXTURES_POLL_INTERVAL_SEC", "30"))
+
+# dedupe prune 실행 주기(초) - 매틱 DELETE 방지
+PRUNE_INTERVAL_SEC = int(os.environ.get("LIVE_DEDUPE_PRUNE_INTERVAL_SEC", "3600"))
+
+# INPLAY 라인업 재시도 최대 횟수(0~15분 구간)
+LINEUPS_INPLAY_MAX_TRIES = int(os.environ.get("LIVE_LINEUPS_INPLAY_MAX_TRIES", "8"))
+
+# 최소값 안전장치
+if EVENTS_INTERVAL_SEC < 5:
+    EVENTS_INTERVAL_SEC = 5
+if FIXTURES_POLL_INTERVAL_SEC < 10:
+    FIXTURES_POLL_INTERVAL_SEC = 10
+if PRUNE_INTERVAL_SEC < 300:
+    PRUNE_INTERVAL_SEC = 300
+if LINEUPS_INPLAY_MAX_TRIES < 1:
+    LINEUPS_INPLAY_MAX_TRIES = 1
+
+
 
 # ─────────────────────────────────────
 # 런타임 캐시 (메모리)
@@ -62,6 +85,8 @@ EVENT_MINUTE_CORR_ALLOW = 10
 
 LAST_STATS_SYNC: Dict[int, float] = {}          # fixture_id -> last ts
 LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}   # fixture_id -> state dict
+LAST_EVENTS_SYNC: Dict[int, float] = {}         # fixture_id -> last events poll ts
+
 
 
 # ─────────────────────────────────────
@@ -1015,40 +1040,19 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         if not primary_key:
             return
 
-        # primary_key -> event_id upsert
-        if primary_key not in key_to_id:
-            execute(
-                """
-                INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-                VALUES (%s, %s, %s, now(), now())
-                ON CONFLICT (fixture_id, canonical_key)
-                DO UPDATE SET event_id = EXCLUDED.event_id, updated_at = now()
-                """,
-                (fixture_id, primary_key, event_id),
-            )
-            key_to_id[primary_key] = event_id
-        else:
-            if int(key_to_id[primary_key]) != int(event_id):
-                execute(
-                    """
-                    UPDATE match_event_key_map
-                    SET event_id=%s, updated_at=now()
-                    WHERE fixture_id=%s AND canonical_key=%s
-                    """,
-                    (event_id, fixture_id, primary_key),
-                )
-                key_to_id[primary_key] = event_id
-            else:
-                execute(
-                    """
-                    UPDATE match_event_key_map
-                    SET updated_at = now()
-                    WHERE fixture_id=%s AND canonical_key=%s
-                    """,
-                    (fixture_id, primary_key),
-                )
+        # ✅ 1) 항상 단일 UPSERT로 정리 (쿼리 수 감량)
+        execute(
+            """
+            INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
+            VALUES (%s, %s, %s, now(), now())
+            ON CONFLICT (fixture_id, canonical_key)
+            DO UPDATE SET event_id = EXCLUDED.event_id, updated_at = now()
+            """,
+            (fixture_id, primary_key, event_id),
+        )
+        key_to_id[primary_key] = int(event_id)
 
-        # ★ event_id 당 1개 키만 유지 (타임라인 2배 방지)
+        # ✅ 2) event_id 당 1개 키만 유지 (단일 DELETE)
         execute(
             """
             DELETE FROM match_event_key_map
@@ -1182,13 +1186,10 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         # (2) 과거 ID|... 키가 남아있으면(예전 시스템) 그 event_id를 가져와 stable 키로 마이그레이션
         if chosen_event_id is None and id_key and (id_key in key_to_id):
             chosen_event_id = int(key_to_id[id_key])
-            # stable 키로 고정(키 1개 정책 유지)
-            # 우선 desired_n이 비어있으면 거기로, 아니면 기존 n 중 빈 곳으로
             if desired_n not in used_set:
                 chosen_key = k_desired
                 used_set.add(desired_n)
             else:
-                # 빈 n 찾기
                 nn = desired_n
                 while nn in used_set:
                     nn += 1
@@ -1323,10 +1324,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         # 1) 과거에 ID|... 키가 남아있으면(예전 방식) 제거 (마이그레이션 완료)
         if id_key:
             try:
-                execute(
-                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s AND event_id<>%s",
-                    (fixture_id, id_key, ev_id_used),
-                )
+                # ✅ 중복 DELETE 제거: canonical_key 기준 단일 DELETE면 충분
                 execute(
                     "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s",
                     (fixture_id, id_key),
@@ -1379,6 +1377,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
 
 
+
 # ─────────────────────────────────────
 # Team stats / lineups
 # ─────────────────────────────────────
@@ -1421,9 +1420,11 @@ def _ensure_lineups_state(fixture_id: int) -> Dict[str, Any]:
             "lineups_ready": False,
             "players_by_team": {},
             "last_try_ts": 0.0,
+            "inplay_tries": 0,   # ✅ INPLAY(0~15분) 라인업 재시도 횟수 제한용
         }
         LINEUPS_STATE[fixture_id] = st
     return st
+
 
 
 def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], updated_at: dt.datetime) -> bool:
@@ -1571,6 +1572,34 @@ def maybe_sync_lineups(
                 print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
+            return
+
+        return
+
+    # INPLAY: 초반 재시도 (elapsed<=15)
+    if status_group == "INPLAY":
+        el = elapsed if elapsed is not None else 0
+        if 0 <= el <= 15:
+            # ✅ 과다 호출 방지: COOLDOWN + 최대 시도 횟수 상한
+            tries = int(st.get("inplay_tries") or 0)
+            if tries >= int(LINEUPS_INPLAY_MAX_TRIES):
+                return
+
+            if (now_ts - last_try) < COOLDOWN_SEC:
+                return
+
+            try:
+                st["last_try_ts"] = time.time()
+                st["inplay_tries"] = tries + 1
+
+                resp = fetch_lineups(session, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+                if ready:
+                    st["success"] = True
+                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) try={st['inplay_tries']} ready={ready}")
+            except Exception as e:
+                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
+
             return
 
         return
@@ -2047,21 +2076,36 @@ def run_once() -> None:
             cache_key = (lid, date_str)
             cached = fc.get(cache_key)
 
+            # ✅ (추가) fixtures 폴링 캐시: FIXTURES_POLL_INTERVAL_SEC 안에는 /fixtures 재호출 금지
             if cached and float(cached.get("exp") or 0) >= now_ts:
                 if cached.get("no") is True:
                     continue
+
                 cached_season = cached.get("season")
-                if isinstance(cached_season, int):
-                    try:
-                        rows = fetch_fixtures(s, lid, date_str, cached_season)
-                        if rows:
-                            fixtures = rows
-                            used_season = cached_season
-                        else:
+                cached_fx = cached.get("fixtures")
+                fx_exp = float(cached.get("fx_exp") or 0.0)
+
+                if isinstance(cached_season, int) and isinstance(cached_fx, list) and fx_exp >= now_ts:
+                    fixtures = cached_fx
+                    used_season = cached_season
+
+            # 기존 캐시(시즌 고정) 기반 fetch (단, 폴링 캐시 미적중 시에만)
+            if used_season is None:
+                if cached and float(cached.get("exp") or 0) >= now_ts:
+                    if cached.get("no") is True:
+                        continue
+                    cached_season = cached.get("season")
+                    if isinstance(cached_season, int):
+                        try:
+                            rows = fetch_fixtures(s, lid, date_str, cached_season)
+                            if rows:
+                                fixtures = rows
+                                used_season = cached_season
+                            else:
+                                fc.pop(cache_key, None)
+                        except Exception as e:
                             fc.pop(cache_key, None)
-                    except Exception as e:
-                        fc.pop(cache_key, None)
-                        print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
+                            print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
             if used_season is None:
                 for season in infer_season_candidates(date_str):
@@ -2078,6 +2122,18 @@ def run_once() -> None:
             if used_season is None:
                 fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
                 continue
+
+            # ✅ (추가) 폴링 캐시 저장
+            try:
+                prev = fc.get(cache_key) or {}
+                prev["season"] = int(used_season)
+                prev["no"] = False
+                prev["exp"] = float(prev.get("exp") or (now_ts + SEASON_TTL))
+                prev["fx_exp"] = now_ts + float(FIXTURES_POLL_INTERVAL_SEC)
+                prev["fixtures"] = fixtures
+                fc[cache_key] = prev
+            except Exception:
+                pass
 
             total_fixtures += len(fixtures)
             print(f"[fixtures] league={lid} date={date_str} season={used_season} count={len(fixtures)}")
@@ -2132,18 +2188,26 @@ def run_once() -> None:
 
                     # 1) events raw 저장 + match_events 수렴 + 스코어 보정 (순서 유지)
                     try:
-                        events = fetch_events(s, fixture_id)
-                        upsert_match_events_raw(fixture_id, events)
-                        upsert_match_events(fixture_id, events)
+                        now_ts_ev = time.time()
+                        last_ev = LAST_EVENTS_SYNC.get(fixture_id)
+                        if (last_ev is None) or ((now_ts_ev - last_ev) >= float(EVENTS_INTERVAL_SEC)):
+                            events = fetch_events(s, fixture_id)
+                            LAST_EVENTS_SYNC[fixture_id] = now_ts_ev
 
-                        goals_obj = (item.get("goals") or {})
-                        hint_h = safe_int(goals_obj.get("home"))
-                        hint_a = safe_int(goals_obj.get("away"))
+                            upsert_match_events_raw(fixture_id, events)
+                            upsert_match_events(fixture_id, events)
 
-                        h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-                        update_live_score_if_needed(fixture_id, sg, h, a)
+                            goals_obj = (item.get("goals") or {})
+                            hint_h = safe_int(goals_obj.get("home"))
+                            hint_a = safe_int(goals_obj.get("away"))
 
-                        print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
+                            h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
+                            update_live_score_if_needed(fixture_id, sg, h, a)
+
+                            print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
+                        else:
+                            # 쿨다운 중엔 events는 스킵
+                            pass
                     except Exception as ev_err:
                         print(f"      [events] fixture_id={fixture_id} err: {ev_err}", file=sys.stderr)
 
@@ -2169,6 +2233,7 @@ def run_once() -> None:
             if g in ("FINISHED", "OTHER"):
                 finished_ids.append(int(fid))
                 LAST_STATS_SYNC.pop(fid, None)
+                LAST_EVENTS_SYNC.pop(fid, None)
                 LINEUPS_STATE.pop(fid, None)
 
         if len(LINEUPS_STATE) > 3000:
@@ -2181,13 +2246,17 @@ def run_once() -> None:
     #    incoming_id 없는 이벤트가 synthetic_id로 재생성되며 "추가 삽입"이 발생할 수 있음(타임라인 중복).
     #    아래의 prune_event_dedupe_older_than(days=3)만으로 충분.
 
-
+    # ✅ (변경) prune를 매틱 실행하지 말고 PRUNE_INTERVAL_SEC 주기로만 실행
     try:
-        prune_event_dedupe_older_than(days=3)
+        last_prune = float(getattr(run_once, "_last_prune_ts", 0.0) or 0.0)
+        if (not last_prune) or ((time.time() - last_prune) >= float(PRUNE_INTERVAL_SEC)):
+            prune_event_dedupe_older_than(days=3)
+            run_once._last_prune_ts = time.time()  # type: ignore[attr-defined]
     except Exception:
         pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+
 
 
 # ─────────────────────────────────────
