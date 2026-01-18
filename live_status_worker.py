@@ -305,8 +305,9 @@ def _db_table_columns(table_name: str) -> set:
 def _normalize_standings_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     /standings 응답을 standings 테이블 upsert용 row list로 평탄화.
-    표준 형태:
-      response[0].league.standings = [[...], [...]] (그룹/컨퍼런스/스테이지별)
+    현재 DB 스키마 기준:
+      PK: (league_id, season, group_name, team_id)
+      cols: rank, points, goals_diff, played, win, draw, lose, goals_for, goals_against, form, updated_utc, description
     """
     out: List[Dict[str, Any]] = []
     resp = (payload or {}).get("response") or []
@@ -327,46 +328,54 @@ def _normalize_standings_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
             team = row.get("team") or {}
             all_ = row.get("all") or {}
-            goals = all_.get("goals") or {}
+            goals = (all_.get("goals") or {}) if isinstance(all_, dict) else {}
 
-            team_name = safe_text(team.get("name")) or ""
-            team_name = team_name.strip()
-            if not team_name:
+            team_id = safe_int(team.get("id"))
+            if team_id is None:
                 continue
 
             rank = safe_int(row.get("rank")) or 0
-            played = safe_int(all_.get("played")) or 0
-            win = safe_int(all_.get("win")) or 0
-            draw = safe_int(all_.get("draw")) or 0
-            loss = safe_int(all_.get("lose")) or 0
-            gf = safe_int(goals.get("for")) or 0
-            ga = safe_int(goals.get("against")) or 0
-            gd = safe_int(row.get("goalsDiff"))
-            if gd is None:
-                gd = gf - ga
-            points = safe_int(row.get("points")) or 0
+            played = safe_int(all_.get("played")) if isinstance(all_, dict) else None
+            win = safe_int(all_.get("win")) if isinstance(all_, dict) else None
+            draw = safe_int(all_.get("draw")) if isinstance(all_, dict) else None
+            lose = safe_int(all_.get("lose")) if isinstance(all_, dict) else None
 
-            group_name = safe_text(row.get("group"))  # 일부 리그에서만
-            form = safe_text(row.get("form"))         # 일부 리그에서만
+            goals_for = safe_int(goals.get("for")) if isinstance(goals, dict) else None
+            goals_against = safe_int(goals.get("against")) if isinstance(goals, dict) else None
+
+            goals_diff = safe_int(row.get("goalsDiff"))
+            if goals_diff is None and goals_for is not None and goals_against is not None:
+                goals_diff = goals_for - goals_against
+
+            points = safe_int(row.get("points"))
+
+            # API row에 group이 없으면 DB 기본값(Overall)로 맞추되,
+            # PK에 포함이므로 None이면 "Overall"로 강제
+            group_name = (safe_text(row.get("group")) or "Overall").strip() or "Overall"
+
+            form = safe_text(row.get("form"))
+            description = safe_text(row.get("description"))
 
             out.append(
                 {
-                    "team_name": team_name,
+                    "group_name": group_name,
                     "rank": rank,
+                    "team_id": int(team_id),
+                    "points": points,
+                    "goals_diff": goals_diff,
                     "played": played,
                     "win": win,
                     "draw": draw,
-                    "loss": loss,
-                    "gf": gf,
-                    "ga": ga,
-                    "gd": gd,
-                    "points": points,
-                    "group_name": group_name,
+                    "lose": lose,
+                    "goals_for": goals_for,
+                    "goals_against": goals_against,
                     "form": form,
+                    "description": description,
                 }
             )
 
     return out
+
 
 
 def refresh_standings_for_league(
@@ -418,14 +427,31 @@ def refresh_standings_for_league(
         last_map[key] = now_ts
         return
 
-    base_cols = ["league_id", "season", "team_name", "rank", "played", "win", "draw", "loss", "gf", "ga", "gd", "points"]
+    # ✅ 현재 DB standings 스키마 기준으로 컬럼 구성
+    # PK: (league_id, season, group_name, team_id)
+    base_cols = ["league_id", "season", "group_name", "team_id", "rank"]
+
     opt_cols: List[str] = []
-    if "group_name" in cols:
-        opt_cols.append("group_name")
-    if "form" in cols:
-        opt_cols.append("form")
+    # 아래 컬럼들은 테이블에 있으면 넣고, 없으면 안전하게 제외
+    for c in (
+        "points",
+        "goals_diff",
+        "played",
+        "win",
+        "draw",
+        "lose",
+        "goals_for",
+        "goals_against",
+        "form",
+        "updated_utc",
+        "description",
+    ):
+        if c in cols:
+            opt_cols.append(c)
 
     use_cols = base_cols + opt_cols
+
+    now_updated_utc = iso_utc(now_utc())
 
     placeholders: List[str] = []
     values: List[Any] = []
@@ -436,19 +462,21 @@ def refresh_standings_for_league(
                 values.append(int(league_id))
             elif c == "season":
                 values.append(int(season))
+            elif c == "updated_utc":
+                values.append(now_updated_utc)
             else:
                 values.append(r.get(c))
 
     set_parts: List[str] = []
     for c in use_cols:
-        if c in ("league_id", "season", "team_name"):
+        if c in ("league_id", "season", "group_name", "team_id"):
             continue
         set_parts.append(f"{c}=EXCLUDED.{c}")
 
     sql = f"""
     INSERT INTO standings ({", ".join(use_cols)})
     VALUES {", ".join(placeholders)}
-    ON CONFLICT (league_id, season, team_name)
+    ON CONFLICT (league_id, season, group_name, team_id)
     DO UPDATE SET {", ".join(set_parts)}
     """
 
@@ -457,6 +485,7 @@ def refresh_standings_for_league(
         print(f"      [standings] refreshed league={league_id} season={season} rows={len(rows)}")
     except Exception as e:
         print(f"      [standings] upsert err league={league_id} season={season}: {e}", file=sys.stderr)
+
 
     last_map[key] = now_ts
 
