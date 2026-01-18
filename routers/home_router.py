@@ -155,14 +155,8 @@ def route_team_info():
 @home_bp.route("/team_insights_overall")
 def route_team_insights_overall():
     """
-    Insights Overall 탭 전용 엔드포인트.
-
-    Query:
-      - league_id: 리그 ID (필수)
-      - team_id  : 팀 ID (필수)
-      - season   : 시즌 (선택, 없으면 최신 시즌)
-      - comp     : Competition 필터 (선택, 예: "League", "Cup")
-      - last_n   : "Last 3", "Last 5" 등 (선택)
+    ✅ 완전무결:
+    - season이 오염돼도(2027/20262027 등) DB 기준으로 보정 후 조회
     """
     league_id: Optional[int] = request.args.get("league_id", type=int)
     team_id: Optional[int] = request.args.get("team_id", type=int)
@@ -173,6 +167,10 @@ def route_team_insights_overall():
     season: Optional[int] = request.args.get("season", type=int)
     comp: Optional[str] = request.args.get("comp", type=str)
     last_n: Optional[str] = request.args.get("last_n", type=str)
+
+    # ✅ season 보정(없어도 됨 / 틀려도 DB 기준으로 고정)
+    from leaguedetail.seasons_block import resolve_season_for_league
+    season = resolve_season_for_league(league_id=int(league_id), season=season)
 
     row = get_team_insights_overall_with_filters(
         team_id=team_id,
@@ -185,6 +183,7 @@ def route_team_insights_overall():
         return jsonify({"ok": False, "error": "not_found"}), 404
 
     return jsonify({"ok": True, "row": row})
+
 
 
 # ─────────────────────────────────────

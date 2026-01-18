@@ -7,8 +7,10 @@
 #   * /fixtures/lineups  → match_lineups
 #   * /fixtures/statistics → match_team_stats
 #   * /fixtures/players  → match_player_stats
+#   * /standings         → standings (league+season)
 #
 # 특징:
+
 # - 이미 백필된 경기(match_events에 row 존재)는 스킵
 # - LIVE_LEAGUES env 에 포함된 리그만 대상
 # - 스키마 변경 없음
@@ -130,14 +132,25 @@ def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry
 
 
 def _status_group_from_short(short: Optional[str]) -> str:
-    s = (short or "").upper()
+    s = (short or "").upper().strip()
+
     if s in ("FT", "AET", "PEN"):
         return "FINISHED"
+
+    # 라이브 워커와 동일하게 맞춤
     if s in ("NS", "TBD"):
-        return "SCHEDULED"
-    if s in ("PST", "CANC", "ABD", "AWD", "WO"):
-        return "CANCELLED"
-    return "LIVE"
+        return "UPCOMING"
+
+    # INPLAY(HT 포함)
+    if s in ("1H", "2H", "ET", "P", "BT", "INT", "LIVE", "HT"):
+        return "INPLAY"
+
+    # 연기/취소/중단 등
+    if s in ("PST", "CANC", "ABD", "AWD", "WO", "SUSP"):
+        return "OTHER"
+
+    return "OTHER"
+
 
 
 def _extract_fixture_basic(fx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -260,6 +273,31 @@ def fetch_player_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
     data = _safe_get("/fixtures/players", params={"fixture": fixture_id})
     rows = data.get("response", []) or []
     return [r for r in rows if isinstance(r, dict)]
+
+def fetch_standings_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
+    # API-Sports standings는 보통 response[0].league.standings 가 "리스트의 리스트" 구조
+    data = _safe_get("/standings", params={"league": league_id, "season": int(season)})
+    resp = data.get("response") or []
+    if not resp or not isinstance(resp, list) or not isinstance(resp[0], dict):
+        return []
+
+    league = (resp[0].get("league") or {})
+    standings = league.get("standings") or []
+    if not isinstance(standings, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for group in standings:
+        # group: 보통 List[Dict] (그룹/컨퍼런스/Overall 등)
+        if isinstance(group, list):
+            for row in group:
+                if isinstance(row, dict):
+                    out.append(row)
+        elif isinstance(group, dict):
+            # 혹시 단일 dict로 오는 예외 케이스
+            out.append(group)
+    return out
+
 
 
 # ─────────────────────────────────────
@@ -550,6 +588,70 @@ def upsert_match_player_stats(fixture_id: int, players_stats: List[Dict[str, Any
                 (fixture_id, int(player_id), json.dumps(p, ensure_ascii=False)),
             )
 
+def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]]) -> None:
+    # standings는 league+season 단위 최종본 목적 → 통째로 교체(스테일 팀/그룹 제거)
+    execute("DELETE FROM standings WHERE league_id = %s AND season = %s", (int(league_id), int(season)))
+
+    updated_utc = now_utc().isoformat()
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+
+        rank = r.get("rank")
+        team_id = (r.get("team") or {}).get("id")
+
+        # NOT NULL 컬럼들 방어
+        if rank is None or team_id is None:
+            continue
+
+        group_name = (r.get("group") or "Overall")
+        points = r.get("points")
+        goals_diff = r.get("goalsDiff")
+
+        all_ = r.get("all") or {}
+        played = all_.get("played")
+        win = all_.get("win")
+        draw = all_.get("draw")
+        lose = all_.get("lose")
+
+        goals = all_.get("goals") or {}
+        goals_for = goals.get("for")
+        goals_against = goals.get("against")
+
+        form = r.get("form")
+        description = r.get("description")
+
+        execute(
+            """
+            INSERT INTO standings (
+                league_id, season, group_name, rank, team_id,
+                points, goals_diff, played, win, draw, lose,
+                goals_for, goals_against, form, updated_utc, description
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (league_id, season, group_name, team_id) DO UPDATE SET
+                rank = EXCLUDED.rank,
+                points = EXCLUDED.points,
+                goals_diff = EXCLUDED.goals_diff,
+                played = EXCLUDED.played,
+                win = EXCLUDED.win,
+                draw = EXCLUDED.draw,
+                lose = EXCLUDED.lose,
+                goals_for = EXCLUDED.goals_for,
+                goals_against = EXCLUDED.goals_against,
+                form = EXCLUDED.form,
+                updated_utc = EXCLUDED.updated_utc,
+                description = EXCLUDED.description
+            """,
+            (
+                int(league_id), int(season), str(group_name), int(rank), int(team_id),
+                points, goals_diff, played, win, draw, lose,
+                goals_for, goals_against, form, updated_utc, description
+            ),
+        )
+
+
 
 # ─────────────────────────────────────
 #  이미 백필된 경기인지 체크
@@ -582,6 +684,19 @@ def has_team_stats(fixture_id: int) -> bool:
 
 def has_player_stats(fixture_id: int) -> bool:
     return _has_any_row("match_player_stats", fixture_id)
+
+def has_standings(league_id: int, season: int) -> bool:
+    row = fetch_one(
+        """
+        SELECT 1
+        FROM standings
+        WHERE league_id = %s AND season = %s
+        LIMIT 1
+        """,
+        (int(league_id), int(season)),
+    )
+    return row is not None
+
 
 
 
@@ -655,26 +770,98 @@ def main() -> None:
     total_new = 0
     total_skipped = 0
 
+    fetched_standings_keys = set()  # (league_id, season) 중복 호출 방지
+
     for target_date in target_dates:
         for lid in live_leagues:
             try:
                 season_guess = pick_season_for_date(lid, target_date)
+
+                # ✅ standings는 league+season 단위. season_guess가 틀릴 수 있어 fallback 시도
+                if season_guess is not None:
+                    # 후보 시즌: guess, guess+1, guess-1, 그리고 leagues API의 current 시즌(있으면)
+                    seasons_to_try: List[int] = []
+
+                    try:
+                        seasons_to_try.append(int(season_guess))
+                        seasons_to_try.append(int(season_guess) + 1)
+                        seasons_to_try.append(int(season_guess) - 1)
+
+                        # current 시즌 추가
+                        seasons_meta = fetch_league_seasons(int(lid))
+                        for sm in seasons_meta:
+                            if sm.get("current") is True and sm.get("year") is not None:
+                                try:
+                                    seasons_to_try.append(int(sm["year"]))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                    # 정리(중복 제거 + 비정상 연도 제거)
+                    seasons_clean: List[int] = []
+                    seen = set()
+                    for y in seasons_to_try:
+                        if not isinstance(y, int):
+                            continue
+                        if y < 1900 or y > 2100:
+                            continue
+                        if y in seen:
+                            continue
+                        seen.add(y)
+                        seasons_clean.append(y)
+
+                    inserted = False
+
+                    for y in seasons_clean:
+                        skey = (int(lid), int(y))
+
+                        # 이미 이번 실행에서 성공적으로 넣은 시즌이면 스킵
+                        if skey in fetched_standings_keys:
+                            continue
+
+                        need_st = force or (not has_standings(int(lid), int(y)))
+                        if not need_st:
+                            # 이미 DB에 있으면 이번엔 굳이 안 받음
+                            fetched_standings_keys.add(skey)
+                            continue
+
+                        try:
+                            st_rows = fetch_standings_from_api(int(lid), int(y))
+                            if st_rows:
+                                upsert_standings_rows(int(lid), int(y), st_rows)
+                                fetched_standings_keys.add(skey)
+                                print(f"    * standings league={lid} season={y}: rows={len(st_rows)}")
+                                inserted = True
+                                break
+                            else:
+                                # ✅ empty면 캐시로 막지 말고 다음 후보 시즌을 계속 시도
+                                print(f"    ! standings league={lid} season={y}: empty response", file=sys.stderr)
+                                continue
+                        except Exception as se:
+                            print(f"    ! standings league={lid} season={y} 에러: {se}", file=sys.stderr)
+                            continue
+
+                    # inserted=False면 정말로 API에 standings가 없거나(컵 등) 시즌이 더 다를 수 있음
+
                 fixtures = fetch_fixtures_from_api(lid, target_date, season_guess)
+
                 print(f"  - date={target_date} league {lid}: season={season_guess} fixtures={len(fixtures)}")
+
 
                 for fx in fixtures:
                     basic = _extract_fixture_basic(fx)
                     if basic is None:
                         continue
-                    if basic.get("status_group") != "FINISHED":
-                        continue
 
                     fixture_id = basic["fixture_id"]
+                    sg = (basic.get("status_group") or "").strip()
 
                     season = basic.get("season") or season_guess
                     if season is None:
                         continue
 
+                    # ✅ 모든 상태(NS/INPLAY/FINISHED 포함)에서 fixtures/matches/raw는 항상 업서트
                     fx_full = fetch_fixture_by_id(fixture_id) or fx
 
                     try:
@@ -685,6 +872,10 @@ def main() -> None:
                     upsert_fixture_row(fx_full, lid, int(season))
                     upsert_match_row(fx_full, lid, int(season))
 
+                    # ✅ 무거운 백필은 FINISHED만 (기존 정책 유지)
+                    if sg != "FINISHED":
+                        continue
+
                     need_events = force or (not has_match_events(fixture_id))
                     need_lineups = force or (not has_lineups(fixture_id))
                     need_team_stats = force or (not has_team_stats(fixture_id))
@@ -693,6 +884,7 @@ def main() -> None:
                     if not (need_events or need_lineups or need_team_stats or need_player_stats):
                         total_skipped += 1
                         continue
+
 
                     todo = []
                     if need_events:

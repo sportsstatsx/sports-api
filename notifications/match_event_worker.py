@@ -44,6 +44,51 @@ STATUS_ORDER: Dict[str, int] = {
     "FT": 80,
 }
 
+def _normalize_fixture_status(status: str, status_group: str | None) -> str:
+    """
+    ✅ fixtures 기준으로만 status를 정규화
+    - status_group이 FINISHED면 status가 애매해도 FT로 처리(종료 알림/차단 안정화)
+    - status_group=INPLAY인데 status가 누락(NS/TBD/빈값)이면 LIVE로 보정
+    - HT는 group/status 둘 중 하나라도 HT면 HT
+    """
+    st = (status or "").strip()
+    sg = (status_group or "").strip().upper()
+
+    if sg in ("FINISHED", "FT"):
+        if st in ("FT", "AET"):
+            return st
+        return "FT"
+
+    if st == "HT" or sg == "HT":
+        return "HT"
+
+    if sg == "INPLAY" and st in ("", "NS", "TBD"):
+        return "LIVE"
+
+    return st
+
+
+def load_match_elapsed(match_id: int) -> int | None:
+    """
+    fixtures에서 내려오는 elapsed(= matches.elapsed)를 사용.
+    (득점/레드카드 알림에 분 표기용으로만 사용)
+    """
+    row = fetch_one(
+        """
+        SELECT elapsed
+        FROM matches
+        WHERE fixture_id = %s
+        """,
+        (match_id,),
+    )
+    if not row or row.get("elapsed") is None:
+        return None
+    try:
+        return int(row["elapsed"])
+    except Exception:
+        return None
+
+
 
 def get_subscribed_matches() -> List[int]:
     rows = fetch_all(
@@ -54,72 +99,227 @@ def get_subscribed_matches() -> List[int]:
     )
     return [int(r["match_id"]) for r in rows]
 
+def calc_score_from_db_events(
+    rows: List[Dict[str, Any]],
+    home_id: int,
+    away_id: int,
+    hint_home_ft: int,
+    hint_away_ft: int,
+) -> Tuple[int, int]:
+    """
+    DB의 match_events(Goal/Var)로부터 타임라인 규칙 기반 스코어를 계산.
+    - Missed Penalty 제외
+    - Var(Goal Disallowed/Cancelled/No Goal)로 직전 골 취소 처리(보수적)
+    - Own Goal은 team_id를 반대로 뒤집어 1점 처리(타임라인과 동일한 의도)
+    """
+    def _norm(s: Any) -> str:
+        if s is None:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        return x
+
+    invalid_markers = ("cancel", "disallow", "no goal", "offside", "foul", "annul", "null")
+
+    # goals: {team_id, is_og, minute, extra, cancelled}
+    goals: List[Dict[str, Any]] = []
+
+    # 이미 rows가 정렬되어 들어온다고 가정(혹시 몰라 한번 더)
+    def _key(r: Dict[str, Any]) -> Tuple[int, int, int]:
+        m = r.get("minute")
+        e = r.get("extra")
+        i = r.get("id")
+        mm = int(m) if m is not None else 10**9
+        ee = int(e) if e is not None else 0
+        ii = int(i) if i is not None else 0
+        return (mm, ee, ii)
+
+    evs = sorted(rows or [], key=_key)
+
+    def _add_goal(r: Dict[str, Any]) -> None:
+        detail = _norm(r.get("detail"))
+
+        # 실축PK 제외
+        if "missed penalty" in detail:
+            return
+        if ("miss" in detail) and ("pen" in detail):
+            return
+
+        # Goal.detail에 취소/무효 문구가 붙는(드문) 케이스 방어(OG는 예외)
+        if any(m in detail for m in invalid_markers) and ("own goal" not in detail):
+            return
+
+        tid = r.get("team_id")
+        if tid is None:
+            return
+        team_id = int(tid)
+
+        minute = int(r.get("minute") or 0) if r.get("minute") is not None else 0
+        extra = int(r.get("extra") or 0)
+
+        is_og = ("own goal" in detail)
+
+        goals.append(
+            {
+                "team_id": team_id,
+                "is_og": bool(is_og),
+                "minute": minute,
+                "extra": extra,
+                "cancelled": False,
+            }
+        )
+
+    def _apply_var(r: Dict[str, Any]) -> None:
+        detail = _norm(r.get("detail"))
+        if not detail:
+            return
+
+        is_disallow = ("goal disallowed" in detail) or ("goal cancelled" in detail) or ("no goal" in detail)
+        if not is_disallow:
+            return
+
+        var_team_id = r.get("team_id")
+        var_team_id = int(var_team_id) if var_team_id is not None else None
+        var_minute = r.get("minute")
+        if var_minute is None:
+            return
+        var_elapsed = int(var_minute)
+
+        # 보수적 취소: 같은 분(우선) -> +-1 -> +-2 범위에서 직전 골 취소
+        def _pick_cancel_idx(max_delta: int) -> int | None:
+            best: int | None = None
+            for i in range(len(goals) - 1, -1, -1):
+                g = goals[i]
+                if g.get("cancelled"):
+                    continue
+                g_el = g.get("minute")
+                if g_el is None:
+                    continue
+                if abs(int(g_el) - var_elapsed) > max_delta:
+                    continue
+
+                if var_team_id is not None:
+                    if int(g.get("team_id")) == var_team_id:
+                        return i
+                    if best is None:
+                        best = i
+                else:
+                    return i
+            return best
+
+        idx = _pick_cancel_idx(0)
+        if idx is None:
+            idx = _pick_cancel_idx(1)
+        if idx is None:
+            idx = _pick_cancel_idx(2)
+
+        if idx is not None:
+            goals[idx]["cancelled"] = True
+
+    for r in evs:
+        t = _norm(r.get("type"))
+        if t == "goal":
+            _add_goal(r)
+        elif t == "var":
+            _apply_var(r)
+
+    def _sum_scores() -> Tuple[int, int]:
+        h = 0
+        a = 0
+        for g in goals:
+            if g.get("cancelled"):
+                continue
+            tid = int(g.get("team_id"))
+            is_og = bool(g.get("is_og"))
+
+            scoring_tid = tid
+            if is_og:
+                if tid == home_id:
+                    scoring_tid = away_id
+                elif tid == away_id:
+                    scoring_tid = home_id
+
+            if scoring_tid == home_id:
+                h += 1
+            elif scoring_tid == away_id:
+                a += 1
+        return h, a
+
+    h, a = _sum_scores()
+
+    # hint는 "OG flip 방향이 섞이는 공급자 케이스"까지 완벽히 잡으려면 필요하지만,
+    # 지금은 알림 worker에서 타임라인과 동일하게 OG를 반대로 처리하는 게 1차 목표라
+    # hint는 참고용으로만 둔다(필요 시 여기서 분기 확장 가능).
+    return h, a
+
+
 
 def load_current_match_state(match_id: int) -> MatchState | None:
     """
-    현재 match_id 경기의 상태를 DB에서 읽어서 MatchState로 반환한다.
+    ✅ fixtures 기준으로만 현재 상태를 읽는다.
 
-    - 골 수는 matches.home_ft / matches.away_ft 사용
-    - 레드카드는 match_events(type='Card', detail IN (...)) 를
-      홈/원정팀별로 COUNT 해서 계산
-
-    ✅ 개선(동작 동일):
-    - 홈/원정 레드카드 COUNT 서브쿼리 2개를 1회 JOIN+집계로 축소(폴링 부하 감소)
+    - 스코어: matches.home_ft / away_ft (=/fixtures 기반)
+    - status: matches.status (+ matches.status_group 보정)
+    - 레드카드: match_live_state.home_red / away_red "만" 사용 (없으면 0)
+      -> match_events는 레드카드 판단에 사용하지 않는다.
     """
-    row = fetch_one(
+    base = fetch_one(
         """
         SELECT
             m.fixture_id AS match_id,
             m.status     AS status,
+            m.status_group AS status_group,
+            m.home_id    AS home_id,
+            m.away_id    AS away_id,
             COALESCE(m.home_ft, 0) AS home_goals,
-            COALESCE(m.away_ft, 0) AS away_goals,
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN e.type = 'Card'
-                         AND e.detail IN ('Red Card', 'Second Yellow Card')
-                         AND e.team_id = m.home_id
-                        THEN 1 ELSE 0
-                    END
-                ),
-                0
-            ) AS home_red,
-            COALESCE(
-                SUM(
-                    CASE
-                        WHEN e.type = 'Card'
-                         AND e.detail IN ('Red Card', 'Second Yellow Card')
-                         AND e.team_id = m.away_id
-                        THEN 1 ELSE 0
-                    END
-                ),
-                0
-            ) AS away_red
+            COALESCE(m.away_ft, 0) AS away_goals
         FROM matches m
-        LEFT JOIN match_events e
-               ON e.fixture_id = m.fixture_id
-              AND e.type = 'Card'
-              AND e.detail IN ('Red Card', 'Second Yellow Card')
-              AND e.team_id IN (m.home_id, m.away_id)
         WHERE m.fixture_id = %s
-        GROUP BY
-            m.fixture_id, m.status, m.home_ft, m.away_ft
         """,
         (match_id,),
     )
 
-    if not row:
-        # 해당 match_id 경기 자체가 없으면 None
+    if not base:
         return None
 
-    return MatchState(
-        match_id=int(row["match_id"]),
-        status=str(row["status"]) if row["status"] is not None else "",
-        home_goals=int(row["home_goals"] or 0),
-        away_goals=int(row["away_goals"] or 0),
-        home_red=int(row["home_red"] or 0),
-        away_red=int(row["away_red"] or 0),
+    # fixtures 기반 status 정규화
+    eff_status = _normalize_fixture_status(
+        str(base["status"]) if base.get("status") is not None else "",
+        str(base["status_group"]) if base.get("status_group") is not None else "",
     )
+
+    # ✅ 레드카드는 match_live_state만
+    home_red = 0
+    away_red = 0
+    try:
+        r = fetch_one(
+            """
+            SELECT
+                COALESCE(home_red, 0) AS home_red,
+                COALESCE(away_red, 0) AS away_red
+            FROM match_live_state
+            WHERE fixture_id = %s
+            """,
+            (match_id,),
+        )
+        if r:
+            home_red = int(r.get("home_red") or 0)
+            away_red = int(r.get("away_red") or 0)
+    except Exception:
+        # 테이블이 없거나 조회 실패해도 "0"으로만 간다(요구사항: match_live_state만 본다)
+        home_red = 0
+        away_red = 0
+
+    return MatchState(
+        match_id=int(base["match_id"]),
+        status=eff_status,
+        home_goals=int(base.get("home_goals") or 0),
+        away_goals=int(base.get("away_goals") or 0),
+        home_red=int(home_red),
+        away_red=int(away_red),
+    )
+
+
 
 
 
@@ -228,65 +428,28 @@ def load_match_labels(match_id: int) -> Dict[str, Any]:
 
 def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
     """
-    마지막 득점 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
-    - match_events 에서 type='Goal' 인 것만 대상으로,
-      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    ✅ 요구사항 반영:
+    - 득점 시각을 match_events에서 찾지 않는다.
+    - fixtures(=matches.elapsed)만 사용한다.
+    - extra(추가시간)는 fixtures에 없으니 0으로 둔다.
     """
-    row = fetch_one(
-        """
-        SELECT
-            minute,
-            COALESCE(extra, 0) AS extra
-        FROM match_events
-        WHERE fixture_id = %s
-          AND type = 'Goal'
-        ORDER BY minute DESC NULLS LAST,
-                 extra DESC NULLS LAST,
-                 id DESC
-        LIMIT 1
-        """,
-        (match_id,),
-    )
-
-    if not row or row["minute"] is None:
+    el = load_match_elapsed(match_id)
+    if el is None or el <= 0:
         return None
+    return {"minute": int(el), "extra": 0}
 
-    return {
-        "minute": int(row["minute"]),
-        "extra": int(row["extra"] or 0),
-    }
 
 def load_last_redcard_minute(match_id: int) -> Dict[str, int] | None:
     """
-    마지막 레드카드 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
-    - match_events 에서 type='Card'
-      AND detail IN ('Red Card', 'Second Yellow Card') 인 것만 대상으로,
-      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    ✅ 요구사항 반영:
+    - 레드카드 시각도 match_events에서 찾지 않는다.
+    - fixtures(=matches.elapsed)만 사용한다.
     """
-    row = fetch_one(
-        """
-        SELECT
-            minute,
-            COALESCE(extra, 0) AS extra
-        FROM match_events
-        WHERE fixture_id = %s
-          AND type = 'Card'
-          AND detail IN ('Red Card', 'Second Yellow Card')
-        ORDER BY minute DESC NULLS LAST,
-                 extra DESC NULLS LAST,
-                 id DESC
-        LIMIT 1
-        """,
-        (match_id,),
-    )
-
-    if not row or row["minute"] is None:
+    el = load_match_elapsed(match_id)
+    if el is None or el <= 0:
         return None
+    return {"minute": int(el), "extra": 0}
 
-    return {
-        "minute": int(row["minute"]),
-        "extra": int(row["extra"] or 0),
-    }
 
 
 def load_new_goal_disallowed_events(match_id: int, last_event_id: int) -> List[Dict[str, Any]]:
@@ -342,121 +505,88 @@ def apply_monotonic_state(
     old_rank = STATUS_ORDER.get(old_status, 0)
     new_rank = STATUS_ORDER.get(new_status, 0)
 
+    # status만 단조 보정
     if new_rank < old_rank:
         effective_status = old_status
     else:
         effective_status = new_status
 
-    if allow_goal_decrease:
-        eff_home_goals = current.home_goals
-        eff_away_goals = current.away_goals
-    else:
-        eff_home_goals = max(last.home_goals, current.home_goals)
-        eff_away_goals = max(last.away_goals, current.away_goals)
-
+    # ✅ goals는 max 금지 (가짜 스코어 합성의 근본 원인)
+    # event 기반 스코어는 VAR로 감소할 수 있고, 그게 정상 동작이다.
     return MatchState(
         match_id=current.match_id,
         status=effective_status,
-        home_goals=eff_home_goals,
-        away_goals=eff_away_goals,
+        home_goals=current.home_goals,
+        away_goals=current.away_goals,
         home_red=max(last.home_red, current.home_red),
         away_red=max(last.away_red, current.away_red),
     )
 
 
 
+
 def diff_events(old: MatchState | None, new: MatchState) -> List[Tuple[str, Dict[str, Any]]]:
     events: List[Tuple[str, Dict[str, Any]]] = []
 
-    # 첫 상태 저장용 (알림 X)
     if old is None:
         return events
 
     old_status = old.status or ""
     new_status = new.status or ""
 
-    # ✅ 이미 진짜로 끝난 경기(FT/AET)이면 아무 것도 안 함
-    # PEN 은 여기서 제외해야 PEN → FT/AET 전환 시 알림을 보낼 수 있음
     if old_status in ("FT", "AET"):
         return events
 
-    # ==========================
-    # 1) Kickoff (완화된 기준)
-    # ==========================
+    # 1) Kickoff (fixtures status 전환 기반)
     if old_status in ("", "NS", "TBD") and new_status not in ("", "NS", "TBD"):
         events.append(("kickoff", {}))
 
-    # ==========================
     # 2) Half-time
-    # ==========================
     if new_status == "HT" and old_status != "HT":
         events.append(("ht", {}))
 
-    # ==========================
     # 3) Second half start
-    # ==========================
     if old_status == "HT" and new_status in ("2H", "LIVE"):
         events.append(("2h_start", {}))
 
-    # ==========================
-    # 4) 연장 / 승부차기 / 최종 종료 흐름
-    # ==========================
-
-    # 4-1) 2H(또는 기타) → ET : 연장 시작
+    # 4) ET/PEN/FT 흐름
     if old_status not in ("ET", "AET", "P", "PEN") and new_status == "ET":
         events.append(("et_start", {}))
 
-    # 4-2) ET → AET/FT : 연장 종료 + 최종 종료
     if old_status == "ET" and new_status in ("AET", "FT"):
         events.append(("et_end", {}))
         events.append(("ft", {}))
 
-    # 4-3) ET → P/PEN : 연장 종료 + 승부차기 시작
     if old_status == "ET" and new_status in ("P", "PEN"):
         events.append(("et_end", {}))
         events.append(("pen_start", {}))
 
-    # 4-4) P/PEN → FT/AET : 승부차기 종료 + 최종 종료
     if old_status in ("P", "PEN") and new_status in ("FT", "AET"):
         events.append(("pen_end", {}))
         events.append(("ft", {}))
 
-    # ✅ (버그 수정) "FT/AET 전환"은 score/redcard 등 다른 이벤트가 있어도 누락되면 안 됨
     ft_transition = (old_status not in ("FT", "AET")) and (new_status in ("FT", "AET"))
     if ft_transition:
-        already_has_ft = any(ev[0] == "ft" for ev in events)
-        if not already_has_ft:
+        if not any(ev[0] == "ft" for ev in events):
             events.append(("ft", {}))
 
-    # ==========================
-    # 5) Goal (증가만 감지)
-    # ==========================
-    if new.home_goals > old.home_goals or new.away_goals > old.away_goals:
-        events.append(
-            (
-                "score",
-                {
-                    "old_home": old.home_goals,
-                    "old_away": old.away_goals,
-                },
-            )
-        )
+    # ✅ score: fixtures 스코어 변화로 감지
+    if (new.home_goals != old.home_goals) or (new.away_goals != old.away_goals):
+        payload = {"old_home": old.home_goals, "old_away": old.away_goals}
 
-    # ==========================
-    # 6) Red card (증가만 감지)
-    # ==========================
+        # 감소/정정은 별도 이벤트로(선택 알림)
+        if (new.home_goals < old.home_goals) or (new.away_goals < old.away_goals):
+            events.append(("score_correction", payload))
+        else:
+            events.append(("score", payload))
+
+    # ✅ Red card: match_live_state 값 증가만 감지
     if new.home_red > old.home_red or new.away_red > old.away_red:
-        events.append(
-            (
-                "redcard",
-                {
-                    "old_home": old.home_red,
-                    "old_away": old.away_red,
-                },
-            )
-        )
+        events.append(("redcard", {"old_home": old.home_red, "old_away": old.away_red}))
 
     return events
+
+
 
 
 
@@ -469,6 +599,7 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
     ✅ 개선:
     - fcm_token NULL/빈값/공백 제거 (FCM 예외로 인한 무한 재전송/반복 스팸 방지에 핵심)
     - DISTINCT 로 중복 토큰 제거
+    - score 정정 알림(score_correction)도 notify_score 옵션에 묶음
     """
     option_column = {
         # 킥오프 관련
@@ -477,7 +608,8 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
 
         # 득점 / 카드
         "score": "notify_score",
-        "goal_disallowed": "notify_score",  # ✅ 골 무효(VAR)도 득점 알림 옵션에 묶음
+        "score_correction": "notify_score",  # ✅ 스코어 정정 알림(선택 기능)
+        "goal_disallowed": "notify_score",   # ✅ 골 무효(VAR)도 득점 알림 옵션에 묶음
         "redcard": "notify_redcard",
 
         # 전/후반
@@ -523,6 +655,7 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
 
 
 
+
 def build_message(
     event_type: str,
     match: MatchState,
@@ -535,6 +668,7 @@ def build_message(
     - 리그 이름은 문구에서 제외 (요청 사항)
     - 득점/레드카드에는 팀 이름 + 이모지 포함
     - HT/2H/FT 는 타이틀 한 줄 + 바디에 스코어
+    - ✅ score_correction(스코어 정정) 알림 지원
     """
     home_name = labels.get("home_name", "Home")
     away_name = labels.get("away_name", "Away")
@@ -587,6 +721,17 @@ def build_message(
     # Penalty shoot-out end
     if event_type == "pen_end":
         title = "⏱ Penalties End"
+        body = score_line
+        return (title, body)
+
+    # ✅ Score correction
+    if event_type == "score_correction":
+        old_home = extra.get("old_home")
+        old_away = extra.get("old_away")
+        if old_home is not None and old_away is not None:
+            title = f"🔄 Score corrected ({int(old_home)}–{int(old_away)} → {match.home_goals}–{match.away_goals})"
+        else:
+            title = "🔄 Score corrected"
         body = score_line
         return (title, body)
 
@@ -683,13 +828,11 @@ def build_message(
         body = score_line
         return (title, body)
 
-
-
-
     # Fallback
     title = "Match update"
     body = score_line
     return (title, body)
+
 
 
 def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
@@ -789,14 +932,57 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
 
 
 def process_match(fcm: FCMClient, match_id: int) -> None:
+    # ✅ fixtures 기반(=matches에서 읽음) + red는 match_live_state만
     current_raw = load_current_match_state(match_id)
     if not current_raw:
         log.info("match_id=%s current state not found, skip", match_id)
         return
 
+    # ✅ 종료면: 알림 자체는 더 이상 안 보냄 + 플래그 잠금
+    # (score/카드/킥오프/HT/FT 전부 fixtures 기반이라, match_events Goal 포인터는 불필요)
+    if (current_raw.status or "") in ("FT", "AET"):
+        save_state(current_raw)
+
+        # VAR(Goal Disallowed)만 기존대로 포인터 폭탄 방지용으로 당김
+        vx = fetch_one(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Var'
+              AND detail ILIKE 'Goal Disallowed%%'
+            """,
+            (match_id,),
+        )
+        max_dis_id = int(vx["max_id"] or 0) if vx else 0
+
+        execute(
+            """
+            UPDATE match_notification_state
+            SET
+              kickoff_sent = TRUE,
+              kickoff_10m_sent = TRUE,
+              halftime_sent = TRUE,
+              secondhalf_sent = TRUE,
+              fulltime_sent = TRUE,
+              extra_time_start_sent = TRUE,
+              extra_time_halftime_sent = TRUE,
+              extra_time_secondhalf_sent = TRUE,
+              extra_time_end_sent = TRUE,
+              penalties_start_sent = TRUE,
+              penalties_end_sent = TRUE,
+
+              last_goal_disallowed_event_id = %s,
+
+              updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (max_dis_id, match_id),
+        )
+        return
+
     last = load_last_state(match_id)
 
-    # ✅ state row 존재 여부(먼저 확인: last_goal_disallowed_event_id 조회 안정)
     state_exists = fetch_one(
         """
         SELECT 1 AS ok
@@ -806,19 +992,16 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         (match_id,),
     )
 
-    # ✅ state row가 없으면 먼저 생성 + VAR 포인터 초기화(과거 이벤트 폭탄 방지)
+    # ✅ state row 없으면: 현재값으로만 초기화하고 알림은 보내지 않음(폭탄 방지)
     if not state_exists:
-        # 첫 진입은 raw 기준으로 저장(기본값 컬럼들도 함께 생김)
         save_state(current_raw)
 
-        # ✅ kickoff_10m 누락 방지:
-        # 첫 진입 폴링에서 바로 10분 전 창(0~600초)에 들어올 수 있으니
-        # state row 생성 직후 한 번은 즉시 체크/발송 시도한다.
         try:
             maybe_send_kickoff_10m(fcm, current_raw)
         except Exception:
             log.exception("Error while processing kickoff_10m on first state init for match %s", match_id)
 
+        # VAR 포인터만 현재 MAX로 초기화(과거 VAR 폭탄 방지)
         mx = fetch_one(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id
@@ -829,7 +1012,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             """,
             (match_id,),
         )
-        max_id = int(mx["max_id"] or 0) if mx else 0
+        max_dis_id = int(mx["max_id"] or 0) if mx else 0
 
         execute(
             """
@@ -838,95 +1021,27 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 updated_at = NOW()
             WHERE match_id = %s
             """,
-            (max_id, match_id),
+            (max_dis_id, match_id),
         )
-
-        # 첫 루프는 알림(일반 이벤트) 없이 종료 (과거 이벤트 폭탄 방지)
         return
 
-    # ✅ goal disallowed가 새로 들어온 poll이고, raw 스코어가 감소한 경우에만 감소 허용
-    allow_goal_decrease = False
-    try:
-        st0 = fetch_one(
-            """
-            SELECT last_goal_disallowed_event_id
-            FROM match_notification_state
-            WHERE match_id = %s
-            """,
-            (match_id,),
-        )
-        last_dis_id0 = int(st0["last_goal_disallowed_event_id"] or 0) if st0 else 0
+    # ✅ status/red는 단조 보정, score는 fixtures 값 그대로(감소는 score_correction으로 감지)
+    current = apply_monotonic_state(last, current_raw)
 
-        raw_decreased = False
-        if last is not None:
-            raw_decreased = (
-                (current_raw.home_goals < last.home_goals) or
-                (current_raw.away_goals < last.away_goals)
-            )
-
-        has_new_dis = False
-        if raw_decreased:
-            chk = fetch_one(
-                """
-                SELECT 1 AS ok
-                FROM match_events
-                WHERE fixture_id = %s
-                  AND type = 'Var'
-                  AND detail ILIKE 'Goal Disallowed%%'
-                  AND id > %s
-                LIMIT 1
-                """,
-                (match_id, last_dis_id0),
-            )
-            has_new_dis = bool(chk)
-
-        # ✅ 스코어 감소는 "새 VAR가 같은 폴링에 들어오는 경우" 뿐 아니라
-        #    "VAR 이벤트는 이미 처리됐지만, 스코어 정정이 다음 폴링에서 반영되는 경우"도 커버해야 함.
-        #    단, last_dis_id0 > 0 만으로 허용하면 VAR와 무관한 스코어 감소까지 열릴 수 있어서
-        #    실제 Goal Disallowed 이벤트가 존재하는 경기인지 한 번 더 확인한다.
-        has_any_disallowed = False
-        if raw_decreased and not has_new_dis:
-            chk2 = fetch_one(
-                """
-                SELECT 1 AS ok
-                FROM match_events
-                WHERE fixture_id = %s
-                  AND type = 'Var'
-                  AND detail ILIKE 'Goal Disallowed%%'
-                LIMIT 1
-                """,
-                (match_id,),
-            )
-            has_any_disallowed = bool(chk2)
-
-        allow_goal_decrease = raw_decreased and (has_new_dis or has_any_disallowed)
-
-    except Exception:
-        log.exception("Failed to compute allow_goal_decrease for match %s", match_id)
-
-    # ✅ 단조 상태 강제(필요 시 골 감소 허용) — 여기 1번만!
-    current = apply_monotonic_state(last, current_raw, allow_goal_decrease=allow_goal_decrease)
-
-    # 🔹 킥오프 10분 전 알림 시도 (status 가 NS/TBD 인 경우에만 내부에서 처리)
     try:
         maybe_send_kickoff_10m(fcm, current)
     except Exception:
         log.exception("Error while processing kickoff_10m for match %s", match_id)
 
-    events = diff_events(last, current)
-
-    # 팀/리그 이름 라벨을 한 번만 로딩해서 여러 이벤트에 사용
     labels = load_match_labels(match_id)
+    home_id = labels.get("home_id")
+    away_id = labels.get("away_id")
+
+    # elapsed(분 표기) - fixtures 기반
+    elapsed = load_match_elapsed(match_id)
 
     # ==========================
-    # ✅ VAR: Goal Disallowed 처리
-    #  - match_notification_state.last_goal_disallowed_event_id 기준으로
-    #    새로 들어온 Var 이벤트만 알림
-    #
-    # ✅ 개선(스팸 방지):
-    #  - 토큰 문제/FCM 예외 등으로 전송 실패가 나더라도
-    #    동일 event_id 를 10초마다 무한 재전송하지 않도록
-    #    "시도한 이벤트는 포인터를 진전"시킨다.
+    # ✅ VAR: Goal Disallowed 처리 (fixtures에 없으니 match_events 유지)
     # ==========================
     try:
         st = fetch_one(
@@ -942,8 +1057,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             new_dis = load_new_goal_disallowed_events(match_id, last_dis_id)
 
             if new_dis:
-                home_id = labels.get("home_id")
-                away_id = labels.get("away_id")
                 home_name = labels.get("home_name", "Home")
                 away_name = labels.get("away_name", "Away")
 
@@ -954,19 +1067,14 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                     detail = str(ev.get("detail") or "")
                     team_id = ev.get("team_id")
 
-                    if extra_min:
-                        minute_str = f"{minute}+{extra_min}'"
-                    else:
-                        minute_str = f"{minute}'"
+                    minute_str = f"{minute}+{extra_min}'" if extra_min else f"{minute}'"
 
-                    # 사유 추출: "Goal Disallowed - offside" -> "Offside"
                     reason = None
                     if " - " in detail:
                         reason_raw = detail.split(" - ", 1)[1].strip()
                         if reason_raw:
                             reason = reason_raw[:1].upper() + reason_raw[1:]
 
-                    # 어느 팀 이벤트인지 판별
                     if team_id is not None and home_id is not None and int(team_id) == int(home_id):
                         dis_team = home_name
                     elif team_id is not None and away_id is not None and int(team_id) == int(away_id):
@@ -984,9 +1092,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
                     tokens = get_tokens_for_event(match_id, "goal_disallowed")
 
-                    # ✅ (중요) 보낼 대상이 없거나/있거나 상관없이,
-                    # "이 event_id 는 처리했다"는 포인터는 일단 올린다.
-                    # - 그래야 구독 토큰 문제/FCM 예외로 무한 스팸 재전송이 안 터짐
                     execute(
                         """
                         UPDATE match_notification_state
@@ -996,30 +1101,12 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                         """,
                         (ev_id, match_id),
                     )
-                    last_dis_id = ev_id
 
                     if not tokens:
                         continue
 
-                    # 메시지 구성 (VAR는 "최신 실제 스코어"를 보여줘야 함)
-                    latest_raw = current_raw
-                    try:
-                        for _ in range(3):
-                            rr = load_current_match_state(match_id)
-                            if rr:
-                                if (rr.home_goals != latest_raw.home_goals) or (rr.away_goals != latest_raw.away_goals) or (rr.status != latest_raw.status):
-                                    latest_raw = rr
-                                    break
-                                latest_raw = rr
-                            time.sleep(0.3)
-                    except Exception:
-                        log.exception("Failed to refresh latest score for goal_disallowed match %s", match_id)
-
-                    title, body = build_message("goal_disallowed", latest_raw, extra_payload, labels)
-                    data: Dict[str, Any] = {
-                        "match_id": match_id,
-                        "event_type": "goal_disallowed",
-                    }
+                    title, body = build_message("goal_disallowed", current, extra_payload, labels)
+                    data: Dict[str, Any] = {"match_id": match_id, "event_type": "goal_disallowed"}
                     data.update(extra_payload)
 
                     batch_size = 500
@@ -1027,28 +1114,22 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                         batch = tokens[i : i + batch_size]
                         try:
                             resp = fcm.send_to_tokens(batch, title, body, data)
-                            log.info(
-                                "Sent goal_disallowed notification for match %s to %s devices: %s",
-                                match_id,
-                                len(batch),
-                                resp,
-                            )
+                            log.info("Sent goal_disallowed notification for match %s to %s devices: %s", match_id, len(batch), resp)
                         except Exception:
-                            # ✅ 포인터는 이미 올려놨으므로, 여기서 break 해도 다음 루프 무한 스팸은 안 남
-                            log.exception(
-                                "Failed to send goal_disallowed notification for match %s (event_id=%s)",
-                                match_id,
-                                ev_id,
-                            )
+                            log.exception("Failed to send goal_disallowed notification for match %s (event_id=%s)", match_id, ev_id)
                             break
     except Exception:
         log.exception("Error while processing goal_disallowed for match %s", match_id)
+
+    # ==========================
+    # ✅ fixtures 기반 score/status/red 변화(diff_events)로만 알림 생성
+    # ==========================
+    events = diff_events(last, current)
 
     if not events:
         save_state(current)
         return
 
-    # --- 단계 이벤트 중복/누락 방지: DB 플래그 컬럼 매핑 ---
     flag_column_by_event: Dict[str, str] = {
         "kickoff": "kickoff_sent",
         "ht": "halftime_sent",
@@ -1063,36 +1144,18 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     for event_type, extra in events:
         extra = dict(extra)
 
-        # score 이벤트라면, 마지막 득점 시간(분+추가시간)을 extra 에 추가
-        if event_type == "score":
-            goal_time = load_last_goal_minute(match_id)
-            if goal_time:
-                minute = goal_time.get("minute", 0)
-                extra_min = goal_time.get("extra", 0) or 0
-                if extra_min:
-                    goal_minute_str = f"{minute}+{extra_min}'"
-                else:
-                    goal_minute_str = f"{minute}'"
-                extra["goal_minute_str"] = goal_minute_str
-
-        # redcard 이벤트라면, 마지막 레드카드 시간(분+추가시간)을 extra 에 추가
+        # ✅ score/redcard는 fixtures elapsed로만 분 표시
+        if event_type in ("score", "score_correction"):
+            if elapsed is not None and elapsed > 0:
+                extra["goal_minute_str"] = f"{int(elapsed)}'"
         if event_type == "redcard":
-            red_time = load_last_redcard_minute(match_id)
-            if red_time:
-                minute = red_time.get("minute", 0)
-                extra_min = red_time.get("extra", 0) or 0
-                if extra_min:
-                    red_minute_str = f"{minute}+{extra_min}'"
-                else:
-                    red_minute_str = f"{minute}'"
-                extra["red_minute_str"] = red_minute_str
+            if elapsed is not None and elapsed > 0:
+                extra["red_minute_str"] = f"{int(elapsed)}'"
 
-        # --- (중요) 단계 이벤트는 플래그로 중복 방지 ---
+        # ✅ 단계성 이벤트만 플래그 잠금(스코어/정정/레드는 플래그 없음)
         flag_col = flag_column_by_event.get(event_type)
         flag_was_set = False
         if flag_col:
-            # 기존 동작 유지: "한 번 보냈으면 다시 안 보냄"을 DB 플래그로 보장
-            # ✅ 개선: 전송 예외가 나면 플래그를 다시 FALSE로 되돌려서 영구 누락을 방지한다.
             got = fetch_one(
                 f"""
                 UPDATE match_notification_state
@@ -1109,14 +1172,10 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
         tokens = get_tokens_for_event(match_id, event_type)
         if not tokens:
-            # 대상이 없으면: 단계 이벤트는 "중복 방지"가 더 중요 → 플래그 유지(기존 성격 유지)
             continue
 
         title, body = build_message(event_type, current, extra, labels)
-        data: Dict[str, Any] = {
-            "match_id": match_id,
-            "event_type": event_type,
-        }
+        data: Dict[str, Any] = {"match_id": match_id, "event_type": event_type}
         data.update(extra)
 
         batch_size = 500
@@ -1125,23 +1184,12 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             batch = tokens[i : i + batch_size]
             try:
                 resp = fcm.send_to_tokens(batch, title, body, data)
-                log.info(
-                    "Sent %s notification for match %s to %s devices: %s",
-                    event_type,
-                    match_id,
-                    len(batch),
-                    resp,
-                )
+                log.info("Sent %s notification for match %s to %s devices: %s", event_type, match_id, len(batch), resp)
             except Exception:
                 send_failed = True
-                log.exception(
-                    "Failed to send %s notification for match %s",
-                    event_type,
-                    match_id,
-                )
+                log.exception("Failed to send %s notification for match %s", event_type, match_id)
                 break
 
-        # ✅ 전송 실패 시: 단계 이벤트 플래그를 되돌려 다음 루프에 재시도 가능하게(영구 누락 방지)
         if send_failed and flag_was_set and flag_col:
             try:
                 execute(
@@ -1156,6 +1204,12 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
 
     save_state(current)
+
+
+
+
+
+
 
 
 
@@ -1180,6 +1234,13 @@ def run_once(fcm: FCMClient | None = None) -> None:
 def run_forever(interval_seconds: int = 10) -> None:
     """
     Worker 모드: interval_seconds 간격으로 run_once 를 반복 실행.
+
+    ✅ 개선:
+    - 워커 재시작(재배포) 직후 1회, "부트스트랩"으로
+      match_notification_state(상태/포인터/단계 플래그)를 현재 시점으로 맞추고
+      알림은 보내지 않는다.
+    - 이렇게 하면 재배포 순간의 단계/골/VAR "알림 폭탄"이 사라지고,
+      그 다음 루프부터는 정상적으로 "새 이벤트"만 알림이 간다.
     """
     fcm = FCMClient()
     log.info(
@@ -1187,14 +1248,113 @@ def run_forever(interval_seconds: int = 10) -> None:
         interval_seconds,
     )
 
+    # --------------------------
+    # ✅ BOOTSTRAP (재시작 1회)
+    # --------------------------
+    try:
+        matches = get_subscribed_matches()
+        if matches:
+            log.info("Bootstrap: syncing notification state for %s subscribed matches (no notifications).", len(matches))
+
+        for match_id in matches:
+            current_raw = load_current_match_state(match_id)
+            if not current_raw:
+                continue
+
+            # state row 보장 + last_status/last_goals/last_red = 현재로 맞춤
+            save_state(current_raw)
+
+            # 포인터를 현재 MAX로 당겨서 과거 Goal/VAR를 new로 읽지 않게
+            gx = fetch_one(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Goal'
+                """,
+                (match_id,),
+            )
+            max_goal_id = int(gx["max_id"] or 0) if gx else 0
+
+            vx = fetch_one(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Var'
+                  AND detail ILIKE 'Goal Disallowed%%'
+                """,
+                (match_id,),
+            )
+            max_dis_id = int(vx["max_id"] or 0) if vx else 0
+
+            # 단계 플래그를 "현재 상태 기준"으로 잠가서
+            # 재시작 직후 kickoff/ht/2h/ft/et/pen 단계 알림이 튀지 않게
+            st = (current_raw.status or "").strip()
+            rank = STATUS_ORDER.get(st, 0)
+
+            kickoff_sent = (st not in ("", "NS", "TBD")) and (rank >= 10 or st == "LIVE")
+            halftime_sent = rank >= 20
+            secondhalf_sent = rank >= 30
+            extra_time_start_sent = rank >= 40
+            extra_time_end_sent = rank >= 60  # AET(60) 이상이면 ET 종료는 이미 지난 상태
+            penalties_start_sent = rank >= 50  # P(50) / PEN(70)
+            penalties_end_sent = rank >= 80     # FT/AET면 승부차기도 이미 끝났다고 간주(FT에서만 true 의미)
+            fulltime_sent = rank >= 80
+
+            execute(
+                """
+                UPDATE match_notification_state
+                SET
+                  last_goal_event_id = %s,
+                  last_goal_disallowed_event_id = %s,
+                  last_goal_home_goals = %s,
+                  last_goal_away_goals = %s,
+
+                  kickoff_sent = %s,
+                  halftime_sent = %s,
+                  secondhalf_sent = %s,
+                  extra_time_start_sent = %s,
+                  extra_time_end_sent = %s,
+                  penalties_start_sent = %s,
+                  penalties_end_sent = %s,
+                  fulltime_sent = %s,
+
+                  updated_at = NOW()
+                WHERE match_id = %s
+                """,
+                (
+                    max_goal_id,
+                    max_dis_id,
+                    int(current_raw.home_goals),
+                    int(current_raw.away_goals),
+
+                    bool(kickoff_sent),
+                    bool(halftime_sent),
+                    bool(secondhalf_sent),
+                    bool(extra_time_start_sent),
+                    bool(extra_time_end_sent),
+                    bool(penalties_start_sent),
+                    bool(penalties_end_sent),
+                    bool(fulltime_sent),
+
+                    match_id,
+                ),
+            )
+    except Exception:
+        log.exception("Bootstrap failed (will continue normal loop)")
+
+    # --------------------------
+    # NORMAL LOOP
+    # --------------------------
     while True:
         try:
             run_once(fcm)
         except Exception:
-            # 에러가 나도 워커가 죽지 않도록 로그만 찍고 다음 루프로 진행
             log.exception("Error while processing matches in worker loop")
 
         time.sleep(interval_seconds)
+
 
 
 if __name__ == "__main__":
