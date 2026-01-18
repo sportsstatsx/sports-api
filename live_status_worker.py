@@ -1737,7 +1737,8 @@ def run_once() -> None:
         )
         return row if isinstance(row, dict) else None
 
-        def _ensure_post_state(fixture_id: int, now_dt: dt.datetime, item: Dict[str, Any]) -> Dict[str, Any]:
+
+    def _ensure_post_state(fixture_id: int, now_dt: dt.datetime, item: Dict[str, Any]) -> Dict[str, Any]:
         st = _get_post_state(fixture_id)
         if st:
             return st
@@ -1763,6 +1764,7 @@ def run_once() -> None:
 
         st2 = _get_post_state(fixture_id)
         return st2 if st2 else {"fixture_id": fixture_id, "ft_seen_at": now_dt, "did_60": False, "did_30m": False, "last_run_at": None}
+
 
 
     def _mark_post_done(fixture_id: int, *, did_60: bool, did_30m: bool) -> None:
