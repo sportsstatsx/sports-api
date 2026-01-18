@@ -147,14 +147,16 @@ def parse_live_leagues(env: str) -> List[int]:
 def target_dates_for_live() -> List[str]:
     """
     기본 UTC 오늘.
-    UTC 00~03시는 자정 넘어가는 경기 누락 방지 위해 UTC 어제도 같이 조회.
+    UTC 자정 경계에서 누락/지연/중단재개 케이스가 자주 발생하므로
+    00~06시는 UTC 어제도 같이 조회한다.
     """
     now = now_utc()
     today = now.date()
     dates = [today.isoformat()]
-    if now.hour <= 3:
+    if now.hour <= 6:
         dates.insert(0, (today - dt.timedelta(days=1)).isoformat())
     return dates
+
 
 
 def map_status_group(short_code: Optional[str]) -> str:
@@ -178,7 +180,10 @@ def map_status_group(short_code: Optional[str]) -> str:
 
 def infer_season_candidates(date_str: str) -> List[int]:
     y = int(date_str[:4])
+    # 대부분 리그는 '해당 연도' 또는 '직전 시즌'이 정답.
+    # y+1은 극히 예외(미래 시즌)라 마지막 후보로만 둔다.
     return [y, y - 1, y + 1]
+
 
 
 # ─────────────────────────────────────
@@ -575,12 +580,16 @@ def ensure_event_dedupe_tables() -> None:
         """
     )
 
+    # canonical_key 조회/재사용, event_id 역조회 모두 빠르게
     execute(
         "CREATE INDEX IF NOT EXISTS idx_match_event_key_map_event "
         "ON match_event_key_map (fixture_id, event_id);"
     )
+    execute(
+        "CREATE INDEX IF NOT EXISTS idx_match_event_key_map_fixture_updated "
+        "ON match_event_key_map (fixture_id, updated_at);"
+    )
 
-    # ✅ 재시작/상태유실에도 FINISHED postmatch가 재실행되지 않도록 DB에 상태 저장
     execute(
         """
         CREATE TABLE IF NOT EXISTS match_postmatch_states (
@@ -601,6 +610,7 @@ def ensure_event_dedupe_tables() -> None:
 
 
 
+
 def prune_event_dedupe_for_fixtures(fixture_ids: List[int]) -> None:
     if not fixture_ids:
         return
@@ -608,28 +618,43 @@ def prune_event_dedupe_for_fixtures(fixture_ids: List[int]) -> None:
     execute("DELETE FROM match_event_states WHERE fixture_id = ANY(%s)", (fixture_ids,))
 
 
-def prune_event_dedupe_older_than(days: int = 3) -> None:
+def prune_event_dedupe_older_than(days: int = 14) -> None:
+    """
+    ✅ key_map/state prune는 '아주 보수적'이어야 함.
+    - key_map이 먼저 지워지면 다음 조회에서 synthetic_id가 재생성되어 타임라인 중복이 다시 발생할 수 있음.
+    - 따라서 FINISHED/OTHER이고, 경기 날짜도 충분히 지난 fixture만 정리한다.
+    """
     try:
         d = int(days)
     except Exception:
+        d = 14
+    if d < 3:
         d = 3
-    if d < 1:
-        d = 1
 
     execute(
         """
-        DELETE FROM match_event_states
-        WHERE updated_at < now() - (%s::text || ' days')::interval
+        DELETE FROM match_event_states s
+        USING matches m
+        WHERE m.fixture_id = s.fixture_id
+          AND m.status_group IN ('FINISHED','OTHER')
+          AND m.date_utc::timestamptz < now() - (%s::text || ' days')::interval
+          AND s.updated_at < now() - (%s::text || ' days')::interval
         """,
-        (str(d),),
+        (str(d), str(d)),
     )
+
     execute(
         """
-        DELETE FROM match_event_key_map
-        WHERE updated_at < now() - (%s::text || ' days')::interval
+        DELETE FROM match_event_key_map k
+        USING matches m
+        WHERE m.fixture_id = k.fixture_id
+          AND m.status_group IN ('FINISHED','OTHER')
+          AND m.date_utc::timestamptz < now() - (%s::text || ' days')::interval
+          AND k.updated_at < now() - (%s::text || ' days')::interval
         """,
-        (str(d),),
+        (str(d), str(d)),
     )
+
 
 
 # ─────────────────────────────────────
@@ -874,19 +899,17 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    ✅ 중복/타임라인 붕괴 근본 해결 (확정판)
+    ✅ 중복/타임라인 붕괴 근본 해결 (name-first stable key)
 
-    핵심 원인:
-      - incoming_id(양수)가 나중에 생기면 기존 synthetic(음수)와 PK가 달라져 "새 row"가 추가됨
-      - StableKey가 tick 내 순서(n)에 의존하면 순서가 바뀌는 순간 키가 흔들려 새 synthetic가 또 생성됨
+    핵심 원인(지금까지 중복이 안 죽는 이유):
+      - 라이브 중 pid(player.id)가 나중에 채워지면 stable_base가 (name 기반 -> pid 기반)으로 바뀌어
+        기존 synthetic_id와 다른 새 synthetic_id가 생성됨 => 같은 이벤트가 2개 row로 공존
 
     해결:
-      1) event_id(PK)는 절대 incoming_id로 갈아타지 않는다.
-         -> 항상 stable_key 기반(우리 쪽 안정 ID)로 수렴한다.
-      2) n(occurrence)은 "시간 정렬" 기준으로 결정하고,
-         DB에 이미 있던 stable_base|n:*가 있으면 우선 재사용한다.
-      3) 과거에 남아있는 ID|... 키는 stable 키로 자동 마이그레이션한다(키 1개 정책 유지).
-      4) 이미 DB에 쌓여있는 "incoming_id row"가 stable id와 중복이면 실시간으로 제거한다.
+      - stable_base에서 "pid 우선"을 버리고 "name 우선"으로 고정
+        (name이 있으면 항상 name으로, name이 없을 때만 pid로)
+      - incoming_id(양수) 중복 정리는 '무조건 삭제'가 아니라
+        '현재 이벤트와 시그니처가 같은 경우에만' 삭제로 안전화
     """
 
     def _norm(s: Optional[str]) -> str:
@@ -1029,18 +1052,13 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     evs = [ev for _, ev in indexed]
 
     seen_keys_in_tick: List[str] = []
-
-    # stable_base별로 tick 안에서 몇 번째 등장인지
     base_seen_count: Dict[str, int] = {}
-
-    # stable_base별로 이번 tick에서 사용한 n(중복 매핑 방지)
     base_used_n: Dict[str, set] = {}
 
     def _set_primary_key(event_id: int, primary_key: str) -> None:
         if not primary_key:
             return
 
-        # ✅ 1) 항상 단일 UPSERT로 정리 (쿼리 수 감량)
         execute(
             """
             INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
@@ -1052,7 +1070,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         )
         key_to_id[primary_key] = int(event_id)
 
-        # ✅ 2) event_id 당 1개 키만 유지 (단일 DELETE)
         execute(
             """
             DELETE FROM match_event_key_map
@@ -1063,7 +1080,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             (fixture_id, event_id, primary_key),
         )
 
-        # 메모리 dict도 같이 정리
         for k, vid in list(key_to_id.items()):
             if int(vid) == int(event_id) and k != primary_key:
                 del key_to_id[k]
@@ -1082,28 +1098,35 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     ) -> str:
         mb = _minute_bucket10(minute)
 
+        # ✅ name-first: pname이 있으면 무조건 name으로, 없으면 pid로
+        def _who_name_first(pid: Optional[int], nm: str, unk_prefix: str = "who") -> str:
+            if nm:
+                return f"name:{nm}"
+            if pid is not None:
+                return f"pid:{int(pid)}"
+            return f"{unk_prefix}:unk"
+
         if ev_type_norm == "goal":
             kind = _goal_kind(detail_norm)
-            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+            who = _who_name_first(p_id, pname, "who")
             return f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
 
         if ev_type_norm == "card":
             ck = _card_kind(detail_norm)
-            who = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "who:unk")
+            who = _who_name_first(p_id, pname, "who")
             return f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
 
         if ev_type_norm in ("subst", "substitution", "sub"):
-            out_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "out:unk")
-            in_part = f"pid:{int(player_in_id)}" if player_in_id is not None else (
-                f"name:{_safe_name(player_in_name)}" if player_in_name else "in:unk"
-            )
+            out_part = _who_name_first(p_id, pname, "out")
+            in_nm = _safe_name(player_in_name) if player_in_name else ""
+            in_part = _who_name_first(player_in_id, in_nm, "in")
             return f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
 
         if ev_type_norm == "var":
             return f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
 
-        p_part = f"pid:{int(p_id)}" if p_id is not None else (f"name:{pname}" if pname else "p:unk")
-        a_part = f"pid:{int(a_id)}" if a_id is not None else (f"name:{aname}" if aname else "a:unk")
+        p_part = _who_name_first(p_id, pname, "p")
+        a_part = _who_name_first(a_id, aname, "a")
         return f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
 
     for ev in evs:
@@ -1150,7 +1173,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         incoming_id = safe_int(ev.get("id"))
         id_key = f"ID|{fixture_id}|{int(incoming_id)}" if incoming_id is not None else ""
 
-        # ───────────── stable_base 생성(항상) ─────────────
         stable_base = _build_stable_base(
             ev_type_norm=ev_type_norm,
             detail_norm=detail_norm,
@@ -1164,7 +1186,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             player_in_name=player_in_name,
         )
 
-        # ───────────── n(occurrence) 결정: 시간순으로 + DB 기존 n 재사용 ─────────────
         base_seen_count[stable_base] = base_seen_count.get(stable_base, 0) + 1
         desired_n = int(base_seen_count[stable_base])
 
@@ -1176,14 +1197,12 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         chosen_key = ""
         chosen_event_id: Optional[int] = None
 
-        # (1) 가장 우선: desired_n 키가 이미 있으면 그대로
         k_desired = f"{stable_base}|n:{desired_n}"
         if k_desired in key_to_id and desired_n not in used_set:
             chosen_key = k_desired
             chosen_event_id = int(key_to_id[k_desired])
             used_set.add(desired_n)
 
-        # (2) 과거 ID|... 키가 남아있으면(예전 시스템) 그 event_id를 가져와 stable 키로 마이그레이션
         if chosen_event_id is None and id_key and (id_key in key_to_id):
             chosen_event_id = int(key_to_id[id_key])
             if desired_n not in used_set:
@@ -1196,7 +1215,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 chosen_key = f"{stable_base}|n:{nn}"
                 used_set.add(nn)
 
-        # (3) DB에 이미 존재하던 n들이 있으면 그 중 아직 안 쓴 n으로 매칭(순서 흔들림 완화)
         if chosen_event_id is None:
             existing_ns = base_to_existing_ns.get(stable_base) or []
             for n in existing_ns:
@@ -1209,7 +1227,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                     used_set.add(int(n))
                     break
 
-        # (4) 여기까지 못 찾으면 새 이벤트: desired_n 키로 synthetic 생성
         if chosen_event_id is None:
             chosen_key = k_desired
             chosen_event_id = _synthetic_id_from_key(chosen_key)
@@ -1217,11 +1234,8 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_id_used = int(chosen_event_id)
         primary_key = chosen_key
-
-        # 상태 기록(상태용)
         seen_keys_in_tick.append(primary_key)
 
-        # ───────────── match_events UPSERT (minute/extra 보정 허용) ─────────────
         execute(
             """
             INSERT INTO match_events (
@@ -1317,14 +1331,11 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             ),
         )
 
-        # ───────────── key_map 저장 (event_id 당 1개 키만 유지) ─────────────
         _set_primary_key(ev_id_used, primary_key)
 
-        # ───────────── 과거/기존 중복 정리 (실시간 수렴) ─────────────
-        # 1) 과거에 ID|... 키가 남아있으면(예전 방식) 제거 (마이그레이션 완료)
+        # (마이그레이션) 과거 ID|... 키 제거
         if id_key:
             try:
-                # ✅ 중복 DELETE 제거: canonical_key 기준 단일 DELETE면 충분
                 execute(
                     "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s",
                     (fixture_id, id_key),
@@ -1333,12 +1344,32 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             except Exception:
                 pass
 
-        # 2) incoming_id row가 따로 생긴(양수) 중복이면 제거
+        # ✅ incoming_id(양수) 중복 정리: '무조건 삭제' 금지
+        #    현재 이벤트와 시그니처가 같은 경우에만 삭제
         if incoming_id is not None and int(incoming_id) != int(ev_id_used):
             try:
                 execute(
-                    "DELETE FROM match_events WHERE id=%s AND fixture_id=%s",
-                    (int(incoming_id), fixture_id),
+                    """
+                    DELETE FROM match_events
+                    WHERE id=%s
+                      AND fixture_id=%s
+                      AND team_id IS NOT DISTINCT FROM %s
+                      AND player_id IS NOT DISTINCT FROM %s
+                      AND type IS NOT DISTINCT FROM %s
+                      AND detail IS NOT DISTINCT FROM %s
+                      AND minute IS NOT DISTINCT FROM %s
+                      AND extra IS NOT DISTINCT FROM %s
+                    """,
+                    (
+                        int(incoming_id),
+                        fixture_id,
+                        t_id,
+                        p_id,
+                        ev_type,
+                        detail,
+                        minute,
+                        extra0,
+                    ),
                 )
             except Exception:
                 pass
@@ -1350,7 +1381,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             except Exception:
                 pass
 
-    # ───────────── match_event_states 갱신 ─────────────
     if seen_keys_in_tick:
         execute(
             """
@@ -1374,6 +1404,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             """,
             (fixture_id,),
         )
+
 
 
 
@@ -1572,6 +1603,35 @@ def maybe_sync_lineups(
                 print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
+            return
+
+        return
+
+    # INPLAY: 초반 재시도 (elapsed<=15)
+    if status_group == "INPLAY":
+        el = elapsed if elapsed is not None else 0
+        if 0 <= el <= 15:
+            tries = int(st.get("inplay_tries") or 0)
+            if tries >= int(LINEUPS_INPLAY_MAX_TRIES):
+                return
+
+            if (now_ts - last_try) < COOLDOWN_SEC:
+                return
+
+            try:
+                st["last_try_ts"] = time.time()
+                st["inplay_tries"] = tries + 1
+
+                resp = fetch_lineups(session, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+                if ready:
+                    st["success"] = True
+                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) try={st['inplay_tries']} ready={ready}")
+            except Exception as e:
+                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
+
+        return
+
             return
 
         return
