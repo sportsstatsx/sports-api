@@ -1724,12 +1724,12 @@ def main() -> None:
     # (HOCKEY_SEASON 환경변수도 더 이상 강제하지 않음)
 
     super_fast_leagues = _int_set_env("HOCKEY_LIVE_SUPER_FAST_LEAGUES")
-    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 2.0)  # super fast
+    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 5.0)  # super fast
 
     fast_leagues = _int_set_env("HOCKEY_LIVE_FAST_LEAGUES")
-    fast_interval = _float_env("HOCKEY_LIVE_FAST_INTERVAL_SEC", 5.0)   # fast
+    fast_interval = _float_env("HOCKEY_LIVE_FAST_INTERVAL_SEC", 10.0)   # fast
 
-    slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 15.0)  # slow(기본)
+    slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 20.0)  # slow(기본)
     idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0) # 후보 없을 때
 
 
@@ -1752,7 +1752,7 @@ def main() -> None:
 
 
     super_fast_leagues = _int_set_env("HOCKEY_LIVE_SUPER_FAST_LEAGUES")
-    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 2.0)
+    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 5.0)
 
     log.info(
         "🏒 hockey live worker(interval tiers): super_fast_leagues=%s super_fast=%.1fs fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
