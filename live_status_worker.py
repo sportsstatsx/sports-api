@@ -38,7 +38,7 @@ from db import execute  # dev 스키마 확정 → 런타임 schema 조회 불�
 
 API_KEY = os.environ.get("APIFOOTBALL_KEY") or os.environ.get("API_FOOTBALL_KEY")
 LIVE_LEAGUES_ENV = os.environ.get("LIVE_LEAGUES", "")
-INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "5"))  # ✅ fixtures 5초
+INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "10"))  # ✅ fixtures 5초
 
 BASE = "https://v3.football.api-sports.io"
 UA = "SportsStatsX-LiveWorker/1.0"
