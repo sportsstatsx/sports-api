@@ -19,12 +19,56 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     - league_id: 리그 ID (필수)
     - season: 쿼리에서 넘어온 시즌 (없으면 DB에서 최신 시즌 선택)
 
-    ✅ 기존에 이미 잘 되던 구조는 그대로 유지하되,
-       앱에서 바로 쓰기 편한 평탄화 필드
-       (league_name, league_logo, standings, seasons, season_champions)를 추가로 내려준다.
+    ✅ 근본해결 포인트:
+    1) resolved_season은 resolve_season_for_league()가 "검증/보정"까지 책임진다.
+    2) season_label은 DB의 min/max year로 생성해서 캘린더 시즌/스플릿 시즌을 자동 처리한다.
+       - 캘린더 시즌: "2026"
+       - 스플릿 시즌: "2025-2026"
     """
-    # 1) 시즌 결정 (없으면 최신 시즌)
+    # 1) 시즌 결정 (없으면 최신 시즌 / 들어와도 DB 기준으로 보정)
     resolved_season = resolve_season_for_league(league_id=league_id, season=season)
+
+    # 1-1) DB 기반 시즌 라벨 생성
+    def _year_of(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        # datetime / date 객체
+        y = getattr(v, "year", None)
+        if y is not None:
+            try:
+                return int(y)
+            except Exception:
+                return None
+        # 문자열(예: "2026-01-16 23:20:00+00")
+        if isinstance(v, str) and len(v) >= 4 and v[:4].isdigit():
+            try:
+                return int(v[:4])
+            except Exception:
+                return None
+        return None
+
+    season_label: Optional[str] = None
+    if resolved_season is not None:
+        row = fetch_one(
+            """
+            SELECT
+              MIN(date_utc::timestamptz) AS min_dt,
+              MAX(date_utc::timestamptz) AS max_dt
+            FROM matches
+            WHERE league_id = %s
+              AND season = %s
+            """,
+            (league_id, resolved_season),
+        )
+        if row:
+            min_y = _year_of(row.get("min_dt"))
+            max_y = _year_of(row.get("max_dt"))
+            if min_y is not None and max_y is not None:
+                season_label = str(min_y) if min_y == max_y else f"{min_y}-{max_y}"
+
+        # 폴백(라벨 생성 실패 시)
+        if not season_label:
+            season_label = str(resolved_season)
 
     # 2) 블록별 데이터 조립 (기존 구조 유지)
     seasons_block = build_seasons_block(league_id=league_id)
@@ -74,10 +118,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
                 league_logo = logo_from_db
 
     # 3-2) 시즌 챔피언에 team_logo 채워넣기
-    # standings_rows 에는 team_id / team_logo 가 들어 있으므로,
-    # 같은 team_id 를 가진 챔피언에게 team_logo 를 복사해준다.
     if isinstance(season_champions, list) and isinstance(standings_rows, list):
-        # team_id → team_logo 매핑 생성
         logo_by_team_id: Dict[int, str] = {}
         for row in standings_rows:
             if not isinstance(row, dict):
@@ -115,6 +156,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     return {
         "league_id": league_id,
         "season": resolved_season,
+        "season_label": season_label,
 
         # 평탄화 필드
         "league_name": league_name,
@@ -123,7 +165,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "seasons": seasons_list,
         "season_champions": season_champions,
 
-        # 🔥 NEW — Standings의 컨텍스트 옵션을 리그디테일 번들로 직접 flatten
+        # Standings 컨텍스트 옵션 flatten
         "standingsConferences": (ctx_opts.get("conferences", []) or []),
         "standingsGroups": (ctx_opts.get("groups", []) or []),
 
@@ -133,5 +175,6 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         "standings_block": standings_block,
         "seasons_block": seasons_block,
     }
+
 
 
