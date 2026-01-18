@@ -293,6 +293,55 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb{
 }
 html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,243,245,0.28); }
 
+/* ─────────────────────────────────────
+   Fixtures filters compact layout
+   ───────────────────────────────────── */
+
+.fxFilters{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap:10px;
+  align-items:end;
+}
+
+.fxBtnRow{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:8px;
+}
+
+.leagueBar{
+  display:flex;
+  gap:8px;
+  align-items:center;
+}
+
+.leagueBar select{
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.leagueBtns{
+  flex: 0 0 auto;
+  display:flex;
+  gap:6px;
+}
+
+.leaguePills{
+  margin-top:6px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+
+.leaguePills .pill{
+  font-size:11px;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid var(--border2);
+  color: var(--muted);
+  background: transparent;
+}
 
 
   </style>
@@ -314,19 +363,18 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     <div class="card">
       <h2>Fixtures Browser</h2>
 
-      <div class="row">
-        <div style="min-width:190px; flex: 0 0 190px;">
+      <div class="fxFilters">
+        <div>
           <label class="muted">Date (From)</label>
           <input id="fxDate" type="date"/>
         </div>
 
-        <div style="min-width:190px; flex: 0 0 190px;">
+        <div>
           <label class="muted">Date (To)</label>
           <input id="fxDateTo" type="date"/>
         </div>
 
-
-        <div style="min-width:220px; flex: 1 1 220px;">
+        <div>
           <label class="muted">Timezone</label>
           <select id="fxTz">
             <option value="Asia/Seoul">Asia/Seoul</option>
@@ -337,46 +385,41 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           </select>
         </div>
 
-        <div style="min-width:260px; flex: 1 1 260px;">
+        <div>
           <label class="muted">League Filter (from loaded list)</label>
 
-          <div class="row" style="gap:8px; align-items:flex-end;">
-            <div style="flex: 1 1 220px;">
-              <select id="fxLeaguePick">
-                <option value="">(리그 목록 로딩 전)</option>
-              </select>
-            </div>
+          <div class="leagueBar">
+            <select id="fxLeaguePick">
+              <option value="">(전체 리그)</option>
+            </select>
 
-            <div style="flex: 1 1 220px;">
-              <input id="fxLeagueIds" placeholder="선택된 league_ids (자동)" readonly />
-            </div>
-
-            <div style="flex:0 0 auto; display:flex; gap:6px;">
-              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">추가</button>
-              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">제거</button>
-              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">전체</button>
+            <div class="leagueBtns">
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">+</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">−</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">ALL</button>
             </div>
           </div>
 
-          <div class="muted mini" style="margin-top:6px;">
-            ※ 날짜로 불러온 리스트에 있는 리그만 드롭다운에 뜹니다. (추가/제거/전체로 필터 제어)
-          </div>
+          <div id="fxLeaguePills" class="leaguePills"></div>
+
+          <!-- ✅ 기능 유지용: 실제 필터 값은 이 hidden input에 유지 -->
+          <input id="fxLeagueIds" type="hidden" />
         </div>
 
-
-        <div style="min-width:220px; flex: 1 1 220px;">
+        <div>
           <label class="muted">Search (team/league)</label>
           <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
         </div>
 
-        <div style="min-width:290px; flex: 0 0 290px; align-self:flex-end;">
-          <div class="row" style="gap:8px;">
-            <button class="primary" style="flex:1;" onclick="loadFixtures()">불러오기</button>
-            <button id="btnOverridesOnly" style="flex:1;" onclick="loadOverridesOnly()">OVR만 보기</button>
+        <div>
+          <label class="muted">Actions</label>
+          <div class="fxBtnRow">
+            <button class="primary" onclick="loadFixtures()">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()">OVR만 보기</button>
           </div>
         </div>
-
       </div>
+
 
       <div class="muted" style="margin-top:10px;" id="fxHint"></div>
 
@@ -823,6 +866,44 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     return set.size ? set : null;
   }
 
+
+  function fxUpdateLeaguePills() {
+    const box = document.getElementById("fxLeaguePills");
+    const input = document.getElementById("fxLeagueIds");
+    if (!box || !input) return;
+
+    const set = parseLeagueIdsSet(input.value || "");
+    box.innerHTML = "";
+
+    if (!set || set.size === 0) {
+      const d = document.createElement("span");
+      d.className = "pill";
+      d.textContent = "(전체 리그)";
+      box.appendChild(d);
+      return;
+    }
+
+    const ids = Array.from(set).sort((a,b)=>a-b);
+
+    // 너무 길어지면 앞부분만 보여주고 count로 표시
+    const maxShow = 10;
+    const shown = ids.slice(0, maxShow);
+    for (const id of shown) {
+      const p = document.createElement("span");
+      p.className = "pill";
+      p.textContent = String(id);
+      box.appendChild(p);
+    }
+
+    if (ids.length > maxShow) {
+      const more = document.createElement("span");
+      more.className = "pill";
+      more.textContent = `+${ids.length - maxShow}`;
+      box.appendChild(more);
+    }
+  }
+
+
   // ─────────────────────────────────────
   // League dropdown (from loaded fixtures)
   // ─────────────────────────────────────
@@ -855,7 +936,6 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       return c !== 0 ? c : (a.id - b.id);
     });
 
-    // 옵션 재구성
     sel.innerHTML = "";
 
     const optAll = document.createElement("option");
@@ -869,8 +949,8 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       optNone.textContent = "(이 기간에 리그 없음)";
       sel.appendChild(optNone);
       sel.value = "";
-      // 로드된 게 없으면 필터도 비움
       input.value = "";
+      fxUpdateLeaguePills();
       return;
     }
 
@@ -881,17 +961,20 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       sel.appendChild(opt);
     }
 
-    // 선택 복원: 이전 선택이 아직 존재하면 유지, 아니면 비움
+    // 선택 복원
     if (prevSel && arr.some(x => String(x.id) === prevSel)) sel.value = prevSel;
     else sel.value = "";
 
-    // ✅ 편의: 현재 필터가 단일 리그면 드롭다운도 그 값으로 맞춤
+    // 단일 필터면 드롭다운도 맞춤
     const set = parseLeagueIdsSet(input.value || "");
     if (set && set.size === 1) {
       const only = Array.from(set)[0];
       if (arr.some(x => x.id === only)) sel.value = String(only);
     }
+
+    fxUpdateLeaguePills();
   }
+
 
   function fxAddLeagueFromPick() {
     const sel = document.getElementById("fxLeaguePick");
@@ -899,7 +982,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     if (!sel || !input) return;
 
     const v = String(sel.value || "").trim();
-    if (!v) return; // (전체 리그) 선택이면 아무것도 안 함
+    if (!v) return;
 
     const set = parseLeagueIdsSet(input.value || "") || new Set();
     const n = Number(v);
@@ -908,8 +991,10 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     set.add(n);
     input.value = Array.from(set).sort((a,b)=>a-b).join(",");
 
+    fxUpdateLeaguePills();
     renderFixtures();
   }
+
 
   function fxRemoveLeagueFromPick() {
     const sel = document.getElementById("fxLeaguePick");
@@ -928,16 +1013,20 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     set.delete(n);
     input.value = Array.from(set).sort((a,b)=>a-b).join(",");
 
+    fxUpdateLeaguePills();
     renderFixtures();
   }
+
 
   function fxClearLeagueFilter() {
     const sel = document.getElementById("fxLeaguePick");
     const input = document.getElementById("fxLeagueIds");
     if (input) input.value = "";
     if (sel) sel.value = "";
+    fxUpdateLeaguePills();
     renderFixtures();
   }
+
 
 
   // ✅ innerHTML에 들어갈 값 최소 이스케이프(XSS 방어)
