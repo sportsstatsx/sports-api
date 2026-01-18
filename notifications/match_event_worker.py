@@ -613,6 +613,7 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
     ✅ 개선:
     - fcm_token NULL/빈값/공백 제거 (FCM 예외로 인한 무한 재전송/반복 스팸 방지에 핵심)
     - DISTINCT 로 중복 토큰 제거
+    - score 정정 알림(score_correction)도 notify_score 옵션에 묶음
     """
     option_column = {
         # 킥오프 관련
@@ -621,7 +622,8 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
 
         # 득점 / 카드
         "score": "notify_score",
-        "goal_disallowed": "notify_score",  # ✅ 골 무효(VAR)도 득점 알림 옵션에 묶음
+        "score_correction": "notify_score",  # ✅ 스코어 정정 알림(선택 기능)
+        "goal_disallowed": "notify_score",   # ✅ 골 무효(VAR)도 득점 알림 옵션에 묶음
         "redcard": "notify_redcard",
 
         # 전/후반
@@ -667,6 +669,7 @@ def get_tokens_for_event(match_id: int, event_type: str) -> List[str]:
 
 
 
+
 def build_message(
     event_type: str,
     match: MatchState,
@@ -679,6 +682,7 @@ def build_message(
     - 리그 이름은 문구에서 제외 (요청 사항)
     - 득점/레드카드에는 팀 이름 + 이모지 포함
     - HT/2H/FT 는 타이틀 한 줄 + 바디에 스코어
+    - ✅ score_correction(스코어 정정) 알림 지원
     """
     home_name = labels.get("home_name", "Home")
     away_name = labels.get("away_name", "Away")
@@ -731,6 +735,17 @@ def build_message(
     # Penalty shoot-out end
     if event_type == "pen_end":
         title = "⏱ Penalties End"
+        body = score_line
+        return (title, body)
+
+    # ✅ Score correction
+    if event_type == "score_correction":
+        old_home = extra.get("old_home")
+        old_away = extra.get("old_away")
+        if old_home is not None and old_away is not None:
+            title = f"🔄 Score corrected ({int(old_home)}–{int(old_away)} → {match.home_goals}–{match.away_goals})"
+        else:
+            title = "🔄 Score corrected"
         body = score_line
         return (title, body)
 
@@ -827,13 +842,11 @@ def build_message(
         body = score_line
         return (title, body)
 
-
-
-
     # Fallback
     title = "Match update"
     body = score_line
     return (title, body)
+
 
 
 def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
@@ -969,7 +982,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         max_dis_id = int(vx["max_id"] or 0) if vx else 0
 
         # 종료된 경기는 단계성 알림도 더 이상 필요 없으니 전부 TRUE로 잠금
-        # (컬럼은 네 테이블 스크린샷 기준)
         execute(
             """
             UPDATE match_notification_state
@@ -1091,16 +1103,72 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     home_id = labels.get("home_id")
     away_id = labels.get("away_id")
 
+    # ─────────────────────────────────────────
+    # ✅ (NEW) Goal 포인터 드리프트/리셋 감지 + 상태 동기화
+    # - match_events 가 재구성(삭제/재삽입)되면 id가 뒤로 갈 수 있음
+    # - 이 경우 last_goal_event_id 가 "현재 MAX"보다 커져서 새 골을 영원히 못 읽는 버그가 생김
+    # ─────────────────────────────────────────
+    try:
+        stg0 = fetch_one(
+            """
+            SELECT
+              COALESCE(last_goal_event_id, 0) AS last_goal_event_id,
+              COALESCE(last_goal_home_goals, 0) AS last_goal_home_goals,
+              COALESCE(last_goal_away_goals, 0) AS last_goal_away_goals,
+              COALESCE(last_goal_disallowed_event_id, 0) AS last_goal_disallowed_event_id
+            FROM match_notification_state
+            WHERE match_id = %s
+            """,
+            (match_id,),
+        )
+
+        last_goal_id0 = int(stg0["last_goal_event_id"] or 0) if stg0 else 0
+
+        gx0 = fetch_one(
+            """
+            SELECT COALESCE(MAX(id), 0) AS max_id
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Goal'
+            """,
+            (match_id,),
+        )
+        cur_max_goal_id = int(gx0["max_id"] or 0) if gx0 else 0
+
+        # 포인터가 현재 MAX보다 크면(=뒤로 감김/재삽입) 즉시 복구
+        if cur_max_goal_id < last_goal_id0:
+            execute(
+                """
+                UPDATE match_notification_state
+                SET
+                  last_goal_event_id = %s,
+                  last_goal_home_goals = %s,
+                  last_goal_away_goals = %s,
+                  updated_at = NOW()
+                WHERE match_id = %s
+                """,
+                (cur_max_goal_id, int(current_raw.home_goals), int(current_raw.away_goals), match_id),
+            )
+            # 복구 루프에서는 알림을 보내지 않음(폭탄/오판 방지)
+            save_state(current)
+            return
+    except Exception:
+        log.exception("Goal pointer drift check failed for match %s (will continue)", match_id)
+
     # ==========================
     # ✅ 0) Goal 알림 (match_events 포인터 기반, OG 포함)
+    # + (NEW) DB 정정으로 현재 스코어가 바뀌었는데도 포인터가 안 움직이면 정정 알림(선택)
     # ==========================
+    sent_score_correction = False
+
     try:
         stg = fetch_one(
             """
             SELECT
               COALESCE(last_goal_event_id, 0) AS last_goal_event_id,
               COALESCE(last_goal_home_goals, 0) AS last_goal_home_goals,
-              COALESCE(last_goal_away_goals, 0) AS last_goal_away_goals
+              COALESCE(last_goal_away_goals, 0) AS last_goal_away_goals,
+              COALESCE(last_goal_disallowed_event_id, 0) AS last_goal_disallowed_event_id
             FROM match_notification_state
             WHERE match_id = %s
             """,
@@ -1109,6 +1177,86 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         last_goal_id = int(stg["last_goal_event_id"] or 0) if stg else 0
         g_home = int(stg["last_goal_home_goals"] or 0) if stg else 0
         g_away = int(stg["last_goal_away_goals"] or 0) if stg else 0
+        last_dis_id = int(stg["last_goal_disallowed_event_id"] or 0) if stg else 0
+
+        # (NEW) 현재 DB 기준으로 "새 골/새 VAR"이 없는지 확인
+        new_goals_peek = fetch_one(
+            """
+            SELECT 1 AS ok
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Goal'
+              AND id > %s
+            LIMIT 1
+            """,
+            (match_id, last_goal_id),
+        )
+
+        new_dis_peek = fetch_one(
+            """
+            SELECT 1 AS ok
+            FROM match_events
+            WHERE fixture_id = %s
+              AND type = 'Var'
+              AND detail ILIKE 'Goal Disallowed%%'
+              AND id > %s
+            LIMIT 1
+            """,
+            (match_id, last_dis_id),
+        )
+
+        # (NEW) 새 이벤트가 없는데 current_raw 스코어와 누적 스코어가 다르면 "정정"이 발생한 것
+        if (not new_goals_peek) and (not new_dis_peek):
+            if (int(current_raw.home_goals) != int(g_home)) or (int(current_raw.away_goals) != int(g_away)):
+                tokens = get_tokens_for_event(match_id, "score_correction")
+                if tokens:
+                    extra_payload = {
+                        "old_home": int(g_home),
+                        "old_away": int(g_away),
+                        "new_home": int(current_raw.home_goals),
+                        "new_away": int(current_raw.away_goals),
+                    }
+
+                    corr_state = MatchState(
+                        match_id=current.match_id,
+                        status=current.status,
+                        home_goals=int(current_raw.home_goals),
+                        away_goals=int(current_raw.away_goals),
+                        home_red=current.home_red,
+                        away_red=current.away_red,
+                    )
+
+                    title, body = build_message("score_correction", corr_state, extra_payload, labels)
+                    data: Dict[str, Any] = {"match_id": match_id, "event_type": "score_correction"}
+                    data.update(extra_payload)
+
+                    batch_size = 500
+                    any_success = False
+                    for i in range(0, len(tokens), batch_size):
+                        batch = tokens[i : i + batch_size]
+                        try:
+                            resp = fcm.send_to_tokens(batch, title, body, data)
+                            any_success = True
+                            log.info("Sent score_correction notification for match %s to %s devices: %s", match_id, len(batch), resp)
+                        except Exception:
+                            log.exception("Failed to send score_correction notification for match %s", match_id)
+                            break
+
+                    if any_success:
+                        sent_score_correction = True
+                        # 정정 성공 시 누적 스코어를 즉시 동기화
+                        execute(
+                            """
+                            UPDATE match_notification_state
+                            SET last_goal_home_goals = %s,
+                                last_goal_away_goals = %s,
+                                updated_at = NOW()
+                            WHERE match_id = %s
+                            """,
+                            (int(current_raw.home_goals), int(current_raw.away_goals), match_id),
+                        )
+                        g_home = int(current_raw.home_goals)
+                        g_away = int(current_raw.away_goals)
 
         new_goals = fetch_all(
             """
@@ -1138,7 +1286,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
 
             dlow = detail.lower()
 
-            # ✅ (추가) cancel/disallow/no goal/offside 등 무효 마커가 붙은 Goal은 스킵 (OG는 예외)
+            # ✅ cancel/disallow/no goal/offside 등 무효 마커가 붙은 Goal은 스킵 (OG는 예외)
             if any(m in dlow for m in invalid_markers) and ("own goal" not in dlow):
                 execute(
                     """
@@ -1258,7 +1406,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     # ==========================
     # ✅ VAR: Goal Disallowed 처리 (기존 로직 유지)
     # ==========================
-    var_processed_ok = False
     try:
         st = fetch_one(
             """
@@ -1335,25 +1482,26 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                         except Exception:
                             log.exception("Failed to send goal_disallowed notification for match %s (event_id=%s)", match_id, ev_id)
                             break
-
-        var_processed_ok = True
     except Exception:
         log.exception("Error while processing goal_disallowed for match %s", match_id)
 
-    if var_processed_ok:
-        try:
-            execute(
-                """
-                UPDATE match_notification_state
-                SET last_goal_home_goals = %s,
-                    last_goal_away_goals = %s,
-                    updated_at = NOW()
-                WHERE match_id = %s
-                """,
-                (int(current_raw.home_goals), int(current_raw.away_goals), match_id),
-            )
-        except Exception:
-            log.exception("Failed to reset last_goal_home/away_goals after VAR for match %s", match_id)
+    # ─────────────────────────────────────────
+    # ✅ (NEW) VAR 처리 성공/실패와 무관하게 "누적 스코어"를 현재 DB 계산값으로 동기화
+    # - 예외 때문에 var_processed_ok=False가 되면 정정이 영원히 안 따라가는 문제가 있었음
+    # ─────────────────────────────────────────
+    try:
+        execute(
+            """
+            UPDATE match_notification_state
+            SET last_goal_home_goals = %s,
+                last_goal_away_goals = %s,
+                updated_at = NOW()
+            WHERE match_id = %s
+            """,
+            (int(current_raw.home_goals), int(current_raw.away_goals), match_id),
+        )
+    except Exception:
+        log.exception("Failed to reconcile last_goal_home/away_goals to current_raw for match %s", match_id)
 
     # ==========================
     # 1) 나머지 단계/레드카드 이벤트(diff_events)
@@ -1436,6 +1584,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
 
     save_state(current)
+
 
 
 
