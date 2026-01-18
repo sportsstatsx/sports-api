@@ -154,6 +154,14 @@ def team_detail_bundle():
             league_id=league_id,
             season=season,
         )
+        if resolved_season is None:
+            return jsonify({"ok": False, "error": "season_not_resolvable"}), 400
+
+        bundle = get_team_detail_bundle(
+            team_id=team_id,
+            league_id=league_id,
+            season=resolved_season,
+        )
 
         # ✅ 디버그 로그(한 번만 보고 지워도 됨)
         current_app.logger.info(
