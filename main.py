@@ -1643,6 +1643,128 @@ def admin_fixture_meta():
     return jsonify({"ok": True, "fixture": fixture})
 
 
+@app.get(f"/{ADMIN_PATH}/api/match_snapshot")
+@require_admin
+def admin_match_snapshot():
+    """
+    Admin UI에서 analysis 글 작성 시,
+    (sport, fixture_key) 기반으로 insights_overall / ai_predictions 블록을 생성해 내려준다.
+
+    GET /{ADMIN_PATH}/api/match_snapshot?sport=football&fixture_key=1379184
+      (&comp=All&last_n=10 같은 선택 파라미터는 필요하면 확장)
+    """
+    sport = (request.args.get("sport") or "").strip().lower()
+    fixture_key = (request.args.get("fixture_key") or "").strip()
+
+    if not sport or not fixture_key:
+        return jsonify({"ok": False, "error": "sport_and_fixture_key_required"}), 400
+
+    if sport != "football":
+        return jsonify({"ok": False, "error": "sport_not_supported_yet"}), 400
+
+    try:
+        fixture_id = int(fixture_key)
+    except Exception:
+        return jsonify({"ok": False, "error": "fixture_key_must_be_int_for_football"}), 400
+
+    # (선택) 필터 기본값
+    comp = (request.args.get("comp") or "All").strip()
+    last_n_raw = (request.args.get("last_n") or "10").strip()
+    try:
+        last_n = int(last_n_raw)
+    except Exception:
+        last_n = 10
+    last_n = max(3, min(last_n, 50))
+
+    # matches에서 블록 생성에 필요한 최소 헤더 구성
+    sql = """
+    SELECT
+      m.fixture_id,
+      m.league_id,
+      m.season,
+      m.date_utc,
+      m.home_id,
+      m.away_id
+    FROM matches m
+    WHERE m.fixture_id = %s
+    LIMIT 1
+    """
+    row = fetch_one(sql, (fixture_id,))
+    if not row:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+
+    def _to_iso(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        try:
+            vv = v
+            if getattr(vv, "tzinfo", None) is None:
+                vv = vv.replace(tzinfo=timezone.utc)
+            return vv.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return str(v)
+
+    header = {
+        "fixture_id": int(row.get("fixture_id") or fixture_id),
+        "league_id": int(row.get("league_id") or 0),
+        "season": int(row.get("season") or 0),
+        "kickoff_utc": _to_iso(row.get("date_utc")),
+        "home": {"id": int(row.get("home_id") or 0)},
+        "away": {"id": int(row.get("away_id") or 0)},
+        "filters": {
+            "comp": comp,
+            "last_n": last_n,
+        },
+    }
+
+    # ✅ 여기서 실제 블록 생성(지연 import로 앱 전체 부팅 리스크 최소화)
+    try:
+        # 너 프로젝트 구조에 맞게 import 경로가 맞아야 함
+        from services.matchdetail.insights_block import build_insights_overall_block
+        from services.matchdetail.ai_predictions_block import build_ai_predictions_block
+    except Exception as e:
+        _admin_log(
+            event_type="match_snapshot_import_fail",
+            ok=False,
+            status_code=500,
+            fixture_id=fixture_id,
+            detail={"error": str(e)},
+        )
+        return jsonify({"ok": False, "error": f"import_failed: {e}"}), 500
+
+    try:
+        insights_overall = build_insights_overall_block(header)
+        ai_predictions = build_ai_predictions_block(header, insights_overall)
+
+        _admin_log(
+            event_type="match_snapshot_ok",
+            ok=True,
+            status_code=200,
+            fixture_id=fixture_id,
+            detail={"comp": comp, "last_n": last_n},
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "blocks": {
+                    "insights_overall": insights_overall,
+                    "ai_predictions": ai_predictions,
+                },
+            }
+        )
+    except Exception as e:
+        _admin_log(
+            event_type="match_snapshot_fail",
+            ok=False,
+            status_code=500,
+            fixture_id=fixture_id,
+            detail={"error": str(e)},
+        )
+        raise
+
+
 
 # ─────────────────────────────────────
 # Board APIs (admin)
@@ -1976,6 +2098,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
