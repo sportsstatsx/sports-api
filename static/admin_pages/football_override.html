@@ -302,9 +302,9 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     <div>
       <h1 style="margin:0 0 6px 0;">SportsStatsX Admin</h1>
       <div class="muted">
-        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
-        · <button class="soft" style="padding:6px 10px;" onclick="logoutToken()">토큰 삭제(로그아웃)</button>
-      </div>
+  경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+</div>
+
     </div>
     <div class="muted" id="statusLine"></div>
   </div>
@@ -341,9 +341,13 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
         </div>
 
-        <div style="min-width:140px; flex: 0 0 140px; align-self:flex-end;">
-          <button class="primary" style="width:100%;" onclick="loadFixtures()">불러오기</button>
+        <div style="min-width:290px; flex: 0 0 290px; align-self:flex-end;">
+          <div class="row" style="gap:8px;">
+            <button class="primary" style="flex:1;" onclick="loadFixtures()">불러오기</button>
+            <button id="btnOverridesOnly" style="flex:1;" onclick="loadOverridesOnly()">OVR만 보기</button>
+          </div>
         </div>
+
       </div>
 
       <div class="muted" style="margin-top:10px;" id="fxHint"></div>
@@ -677,6 +681,8 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   let bundleRaw = null;
   let bundleMerged = null;
 
+  // ✅ override-only 모드(날짜 무시하고 override 적용된 fixture만 전체 조회)
+  let overrideOnlyMode = false;
 
   // 현재(노출) fixtures
   let currentFixtures = [];
@@ -684,6 +690,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   // 원본(raw) fixtures 캐시: 같은 필터(date/tz/league_ids) 기준으로 한 번만 가져오기
   let rawCacheKey = "";
   let rawFixturesMap = null;
+
 
   function setStatusLine(msg) {
     document.getElementById("statusLine").textContent = msg || "";
@@ -848,6 +855,42 @@ function safeUrl(u) {
       return dateUtcStr || "";
     }
   }
+
+  function ymdInTz(dateUtcStr, tz) {
+    // dateUtcStr(UTC) -> tz 기준 YYYY-MM-DD
+    try {
+      const d = new Date(dateUtcStr);
+      const parts = new Intl.DateTimeFormat("sv-SE", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(d);
+      const y = parts.find(p => p.type === "year")?.value || "1970";
+      const m = parts.find(p => p.type === "month")?.value || "01";
+      const da = parts.find(p => p.type === "day")?.value || "01";
+      return `${y}-${m}-${da}`;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function setOverrideMode(on) {
+    overrideOnlyMode = !!on;
+
+    const btn = document.getElementById("btnOverridesOnly");
+    if (btn) {
+      // ✅ 켜짐 표시(테두리 강조)
+      btn.classList.toggle("primary", overrideOnlyMode);
+      btn.textContent = overrideOnlyMode ? "OVR 보기중" : "OVR만 보기";
+      btn.title = overrideOnlyMode ? "클릭하면 일반 날짜 조회로 돌아갑니다" : "override 적용된 fixture만 전체 조회";
+    }
+
+    // raw 캐시 무효화(모드가 바뀌면 key 의미가 달라짐)
+    rawFixturesMap = null;
+    rawCacheKey = "";
+  }
+
 
   function statusOrderKey(sg) {
   const v = (sg || "").toUpperCase();
@@ -1056,17 +1099,29 @@ if (awayLogo) {
 
 
   function getFilterKey() {
-    const date = document.getElementById("fxDate").value || "";
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
+
+    // ✅ OVR 모드에서는 "선택된 경기의 날짜(해당 tz 기준)"로 raw 캐시 키를 잡는다
+    const date =
+      (overrideOnlyMode && selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
+
     return `${date}__${tz}__${leagueIds}`;
   }
 
 
+
   function buildFixturesQuery() {
-    const date = document.getElementById("fxDate").value;
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
+
+    // ✅ OVR 모드에서는 선택된 경기 날짜를 사용(선택 전이면 fxDate 사용)
+    const date =
+      (overrideOnlyMode && selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
 
     const qs = new URLSearchParams();
     qs.set("date", date);
@@ -1074,6 +1129,7 @@ if (awayLogo) {
     if (leagueIds) qs.set("league_ids", leagueIds);
     return qs;
   }
+
 
 
   async function ensureRawLoaded() {
@@ -1258,6 +1314,9 @@ if (awayLogo) {
 
 
   async function loadFixtures() {
+    // ✅ 일반 날짜 조회로 들어오면 OVR 모드 OFF
+    setOverrideMode(false);
+
     const date = document.getElementById("fxDate").value;
     if (!date) {
       alert("Date를 선택하세요");
@@ -1283,7 +1342,6 @@ if (awayLogo) {
     selectedFixture = null;
     renderSelectedSummary(null);
 
-
     // raw 캐시 무효화(필터 변경될 수 있으니)
     rawFixturesMap = null;
     rawCacheKey = "";
@@ -1301,7 +1359,6 @@ if (awayLogo) {
     bundleRaw = null;
     bundleMerged = null;
 
-
     setStatusLine("");
     renderFixtures();
 
@@ -1313,6 +1370,59 @@ if (awayLogo) {
 
     showTab("now");
   }
+
+  async function loadOverridesOnly() {
+    // ✅ 토글: 이미 OVR 모드면 일반 날짜 조회로 복귀
+    if (overrideOnlyMode) {
+      return loadFixtures();
+    }
+
+    setOverrideMode(true);
+
+    setStatusLine("override 적용된 fixtures 전체 불러오는 중...");
+
+    // ✅ 서버에 이 endpoint가 있어야 함(아래 참고)
+    const r = await api(adminUrl(`/api/fixtures_overridden`), { method: "GET" });
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setStatusLine("");
+      alert(
+        "override 목록 로드 실패: " + JSON.stringify(r.data) +
+        "\n\n필요 endpoint: GET " + adminUrl("/api/fixtures_overridden") +
+        "\n응답 예시: { ok:true, rows:[...fixtures_merged rows...] }"
+      );
+      setOverrideMode(false);
+      return;
+    }
+
+    currentFixtures = r.data.rows || [];
+
+    // 선택 초기화
+    selectedFixture = null;
+    renderSelectedSummary(null);
+
+    // raw 캐시 무효화
+    rawFixturesMap = null;
+    rawCacheKey = "";
+
+    document.getElementById("fxPreviewNow").textContent = "{}";
+    document.getElementById("fxPreviewRaw").textContent = "{}";
+    document.getElementById("fxPreviewPatch").textContent = "{}";
+    document.getElementById("fxPreviewDiff").textContent = "[]";
+    document.getElementById("rawHint").textContent = "";
+
+    document.getElementById("bundlePreviewRaw").textContent = "{}";
+    document.getElementById("bundlePreviewMerged").textContent = "{}";
+    document.getElementById("bundlePreviewDiff").textContent = "[]";
+    bundleRaw = null;
+    bundleMerged = null;
+
+    setStatusLine("");
+    renderFixtures();
+    showTab("now");
+  }
+
+
 
 
   async function getOverride() {
