@@ -401,10 +401,13 @@ select option {
     }
 
     .modalCard {
-      width: min(980px, 96vw);
+      /* ✅ 가로 폭 더 줄임 */
+      width: min(860px, 92vw);
       max-height: min(86vh, 860px);
 
-      /* ✅ 카드 자체를 “완전 불투명 패널”로 */
+      /* ✅ background가 어떤 경우에도 gradient/투명으로 덮이지 않도록 강제 */
+      background-color: var(--panel);
+      background-image: none;
       background: var(--panel);
 
       border: 1px solid var(--line2);
@@ -414,6 +417,7 @@ select option {
       display:flex;
       flex-direction: column;
     }
+
 
     .modalTop {
       display:flex;
@@ -433,25 +437,45 @@ select option {
       letter-spacing: 0.2px;
     }
 
-    .modalBody {
-      padding: 14px;
-      overflow: auto;
-
-      /* ✅ 바디도 solid */
-      background: var(--panel);
+    /* ✅ 모달 안 폼 컨트롤이 rgba라서 “반투명처럼” 보이는 문제 해결 */
+    .modalCard input,
+    .modalCard select,
+    .modalCard textarea {
+      background: var(--panel2);
     }
 
 
+
+    /* ✅ 2줄 정리 + 겹침 방지(각 칸 min-width:0) */
     .fxControls {
-      display:grid;
-      grid-template-columns: 180px 200px 1fr 1fr auto;
+      display: grid;
+      grid-template-columns: 170px 210px 1fr 1fr;
+      grid-template-areas:
+        "date tz leagues search"
+        "date tz leagues btn";
       gap: 10px;
       align-items: end;
     }
+
+    .fxControls .col { gap: 6px; min-width: 0; }
+
+    .fxColDate { grid-area: date; }
+    .fxColTz { grid-area: tz; }
+    .fxColLeagues { grid-area: leagues; }
+    .fxColSearch { grid-area: search; }
+    .fxColBtn { grid-area: btn; }
+
+    /* ✅ 화면 좁아지면 2열로 자동 정리 */
     @media (max-width: 860px) {
-      .fxControls { grid-template-columns: 1fr 1fr; }
+      .fxControls {
+        grid-template-columns: 1fr 1fr;
+        grid-template-areas:
+          "date tz"
+          "leagues search"
+          "btn btn";
+      }
     }
-    .fxControls .col { gap: 6px; }
+
 
     .fxList {
       margin-top: 12px;
@@ -508,6 +532,40 @@ select option {
       overflow: hidden;
       text-overflow: ellipsis;
     }
+
+    .fxTeams {
+      margin-top: 6px;
+      display:flex;
+      align-items:center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .fxLogo {
+      width: 18px;
+      height: 18px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--panel2);
+      object-fit: cover;
+      flex: 0 0 auto;
+    }
+    .fxTeamName {
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
+    .fxVs {
+      font-size: 12px;
+      font-weight: 900;
+      opacity: 0.65;
+      flex: 0 0 auto;
+      padding: 0 2px;
+    }
+
     .fxRight {
       display:flex;
       align-items:center;
@@ -755,12 +813,12 @@ select option {
 
     <div class="modalBody">
       <div class="fxControls">
-        <div class="col">
+        <div class="col fxColDate">
           <label>Date</label>
           <input id="fxDate" type="date" />
         </div>
 
-        <div class="col">
+        <div class="col fxColTz">
           <label>Timezone</label>
           <select id="fxTz">
             <option value="Asia/Seoul">Asia/Seoul</option>
@@ -771,21 +829,22 @@ select option {
           </select>
         </div>
 
-        <div class="col">
+        <div class="col fxColLeagues">
           <label>League IDs (comma, optional)</label>
           <input id="fxLeagueIds" placeholder="예: 39,140,78" />
         </div>
 
-        <div class="col">
+        <div class="col fxColSearch">
           <label>Search (team/league)</label>
           <input id="fxSearch" placeholder="예: Arsenal / LaLiga" />
         </div>
 
-        <div class="col">
+        <div class="col fxColBtn">
           <label>&nbsp;</label>
           <button class="btn" type="button" onclick="loadFixtureBrowser()">불러오기</button>
         </div>
       </div>
+
 
       <div class="subtle" id="fxStatus" style="margin-top:10px;"></div>
       <div class="fxList" id="fxList"></div>
@@ -827,6 +886,16 @@ select option {
       .replaceAll("'", "&#039;");
   }
 
+  // ✅ 로고 URL이 없거나 깨지면 깔끔하게 대체(투명 1px)
+  const _EMPTY_LOGO =
+    "data:image/gif;base64,R0lGODlhAQABAAAAACwAAAAAAQABAAA=";
+
+  function safeLogo(u) {
+    const s = (u == null) ? "" : String(u).trim();
+    return s ? s : _EMPTY_LOGO;
+  }
+
+  
   function isoToDatetimeLocal(iso) {
     if (!iso) return "";
     const d = new Date(iso);
@@ -1233,7 +1302,7 @@ async function deletePostById(id) {
     if (String(f.fixture_key || f.fixture_id || "") !== String(fixtureKey)) return false;
     if (!f.home || !f.away) return false;
     if (!f.home.name || !f.away.name) return false;
-    if (!f.home.logo || !f.away.logo) return false;
+    // ✅ 로고는 없어도 프리뷰/리스트는 보여주자(football-override 스타일)
     return true;
   }
 
@@ -1252,22 +1321,26 @@ async function deletePostById(id) {
       ? `<div class="mpTop">${escapeHtml(leagueName)}${leagueName && kickoff ? " · " : ""}${escapeHtml(kickoff)}</div>`
       : "";
 
+    const hLogo = safeLogo(fixture.home.logo);
+    const aLogo = safeLogo(fixture.away.logo);
+
     box.innerHTML = `
       ${top}
       <div class="mpRow">
         <div class="team left">
-          <img class="logo" src="${escapeHtml(fixture.home.logo)}" alt="H" />
+          <img class="logo" src="${escapeHtml(hLogo)}" alt="H" onerror="this.src='${_EMPTY_LOGO}'" />
           <div class="name" title="${escapeHtml(fixture.home.name)}">${escapeHtml(fixture.home.name)}</div>
         </div>
         <div class="vs">VS</div>
         <div class="team right">
-          <img class="logo" src="${escapeHtml(fixture.away.logo)}" alt="A" />
+          <img class="logo" src="${escapeHtml(aLogo)}" alt="A" onerror="this.src='${_EMPTY_LOGO}'" />
           <div class="name" title="${escapeHtml(fixture.away.name)}">${escapeHtml(fixture.away.name)}</div>
         </div>
       </div>
     `;
     box.style.display = "block";
   }
+
 
   function renderMatchPreviewFromSnapshot() {
     // analysis에서만 보여주고, 아니면 숨김
@@ -1423,6 +1496,31 @@ async function deletePostById(id) {
   return fallback;
 }
 
+function fxPickLogo(row, side /* "home" | "away" */) {
+  const r = row || {};
+  const s = String(side || "").toLowerCase();
+
+  // 1) flat keys
+  const flat = (s === "home")
+    ? (r.home_logo || r.homeLogo || r.home_team_logo)
+    : (r.away_logo || r.awayLogo || r.away_team_logo);
+  if (flat) return String(flat).trim();
+
+  // 2) nested common shapes
+  const t = (s === "home")
+    ? (r.home || (r.teams && r.teams.home) || (r.team && r.team.home))
+    : (r.away || (r.teams && r.teams.away) || (r.team && r.team.away));
+
+  if (t) {
+    if (t.logo) return String(t.logo).trim();
+    if (t.team && t.team.logo) return String(t.team.logo).trim();
+  }
+
+  // 3) fallback
+  return "";
+}
+
+
 
   function openFixturePicker() {
     // sport 선택이 비어있으면 football로 기본
@@ -1517,7 +1615,6 @@ function filterFixtureRows(rows) {
   fxSetStatus("rows: " + viewRows.length + " (클릭하면 Fixture Key에 자동 입력)");
 
   for (const r of viewRows) {
-    // ✅ fxPick이 이제 object면 name/id를 뽑아주므로 [object Object] 방지
     const fixtureId = String(fxPick(r, ["fixture_id", "fixtureId", "id", "fixture"], ""));
 
     const league = String(fxPick(r, ["league_name", "league", "leagueName", "competition"], ""));
@@ -1532,6 +1629,9 @@ function filterFixtureRows(rows) {
     const ag = fxPick(r, ["away_goals", "awayGoals", "goals_away", "away_score"], null);
     const scoreTxt = (hg != null && ag != null) ? `${hg} : ${ag}` : "- : -";
 
+    const hLogo = safeLogo(fxPickLogo(r, "home"));
+    const aLogo = safeLogo(fxPickLogo(r, "away"));
+
     const div = document.createElement("div");
     div.className = "fxItem";
     div.innerHTML = `
@@ -1542,10 +1642,16 @@ function filterFixtureRows(rows) {
           ${league ? `<span>${escapeHtml(league)}</span>` : ""}
           ${kickoff ? `<span>· ${escapeHtml(String(kickoff).slice(0, 16).replace("T"," "))}</span>` : ""}
         </div>
-        <div class="fxTitle" title="${escapeHtml(home + " vs " + away)}">
-          ${escapeHtml(home)} <span style="opacity:.6;font-weight:800;">vs</span> ${escapeHtml(away)}
+
+        <div class="fxTeams" title="${escapeHtml(home + " vs " + away)}">
+          <img class="fxLogo" src="${escapeHtml(hLogo)}" alt="" onerror="this.src='${_EMPTY_LOGO}'" />
+          <div class="fxTeamName">${escapeHtml(home)}</div>
+          <div class="fxVs">vs</div>
+          <div class="fxTeamName" style="text-align:right;">${escapeHtml(away)}</div>
+          <img class="fxLogo" src="${escapeHtml(aLogo)}" alt="" onerror="this.src='${_EMPTY_LOGO}'" />
         </div>
       </div>
+
       <div class="fxRight">
         <div class="fxScore">${escapeHtml(scoreTxt)}</div>
         <div style="opacity:.75;">선택</div>
@@ -1562,6 +1668,7 @@ function filterFixtureRows(rows) {
     box.appendChild(div);
   }
 }
+
 
 
 
