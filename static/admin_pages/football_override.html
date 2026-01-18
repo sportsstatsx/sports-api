@@ -316,9 +316,15 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
       <div class="row">
         <div style="min-width:190px; flex: 0 0 190px;">
-          <label class="muted">Date</label>
+          <label class="muted">Date (From)</label>
           <input id="fxDate" type="date"/>
         </div>
+
+        <div style="min-width:190px; flex: 0 0 190px;">
+          <label class="muted">Date (To)</label>
+          <input id="fxDateTo" type="date"/>
+        </div>
+
 
         <div style="min-width:220px; flex: 1 1 220px;">
           <label class="muted">Timezone</label>
@@ -847,6 +853,53 @@ function safeUrl(u) {
     return `${yyyy}-${mm}-${dd}`;
   }
 
+  function parseYmdToUtcDate(ymd) {
+    // "YYYY-MM-DD" -> Date(UTC 기준)
+    // ✅ 로컬 타임존 영향 제거용: 항상 Z로 고정
+    return new Date(String(ymd).trim() + "T00:00:00Z");
+  }
+
+  function fmtUtcDateToYmd(d) {
+    // Date -> "YYYY-MM-DD"
+    return d.toISOString().slice(0, 10);
+  }
+
+  function enumerateYmdRange(fromYmd, toYmd, maxDays = 31) {
+    const a = String(fromYmd || "").trim();
+    const b = String(toYmd || "").trim();
+    if (!a) return { ok:false, days:[], error:"from_date_required" };
+
+    const fromD = parseYmdToUtcDate(a);
+    const toD = parseYmdToUtcDate(b || a);
+
+    if (!Number.isFinite(fromD.getTime()) || !Number.isFinite(toD.getTime())) {
+      return { ok:false, days:[], error:"invalid_date" };
+    }
+
+    // ✅ 뒤집혔으면 swap
+    let start = fromD;
+    let end = toD;
+    if (end.getTime() < start.getTime()) {
+      const tmp = start; start = end; end = tmp;
+    }
+
+    const days = [];
+    let cur = start;
+    for (let i=0; i<maxDays; i++) {
+      days.push(fmtUtcDateToYmd(cur));
+      if (fmtUtcDateToYmd(cur) === fmtUtcDateToYmd(end)) break;
+      cur = new Date(cur.getTime() + 86400000); // +1 day
+    }
+
+    // ✅ maxDays 초과 감지(끝까지 못 감)
+    if (days[days.length-1] !== fmtUtcDateToYmd(end)) {
+      return { ok:false, days:[], error:`range_too_large(max=${maxDays})` };
+    }
+
+    return { ok:true, days, error:null };
+  }
+
+
   function fmtInTz(dateUtcStr, tz) {
     try {
       const d = new Date(dateUtcStr);
@@ -1102,8 +1155,11 @@ if (awayLogo) {
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
 
-    // ✅ OVR 모드는 “현재 날짜 기준 필터링”으로 동작(서버 추가 없이 전체 날짜 무시 조회는 불가)
-    const date = (document.getElementById("fxDate").value || "");
+    // ✅ Raw 비교는 "선택된 경기의 날짜(해당 tz 기준)"로 잡아야 기간 조회에서도 정확함
+    const date =
+      (selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
 
     return `${date}__${tz}__${leagueIds}`;
   }
@@ -1111,12 +1167,14 @@ if (awayLogo) {
 
 
 
-  function buildFixturesQuery() {
+
+  function buildFixturesQuery(dateOverride) {
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
 
-    // ✅ OVR 모드도 “현재 선택한 Date”를 그대로 사용
-    const date = (document.getElementById("fxDate").value || "");
+    const date = (dateOverride != null && String(dateOverride).trim() !== "")
+      ? String(dateOverride).trim()
+      : (document.getElementById("fxDate").value || "");
 
     const qs = new URLSearchParams();
     qs.set("date", date);
@@ -1128,6 +1186,7 @@ if (awayLogo) {
 
 
 
+
   async function ensureRawLoaded() {
     const key = getFilterKey();
     if (rawFixturesMap && rawCacheKey === key) return true;
@@ -1135,7 +1194,14 @@ if (awayLogo) {
     rawFixturesMap = null;
     rawCacheKey = key;
 
-    const qs = buildFixturesQuery();
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const dateForRaw =
+      (selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
+
+    const qs = buildFixturesQuery(dateForRaw);
+
     document.getElementById("rawHint").textContent = "원본(raw) 불러오는 중...";
     const r = await api(adminUrl(`/api/fixtures_raw?` + qs.toString()), { method: "GET" });
 
@@ -1153,6 +1219,7 @@ if (awayLogo) {
     document.getElementById("rawHint").textContent = `원본(raw) rows: ${rows.length}`;
     return true;
   }
+
 
   function diffObjects(a, b, path="", out=[]) {
     // a=raw, b=current
@@ -1374,38 +1441,60 @@ if (awayLogo) {
       return loadFixtures();
     }
 
-    // ✅ 서버 추가 없이: “해당 날짜(date/tz/league_ids)에서 OVR만 보기”로 동작
     setOverrideMode(true);
 
-    const date = document.getElementById("fxDate").value;
-    if (!date) {
-      alert("Date를 선택하세요");
+    const from = document.getElementById("fxDate").value;
+    const to = (document.getElementById("fxDateTo")?.value || "").trim();
+
+    if (!from) {
+      alert("Date (From)를 선택하세요");
       setOverrideMode(false);
       return;
     }
 
-    const qs = buildFixturesQuery();
-
-    setStatusLine("OVR만 보기(해당 날짜) 불러오는 중...");
-
-    // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용 후 프론트에서 _has_override만 필터
-    const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
-
-    if (r.status >= 400 || !r.data || !r.data.ok) {
+    const range = enumerateYmdRange(from, to || from, 31);
+    if (!range.ok) {
       setStatusLine("");
-      alert("fixtures_merged 로드 실패: " + JSON.stringify(r.data));
+      alert("기간 설정 오류: " + range.error + "\n\n(최대 31일까지만 지원)");
       setOverrideMode(false);
       return;
     }
 
-    const rows = r.data.rows || [];
-    currentFixtures = rows.filter(x => x && x._has_override === true);
+    const days = range.days;
+
+    setStatusLine(`OVR 기간 조회중... (0/${days.length})`);
+
+    const map = {}; // fixture_id -> row (dedupe)
+
+    for (let i=0; i<days.length; i++) {
+      const day = days[i];
+      setStatusLine(`OVR 기간 조회중... (${i+1}/${days.length}) ${day}`);
+
+      const qs = buildFixturesQuery(day);
+      const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
+
+      if (r.status >= 400 || !r.data || !r.data.ok) {
+        setStatusLine("");
+        alert(`fixtures_merged 로드 실패 (${day}): ` + JSON.stringify(r.data));
+        setOverrideMode(false);
+        return;
+      }
+
+      const rows = r.data.rows || [];
+      for (const x of rows) {
+        if (!x) continue;
+        if (x._has_override !== true) continue;
+        map[String(x.fixture_id)] = x;
+      }
+    }
+
+    currentFixtures = Object.values(map);
 
     // 선택 초기화
     selectedFixture = null;
     renderSelectedSummary(null);
 
-    // raw 캐시 무효화(필터 변경될 수 있으니)
+    // raw 캐시 무효화
     rawFixturesMap = null;
     rawCacheKey = "";
 
@@ -1425,6 +1514,7 @@ if (awayLogo) {
     renderFixtures();
     showTab("now");
   }
+
 
 
 
@@ -2234,7 +2324,10 @@ if (awayLogo) {
 
 
   document.getElementById("fxDate").value = isoDateLocal();
+  const fxDateTo = document.getElementById("fxDateTo");
+  if (fxDateTo) fxDateTo.value = document.getElementById("fxDate").value;
   document.getElementById("fxTz").value = "Asia/Seoul";
+
 
   // ✅ 필터/검색 즉시 반영 (서버 재호출 없이 UI 리스트만 갱신)
   (function attachFxLiveFilters(){
