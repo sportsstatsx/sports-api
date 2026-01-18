@@ -1643,18 +1643,36 @@ def admin_fixture_meta():
     return jsonify({"ok": True, "fixture": fixture})
 
 
-@app.get(f"/{ADMIN_PATH}/api/match_snapshot")
+@app.route(f"/{ADMIN_PATH}/api/match_snapshot", methods=["GET", "POST"])
 @require_admin
 def admin_match_snapshot():
     """
     Admin UI에서 analysis 글 작성 시,
     (sport, fixture_key) 기반으로 insights_overall / ai_predictions 블록을 생성해 내려준다.
 
-    GET /{ADMIN_PATH}/api/match_snapshot?sport=football&fixture_key=1379184
-      (&comp=All&last_n=10 같은 선택 파라미터는 필요하면 확장)
+    ✅ 지원:
+    - POST JSON (프론트 최신): { sport, fixture_key, filters: { scope:"league", last_n:"3|5|7|10|season_current|season_prev", league_id, season, comp } }
+    - GET query (레거시): ?sport=football&fixture_key=...&comp=All&last_n=10
+
+    ✅ 핵심 정책:
+    - scope는 무조건 "league"로 강제 (선택한 경기 리그 기준)
+    - last_n: 3/5/7/10 또는 season_current/season_prev 지원
+      * season_current: 해당 경기 season으로 계산
+      * season_prev: (해당 경기 season - 1)로 계산
     """
-    sport = (request.args.get("sport") or "").strip().lower()
-    fixture_key = (request.args.get("fixture_key") or "").strip()
+    # ── 1) 입력 파싱: POST 우선, 없으면 GET
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    if not isinstance(body, dict):
+        body = {}
+
+    if request.method == "POST":
+        sport = (body.get("sport") or "").strip().lower()
+        fixture_key = (body.get("fixture_key") or "").strip()
+        filters_in = body.get("filters") or {}
+    else:
+        sport = (request.args.get("sport") or "").strip().lower()
+        fixture_key = (request.args.get("fixture_key") or "").strip()
+        filters_in = {}
 
     if not sport or not fixture_key:
         return jsonify({"ok": False, "error": "sport_and_fixture_key_required"}), 400
@@ -1667,16 +1685,10 @@ def admin_match_snapshot():
     except Exception:
         return jsonify({"ok": False, "error": "fixture_key_must_be_int_for_football"}), 400
 
-    # (선택) 필터 기본값
-    comp = (request.args.get("comp") or "All").strip()
-    last_n_raw = (request.args.get("last_n") or "10").strip()
-    try:
-        last_n = int(last_n_raw)
-    except Exception:
-        last_n = 10
-    last_n = max(3, min(last_n, 50))
+    if not isinstance(filters_in, dict):
+        filters_in = {}
 
-    # matches에서 블록 생성에 필요한 최소 헤더 구성
+    # ── 2) matches에서 기본 메타 확보 (league_id/season/home/away)
     sql = """
     SELECT
       m.fixture_id,
@@ -1706,22 +1718,92 @@ def admin_match_snapshot():
         except Exception:
             return str(v)
 
+    base_league_id = int(row.get("league_id") or 0)
+    base_season = int(row.get("season") or 0)
+
+    # ── 3) filters 정규화: 리그 기준 강제 + last_n(숫자/시즌모드) 처리
+    # comp
+    if request.method == "POST":
+        comp = str(filters_in.get("comp") or "All").strip() or "All"
+    else:
+        comp = (request.args.get("comp") or "All").strip() or "All"
+
+    # scope: 무조건 league 강제
+    scope = "league"
+
+    # league_id/season: filters가 오면 우선, 없으면 match 기준
+    try:
+        league_id = int(filters_in.get("league_id")) if filters_in.get("league_id") is not None else base_league_id
+    except Exception:
+        league_id = base_league_id
+
+    # last_n raw (POST는 filters, GET은 query)
+    if request.method == "POST":
+        last_n_raw = filters_in.get("last_n")
+    else:
+        last_n_raw = request.args.get("last_n")
+
+    last_n_mode = ""
+    last_n_val: int | None = None
+
+    # season_current / season_prev / n3/n5... / "3"
+    s = (str(last_n_raw).strip() if last_n_raw is not None else "")
+    s_low = s.lower()
+
+    if s_low in ("season_current", "current_season", "this_season"):
+        last_n_mode = "season_current"
+    elif s_low in ("season_prev", "prev_season", "previous_season", "last_season"):
+        last_n_mode = "season_prev"
+    else:
+        # "n5" 같은 형태도 허용
+        if s_low.startswith("n") and s_low[1:].isdigit():
+            s_low = s_low[1:]
+        try:
+            v = int(s_low) if s_low else 10
+        except Exception:
+            v = 10
+        v = max(3, min(v, 50))
+        last_n_val = v
+
+    # season 결정:
+    # - filters.season 있으면 우선
+    # - 없으면 base_season
+    # - last_n_mode가 season_prev면 season-1 적용
+    try:
+        season_in = int(filters_in.get("season")) if filters_in.get("season") is not None else base_season
+    except Exception:
+        season_in = base_season
+
+    if last_n_mode == "season_prev":
+        season = max(0, season_in - 1)
+    else:
+        season = season_in
+
+    # header.filters.last_n 형태:
+    # - 숫자 모드: int
+    # - 시즌 모드: "season_current" / "season_prev" 문자열 그대로 전달 (블록 쪽에서 해석 가능하게)
+    header_last_n: Any
+    if last_n_mode:
+        header_last_n = last_n_mode
+    else:
+        header_last_n = int(last_n_val or 10)
+
     header = {
         "fixture_id": int(row.get("fixture_id") or fixture_id),
-        "league_id": int(row.get("league_id") or 0),
-        "season": int(row.get("season") or 0),
+        "league_id": int(league_id or 0),
+        "season": int(season or 0),
         "kickoff_utc": _to_iso(row.get("date_utc")),
         "home": {"id": int(row.get("home_id") or 0)},
         "away": {"id": int(row.get("away_id") or 0)},
         "filters": {
+            "scope": scope,
             "comp": comp,
-            "last_n": last_n,
+            "last_n": header_last_n,
         },
     }
 
-    # ✅ 여기서 실제 블록 생성(지연 import로 앱 전체 부팅 리스크 최소화)
+    # ── 4) 블록 생성 (지연 import)
     try:
-        # 너 프로젝트 구조에 맞게 import 경로가 맞아야 함
         from matchdetail.insights_block import build_insights_overall_block
         from matchdetail.ai_predictions_block import build_ai_predictions_block
     except Exception as e:
@@ -1743,7 +1825,14 @@ def admin_match_snapshot():
             ok=True,
             status_code=200,
             fixture_id=fixture_id,
-            detail={"comp": comp, "last_n": last_n},
+            detail={
+                "scope": scope,
+                "comp": comp,
+                "last_n": header_last_n,
+                "league_id": header.get("league_id"),
+                "season": header.get("season"),
+                "method": request.method,
+            },
         )
         return jsonify(
             {
@@ -1763,6 +1852,7 @@ def admin_match_snapshot():
             detail={"error": str(e)},
         )
         raise
+
 
 
 
@@ -2098,6 +2188,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
