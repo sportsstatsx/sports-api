@@ -75,8 +75,18 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+    # 🔥 변경점: standings 데이터가 없을 때도 "빈 블록 + 안내 문구"를 내려준다
     if not rows:
-        return None
+        return {
+            "league": {
+                "league_id": league_id,
+                "season": season,
+                "name": league_name,
+            },
+            "rows": [],
+            "context_options": {"conferences": [], "groups": []},
+            "message": "Standings are not available yet.",
+        }
 
     def _coalesce_int(v: Any, default: int = 0) -> int:
         try:
@@ -140,7 +150,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 if (r.get("group_name") or "").strip() == main_group
             ]
 
-
     # 3) position 기준 정렬 후 JSON 매핑
     dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0))
 
@@ -183,6 +192,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # (지금은 안 써도 되고, 나중에 점진적으로 마이그레이션 가능)
         "context_options": context_options,
     }
+
 
 
 def _build_context_options_from_rows(
