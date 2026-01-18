@@ -294,41 +294,82 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb{
 html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,243,245,0.28); }
 
 /* ─────────────────────────────────────
-   Fixtures filters compact layout
+   Fixtures filters compact layout (aligned)
    ───────────────────────────────────── */
 
 .fxFilters{
   display:grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap:10px;
-  align-items:end;
+  align-items:start;            /* ✅ end(아래정렬) → start(위정렬) */
 }
 
+/* ✅ 각 칸을 세로 스택으로 고정해서 라벨/컨트롤 라인 맞춤 */
+.fxFilters > div{
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+}
+
+/* ✅ 라벨 높이 고정(줄바꿈 때문에 컨트롤 라인이 흔들리는 현상 방지) */
+.fxFilters label{
+  margin:0 0 6px 0;
+  line-height:1;
+  height:14px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+/* ✅ 컨트롤(입력/셀렉트/버튼) 높이 통일 */
+.fxFilters input,
+.fxFilters select{
+  min-height:36px;
+  box-sizing:border-box;
+}
+
+/* Actions 버튼 줄도 입력박스 높이와 맞추기 */
 .fxBtnRow{
   display:grid;
   grid-template-columns: 1fr 1fr;
   gap:8px;
+  margin-top:auto;
+}
+.fxBtnRow button{
+  min-height:36px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
 }
 
+/* League: select + 버튼들을 한 줄로 “같은 높이” */
 .leagueBar{
-  display:flex;
+  display:grid;
+  grid-template-columns: 1fr auto;
   gap:8px;
-  align-items:center;
+  align-items:stretch;
 }
 
 .leagueBar select{
-  flex: 1 1 auto;
-  min-width: 0;
+  min-width:0;
 }
 
 .leagueBtns{
-  flex: 0 0 auto;
   display:flex;
   gap:6px;
 }
+.leagueBtns .btnsm{
+  min-height:36px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:0 10px;
+}
 
+/* pills가 없을 때도 높이 유지해서 아래 줄이 들쭉날쭉해 보이는 것 방지 */
 .leaguePills{
   margin-top:6px;
+  min-height:18px;
   display:flex;
   flex-wrap:wrap;
   gap:6px;
@@ -342,6 +383,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   color: var(--muted);
   background: transparent;
 }
+
 
 
   </style>
