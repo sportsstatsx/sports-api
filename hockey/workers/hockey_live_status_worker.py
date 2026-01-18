@@ -632,11 +632,34 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             for row in group_rows:
                 team = row.get("team") if isinstance(row.get("team"), dict) else {}
                 team_id = _safe_int(team.get("id"))
-                if team_id is None:
+
+                # ✅ (1) team_id가 None/0/음수면 스킵 (FK 위반 근본 차단)
+                if team_id is None or team_id <= 0:
                     skipped += 1
+                    tname = _safe_text(team.get("name"))
+                    log.warning(
+                        "standings skip(invalid team_id): league=%s season=%s team_id=%s team_name=%s",
+                        lid, season, team_id, tname
+                    )
+                    continue
+
+                # ✅ (2) hockey_teams에 없는 team_id면 스킵 (meta refresh 레이스 방지)
+                #     (원하면 나중에 여기서 팀 자동 보강 로직도 넣을 수 있음)
+                exists = hockey_fetch_one(
+                    "SELECT 1 FROM hockey_teams WHERE id=%s LIMIT 1",
+                    (int(team_id),),
+                )
+                if not exists:
+                    skipped += 1
+                    tname = _safe_text(team.get("name"))
+                    log.warning(
+                        "standings skip(team not in hockey_teams): league=%s season=%s team_id=%s team_name=%s",
+                        lid, season, team_id, tname
+                    )
                     continue
 
                 position = _safe_int(row.get("rank")) or _safe_int(row.get("position")) or 0
+
 
                 stage = _safe_text(row.get("stage")) or default_stage
                 g = row.get("group")
