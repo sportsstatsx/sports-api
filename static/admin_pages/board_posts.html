@@ -446,35 +446,60 @@ select option {
 
 
 
-    /* ✅ 2줄 정리 + 겹침 방지(각 칸 min-width:0) */
+    /* ✅ Fixtures Browser 필터: 1줄(기본) + 2줄(검색) + 버튼은 우측 고정 */
     .fxControls {
       display: grid;
-      grid-template-columns: 170px 210px 1fr 1fr;
+      grid-template-columns: 180px 220px 1fr 160px;
       grid-template-areas:
-        "date tz leagues search"
-        "date tz leagues btn";
+        "date tz leagues btn"
+        "search search search btn";
       gap: 10px;
       align-items: end;
     }
 
-    .fxControls .col { gap: 6px; min-width: 0; }
+    .fxControls .col { gap: 4px; min-width: 0; }
 
     .fxColDate { grid-area: date; }
     .fxColTz { grid-area: tz; }
     .fxColLeagues { grid-area: leagues; }
     .fxColSearch { grid-area: search; }
-    .fxColBtn { grid-area: btn; }
+    .fxColBtn { grid-area: btn; align-self: stretch; }
 
-    /* ✅ 화면 좁아지면 2열로 자동 정리 */
+    /* ✅ 버튼 컬럼의 라벨은 공간만 유지하고 안 보이게 */
+    .fxColBtn label { visibility: hidden; }
+
+    /* ✅ 모달 안에서만 폼 높이/패딩 통일 */
+    .fxControls input,
+    .fxControls select {
+      height: 40px;
+      padding: 0 12px;
+      box-sizing: border-box;
+    }
+
+    /* ✅ 불러오기 버튼도 인풋 높이와 동일 + 컬럼 꽉 채우기 */
+    .fxControls .btn.fxBtn {
+      height: 40px;
+      width: 100%;
+      padding: 0 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+    }
+
+    /* ✅ 좁은 화면에서는 2열 + 버튼 full */
     @media (max-width: 860px) {
       .fxControls {
         grid-template-columns: 1fr 1fr;
         grid-template-areas:
           "date tz"
-          "leagues search"
+          "leagues leagues"
+          "search search"
           "btn btn";
       }
+      .fxColBtn label { display:none; }
     }
+
 
 
     .fxList {
@@ -841,7 +866,8 @@ select option {
 
         <div class="col fxColBtn">
           <label>&nbsp;</label>
-          <button class="btn" type="button" onclick="loadFixtureBrowser()">불러오기</button>
+          <button class="btn fxBtn" type="button" onclick="loadFixtureBrowser()">불러오기</button>
+
         </div>
       </div>
 
