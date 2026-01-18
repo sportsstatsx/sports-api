@@ -2,13 +2,11 @@
 #
 # 목표:
 # - 이 파일 1개만으로 라이브 업데이트가 돌아가게 단순화
-# - DB 기존 스키마 변경 없음 (기존 테이블/컬럼/PK/타입 유지)
-#   * 단, dedupe/state용 "추가 테이블 생성"은 허용
+# - DB 스키마 변경 없음 (테이블/컬럼/PK 그대로 사용)
 # - /fixtures 기반 상태/스코어 업데이트 + 원본 raw 저장(match_fixtures_raw)
 # - INPLAY 경기: /events 저장 + events 기반 스코어 "정교 보정"(취소골/실축PK 제외, OG 반영)
 # - INPLAY 경기: /statistics 60초 쿨다운
-# - lineups: 프리매치(-60/-10 슬롯 1회씩) + 킥오프 직후(elapsed<=15) 재시도 정책
-# - FINISHED: FT 최초 관측 시각 기준 +60초 / +30분에 1회씩 확정 수집
+# - lineups: 프리매치(-60/-10 슬롯 1회씩) + 킥오프 직후(elapsed<=5) 재시도 정책
 #
 # 사용 테이블/PK (확인 완료):
 # - fixtures(fixture_id PK)
@@ -19,10 +17,6 @@
 # - match_lineups(fixture_id, team_id PK)
 # - match_team_stats(fixture_id, team_id, name PK)
 # - match_player_stats는 라이브에서 미사용(스키마 유지)
-#
-# (추가 테이블 - 기존 스키마 변경 없이 테이블 추가만)
-# - match_event_states (fixture_id PK)
-# - match_event_key_map ((fixture_id, canonical_key) PK)
 
 import os
 import sys
@@ -34,7 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from db import execute, fetch_one
+from db import execute  # dev 스키마 확정 → 런타임 schema 조회 불필요
+
 
 
 # ─────────────────────────────────────
@@ -48,45 +43,17 @@ INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "10"))
 BASE = "https://v3.football.api-sports.io"
 UA = "SportsStatsX-LiveWorker/1.0"
 
-STATS_INTERVAL_SEC = 60
+STATS_INTERVAL_SEC = 60  # stats 쿨다운
 REQ_TIMEOUT = 12
 REQ_RETRIES = 2
 
-# 이벤트 시간 보정 허용 범위(분)
-EVENT_MINUTE_CORR_ALLOW = 10
-
-# events 폴링 쿨다운(초) - INPLAY에서 /fixtures/events 과다 호출 방지
-EVENTS_INTERVAL_SEC = int(os.environ.get("LIVE_EVENTS_INTERVAL_SEC", "20"))
-
-# fixtures 폴링 쿨다운(초) - /fixtures 리그×날짜 매틱 호출 방지
-FIXTURES_POLL_INTERVAL_SEC = int(os.environ.get("LIVE_FIXTURES_POLL_INTERVAL_SEC", "30"))
-
-# dedupe prune 실행 주기(초) - 매틱 DELETE 방지
-PRUNE_INTERVAL_SEC = int(os.environ.get("LIVE_DEDUPE_PRUNE_INTERVAL_SEC", "3600"))
-
-# INPLAY 라인업 재시도 최대 횟수(0~15분 구간)
-LINEUPS_INPLAY_MAX_TRIES = int(os.environ.get("LIVE_LINEUPS_INPLAY_MAX_TRIES", "8"))
-
-# 최소값 안전장치
-if EVENTS_INTERVAL_SEC < 5:
-    EVENTS_INTERVAL_SEC = 5
-if FIXTURES_POLL_INTERVAL_SEC < 10:
-    FIXTURES_POLL_INTERVAL_SEC = 10
-if PRUNE_INTERVAL_SEC < 300:
-    PRUNE_INTERVAL_SEC = 300
-if LINEUPS_INPLAY_MAX_TRIES < 1:
-    LINEUPS_INPLAY_MAX_TRIES = 1
-
-
 
 # ─────────────────────────────────────
-# 런타임 캐시 (메모리)
+# 런타임 캐시
 # ─────────────────────────────────────
 
-LAST_STATS_SYNC: Dict[int, float] = {}          # fixture_id -> last ts
-LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}   # fixture_id -> state dict
-LAST_EVENTS_SYNC: Dict[int, float] = {}         # fixture_id -> last events poll ts
-
+LAST_STATS_SYNC: Dict[int, float] = {}  # fixture_id -> last ts
+LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> {"slot60":bool,"slot10":bool,"success":bool}
 
 
 # ─────────────────────────────────────
@@ -100,24 +67,6 @@ def now_utc() -> dt.datetime:
 def iso_utc(dtobj: dt.datetime) -> str:
     x = dtobj.astimezone(dt.timezone.utc)
     return x.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def safe_int(x: Any) -> Optional[int]:
-    if x is None:
-        return None
-    try:
-        return int(x)
-    except Exception:
-        return None
-
-
-def safe_text(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    try:
-        return str(x)
-    except Exception:
-        return None
 
 
 def parse_live_leagues(env: str) -> List[int]:
@@ -146,22 +95,23 @@ def parse_live_leagues(env: str) -> List[int]:
 
 def target_dates_for_live() -> List[str]:
     """
-    기본 UTC 오늘.
-    UTC 자정 경계에서 누락/지연/중단재개 케이스가 자주 발생하므로
-    00~06시는 UTC 어제도 같이 조회한다.
+    기본은 UTC 오늘.
+    (새벽 시간대 경기 누락 방지를 위해 필요하면 UTC 어제도 같이 조회)
     """
     now = now_utc()
     today = now.date()
     dates = [today.isoformat()]
-    if now.hour <= 6:
+
+    # UTC 00~03시는 어제 경기(자정 넘어가는 경기)가 INPLAY/FT로 남아있을 가능성이 높음
+    if now.hour <= 3:
         dates.insert(0, (today - dt.timedelta(days=1)).isoformat())
     return dates
-
 
 
 def map_status_group(short_code: Optional[str]) -> str:
     code = (short_code or "").upper().strip()
 
+    # UPCOMING
     if code in ("NS", "TBD"):
         return "UPCOMING"
 
@@ -169,21 +119,34 @@ def map_status_group(short_code: Optional[str]) -> str:
     if code in ("1H", "2H", "ET", "P", "BT", "INT", "LIVE", "HT"):
         return "INPLAY"
 
+    # FINISHED
     if code in ("FT", "AET", "PEN"):
         return "FINISHED"
 
+    # 기타
     if code in ("SUSP", "PST", "CANC", "ABD", "AWD", "WO"):
         return "OTHER"
 
     return "OTHER"
 
 
-def infer_season_candidates(date_str: str) -> List[int]:
-    y = int(date_str[:4])
-    # 대부분 리그는 '해당 연도' 또는 '직전 시즌'이 정답.
-    # y+1은 극히 예외(미래 시즌)라 마지막 후보로만 둔다.
-    return [y, y - 1, y + 1]
+def safe_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
 
+
+def safe_text(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        s = str(x)
+        return s
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────
@@ -202,8 +165,20 @@ def _session() -> requests.Session:
     return s
 
 
-class _TokenBucket:
-    def __init__(self) -> None:
+def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    API-Sports GET 호출 공통 함수.
+
+    개선점(스키마 변경 없음):
+    - ENV 기반 레이트리밋(RATE_LIMIT_PER_MIN / RATE_LIMIT_BURST) 적용 (토큰버킷)
+    - 429(Too Many Requests) 대응: Retry-After 헤더 존중
+    - 기존 재시도(REQ_RETRIES) 유지
+    """
+    url = f"{BASE}{path}"
+
+    # --- rate limiter (token bucket) ---
+    if not hasattr(api_get, "_rl"):
+        # ENV가 없으면 기본값(기존 동작과 유사하게 너무 느리게 막지 않도록 넉넉히)
         try:
             per_min = float(os.environ.get("RATE_LIMIT_PER_MIN", "0") or "0")
         except Exception:
@@ -213,53 +188,61 @@ class _TokenBucket:
         except Exception:
             burst = 0.0
 
-        self.rate = (per_min / 60.0) if per_min > 0 else 0.0
-        if self.rate > 0:
-            self.max_tokens = burst if burst > 0 else max(1.0, self.rate * 5)
-        else:
-            self.max_tokens = 0.0
+        # 값이 0이면 '제한 없음'으로 취급(기존 동작 유지)
+        rate_per_sec = (per_min / 60.0) if per_min > 0 else 0.0
+        max_tokens = burst if burst > 0 else (max(1.0, rate_per_sec * 5) if rate_per_sec > 0 else 0.0)
 
-        self.tokens = self.max_tokens
-        self.ts = time.time()
+        api_get._rl = {
+            "rate": rate_per_sec,
+            "max": max_tokens,
+            "tokens": max_tokens,
+            "ts": time.time(),
+        }
 
-    def acquire(self) -> None:
-        if self.rate <= 0 or self.max_tokens <= 0:
-            return
+    rl = api_get._rl  # type: ignore[attr-defined]
+
+    def _acquire_token() -> None:
+        rate = float(rl.get("rate") or 0.0)
+        max_t = float(rl.get("max") or 0.0)
+        if rate <= 0 or max_t <= 0:
+            return  # 제한 없음
 
         now_ts = time.time()
-        elapsed = max(0.0, now_ts - self.ts)
+        last_ts = float(rl.get("ts") or now_ts)
+        elapsed = max(0.0, now_ts - last_ts)
+        # refill
+        tokens = float(rl.get("tokens") or 0.0) + elapsed * rate
+        if tokens > max_t:
+            tokens = max_t
+        rl["tokens"] = tokens
+        rl["ts"] = now_ts
 
-        self.tokens = min(self.max_tokens, self.tokens + elapsed * self.rate)
-        self.ts = now_ts
-
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
+        if tokens >= 1.0:
+            rl["tokens"] = tokens - 1.0
             return
 
-        need = 1.0 - self.tokens
-        wait_sec = need / self.rate if self.rate > 0 else 0.25
+        # 부족하면 필요한 시간만큼 sleep
+        need = 1.0 - tokens
+        wait_sec = need / rate if rate > 0 else 0.25
         if wait_sec > 0:
             time.sleep(wait_sec)
 
+        # 재획득(한 번 더 refill 후 1개 사용)
         now_ts2 = time.time()
-        elapsed2 = max(0.0, now_ts2 - self.ts)
-        self.tokens = min(self.max_tokens, self.tokens + elapsed2 * self.rate)
-        self.ts = now_ts2
-        self.tokens = max(0.0, self.tokens - 1.0)
+        elapsed2 = max(0.0, now_ts2 - float(rl.get("ts") or now_ts2))
+        tokens2 = float(rl.get("tokens") or 0.0) + elapsed2 * rate
+        if tokens2 > max_t:
+            tokens2 = max_t
+        rl["tokens"] = max(0.0, tokens2 - 1.0)
+        rl["ts"] = now_ts2
 
-
-_RL = _TokenBucket()
-
-
-def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{BASE}{path}"
     last_err: Optional[Exception] = None
-
     for _ in range(REQ_RETRIES + 1):
         try:
-            _RL.acquire()
+            _acquire_token()
             r = session.get(url, params=params, timeout=REQ_TIMEOUT)
 
+            # 429 대응
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 try:
@@ -277,6 +260,7 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
             time.sleep(0.4)
 
     raise last_err  # type: ignore
+
 
 
 def fetch_fixtures(session: requests.Session, league_id: int, date_str: str, season: int) -> List[Dict[str, Any]]:
@@ -298,367 +282,21 @@ def fetch_lineups(session: requests.Session, fixture_id: int) -> List[Dict[str, 
     data = api_get(session, "/fixtures/lineups", {"fixture": fixture_id})
     return (data.get("response") or []) if isinstance(data, dict) else []
 
-# ─────────────────────────────────────
-# Standings (Football) - FT 최초 관측 시 1회 갱신
-# ─────────────────────────────────────
 
-def fetch_standings(session: requests.Session, league_id: int, season: int) -> Dict[str, Any]:
-    return api_get(session, "/standings", {"league": int(league_id), "season": int(season)})
-
-
-def _db_table_columns(table_name: str) -> set:
+def infer_season_candidates(date_str: str) -> List[int]:
     """
-    standings 테이블 컬럼을 동적으로 확인해서,
-    환경별(컬럼 추가/누락) 차이로 워커가 죽지 않게 한다.
+    DB 의 season 테이블 등에 의존하지 않고도 안정적으로 시즌을 추론.
+    - 먼저 date 연도
+    - 그 다음 date 연도-1
+    - 마지막으로 date 연도+1 (드물지만 컵/특수 케이스)
     """
-    try:
-        # ✅ 상단 import 변경 없이, 함수 내부에서만 import
-        from db import fetch_all  # type: ignore
-    except Exception:
-        return set()
-
-    rows = fetch_all(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s
-        """,
-        (table_name,),
-    )
-    cols = set()
-    for r in rows or []:
-        if isinstance(r, dict) and r.get("column_name"):
-            cols.add(r["column_name"])
-    return cols
-
-
-def _normalize_standings_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    /standings 응답을 standings 테이블 upsert용 row list로 평탄화.
-    현재 DB 스키마 기준:
-      PK: (league_id, season, group_name, team_id)
-      cols: rank, points, goals_diff, played, win, draw, lose, goals_for, goals_against, form, updated_utc, description
-    """
-    out: List[Dict[str, Any]] = []
-    resp = (payload or {}).get("response") or []
-    if not isinstance(resp, list) or not resp:
-        return out
-
-    league = (resp[0] or {}).get("league") or {}
-    blocks = league.get("standings") or []
-    if not isinstance(blocks, list):
-        return out
-
-    for block in blocks:
-        if not isinstance(block, list):
-            continue
-        for row in block:
-            if not isinstance(row, dict):
-                continue
-
-            team = row.get("team") or {}
-            all_ = row.get("all") or {}
-            goals = (all_.get("goals") or {}) if isinstance(all_, dict) else {}
-
-            team_id = safe_int(team.get("id"))
-            if team_id is None:
-                continue
-
-            rank = safe_int(row.get("rank")) or 0
-            played = safe_int(all_.get("played")) if isinstance(all_, dict) else None
-            win = safe_int(all_.get("win")) if isinstance(all_, dict) else None
-            draw = safe_int(all_.get("draw")) if isinstance(all_, dict) else None
-            lose = safe_int(all_.get("lose")) if isinstance(all_, dict) else None
-
-            goals_for = safe_int(goals.get("for")) if isinstance(goals, dict) else None
-            goals_against = safe_int(goals.get("against")) if isinstance(goals, dict) else None
-
-            goals_diff = safe_int(row.get("goalsDiff"))
-            if goals_diff is None and goals_for is not None and goals_against is not None:
-                goals_diff = goals_for - goals_against
-
-            points = safe_int(row.get("points"))
-
-            # API row에 group이 없으면 DB 기본값(Overall)로 맞추되,
-            # PK에 포함이므로 None이면 "Overall"로 강제
-            group_name = (safe_text(row.get("group")) or "Overall").strip() or "Overall"
-
-            form = safe_text(row.get("form"))
-            description = safe_text(row.get("description"))
-
-            out.append(
-                {
-                    "group_name": group_name,
-                    "rank": rank,
-                    "team_id": int(team_id),
-                    "points": points,
-                    "goals_diff": goals_diff,
-                    "played": played,
-                    "win": win,
-                    "draw": draw,
-                    "lose": lose,
-                    "goals_for": goals_for,
-                    "goals_against": goals_against,
-                    "form": form,
-                    "description": description,
-                }
-            )
-
-    return out
-
-
-
-def refresh_standings_for_league(
-    session: requests.Session,
-    league_id: int,
-    season: int,
-) -> None:
-    """
-    리그+시즌 standings를 받아 standings 테이블에 upsert.
-    ✅ 쿨다운(기본 5분)으로 FT 연속 처리/재시작에도 스팸 방지.
-    """
-    try:
-        cooldown = int(os.environ.get("STANDINGS_REFRESH_MIN_INTERVAL_SEC", "300"))
-    except Exception:
-        cooldown = 300
-    if cooldown < 30:
-        cooldown = 30
-
-    # 함수 attribute로 마지막 실행 ts 보관(전역 추가 없이)
-    last_map = getattr(refresh_standings_for_league, "_last_map", None)
-    if not isinstance(last_map, dict):
-        last_map = {}
-        setattr(refresh_standings_for_league, "_last_map", last_map)
-
-    key = (int(league_id), int(season))
-    now_ts = time.time()
-    last_ts = float(last_map.get(key) or 0.0)
-    if last_ts and (now_ts - last_ts) < cooldown:
-        return
-
-    cols = _db_table_columns("standings")
-    if not cols:
-        # 컬럼 조회 실패해도 최소 컬럼으로 시도할 수는 있지만,
-        # 여기선 안전하게 스킵(테이블 없거나 db 모듈 미스 등)
-        print(f"      [standings] skip: cannot read columns (table=standings)")
-        last_map[key] = now_ts
-        return
-
-    try:
-        payload = fetch_standings(session, league_id, season)
-    except Exception as e:
-        print(f"      [standings] fetch err league={league_id} season={season}: {e}", file=sys.stderr)
-        last_map[key] = now_ts
-        return
-
-    rows = _normalize_standings_rows(payload)
-    if not rows:
-        print(f"      [standings] empty league={league_id} season={season}")
-        last_map[key] = now_ts
-        return
-
-    # ✅ 현재 DB standings 스키마 기준으로 컬럼 구성
-    # PK: (league_id, season, group_name, team_id)
-    base_cols = ["league_id", "season", "group_name", "team_id", "rank"]
-
-    opt_cols: List[str] = []
-    # 아래 컬럼들은 테이블에 있으면 넣고, 없으면 안전하게 제외
-    for c in (
-        "points",
-        "goals_diff",
-        "played",
-        "win",
-        "draw",
-        "lose",
-        "goals_for",
-        "goals_against",
-        "form",
-        "updated_utc",
-        "description",
-    ):
-        if c in cols:
-            opt_cols.append(c)
-
-    use_cols = base_cols + opt_cols
-
-    now_updated_utc = iso_utc(now_utc())
-
-    placeholders: List[str] = []
-    values: List[Any] = []
-    for r in rows:
-        placeholders.append("(" + ",".join(["%s"] * len(use_cols)) + ")")
-        for c in use_cols:
-            if c == "league_id":
-                values.append(int(league_id))
-            elif c == "season":
-                values.append(int(season))
-            elif c == "updated_utc":
-                values.append(now_updated_utc)
-            else:
-                values.append(r.get(c))
-
-    set_parts: List[str] = []
-    for c in use_cols:
-        if c in ("league_id", "season", "group_name", "team_id"):
-            continue
-        set_parts.append(f"{c}=EXCLUDED.{c}")
-
-    sql = f"""
-    INSERT INTO standings ({", ".join(use_cols)})
-    VALUES {", ".join(placeholders)}
-    ON CONFLICT (league_id, season, group_name, team_id)
-    DO UPDATE SET {", ".join(set_parts)}
-    """
-
-    try:
-        execute(sql, tuple(values))
-        print(f"      [standings] refreshed league={league_id} season={season} rows={len(rows)}")
-    except Exception as e:
-        print(f"      [standings] upsert err league={league_id} season={season}: {e}", file=sys.stderr)
-
-
-    last_map[key] = now_ts
-
-
-def refresh_standings_for_fixture(
-    session: requests.Session,
-    fixture_id: int,
-    league_id_hint: Optional[int] = None,
-    season_hint: Optional[int] = None,
-) -> None:
-    """
-    fixture_id 기준으로 league_id/season을 안정적으로 확보해서 standings refresh.
-    - hint가 있으면 우선 사용
-    - 없으면 matches에서 조회 (가장 확실)
-    """
-    lid = league_id_hint
-    sea = season_hint
-
-    if lid is None or sea is None:
-        row = fetch_one(
-            "SELECT league_id, season FROM matches WHERE fixture_id=%s",
-            (fixture_id,),
-        )
-        if isinstance(row, dict):
-            if lid is None:
-                lid = safe_int(row.get("league_id"))
-            if sea is None:
-                sea = safe_int(row.get("season"))
-
-    if lid is None or sea is None:
-        return
-
-    refresh_standings_for_league(session, int(lid), int(sea))
+    y = int(date_str[:4])
+    return [y, y - 1, y + 1]
 
 
 
 # ─────────────────────────────────────
-# DB Dedupe Tables (추가 테이블 생성)
-# ─────────────────────────────────────
-
-def ensure_event_dedupe_tables() -> None:
-    execute(
-        """
-        CREATE TABLE IF NOT EXISTS match_event_states (
-          fixture_id BIGINT PRIMARY KEY,
-          seen_keys TEXT[] NOT NULL DEFAULT '{}'::text[],
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """
-    )
-
-    execute(
-        """
-        CREATE TABLE IF NOT EXISTS match_event_key_map (
-          fixture_id BIGINT NOT NULL,
-          canonical_key TEXT NOT NULL,
-          event_id BIGINT NOT NULL,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-          PRIMARY KEY (fixture_id, canonical_key)
-        );
-        """
-    )
-
-    # canonical_key 조회/재사용, event_id 역조회 모두 빠르게
-    execute(
-        "CREATE INDEX IF NOT EXISTS idx_match_event_key_map_event "
-        "ON match_event_key_map (fixture_id, event_id);"
-    )
-    execute(
-        "CREATE INDEX IF NOT EXISTS idx_match_event_key_map_fixture_updated "
-        "ON match_event_key_map (fixture_id, updated_at);"
-    )
-
-    execute(
-        """
-        CREATE TABLE IF NOT EXISTS match_postmatch_states (
-          fixture_id BIGINT PRIMARY KEY,
-          ft_seen_at TIMESTAMPTZ NOT NULL,
-          did_60 BOOLEAN NOT NULL DEFAULT FALSE,
-          did_30m BOOLEAN NOT NULL DEFAULT FALSE,
-          last_run_at TIMESTAMPTZ,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """
-    )
-
-    execute(
-        "CREATE INDEX IF NOT EXISTS idx_match_postmatch_states_updated "
-        "ON match_postmatch_states (updated_at);"
-    )
-
-
-
-
-def prune_event_dedupe_for_fixtures(fixture_ids: List[int]) -> None:
-    if not fixture_ids:
-        return
-    execute("DELETE FROM match_event_key_map WHERE fixture_id = ANY(%s)", (fixture_ids,))
-    execute("DELETE FROM match_event_states WHERE fixture_id = ANY(%s)", (fixture_ids,))
-
-
-def prune_event_dedupe_older_than(days: int = 14) -> None:
-    """
-    ✅ key_map/state prune는 '아주 보수적'이어야 함.
-    - key_map이 먼저 지워지면 다음 조회에서 synthetic_id가 재생성되어 타임라인 중복이 다시 발생할 수 있음.
-    - 따라서 FINISHED/OTHER이고, 경기 날짜도 충분히 지난 fixture만 정리한다.
-    """
-    try:
-        d = int(days)
-    except Exception:
-        d = 14
-    if d < 3:
-        d = 3
-
-    execute(
-        """
-        DELETE FROM match_event_states s
-        USING matches m
-        WHERE m.fixture_id = s.fixture_id
-          AND m.status_group IN ('FINISHED','OTHER')
-          AND m.date_utc::timestamptz < now() - (%s::text || ' days')::interval
-          AND s.updated_at < now() - (%s::text || ' days')::interval
-        """,
-        (str(d), str(d)),
-    )
-
-    execute(
-        """
-        DELETE FROM match_event_key_map k
-        USING matches m
-        WHERE m.fixture_id = k.fixture_id
-          AND m.status_group IN ('FINISHED','OTHER')
-          AND m.date_utc::timestamptz < now() - (%s::text || ' days')::interval
-          AND k.updated_at < now() - (%s::text || ' days')::interval
-        """,
-        (str(d), str(d)),
-    )
-
-
-
-# ─────────────────────────────────────
-# DB Upsert: fixtures / matches / raw
+# DB Upsert
 # ─────────────────────────────────────
 
 def upsert_fixture_row(
@@ -669,6 +307,7 @@ def upsert_fixture_row(
     status_short: Optional[str],
     status_group: Optional[str],
 ) -> None:
+    # 변경이 있을 때만 UPDATE (DB write/bloat 감소)
     execute(
         """
         INSERT INTO fixtures (fixture_id, league_id, season, date_utc, status, status_group)
@@ -690,11 +329,25 @@ def upsert_fixture_row(
     )
 
 
+
 def upsert_match_row_from_fixture(
     fixture_obj: Dict[str, Any],
     league_id: Optional[int],
     season: Optional[int],
 ) -> Tuple[int, int, int, str, str]:
+    """
+    dev 스키마(matches) 정확 매핑 업서트.
+    반환: (fixture_id, home_id, away_id, status_group, date_utc)
+
+    matches 컬럼(확인됨):
+      fixture_id(PK), league_id, season, date_utc, status, status_group,
+      home_id, away_id, home_ft, away_ft, elapsed, home_ht, away_ht,
+      referee, fixture_timezone, fixture_timestamp,
+      status_short, status_long, status_elapsed, status_extra,
+      venue_id, venue_name, venue_city, league_round
+    """
+
+    # ---- 필수 입력(스키마 NOT NULL) ----
     if league_id is None:
         raise ValueError("league_id is required (matches.league_id NOT NULL)")
     if season is None:
@@ -714,22 +367,26 @@ def upsert_match_row_from_fixture(
     if not date_utc:
         raise ValueError("date_utc missing (matches.date_utc NOT NULL)")
 
+    # ---- status ----
     st = fx.get("status") or {}
     status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
     status_long = safe_text(st.get("long")) or ""
     status_elapsed = safe_int(st.get("elapsed"))
-    status_extra = safe_int(st.get("extra"))
+    status_extra = safe_int(st.get("extra"))  # 없으면 None
 
     status_group = map_status_group(status_short)
-    status = (status_short or "").strip() or "UNK"
+    status = (status_short or "").strip() or "UNK"  # matches.status NOT NULL
 
+    # ---- teams ----
     home = (teams.get("home") or {}) if isinstance(teams, dict) else {}
     away = (teams.get("away") or {}) if isinstance(teams, dict) else {}
     home_id = safe_int(home.get("id")) or 0
     away_id = safe_int(away.get("id")) or 0
     if home_id == 0 or away_id == 0:
+        # matches.home_id/away_id NOT NULL
         raise ValueError("home_id/away_id missing (matches.home_id/away_id NOT NULL)")
 
+    # ---- goals / halftime ----
     home_ft = safe_int(goals.get("home")) if isinstance(goals, dict) else None
     away_ft = safe_int(goals.get("away")) if isinstance(goals, dict) else None
 
@@ -737,11 +394,18 @@ def upsert_match_row_from_fixture(
     home_ht = safe_int(ht.get("home"))
     away_ht = safe_int(ht.get("away"))
 
+    # elapsed 컬럼은 matches.elapsed (별도) → status_elapsed를 그대로 씀(네 스키마에 elapsed 존재)
     elapsed = status_elapsed
 
+    # ---- fixture meta ----
     referee = safe_text(fx.get("referee"))
     fixture_timezone = safe_text(fx.get("timezone"))
-    fixture_timestamp = safe_int(fx.get("timestamp"))
+    fixture_timestamp = None
+    try:
+        # API-Sports fixture.timestamp는 보통 int(유닉스)
+        fixture_timestamp = safe_int(fx.get("timestamp"))
+    except Exception:
+        fixture_timestamp = None
 
     venue = fx.get("venue") or {}
     venue_id = safe_int(venue.get("id")) if isinstance(venue, dict) else None
@@ -861,6 +525,13 @@ def upsert_match_row_from_fixture(
     return fixture_id, home_id, away_id, status_group, date_utc
 
 
+
+
+
+
+
+
+
 def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any], fetched_at: dt.datetime) -> None:
     raw = json.dumps(fixture_obj, ensure_ascii=False, separators=(",", ":"))
     execute(
@@ -878,8 +549,61 @@ def upsert_match_fixtures_raw(fixture_id: int, fixture_obj: Dict[str, Any], fetc
     )
 
 
+
 def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> None:
-    raw = json.dumps(events or [], ensure_ascii=False, separators=(",", ":"))
+    """
+    추가:
+    - 벤치/스태프 Card 이벤트는 raw에도 저장하지 않음(수집 차단)
+    - ✅ 단, "라인업이 확정(lineups_ready)"된 경우에만 벤치/스태프 필터 적용
+      (초반/불완전 라인업에서 정상 카드까지 오탐 차단되는 문제 방지)
+    """
+
+    def _norm(s: Optional[str]) -> str:
+        if not s:
+            return ""
+        x = str(s).lower().strip()
+        x = " ".join(x.split())
+        return x
+
+    def _is_bench_staff_card(ev: Dict[str, Any]) -> bool:
+        # Card가 아니면 대상 아님
+        ev_type = _norm(safe_text(ev.get("type")))
+        if ev_type != "card":
+            return False
+
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+
+        # player_id가 없으면 애매 -> 오탐 방지 위해 저장 유지
+        if p_id is None or t_id is None:
+            return False
+
+        st = LINEUPS_STATE.get(fixture_id) or {}
+
+        # ✅ 라인업이 확정되기 전에는 "벤치/스태프" 판정 자체를 하지 않음
+        if not st.get("lineups_ready"):
+            return False
+
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        # 라인업 셋이 없으면 판단 불가 -> 오탐 방지 위해 저장 유지
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        # 라인업에 없는 player_id인 Card => 벤치/스태프 카드로 간주하여 차단
+        return p_id not in ids
+
+    filtered: List[Dict[str, Any]] = []
+    for ev in events or []:
+        if _is_bench_staff_card(ev):
+            continue
+        filtered.append(ev)
+
+    raw = json.dumps(filtered, ensure_ascii=False, separators=(",", ":"))
     execute(
         """
         INSERT INTO match_events_raw (fixture_id, data_json)
@@ -893,32 +617,28 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
     )
 
 
-# ─────────────────────────────────────
-# 이벤트 dedupe/수렴 (중복/타임라인 붕괴 근본 해결)
-# ─────────────────────────────────────
+
+
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    ✅ 완전체 이벤트 디듀프/수렴 (Goal / Card / Sub / VAR / 기타)
+    match_events 스키마(현재 dev):
+      id(bigint PK), fixture_id, team_id, player_id, type, detail, minute(not null),
+      extra(default 0), assist_player_id, assist_name, player_in_id, player_in_name
 
-    해결하는 중복 유형:
-      1) api_event_id 가 NULL(없음) → synthetic_id 생성된 뒤, 나중에 이름/ID/어시스트가 채워져 다시 내려오며 중복 생성
-      2) minute/extra가 소폭 보정되어 내려오며 다른 키로 굳는 문제
-      3) 동일 사건이 payload 형태만 달라져 반복 등장(assist 추가, player name 채움 등)
-      4) 워커 재시작/장애 후에도 기존 row로 수렴
-
-    방식:
-      - 1차: key_map(기존 canonical_key)로 재사용
-      - 2차: incoming_id가 있으면(그리고 key_map에 있으면) 재사용
-      - 3차(핵심): match_events 테이블의 기존 row를 '시그니처 기반'으로 찾아 event_id를 재사용(unk→name 승격 포함)
-      - 최후: 새 synthetic_id 생성
+    변경 포인트(스키마 변경 없음):
+    1) ✅ 벤치/스태프 Card 차단은 lineups_ready=True 일 때만 적용(초반 오탐 방지)
+    2) ✅ 레드카드 2장 표기 방지:
+       - 같은 퇴장에 대해 'Second Yellow card' + 'Red Card'가 같이 오는 케이스에서
+         Second Yellow가 있으면 같은 분/extra/팀/선수의 Red Card는 스킵 + DB에서도 삭제
+       - 공급자가 같은 카드를 id만 바꿔서 재발급하는 케이스는 "카드 시그니처"로 dedupe + DB 정리
+    3) ✅ signature dedupe 안정화:
+       - extra는 None/0 흔들려서 extra0=coalesce로 통일
+       - 카드 dedupe에서 assist_id 변동으로 중복 생성되는 문제 방지 위해 sig에서 a_id 제외
+    4) 기존 유지:
+       - events.id 없으면 synthetic id(음수)
+       - synthetic Goal 유령 정리
     """
-
-    # 함수 내부 import (상단 import 변경 최소화)
-    try:
-        from db import fetch_all  # type: ignore
-    except Exception:
-        fetch_all = None  # type: ignore
 
     def _norm(s: Optional[str]) -> str:
         if not s:
@@ -929,376 +649,129 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             x = x.replace(ch, "")
         return x
 
-    def _safe_name(x: Any) -> str:
-        return _norm(safe_text(x) or "")
+    def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
+        if _norm(ev_type) != "card":
+            return False
+        if t_id is None or p_id is None:
+            return False
 
-    def _goal_kind(detail_norm: str) -> str:
-        if "own goal" in detail_norm:
-            return "OG"
-        if "pen" in detail_norm and ("goal" in detail_norm or "penalty" in detail_norm):
-            return "P"
-        return "N"
+        st = LINEUPS_STATE.get(fixture_id) or {}
 
-    def _card_kind(detail_norm: str) -> str:
-        if detail_norm == "second yellow card":
-            return "SY"
-        if detail_norm == "red card":
-            return "R"
-        if detail_norm == "yellow card":
-            return "Y"
-        return detail_norm or "C"
+        # ✅ 라인업 확정 전에는 벤치/스태프 판정을 하지 않음(오탐 방지)
+        if not st.get("lineups_ready"):
+            return False
 
-    def _synthetic_id_from_key(key: str) -> int:
+        pb = st.get("players_by_team") or {}
+        ids = pb.get(t_id)
+
+        if not isinstance(ids, set) or not ids:
+            return False
+
+        return p_id not in ids
+
+    def _synthetic_event_id(
+        fixture_id_: int,
+        minute_: int,
+        extra_: Optional[int],
+        t_id_: Optional[int],
+        p_id_: Optional[int],
+        a_id_: Optional[int],
+        ev_type_: Optional[str],
+        detail_: Optional[str],
+        player_name_: Optional[str],
+        assist_name_: Optional[str],
+        comments_: Optional[str],
+    ) -> int:
         import hashlib
+
+        key = "|".join(
+            [
+                str(fixture_id_),
+                str(minute_),
+                str(extra_ or 0),
+                str(t_id_ or 0),
+                str(p_id_ or 0),
+                str(a_id_ or 0),
+                _norm(ev_type_),
+                _norm(detail_),
+                _norm(player_name_),
+                _norm(assist_name_),
+                _norm(comments_),
+            ]
+        )
+
         digest = hashlib.sha1(key.encode("utf-8")).digest()
         h64 = int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
         if h64 == 0:
             h64 = 1
         return -h64
 
-    def _time_key(ev: Dict[str, Any], fallback_idx: int) -> Tuple[int, int, int]:
-        tm = ev.get("time") or {}
-        el = safe_int(tm.get("elapsed"))
-        ex = safe_int(tm.get("extra"))
-        elv = el if el is not None else 10**9
-        exv = ex if ex is not None else 0
-        return (elv, exv, fallback_idx)
+    # fixture 단위 signature cache: {fixture_id: {sig_tuple: last_seen_ts}}
+    if not hasattr(upsert_match_events, "_sig_cache"):
+        upsert_match_events._sig_cache = {}  # type: ignore[attr-defined]
+    sig_cache: Dict[int, Dict[Tuple[Any, ...], float]] = upsert_match_events._sig_cache  # type: ignore[attr-defined]
 
-    def _minute_bucket10(minute: Optional[int]) -> int:
-        if minute is None:
-            return 999
-        if minute < 0:
-            return 0
-        return int(minute // 10)
+    now_ts = time.time()
+    seen = sig_cache.get(fixture_id)
+    if seen is None:
+        seen = {}
+        sig_cache[fixture_id] = seen
 
-    def _is_bench_staff_card(t_id: Optional[int], p_id: Optional[int], ev_type: Optional[str]) -> bool:
-        if _norm(ev_type) != "card":
-            return False
-        if t_id is None or p_id is None:
-            return False
-        st = LINEUPS_STATE.get(fixture_id) or {}
-        if not st.get("lineups_ready"):
-            return False
-        pb = st.get("players_by_team") or {}
-        ids = pb.get(t_id)
-        if not isinstance(ids, set) or not ids:
-            return False
-        return p_id not in ids
+    # 오래된 signature 정리
+    if (len(seen) > 800) or (now_ts - min(seen.values(), default=now_ts) > 1800):
+        cutoff = now_ts - 1800
+        for k, v in list(seen.items()):
+            if v < cutoff:
+                del seen[k]
+        if len(seen) > 1200:
+            for k, _ in sorted(seen.items(), key=lambda kv: kv[1])[: len(seen) - 800]:
+                del seen[k]
 
-    def _who_name_first(pid: Optional[int], nm: str, unk_prefix: str = "who") -> str:
-        if nm:
-            return f"name:{nm}"
-        if pid is not None:
-            return f"pid:{int(pid)}"
-        return f"{unk_prefix}:unk"
+    # ✅ 이번 fetch에서 본 Goal 이벤트 id 모음(유령 골 정리용)
+    current_goal_ids: List[int] = []
 
-    def _build_stable_base(
-        ev_type_norm: str,
-        detail_norm: str,
-        minute: int,
-        t_id: Optional[int],
-        p_id: Optional[int],
-        a_id: Optional[int],
-        pname: str,
-        aname: str,
-        player_in_id: Optional[int],
-        player_in_name: Optional[str],
-    ) -> str:
-        mb = _minute_bucket10(minute)
+    # ✅ 이번 fetch에서 "player_id 확정된 Card" 시그니처 모음(카드 중복 정리용)
+    #   (minute, extra0, team_id, detail_norm, player_id)
+    current_cards_min: List[int] = []
+    current_cards_extra: List[int] = []
+    current_cards_team: List[int] = []
+    current_cards_detail: List[str] = []
+    current_cards_player: List[int] = []
 
-        if ev_type_norm == "goal":
-            kind = _goal_kind(detail_norm)
-            who = _who_name_first(p_id, pname, "who")
-            return f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
-
-        if ev_type_norm == "card":
-            ck = _card_kind(detail_norm)
-            who = _who_name_first(p_id, pname, "who")
-            return f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
-
-        if ev_type_norm in ("subst", "substitution", "sub"):
-            out_part = _who_name_first(p_id, pname, "out")
-            in_nm = _safe_name(player_in_name) if player_in_name else ""
-            in_part = _who_name_first(player_in_id, in_nm, "in")
-            return f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
-
-        if ev_type_norm == "var":
-            return f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
-
-        p_part = _who_name_first(p_id, pname, "p")
-        a_part = _who_name_first(a_id, aname, "a")
-        return f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
-
-    # ───────────── key_map 1회 로드 ─────────────
-    km_row = fetch_one(
-        """
-        SELECT COALESCE(json_agg(json_build_object('k', canonical_key, 'id', event_id)), '[]'::json) AS arr
-        FROM match_event_key_map
-        WHERE fixture_id=%s
-        """,
-        (fixture_id,),
-    )
-
-    km_list: List[Dict[str, Any]] = []
-    try:
-        if isinstance(km_row, dict) and km_row.get("arr") is not None:
-            arr = km_row.get("arr")
-            if isinstance(arr, str):
-                km_list = json.loads(arr)
-            elif isinstance(arr, list):
-                km_list = arr
-    except Exception:
-        km_list = []
-
-    key_to_id: Dict[str, int] = {}
-    for r in km_list:
-        if not isinstance(r, dict):
-            continue
-        k = safe_text(r.get("k"))
-        eid = safe_int(r.get("id"))
-        if k and eid is not None:
-            key_to_id[k] = int(eid)
-
-    # ───────────── stable_base -> existing n 목록(재사용용) ─────────────
-    base_to_existing_ns: Dict[str, List[int]] = {}
-    for k in list(key_to_id.keys()):
-        if "|n:" not in k:
-            continue
-        base, nstr = k.rsplit("|n:", 1)
-        try:
-            n = int(nstr)
-        except Exception:
-            continue
-        arr = base_to_existing_ns.get(base)
-        if arr is None:
-            base_to_existing_ns[base] = [n]
-        else:
-            arr.append(n)
-    for b, arr in base_to_existing_ns.items():
-        arr.sort()
-
-    def _set_primary_key(event_id: int, primary_key: str) -> None:
-        if not primary_key:
-            return
-
-        execute(
-            """
-            INSERT INTO match_event_key_map (fixture_id, canonical_key, event_id, created_at, updated_at)
-            VALUES (%s, %s, %s, now(), now())
-            ON CONFLICT (fixture_id, canonical_key)
-            DO UPDATE SET event_id = EXCLUDED.event_id, updated_at = now()
-            """,
-            (fixture_id, primary_key, event_id),
-        )
-        key_to_id[primary_key] = int(event_id)
-
-        execute(
-            """
-            DELETE FROM match_event_key_map
-            WHERE fixture_id=%s
-              AND event_id=%s
-              AND canonical_key <> %s
-            """,
-            (fixture_id, event_id, primary_key),
-        )
-
-        for k, vid in list(key_to_id.items()):
-            if int(vid) == int(event_id) and k != primary_key:
-                del key_to_id[k]
-
-    # ───────────── 기존 DB events 로드 (핵심: 시그니처 병합용) ─────────────
-    existing: List[Dict[str, Any]] = []
-    if fetch_all is not None:
-        try:
-            existing = fetch_all(
-                """
-                SELECT
-                  id,
-                  team_id,
-                  player_id,
-                  type,
-                  detail,
-                  minute,
-                  extra,
-                  assist_player_id,
-                  assist_name,
-                  player_in_id,
-                  player_in_name
-                FROM match_events
-                WHERE fixture_id=%s
-                """,
-                (fixture_id,),
-            ) or []
-        except Exception:
-            existing = []
-    else:
-        existing = []
-
-    def _etype_norm(x: Any) -> str:
-        return _norm(safe_text(x) or "")
-
-    def _detail_norm(x: Any) -> str:
-        return _norm(safe_text(x) or "")
-
-    def _match_existing_event_id(
-        *,
-        used_ids_in_tick: set,
-        t_id: Optional[int],
-        ev_type_norm: str,
-        detail_norm: str,
-        minute: int,
-        extra0: int,
-        p_id: Optional[int],
-        pname: str,
-        a_id: Optional[int],
-        aname: str,
-        player_in_id: Optional[int],
-        player_in_name_norm: str,
-    ) -> Optional[int]:
-        """
-        DB에 이미 있는 row 중, '같은 사건'으로 볼 수 있는 것을 찾아 id 재사용.
-        - unk → name/pid/assist 채워짐 케이스 병합
-        - minute 보정(±EVENT_MINUTE_CORR_ALLOW) 허용
-        - extra는 둘 다 값이 있으면 일치 요구, 한쪽이 NULL이면 허용
-        """
-        if not existing:
-            return None
-
-        # type별 kind
-        gk = _goal_kind(detail_norm) if ev_type_norm == "goal" else ""
-        ck = _card_kind(detail_norm) if ev_type_norm == "card" else ""
-
-        best_id: Optional[int] = None
-        best_score = -1
-
-        for row in existing:
-            if not isinstance(row, dict):
-                continue
-            rid = safe_int(row.get("id"))
-            if rid is None:
-                continue
-            if rid in used_ids_in_tick:
-                continue
-
-            rt = safe_int(row.get("team_id"))
-            if t_id is not None and rt is not None and int(rt) != int(t_id):
-                continue
-
-            rtype_norm = _etype_norm(row.get("type"))
-            if rtype_norm != ev_type_norm:
-                continue
-
-            rmin = safe_int(row.get("minute"))
-            if rmin is None:
-                continue
-            if abs(int(rmin) - int(minute)) > int(EVENT_MINUTE_CORR_ALLOW):
-                continue
-
-            rextra = safe_int(row.get("extra"))
-            if rextra is not None:
-                # DB에 extra가 이미 있으면, 들어오는 extra가 크게 다르면 제외
-                if int(rextra) != int(extra0):
-                    continue
-
-            rdetail_norm = _detail_norm(row.get("detail"))
-
-            # kind 일치(Goal/Card는 강제)
-            if ev_type_norm == "goal":
-                if _goal_kind(rdetail_norm) != gk:
-                    continue
-            if ev_type_norm == "card":
-                if _card_kind(rdetail_norm) != ck:
-                    continue
-
-            score = 0
-
-            # minute 가까울수록 가중
-            score += max(0, 20 - abs(int(rmin) - int(minute)) * 2)
-
-            # team 일치 가중
-            if t_id is not None and rt is not None and int(rt) == int(t_id):
-                score += 8
-
-            # player 매칭: 같으면 강하게, DB가 NULL이면 "승격 가능"으로 가중
-            rpid = safe_int(row.get("player_id"))
-            if p_id is not None and rpid is not None:
-                if int(p_id) == int(rpid):
-                    score += 40
-                else:
-                    # 같은 type/kind/team/minute라도 player_id가 다르면 다른 사건일 가능성 높음
-                    continue
-            elif p_id is not None and rpid is None:
-                score += 18  # ✅ unk→known 승격 케이스
-            elif p_id is None and rpid is not None:
-                # 들어오는 쪽이 비어있고 DB는 채워진 경우: 병합 가능(업데이트가 덜한 쪽)
-                score += 10
-            else:
-                score += 6
-
-            # assist / in-player 매칭(있으면 가중, DB NULL이면 승격 가중)
-            r_aid = safe_int(row.get("assist_player_id"))
-            if a_id is not None and r_aid is not None:
-                if int(a_id) == int(r_aid):
-                    score += 12
-                else:
-                    # assist가 다르면 다른 사건일 가능성. 단, DB가 비정상일 수도 있으니 바로 컷하진 않음.
-                    score -= 3
-            elif a_id is not None and r_aid is None:
-                score += 7
-
-            # substitution: in/out 둘 다가 중요
-            if ev_type_norm in ("subst", "substitution", "sub"):
-                r_in = safe_int(row.get("player_in_id"))
-                if player_in_id is not None and r_in is not None:
-                    if int(player_in_id) == int(r_in):
-                        score += 18
-                    else:
-                        continue
-                elif player_in_id is not None and r_in is None:
-                    score += 10
-
-            # detail 텍스트 자체가 같으면 추가 가중(표기 보정이 있을 수 있으니 강제는 아님)
-            if rdetail_norm and detail_norm and rdetail_norm == detail_norm:
-                score += 6
-
-            if score > best_score:
-                best_score = score
-                best_id = int(rid)
-
-        return best_id
-
-    # ───────────── Second Yellow 존재 시 같은 대상/근처 Red 스킵 ─────────────
+    # ✅ Second Yellow가 있는 경우 같은 키의 Red Card는 제거(레드 2장 표시 방지)
+    # key: (minute, extra0, team_id, player_id)
     second_yellow_keys: set = set()
+    second_yellow_min: List[int] = []
+    second_yellow_extra: List[int] = []
+    second_yellow_team: List[int] = []
+    second_yellow_player: List[int] = []
+
+    # 1-pass: second yellow 키 먼저 수집(순서 무관하게 red card 스킵 가능)
     for ev in events or []:
         tm = ev.get("time") or {}
-        minute0 = safe_int(tm.get("elapsed"))
-        if minute0 is None:
+        minute = safe_int(tm.get("elapsed"))
+        if minute is None:
             continue
-        extra00 = int(safe_int(tm.get("extra")) or 0)
-        ev_type_norm0 = _norm(safe_text(ev.get("type")))
-        if ev_type_norm0 != "card":
+        extra0 = int(safe_int(tm.get("extra")) or 0)
+
+        ev_type_norm = _norm(safe_text(ev.get("type")))
+        if ev_type_norm != "card":
             continue
-        team0 = ev.get("team") or {}
-        player0 = ev.get("player") or {}
-        t0 = safe_int(team0.get("id"))
-        p0 = safe_int(player0.get("id"))
-        if t0 is None or p0 is None:
+
+        team = ev.get("team") or {}
+        player = ev.get("player") or {}
+        t_id = safe_int(team.get("id"))
+        p_id = safe_int(player.get("id"))
+        if t_id is None or p_id is None:
             continue
-        d0 = _norm(safe_text(ev.get("detail")))
-        if d0 == "second yellow card":
-            second_yellow_keys.add((int(minute0), int(extra00), int(t0), int(p0)))
 
-    # ───────────── 시간순 정렬 ─────────────
-    indexed = list(enumerate(events or []))
-    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
-    evs = [ev for _, ev in indexed]
+        detail_norm = _norm(safe_text(ev.get("detail")))
+        if detail_norm == "second yellow card":
+            k = (int(minute), int(extra0), int(t_id), int(p_id))
+            second_yellow_keys.add(k)
 
-    seen_keys_in_tick: List[str] = []
-    base_seen_count: Dict[str, int] = {}
-    base_used_n: Dict[str, set] = {}
-    used_event_ids_in_tick: set = set()  # ✅ DB 재매칭 시 동일 id 중복 사용 방지
-
-    for ev in evs:
+    # 메인 처리
+    for ev in events or []:
         team = ev.get("team") or {}
         player = ev.get("player") or {}
         assist = ev.get("assist") or {}
@@ -1309,129 +782,77 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
         ev_type = safe_text(ev.get("type"))
         detail = safe_text(ev.get("detail"))
+        comments = safe_text(ev.get("comments"))
 
-        # bench/staff 카드 차단
+        # ---- 벤치/스태프 Card 차단 ----
         if _is_bench_staff_card(t_id, p_id, ev_type):
             continue
 
         tm = ev.get("time") or {}
         minute = safe_int(tm.get("elapsed"))
-        extra0 = int(safe_int(tm.get("extra")) or 0)
+        extra = safe_int(tm.get("extra"))
+        extra0 = int(extra or 0)
+
         if minute is None:
             continue
 
         ev_type_norm = _norm(ev_type)
         detail_norm = _norm(detail)
 
-        # Second Yellow가 있으면 동일키 Red 스킵
-        if ev_type_norm == "card" and t_id is not None and p_id is not None:
-            ksy = (int(minute), int(extra0), int(t_id), int(p_id))
-            if (detail_norm == "red card") and (ksy in second_yellow_keys):
-                continue
+        # ✅ Second Yellow가 있으면 같은 키의 Red Card는 스킵(레드 2장 표시 방지)
+        if ev_type_norm == "card":
+            if t_id is not None and p_id is not None:
+                k = (int(minute), int(extra0), int(t_id), int(p_id))
+                if (detail_norm == "red card") and (k in second_yellow_keys):
+                    continue
+                if detail_norm == "second yellow card":
+                    # 나중 DB 삭제용 배열도 채움
+                    second_yellow_min.append(int(minute))
+                    second_yellow_extra.append(int(extra0))
+                    second_yellow_team.append(int(t_id))
+                    second_yellow_player.append(int(p_id))
 
-        pname = _safe_name((player.get("name") if isinstance(player, dict) else None))
-        aname = _safe_name((assist.get("name") if isinstance(assist, dict) else None))
+        # id 또는 synthetic id
+        ev_id = safe_int(ev.get("id"))
+        if ev_id is None:
+            ev_id = _synthetic_event_id(
+                fixture_id_=fixture_id,
+                minute_=minute,
+                extra_=extra,
+                t_id_=t_id,
+                p_id_=p_id,
+                a_id_=a_id,
+                ev_type_=ev_type,
+                detail_=detail,
+                player_name_=safe_text(player.get("name")),
+                assist_name_=safe_text(assist.get("name")),
+                comments_=comments,
+            )
 
-        # substitution: player=OUT / assist=IN
+        # ✅ Goal이면 현재 Goal id 목록에 추가(정리용)
+        if ev_type_norm == "goal":
+            current_goal_ids.append(ev_id)
+
+        # ✅ Card인데 player_id가 확정된 경우만 "정리 기준"으로 저장
+        if ev_type_norm == "card":
+            if t_id is not None and detail is not None and p_id is not None:
+                current_cards_min.append(int(minute))
+                current_cards_extra.append(int(extra0))
+                current_cards_team.append(int(t_id))
+                current_cards_detail.append(detail_norm)
+                current_cards_player.append(int(p_id))
+
+        # ✅ signature dedupe (id가 바뀌어도 동일 이벤트면 스킵)
+        # - extra는 extra0로 통일(None/0 흔들림 방지)
+        # - a_id는 카드에서 흔들려 중복을 만들 수 있어 제외
+        sig = (int(minute), int(extra0), ev_type_norm, detail_norm, t_id, p_id)
+        prev_ts = seen.get(sig)
+        if prev_ts is not None and (now_ts - prev_ts) < 600:
+            continue
+        seen[sig] = now_ts
+
         player_in_id = None
         player_in_name = None
-        if ev_type_norm in ("subst", "substitution", "sub"):
-            player_in_id = a_id
-            player_in_name = safe_text(assist.get("name"))
-        player_in_name_norm = _safe_name(player_in_name) if player_in_name else ""
-
-        incoming_id = safe_int(ev.get("id"))
-        id_key = f"ID|{fixture_id}|{int(incoming_id)}" if incoming_id is not None else ""
-
-        stable_base = _build_stable_base(
-            ev_type_norm=ev_type_norm,
-            detail_norm=detail_norm,
-            minute=int(minute),
-            t_id=t_id,
-            p_id=p_id,
-            a_id=a_id,
-            pname=pname,
-            aname=aname,
-            player_in_id=player_in_id,
-            player_in_name=player_in_name,
-        )
-
-        base_seen_count[stable_base] = base_seen_count.get(stable_base, 0) + 1
-        desired_n = int(base_seen_count[stable_base])
-
-        used_set = base_used_n.get(stable_base)
-        if used_set is None:
-            used_set = set()
-            base_used_n[stable_base] = used_set
-
-        chosen_key = ""
-        chosen_event_id: Optional[int] = None
-
-        # 1) exact key 재사용
-        k_desired = f"{stable_base}|n:{desired_n}"
-        if k_desired in key_to_id and desired_n not in used_set:
-            chosen_key = k_desired
-            chosen_event_id = int(key_to_id[k_desired])
-            used_set.add(desired_n)
-
-        # 2) incoming_id 기반 재사용(있으면)
-        if chosen_event_id is None and id_key and (id_key in key_to_id):
-            chosen_event_id = int(key_to_id[id_key])
-            if desired_n not in used_set:
-                chosen_key = k_desired
-                used_set.add(desired_n)
-            else:
-                nn = desired_n
-                while nn in used_set:
-                    nn += 1
-                chosen_key = f"{stable_base}|n:{nn}"
-                used_set.add(nn)
-
-        # 3) 같은 stable_base의 기존 n 재사용
-        if chosen_event_id is None:
-            existing_ns = base_to_existing_ns.get(stable_base) or []
-            for n in existing_ns:
-                if n in used_set:
-                    continue
-                kk = f"{stable_base}|n:{int(n)}"
-                if kk in key_to_id:
-                    chosen_key = kk
-                    chosen_event_id = int(key_to_id[kk])
-                    used_set.add(int(n))
-                    break
-
-        # 4) ✅ 핵심: DB 시그니처로 기존 row 병합(unk→name, assist 추가, minute 보정 포함)
-        if chosen_event_id is None:
-            reused = _match_existing_event_id(
-                used_ids_in_tick=used_event_ids_in_tick,
-                t_id=t_id,
-                ev_type_norm=ev_type_norm,
-                detail_norm=detail_norm,
-                minute=int(minute),
-                extra0=int(extra0),
-                p_id=p_id,
-                pname=pname,
-                a_id=a_id,
-                aname=aname,
-                player_in_id=player_in_id,
-                player_in_name_norm=player_in_name_norm,
-            )
-            if reused is not None:
-                chosen_event_id = int(reused)
-                chosen_key = k_desired
-                used_set.add(desired_n)
-
-        # 5) 새 synthetic id
-        if chosen_event_id is None:
-            chosen_key = k_desired
-            chosen_event_id = _synthetic_id_from_key(chosen_key)
-            used_set.add(desired_n)
-
-        ev_id_used = int(chosen_event_id)
-        used_event_ids_in_tick.add(ev_id_used)
-
-        primary_key = chosen_key
-        seen_keys_in_tick.append(primary_key)
 
         execute(
             """
@@ -1452,154 +873,139 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             VALUES (
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
-            ON CONFLICT (id) DO UPDATE SET
-                fixture_id = EXCLUDED.fixture_id,
-
-                team_id = CASE
-                           WHEN match_events.team_id IS NULL THEN EXCLUDED.team_id
-                           ELSE match_events.team_id
-                         END,
-
-                player_id = CASE
-                             WHEN match_events.player_id IS NULL THEN EXCLUDED.player_id
-                             ELSE match_events.player_id
-                           END,
-
-                minute = CASE
-                          WHEN match_events.minute IS NULL THEN EXCLUDED.minute
-                          WHEN EXCLUDED.minute IS NULL THEN match_events.minute
-                          WHEN abs(EXCLUDED.minute - match_events.minute) <= %s THEN EXCLUDED.minute
-                          ELSE match_events.minute
-                        END,
-
-                extra = CASE
-                         WHEN match_events.extra IS NULL THEN EXCLUDED.extra
-                         WHEN EXCLUDED.extra IS NULL THEN match_events.extra
-                         WHEN (match_events.minute IS NOT NULL AND EXCLUDED.minute IS NOT NULL AND abs(EXCLUDED.minute - match_events.minute) <= %s)
-                              THEN EXCLUDED.extra
-                         ELSE match_events.extra
-                       END,
-
-                type = CASE
-                        WHEN EXCLUDED.type IS NULL OR EXCLUDED.type = '' THEN match_events.type
-                        WHEN match_events.type IS NULL OR match_events.type = '' THEN EXCLUDED.type
-                        ELSE match_events.type
-                      END,
-
-                detail = CASE
-                          WHEN EXCLUDED.detail IS NULL OR EXCLUDED.detail = '' THEN match_events.detail
-                          WHEN match_events.detail IS NULL OR match_events.detail = '' THEN EXCLUDED.detail
-                          ELSE match_events.detail
-                        END,
-
-                assist_player_id = CASE
-                                    WHEN match_events.assist_player_id IS NULL THEN EXCLUDED.assist_player_id
-                                    ELSE match_events.assist_player_id
-                                  END,
-                assist_name = CASE
-                               WHEN match_events.assist_name IS NULL OR match_events.assist_name = '' THEN EXCLUDED.assist_name
-                               ELSE match_events.assist_name
-                             END,
-
-                player_in_id = CASE
-                                WHEN match_events.player_in_id IS NULL THEN EXCLUDED.player_in_id
-                                ELSE match_events.player_in_id
-                              END,
-                player_in_name = CASE
-                                  WHEN match_events.player_in_name IS NULL OR match_events.player_in_name = '' THEN EXCLUDED.player_in_name
-                                  ELSE match_events.player_in_name
-                                END
+            ON CONFLICT (id) DO NOTHING
             """,
             (
-                ev_id_used,
+                ev_id,
                 fixture_id,
                 t_id,
                 p_id,
                 ev_type,
                 detail,
                 minute,
-                extra0,
+                extra0,  # ✅ DB에는 int로
                 a_id,
                 safe_text(assist.get("name")),
                 player_in_id,
                 player_in_name,
-                EVENT_MINUTE_CORR_ALLOW,
-                EVENT_MINUTE_CORR_ALLOW,
             ),
         )
 
-        _set_primary_key(ev_id_used, primary_key)
-
-        # (마이그레이션) 과거 ID|... 키 제거
-        if id_key:
-            try:
-                execute(
-                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND canonical_key=%s",
-                    (fixture_id, id_key),
-                )
-                key_to_id.pop(id_key, None)
-            except Exception:
-                pass
-
-        # ✅ incoming_id(양수) 중복 정리: '무조건 삭제' 금지
-        #    현재 이벤트와 시그니처가 같은 경우에만 삭제
-        if incoming_id is not None and int(incoming_id) != int(ev_id_used):
-            try:
-                execute(
-                    """
-                    DELETE FROM match_events
-                    WHERE id=%s
-                      AND fixture_id=%s
-                      AND team_id IS NOT DISTINCT FROM %s
-                      AND player_id IS NOT DISTINCT FROM %s
-                      AND type IS NOT DISTINCT FROM %s
-                      AND detail IS NOT DISTINCT FROM %s
-                      AND minute IS NOT DISTINCT FROM %s
-                      AND extra IS NOT DISTINCT FROM %s
-                    """,
-                    (
-                        int(incoming_id),
-                        fixture_id,
-                        t_id,
-                        p_id,
-                        ev_type,
-                        detail,
-                        minute,
-                        extra0,
-                    ),
-                )
-            except Exception:
-                pass
-            try:
-                execute(
-                    "DELETE FROM match_event_key_map WHERE fixture_id=%s AND event_id=%s",
-                    (fixture_id, int(incoming_id)),
-                )
-            except Exception:
-                pass
-
-    if seen_keys_in_tick:
+    # ✅ 유령 골 정리:
+    # - 현재 API 응답에 포함된 Goal id 목록에 없는 "synthetic Goal(id<0)"은 삭제
+    # - current_goal_ids가 비었으면(Goal이 하나도 없으면) 정리하지 않음(오탐 방지)
+    if current_goal_ids:
         execute(
             """
-            INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
-            VALUES (%s, %s::text[], now())
-            ON CONFLICT (fixture_id) DO UPDATE SET
-              seen_keys = (
-                SELECT array_agg(DISTINCT x)
-                FROM unnest(match_event_states.seen_keys || EXCLUDED.seen_keys) AS x
-              ),
-              updated_at = now()
+            DELETE FROM match_events
+            WHERE fixture_id = %s
+              AND id < 0
+              AND LOWER(type) = 'goal'
+              AND NOT (id = ANY(%s))
             """,
-            (fixture_id, seen_keys_in_tick),
+            (fixture_id, current_goal_ids),
         )
-    else:
+
+    # ✅ Second Yellow가 확정된 경우 같은 키의 Red Card는 DB에서도 제거(레드 2장 방지)
+    if second_yellow_min:
         execute(
-            """
-            INSERT INTO match_event_states (fixture_id, seen_keys, updated_at)
-            VALUES (%s, '{}'::text[], now())
-            ON CONFLICT (fixture_id) DO UPDATE SET updated_at = now()
+            r"""
+            DELETE FROM match_events me
+            USING (
+              SELECT *
+              FROM unnest(
+                %s::int[],
+                %s::int[],
+                %s::int[],
+                %s::int[]
+              ) AS t(minute, extra0, team_id, player_id)
+            ) cur
+            WHERE me.fixture_id = %s
+              AND LOWER(me.type) = 'card'
+              AND me.minute = cur.minute
+              AND COALESCE(me.extra, 0) = cur.extra0
+              AND me.team_id = cur.team_id
+              AND (
+                    me.player_id = cur.player_id
+                 OR me.player_id IS NULL
+              )
+              AND translate(
+                    lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
+                    '"`.,:;!?()[]{}|',
+                    ''
+                  ) = 'red card'
             """,
-            (fixture_id,),
+            (
+                second_yellow_min,
+                second_yellow_extra,
+                second_yellow_team,
+                second_yellow_player,
+                fixture_id,
+            ),
+        )
+
+    # ✅ 카드 중복 정리(보수적 + 실효):
+    # - "player_id 확정된 Card" 시그니처가 현재 응답에 존재하면,
+    #   DB에 동일 시그니처로 중복된 card row(positive/negative id 모두 포함)를 1개만 남기고 정리한다.
+    # - 남길 id 우선순위: (양수 id 최소값) 우선, 없으면 (음수 id 중 가장 큰 값=0에 가까운 값)
+    if current_cards_min:
+        execute(
+            r"""
+            DELETE FROM match_events me
+            USING (
+              SELECT *
+              FROM unnest(
+                %s::int[],
+                %s::int[],
+                %s::int[],
+                %s::text[],
+                %s::int[]
+              ) AS t(minute, extra0, team_id, detail_norm, player_id)
+            ) cur
+            WHERE me.fixture_id = %s
+              AND LOWER(me.type) = 'card'
+              AND me.minute = cur.minute
+              AND COALESCE(me.extra, 0) = cur.extra0
+              AND me.team_id = cur.team_id
+              AND translate(
+                    lower(regexp_replace(coalesce(me.detail,''), '\s+', ' ', 'g')),
+                    '"`.,:;!?()[]{}|',
+                    ''
+                  ) = cur.detail_norm
+              AND (
+                    me.player_id = cur.player_id
+                 OR me.player_id IS NULL
+              )
+              AND me.id <> (
+                    SELECT COALESCE(
+                               MIN(m2.id) FILTER (WHERE m2.id > 0),
+                               MAX(m2.id)
+                           )
+                    FROM match_events m2
+                    WHERE m2.fixture_id = me.fixture_id
+                      AND LOWER(m2.type) = 'card'
+                      AND m2.minute = cur.minute
+                      AND COALESCE(m2.extra, 0) = cur.extra0
+                      AND m2.team_id = cur.team_id
+                      AND translate(
+                            lower(regexp_replace(coalesce(m2.detail,''), '\s+', ' ', 'g')),
+                            '"`.,:;!?()[]{}|',
+                            ''
+                          ) = cur.detail_norm
+                      AND (
+                            m2.player_id = cur.player_id
+                         OR m2.player_id IS NULL
+                      )
+              )
+            """,
+            (
+                current_cards_min,
+                current_cards_extra,
+                current_cards_team,
+                current_cards_detail,
+                current_cards_player,
+                fixture_id,
+            ),
         )
 
 
@@ -1607,11 +1013,20 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
 
 
 
-# ─────────────────────────────────────
-# Team stats / lineups
-# ─────────────────────────────────────
+
+
+
+
+
 
 def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -> None:
+    """
+    /fixtures/statistics response:
+    [
+      { team: {id,name}, statistics: [{type,value}, ...] },
+      ...
+    ]
+    """
     for team_block in stats_resp or []:
         team = team_block.get("team") or {}
         team_id = safe_int(team.get("id"))
@@ -1624,6 +1039,7 @@ def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -
             if not name:
                 continue
             val = s.get("value")
+            # value는 숫자/문자/퍼센트/None 등 다양 → text로 저장
             value_txt = None if val is None else str(val)
 
             execute(
@@ -1639,31 +1055,29 @@ def upsert_match_team_stats(fixture_id: int, stats_resp: List[Dict[str, Any]]) -
             )
 
 
-def _ensure_lineups_state(fixture_id: int) -> Dict[str, Any]:
-    st = LINEUPS_STATE.get(fixture_id)
-    if not st:
-        st = {
-            "slot60": False,
-            "slot10": False,
-            "success": False,
-            "lineups_ready": False,
-            "players_by_team": {},
-            "last_try_ts": 0.0,
-            "inplay_tries": 0,   # ✅ INPLAY(0~15분) 라인업 재시도 횟수 제한용
-        }
-        LINEUPS_STATE[fixture_id] = st
-    return st
-
-
 
 def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], updated_at: dt.datetime) -> bool:
+    """
+    match_lineups PK: (fixture_id, team_id)
+
+    ✅ 변경:
+    - "DB에 뭔가 저장됨"이 아니라,
+      "필터에 쓸 만큼 라인업이 실제로 유의미하게 채워짐"일 때만 True 반환.
+      (대부분 startXI 11명이 들어오면 유의미하다고 판단)
+
+    추가:
+    - 런타임 캐시에 team별 player_id set 저장(players_by_team)
+    - 라인업이 유의미하면 st["lineups_ready"]=True로 마킹(잠금 기준)
+    """
     if not lineups_resp:
         return False
 
     def _extract_player_ids_and_counts(item: Dict[str, Any]) -> Tuple[List[int], int, int]:
         out: List[int] = []
+
         start_arr = item.get("startXI") or []
         sub_arr = item.get("substitutes") or []
+
         start_cnt = 0
         sub_cnt = 0
 
@@ -1700,6 +1114,7 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
     ok_any_write = False
     ready_any = False
 
+    # state 준비
     st = _ensure_lineups_state(fixture_id)
     pb = st.get("players_by_team")
     if not isinstance(pb, dict):
@@ -1727,113 +1142,37 @@ def upsert_match_lineups(fixture_id: int, lineups_resp: List[Dict[str, Any]], up
         )
         ok_any_write = True
 
+        # ---- 런타임 캐시 저장 + 유의미 판단 ----
         try:
-            ids, start_cnt, _sub_cnt = _extract_player_ids_and_counts(item)
+            ids, start_cnt, sub_cnt = _extract_player_ids_and_counts(item)
             pb[team_id] = set(ids)
+
+            # ✅ 유의미(ready) 기준:
+            # - startXI가 11명 이상이면 거의 확정 라인업
+            # - 혹은 추출 ids가 11명 이상(공급자 포맷 차이 방어)
             if (start_cnt >= 11) or (len(ids) >= 11):
                 ready_any = True
         except Exception:
+            # 캐시는 best-effort
             pass
 
+    # 라인업이 유의미한 상태면 state에 ready 마킹(잠금 기준으로 사용)
     if ready_any:
         st["lineups_ready"] = True
 
+    # DB write가 1번도 없으면 False
     if not ok_any_write:
         return False
+
+    # ✅ 반환은 "유의미하게 준비됨" 여부
     return bool(ready_any)
 
 
-def maybe_sync_lineups(
-    session: requests.Session,
-    fixture_id: int,
-    date_utc: str,
-    status_group: str,
-    elapsed: Optional[int],
-    now: dt.datetime,
-) -> None:
-    st = _ensure_lineups_state(fixture_id)
-
-    # success + ready면 완전 잠금
-    if st.get("success") and st.get("lineups_ready"):
-        return
-
-    kickoff: Optional[dt.datetime] = None
-    try:
-        kickoff = dt.datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
-        if kickoff.tzinfo is None:
-            kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
-        else:
-            kickoff = kickoff.astimezone(dt.timezone.utc)
-    except Exception:
-        kickoff = None
-
-    nowu = now.astimezone(dt.timezone.utc)
-
-    COOLDOWN_SEC = 20
-    now_ts = time.time()
-    last_try = float(st.get("last_try_ts") or 0.0)
-
-    # UPCOMING -60 / -10 (1회성)
-    if kickoff and status_group == "UPCOMING":
-        mins = int((kickoff - nowu).total_seconds() / 60)
-
-        if (59 <= mins <= 61) and not st.get("slot60"):
-            st["slot60"] = True
-            try:
-                st["last_try_ts"] = time.time()
-                resp = fetch_lineups(session, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, nowu)
-                if ready:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot60 ready={ready}")
-            except Exception as e:
-                print(f"      [lineups] fixture_id={fixture_id} slot60 err: {e}", file=sys.stderr)
-            return
-
-        if (9 <= mins <= 11) and not st.get("slot10"):
-            st["slot10"] = True
-            try:
-                st["last_try_ts"] = time.time()
-                resp = fetch_lineups(session, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, nowu)
-                if ready:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
-            except Exception as e:
-                print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
-            return
-
-        return
-
-    # INPLAY: 초반 재시도 (elapsed<=15)
-    if status_group == "INPLAY":
-        el = elapsed if elapsed is not None else 0
-        if 0 <= el <= 15:
-            tries = int(st.get("inplay_tries") or 0)
-            if tries >= int(LINEUPS_INPLAY_MAX_TRIES):
-                return
-
-            if (now_ts - last_try) < COOLDOWN_SEC:
-                return
-
-            try:
-                st["last_try_ts"] = time.time()
-                st["inplay_tries"] = tries + 1
-
-                resp = fetch_lineups(session, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, nowu)
-                if ready:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) try={st['inplay_tries']} ready={ready}")
-            except Exception as e:
-                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
-
-        return
 
 
 
 # ─────────────────────────────────────
-# 이벤트 기반 스코어 보정
+# 이벤트 기반 스코어 보정 (정교화 핵심)
 # ─────────────────────────────────────
 
 def calc_score_from_events(
@@ -1843,6 +1182,21 @@ def calc_score_from_events(
     hint_home_ft: Optional[int] = None,
     hint_away_ft: Optional[int] = None,
 ) -> Tuple[int, int]:
+    """
+    Goal + Var 이벤트를 함께 사용해서 "최종 득점"을 계산한다.
+
+    ✅ Var:
+       - Goal Disallowed / Goal cancelled / No Goal  => 직전 Goal 1개를 취소 처리
+       - Goal confirmed                              => 유지(아무것도 안 함)
+    ✅ Missed Penalty(실축)는 득점에서 제외
+    ✅ Own Goal(OG) 처리:
+       - 공급자(team_id)가 '자책한 팀'으로 올 수도, '득점 인정된 팀'으로 올 수도 있어 케이스가 섞임
+       - 그래서 OG를 무조건 flip 하지 않고,
+         (1) OG flip 안한 점수, (2) OG flip 한 점수 두 가지를 모두 계산한 뒤
+         /fixtures goals(hint_home_ft/hint_away_ft)와 더 가까운 쪽을 선택한다.
+       - hint가 없으면 flip 하지 않는 쪽을 기본으로 사용(보수적).
+    """
+
     def _norm(s: Optional[str]) -> str:
         if not s:
             return ""
@@ -1858,7 +1212,17 @@ def calc_score_from_events(
         exv = ex if ex is not None else 0
         return (elv, exv, fallback_idx)
 
-    invalid_markers = ("cancel", "disallow", "no goal", "offside", "foul", "annul", "null")
+    invalid_markers = (
+        "cancel",
+        "disallow",
+        "no goal",
+        "offside",
+        "foul",
+        "annul",
+        "null",
+    )
+
+    # goals: 득점 후보 리스트(Var로 취소되면 cancelled=True)
     goals: List[Dict[str, Any]] = []
 
     indexed = list(enumerate(events or []))
@@ -1868,11 +1232,13 @@ def calc_score_from_events(
     def _add_goal(ev: Dict[str, Any]) -> None:
         detail = _norm(ev.get("detail"))
 
+        # 실축PK 제외
         if "missed penalty" in detail:
             return
         if ("miss" in detail) and ("pen" in detail):
             return
 
+        # Goal.detail에 취소/무효 문구가 붙는(드문) 케이스 방어
         if any(m in detail for m in invalid_markers) and ("own goal" not in detail):
             return
 
@@ -1889,7 +1255,7 @@ def calc_score_from_events(
 
         goals.append(
             {
-                "team_id": team_id,
+                "team_id": team_id,          # 이벤트 team_id (공급자 기준)
                 "is_og": bool(is_og),
                 "elapsed": elapsed,
                 "extra": extra,
@@ -1913,6 +1279,8 @@ def calc_score_from_events(
         var_team_id = safe_int(team.get("id"))
         tm = ev.get("time") or {}
         var_elapsed = safe_int(tm.get("elapsed"))
+
+        # 보수적 취소: elapsed 없으면 취소하지 않음
         if var_elapsed is None:
             return
 
@@ -1928,6 +1296,7 @@ def calc_score_from_events(
                 if abs(g_el - var_elapsed) > max_delta:
                     continue
 
+                # 팀 매칭 우선(가능하면)
                 if var_team_id is not None:
                     if g.get("team_id") == var_team_id:
                         return i
@@ -1975,9 +1344,11 @@ def calc_score_from_events(
                 a += 1
         return h, a
 
+    # 두 방식 계산
     h0, a0 = _sum_scores(flip_og=False)
     h1, a1 = _sum_scores(flip_og=True)
 
+    # hint가 있으면 더 가까운 쪽 선택
     if hint_home_ft is not None and hint_away_ft is not None:
         d0 = abs(h0 - hint_home_ft) + abs(a0 - hint_away_ft)
         d1 = abs(h1 - hint_home_ft) + abs(a1 - hint_away_ft)
@@ -1985,12 +1356,23 @@ def calc_score_from_events(
             return h1, a1
         return h0, a0
 
+    # hint 없으면 보수적으로 flip 안함
     return h0, a0
 
 
+
+
+
 def update_live_score_if_needed(fixture_id: int, status_group: str, home_goals: int, away_goals: int) -> None:
+    """
+    live 중에만 안전하게 덮어쓰기.
+    - status_group 인자는 이미 run_once()에서 판단한 값이므로,
+      DB의 status_group='INPLAY' 조건을 중복으로 걸지 않음(타이밍 이슈로 UPDATE 스킵 방지).
+    - 값이 바뀔 때만 UPDATE 해서 불필요한 DB write를 줄임
+    """
     if status_group != "INPLAY":
         return
+
     execute(
         """
         UPDATE matches
@@ -2006,16 +1388,127 @@ def update_live_score_if_needed(fixture_id: int, status_group: str, home_goals: 
     )
 
 
+
+
+# ─────────────────────────────────────
+# 라인업 정책
+# ─────────────────────────────────────
+
+def _ensure_lineups_state(fixture_id: int) -> Dict[str, Any]:
+    st = LINEUPS_STATE.get(fixture_id)
+    if not st:
+        st = {"slot60": False, "slot10": False, "success": False}
+        LINEUPS_STATE[fixture_id] = st
+    return st
+
+
+def maybe_sync_lineups(
+    session: requests.Session,
+    fixture_id: int,
+    date_utc: str,
+    status_group: str,
+    elapsed: Optional[int],
+    now: dt.datetime,
+) -> None:
+    st = _ensure_lineups_state(fixture_id)
+
+    # ✅ success 잠금 조건 강화:
+    # - success=True 이더라도 lineups_ready가 아니면(=불완전 라인업 가능성) 계속 시도 여지 남김
+    if st.get("success") and st.get("lineups_ready"):
+        return
+
+    kickoff: Optional[dt.datetime] = None
+    try:
+        kickoff = dt.datetime.fromisoformat(date_utc.replace("Z", "+00:00"))
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.replace(tzinfo=dt.timezone.utc)
+        else:
+            kickoff = kickoff.astimezone(dt.timezone.utc)
+    except Exception:
+        kickoff = None
+
+    nowu = now.astimezone(dt.timezone.utc)
+
+    # ---- 공통: 과호출 방지 쿨다운(초) ----
+    # interval=10초라서, lineups는 20초 정도만 쉬어도 충분히 안정적
+    COOLDOWN_SEC = 20
+    now_ts = time.time()
+    last_try = float(st.get("last_try_ts") or 0.0)
+    if (now_ts - last_try) < COOLDOWN_SEC:
+        # 다만 UPCOMING 슬롯(-60/-10)은 1회성이라 쿨다운 걸리지 않게 아래에서 별도 처리
+        pass
+
+    # ─────────────────────────────────────
+    # UPCOMING: -60 / -10 슬롯은 1회만
+    # ─────────────────────────────────────
+    if kickoff and status_group == "UPCOMING":
+        mins = int((kickoff - nowu).total_seconds() / 60)
+
+        # -60 슬롯: 59~61분 사이
+        if (59 <= mins <= 61) and not st.get("slot60"):
+            st["slot60"] = True
+            try:
+                st["last_try_ts"] = time.time()
+                resp = fetch_lineups(session, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
+                    st["success"] = True
+                print(f"      [lineups] fixture_id={fixture_id} slot60 ready={ready}")
+            except Exception as e:
+                print(f"      [lineups] fixture_id={fixture_id} slot60 err: {e}", file=sys.stderr)
+            return
+
+        # -10 슬롯: 9~11분 사이
+        if (9 <= mins <= 11) and not st.get("slot10"):
+            st["slot10"] = True
+            try:
+                st["last_try_ts"] = time.time()
+                resp = fetch_lineups(session, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                # ✅ ready일 때만 success 잠금
+                if ready:
+                    st["success"] = True
+                print(f"      [lineups] fixture_id={fixture_id} slot10 ready={ready}")
+            except Exception as e:
+                print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
+            return
+
+        return
+
+    # ─────────────────────────────────────
+    # INPLAY: 초반에는 불완전 응답이 흔함 → elapsed<=15까지 쿨다운 두고 재시도
+    # ─────────────────────────────────────
+    if status_group == "INPLAY":
+        el = elapsed if elapsed is not None else 0  # elapsed None이어도 0으로 보고 1회는 시도 가능
+
+        # ✅ 기존 5분 → 15분까지 확장
+        if 0 <= el <= 15:
+            # 쿨다운 체크 (UPCOMING 슬롯과 달리 여기서는 적용)
+            last_try = float(st.get("last_try_ts") or 0.0)
+            if (time.time() - last_try) < COOLDOWN_SEC:
+                return
+
+            try:
+                st["last_try_ts"] = time.time()
+                resp = fetch_lineups(session, fixture_id)
+                ready = upsert_match_lineups(fixture_id, resp, nowu)
+
+                if ready:
+                    st["success"] = True  # ✅ ready일 때만 잠금
+                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ready={ready}")
+            except Exception as e:
+                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
+
+
+
 # ─────────────────────────────────────
 # 메인 1회 실행
 # ─────────────────────────────────────
 
 def run_once() -> None:
-    if not hasattr(run_once, "_dedupe_tables_ok"):
-        ensure_event_dedupe_tables()
-        run_once._dedupe_tables_ok = True  # type: ignore[attr-defined]
-
-
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
         return
@@ -2031,253 +1524,29 @@ def run_once() -> None:
 
     s = _session()
 
-    # fixtures 캐시
+    # ─────────────────────────────────────
+    # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
+    # ─────────────────────────────────────
     if not hasattr(run_once, "_fixtures_cache"):
+        # key: (league_id, date_str) -> {"season": int|None, "no": bool, "exp": float}
         run_once._fixtures_cache = {}  # type: ignore[attr-defined]
     fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
 
-    SEASON_TTL = 60 * 60
-    NOFIX_TTL = 60 * 10
-    now_ts = time.time()
+    # TTL (초) - 스키마 변경 없이 호출만 줄임
+    SEASON_TTL = 60 * 60      # 시즌 확정 캐시 60분
+    NOFIX_TTL = 60 * 10       # 그 날짜 경기 없음 캐시 10분
 
+    now_ts = time.time()
+    # 만료 엔트리 정리
     for k, v in list(fc.items()):
         if float(v.get("exp") or 0) < now_ts:
             del fc[k]
 
-
     total_fixtures = 0
     total_inplay = 0
+
+    # 이번 run에서 본 fixture들의 상태(캐시 prune에 사용)
     fixture_groups: Dict[int, str] = {}
-
-    def _update_score_any_status(fixture_id: int, home_goals: int, away_goals: int) -> None:
-        execute(
-            """
-            UPDATE matches
-            SET home_ft = %s,
-                away_ft = %s
-            WHERE fixture_id = %s
-              AND (
-                  matches.home_ft IS DISTINCT FROM %s OR
-                  matches.away_ft IS DISTINCT FROM %s
-              )
-            """,
-            (home_goals, away_goals, fixture_id, home_goals, away_goals),
-        )
-
-    def _postmatch_full_fetch(
-        fixture_id: int,
-        home_id: int,
-        away_id: int,
-        item: Dict[str, Any],
-        tag: str,
-    ) -> None:
-        try:
-            events = fetch_events(s, fixture_id)
-            upsert_match_events_raw(fixture_id, events)
-            upsert_match_events(fixture_id, events)
-
-            goals_obj = (item.get("goals") or {})
-            hint_h = safe_int(goals_obj.get("home"))
-            hint_a = safe_int(goals_obj.get("away"))
-            h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-            _update_score_any_status(fixture_id, h, a)
-
-            print(f"      [{tag}/events] fixture_id={fixture_id} goals={h}:{a} events={len(events)}")
-        except Exception as e:
-            print(f"      [{tag}/events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
-
-        try:
-            stats = fetch_team_stats(s, fixture_id)
-            upsert_match_team_stats(fixture_id, stats)
-            LAST_STATS_SYNC[fixture_id] = time.time()
-            print(f"      [{tag}/stats] fixture_id={fixture_id} updated")
-        except Exception as e:
-            print(f"      [{tag}/stats] fixture_id={fixture_id} err: {e}", file=sys.stderr)
-
-        try:
-            st = _ensure_lineups_state(fixture_id)
-            if not st.get("lineups_ready"):
-                resp = fetch_lineups(s, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, now_utc())
-                if ready:
-                    st["success"] = True
-                print(f"      [{tag}/lineups] fixture_id={fixture_id} ready={ready}")
-        except Exception as e:
-            print(f"      [{tag}/lineups] fixture_id={fixture_id} err: {e}", file=sys.stderr)
-
-    def _postmatch_already_done_in_db(fixture_id: int) -> bool:
-        # ✅ 백필/수동복구로 이미 postmatch 데이터가 있으면 live worker가 다시 손대지 않게 스킵
-        row = fetch_one(
-            """
-            SELECT
-              EXISTS (SELECT 1 FROM match_team_stats WHERE fixture_id=%s) AS has_stats,
-              EXISTS (SELECT 1 FROM match_events_raw  WHERE fixture_id=%s) AS has_events_raw
-            """,
-            (fixture_id, fixture_id),
-        )
-        if isinstance(row, dict):
-            return bool(row.get("has_stats")) and bool(row.get("has_events_raw"))
-        return False
-
-    def _get_post_state(fixture_id: int) -> Optional[Dict[str, Any]]:
-        row = fetch_one(
-            """
-            SELECT
-              fixture_id,
-              ft_seen_at,
-              did_60,
-              did_30m,
-              last_run_at
-            FROM match_postmatch_states
-            WHERE fixture_id=%s
-            """,
-            (fixture_id,),
-        )
-        return row if isinstance(row, dict) else None
-
-    def _ensure_post_state(fixture_id: int, now_dt: dt.datetime, item: Dict[str, Any]) -> Dict[str, Any]:
-        st = _get_post_state(fixture_id)
-        if st:
-            return st
-
-        # ✅ 새로 FINISHED를 본 케이스: ft_seen_at을 지금으로 기록
-        execute(
-            """
-            INSERT INTO match_postmatch_states (fixture_id, ft_seen_at, did_60, did_30m, last_run_at, updated_at)
-            VALUES (%s, %s, FALSE, FALSE, NULL, now())
-            ON CONFLICT (fixture_id) DO NOTHING
-            """,
-            (fixture_id, now_dt),
-        )
-
-        # ✅ (추가) FT 최초 관측 시점에 standings 1회 갱신
-        try:
-            lg = item.get("league") or {}
-            lid_hint = safe_int(lg.get("id"))
-            season_hint = safe_int(lg.get("season"))
-            refresh_standings_for_fixture(s, fixture_id, lid_hint, season_hint)
-        except Exception as e:
-            print(f"      [standings] fixture_id={fixture_id} refresh err: {e}", file=sys.stderr)
-
-        st2 = _get_post_state(fixture_id)
-        return st2 if st2 else {
-            "fixture_id": fixture_id,
-            "ft_seen_at": now_dt,
-            "did_60": False,
-            "did_30m": False,
-            "last_run_at": None,
-        }
-
-
-
-
-    def _mark_post_done(fixture_id: int, *, did_60: bool, did_30m: bool) -> None:
-        execute(
-            """
-            UPDATE match_postmatch_states
-            SET did_60=%s,
-                did_30m=%s,
-                last_run_at=now(),
-                updated_at=now()
-            WHERE fixture_id=%s
-            """,
-            (did_60, did_30m, fixture_id),
-        )
-
-    def _schedule_postmatch_if_needed(
-        fixture_id: int,
-        home_id: int,
-        away_id: int,
-        item: Dict[str, Any],
-    ) -> None:
-        now_dt = now_utc()
-
-        # ✅ 이미 백필로 복구된 경기면 postmatch 재수집 스킵 + 상태를 done으로 박아버림
-        if _postmatch_already_done_in_db(fixture_id):
-            st0 = _get_post_state(fixture_id)
-            if not st0:
-                execute(
-                    """
-                    INSERT INTO match_postmatch_states (fixture_id, ft_seen_at, did_60, did_30m, last_run_at, updated_at)
-                    VALUES (%s, %s, TRUE, TRUE, now(), now())
-                    ON CONFLICT (fixture_id) DO UPDATE SET
-                      did_60=TRUE, did_30m=TRUE, last_run_at=now(), updated_at=now()
-                    """,
-                    (fixture_id, now_dt),
-                )
-            else:
-                _mark_post_done(fixture_id, did_60=True, did_30m=True)
-
-            # ✅ (추가) 백필로 이미 끝난 경기라도, FINISHED로 최초 관측되는 순간 standings는 1회 갱신
-            try:
-                lg = item.get("league") or {}
-                lid_hint = safe_int(lg.get("id"))
-                season_hint = safe_int(lg.get("season"))
-                refresh_standings_for_fixture(s, fixture_id, lid_hint, season_hint)
-            except Exception as e:
-                print(f"      [standings] fixture_id={fixture_id} refresh err: {e}", file=sys.stderr)
-
-            return
-
-        # ✅ 여기서부터는 live worker가 postmatch 스케줄 관리
-        st = _ensure_post_state(fixture_id, now_dt, item)
-
-        ft_seen_at = st.get("ft_seen_at")
-        if isinstance(ft_seen_at, str):
-            try:
-                ft_seen_at_dt = dt.datetime.fromisoformat(ft_seen_at.replace("Z", "+00:00"))
-            except Exception:
-                ft_seen_at_dt = now_dt
-        elif isinstance(ft_seen_at, dt.datetime):
-            ft_seen_at_dt = ft_seen_at
-        else:
-            ft_seen_at_dt = now_dt
-
-        if ft_seen_at_dt.tzinfo is None:
-            ft_seen_at_dt = ft_seen_at_dt.replace(tzinfo=dt.timezone.utc)
-        else:
-            ft_seen_at_dt = ft_seen_at_dt.astimezone(dt.timezone.utc)
-
-        age_sec = (now_dt.astimezone(dt.timezone.utc) - ft_seen_at_dt).total_seconds()
-
-        did_60 = bool(st.get("did_60"))
-        did_30m = bool(st.get("did_30m"))
-
-        if (age_sec >= 60.0) and (not did_60):
-            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+60s")
-            execute(
-                """
-                UPDATE match_postmatch_states
-                SET did_60=TRUE, last_run_at=now(), updated_at=now()
-                WHERE fixture_id=%s
-                """,
-                (fixture_id,),
-            )
-            did_60 = True
-
-        if (age_sec >= 1800.0) and (not did_30m):
-            _postmatch_full_fetch(fixture_id, home_id, away_id, item, tag="postmatch+30m")
-            execute(
-                """
-                UPDATE match_postmatch_states
-                SET did_30m=TRUE, last_run_at=now(), updated_at=now()
-                WHERE fixture_id=%s
-                """,
-                (fixture_id,),
-            )
-            did_30m = True
-
-        if did_60 or did_30m:
-            execute(
-                """
-                UPDATE match_postmatch_states
-                SET updated_at=now()
-                WHERE fixture_id=%s
-                """,
-                (fixture_id,),
-            )
-
-
 
     for date_str in dates:
         for lid in league_ids:
@@ -2286,38 +1555,26 @@ def run_once() -> None:
 
             cache_key = (lid, date_str)
             cached = fc.get(cache_key)
-
-            # ✅ (추가) fixtures 폴링 캐시: FIXTURES_POLL_INTERVAL_SEC 안에는 /fixtures 재호출 금지
             if cached and float(cached.get("exp") or 0) >= now_ts:
                 if cached.get("no") is True:
+                    # 최근에 '그 날짜 경기 없음'으로 판정된 리그/날짜는 잠시 스킵
                     continue
-
                 cached_season = cached.get("season")
-                cached_fx = cached.get("fixtures")
-                fx_exp = float(cached.get("fx_exp") or 0.0)
-
-                if isinstance(cached_season, int) and isinstance(cached_fx, list) and fx_exp >= now_ts:
-                    fixtures = cached_fx
-                    used_season = cached_season
-
-            # 기존 캐시(시즌 고정) 기반 fetch (단, 폴링 캐시 미적중 시에만)
-            if used_season is None:
-                if cached and float(cached.get("exp") or 0) >= now_ts:
-                    if cached.get("no") is True:
-                        continue
-                    cached_season = cached.get("season")
-                    if isinstance(cached_season, int):
-                        try:
-                            rows = fetch_fixtures(s, lid, date_str, cached_season)
-                            if rows:
-                                fixtures = rows
-                                used_season = cached_season
-                            else:
-                                fc.pop(cache_key, None)
-                        except Exception as e:
+                if isinstance(cached_season, int):
+                    try:
+                        rows = fetch_fixtures(s, lid, date_str, cached_season)
+                        if rows:
+                            fixtures = rows
+                            used_season = cached_season
+                        else:
+                            # 캐시 시즌에서 빈 결과면 캐시를 무효화하고 후보를 다시 탐색
                             fc.pop(cache_key, None)
-                            print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
+                    except Exception as e:
+                        # 캐시 시즌 호출 실패 시 후보 탐색으로 fallback
+                        fc.pop(cache_key, None)
+                        print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
+            # 캐시 미스/무효일 때: 시즌 후보를 돌려서 "응답이 있는 시즌"을 선택
             if used_season is None:
                 for season in infer_season_candidates(date_str):
                     try:
@@ -2325,42 +1582,37 @@ def run_once() -> None:
                         if rows:
                             fixtures = rows
                             used_season = season
+                            # 시즌 캐시
                             fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
                             break
                     except Exception as e:
-                        print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
+                        # 시즌 시도 중 오류는 다음 후보로
+                        last = str(e)
+                        print(f"  [fixtures] league={lid} date={date_str} season={season} err: {last}", file=sys.stderr)
 
             if used_season is None:
+                # 결과가 없는 건 흔함(그 날짜에 경기 없음) → 짧게 캐시
                 fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
                 continue
-
-            # ✅ (추가) 폴링 캐시 저장
-            try:
-                prev = fc.get(cache_key) or {}
-                prev["season"] = int(used_season)
-                prev["no"] = False
-                prev["exp"] = float(prev.get("exp") or (now_ts + SEASON_TTL))
-                prev["fx_exp"] = now_ts + float(FIXTURES_POLL_INTERVAL_SEC)
-                prev["fixtures"] = fixtures
-                fc[cache_key] = prev
-            except Exception:
-                pass
 
             total_fixtures += len(fixtures)
             print(f"[fixtures] league={lid} date={date_str} season={used_season} count={len(fixtures)}")
 
             for item in fixtures:
                 try:
+                    # matches / fixtures / raw upsert
                     fx = item.get("fixture") or {}
                     fid = safe_int(fx.get("id"))
                     if fid is None:
                         continue
 
-                    st0 = fx.get("status") or {}
-                    status_short = safe_text(st0.get("short")) or safe_text(st0.get("code")) or ""
+                    st = fx.get("status") or {}
+                    # (7) short/code 통일
+                    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
                     status_group = map_status_group(status_short)
                     fixture_groups[fid] = status_group
 
+                    # fixtures 테이블(요약)
                     upsert_fixture_row(
                         fixture_id=fid,
                         league_id=lid,
@@ -2370,55 +1622,46 @@ def run_once() -> None:
                         status_group=status_group,
                     )
 
+                    # matches 테이블(상세)
                     fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
                         item, league_id=lid, season=used_season
                     )
 
+                    # raw 저장(match_fixtures_raw)
                     try:
                         upsert_match_fixtures_raw(fixture_id, item, fetched_at)
                     except Exception as raw_err:
                         print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
 
-                    # 라인업 정책(순서 유지)
+                    # lineups 정책 적용(UPCOMING도 여기서)
                     try:
                         elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
                         maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
-                    # FINISHED: 즉시 full fetch X, 스케줄만
-                    if sg == "FINISHED":
-                        _schedule_postmatch_if_needed(fixture_id, home_id, away_id, item)
-                        continue
-
-                    # INPLAY 아니면 skip
+                    # INPLAY 처리
                     if sg != "INPLAY":
                         continue
 
                     total_inplay += 1
 
-                    # 1) events raw 저장 + match_events 수렴 + 스코어 보정 (순서 유지)
+                    # 1) events 저장 + 스코어 보정(단일 경로)
                     try:
-                        now_ts_ev = time.time()
-                        last_ev = LAST_EVENTS_SYNC.get(fixture_id)
-                        if (last_ev is None) or ((now_ts_ev - last_ev) >= float(EVENTS_INTERVAL_SEC)):
-                            events = fetch_events(s, fixture_id)
-                            LAST_EVENTS_SYNC[fixture_id] = now_ts_ev
+                        events = fetch_events(s, fixture_id)
+                        upsert_match_events_raw(fixture_id, events)
+                        upsert_match_events(fixture_id, events)
 
-                            upsert_match_events_raw(fixture_id, events)
-                            upsert_match_events(fixture_id, events)
+                        # 이벤트 기반 스코어 계산(정교화)
+                        goals_obj = (item.get("goals") or {})
+                        hint_h = safe_int(goals_obj.get("home"))
+                        hint_a = safe_int(goals_obj.get("away"))
 
-                            goals_obj = (item.get("goals") or {})
-                            hint_h = safe_int(goals_obj.get("home"))
-                            hint_a = safe_int(goals_obj.get("away"))
+                        h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
 
-                            h, a = calc_score_from_events(events, home_id, away_id, hint_h, hint_a)
-                            update_live_score_if_needed(fixture_id, sg, h, a)
+                        update_live_score_if_needed(fixture_id, sg, h, a)
 
-                            print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
-                        else:
-                            # 쿨다운 중엔 events는 스킵
-                            pass
+                        print(f"      [events] fixture_id={fixture_id} goals(events)={h}:{a} events={len(events)}")
                     except Exception as ev_err:
                         print(f"      [events] fixture_id={fixture_id} err: {ev_err}", file=sys.stderr)
 
@@ -2437,32 +1680,25 @@ def run_once() -> None:
                 except Exception as e:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
 
-    # 캐시 prune + dedupe prune
-    finished_ids: List[int] = []
+    # ─────────────────────────────────────
+    # (6) 런타임 캐시 prune (메모리 누적 방지)
+    # ─────────────────────────────────────
     try:
+        # FINISHED/OTHER는 더 이상 필요 없으므로 캐시 제거
         for fid, g in list(fixture_groups.items()):
             if g in ("FINISHED", "OTHER"):
-                finished_ids.append(int(fid))
                 LAST_STATS_SYNC.pop(fid, None)
-                LAST_EVENTS_SYNC.pop(fid, None)
                 LINEUPS_STATE.pop(fid, None)
+                # upsert_match_events signature cache 제거
+                sig_cache = getattr(upsert_match_events, "_sig_cache", None)
+                if isinstance(sig_cache, dict):
+                    sig_cache.pop(fid, None)
 
+        # 아주 오래된 LINEUPS_STATE도 정리(혹시 오늘/어제 범위를 벗어났을 때)
         if len(LINEUPS_STATE) > 3000:
+            # 최근에 쓴다고 보장할 수 없으니, 과감히 일부만 남김
             for fid in list(LINEUPS_STATE.keys())[: len(LINEUPS_STATE) - 2000]:
                 LINEUPS_STATE.pop(fid, None)
-    except Exception:
-        pass
-
-    # ✅ FINISHED에서 key_map/state를 즉시 삭제하면
-    #    incoming_id 없는 이벤트가 synthetic_id로 재생성되며 "추가 삽입"이 발생할 수 있음(타임라인 중복).
-    #    아래의 prune_event_dedupe_older_than(days=3)만으로 충분.
-
-    # ✅ (변경) prune를 매틱 실행하지 말고 PRUNE_INTERVAL_SEC 주기로만 실행
-    try:
-        last_prune = float(getattr(run_once, "_last_prune_ts", 0.0) or 0.0)
-        if (not last_prune) or ((time.time() - last_prune) >= float(PRUNE_INTERVAL_SEC)):
-            prune_event_dedupe_older_than(days=3)
-            run_once._last_prune_ts = time.time()  # type: ignore[attr-defined]
     except Exception:
         pass
 
