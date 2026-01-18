@@ -198,6 +198,22 @@ select option {
     }
     textarea { min-height: 170px; resize: vertical; font-family: var(--mono); line-height: 1.35; }
 
+    /* ✅ FIX: 공통 폼룰이 select 스타일을 덮어쓰는 문제 방지 (라이트/다크 안정화) */
+    :root[data-theme="dark"] select {
+      background: rgba(0,0,0,0.15) !important;
+      color: var(--text) !important;
+    }
+    :root[data-theme="light"] select {
+      background: rgba(255,255,255,0.85) !important;
+      color: var(--text) !important;
+    }
+    :root[data-theme="dark"] select option,
+    :root[data-theme="light"] select option {
+      background: var(--panel) !important;
+      color: var(--text) !important;
+    }
+
+
     .btn {
       padding: 10px 12px;
       border-radius: 12px;
@@ -981,6 +997,28 @@ select option {
     return s ? s : _EMPTY_LOGO;
   }
 
+function formatKickoffLine(fixture) {
+  const leagueName = fixture?.league?.name ? String(fixture.league.name).trim() : "";
+  const kickoff = fixture?.kickoff_utc ? String(fixture.kickoff_utc).slice(0, 16).replace("T", " ") : "";
+  if (leagueName && kickoff) return `${leagueName} · ${kickoff}`;
+  return leagueName || kickoff || "";
+}
+
+function formatTeamsLine(fixture) {
+  const home = fixture?.home?.name ? String(fixture.home.name).trim() : "";
+  const away = fixture?.away?.name ? String(fixture.away.name).trim() : "";
+  if (home && away) return `${home} vs ${away}`;
+  return home || away || "";
+}
+
+// ✅ 2줄 타이틀 고정 포맷 (리그/시간 + 팀 vs 팀)
+function buildTwoLineTitleFromFixture(fixture) {
+  const line1 = formatKickoffLine(fixture);
+  const line2 = formatTeamsLine(fixture);
+  return [line1, line2].filter(Boolean).join("\n");
+}
+
+
   
   function isoToDatetimeLocal(iso) {
     if (!iso) return "";
@@ -1489,7 +1527,12 @@ async function deletePostById(id) {
     writeSnapshotObj(newSnap);
     renderMatchPreview(fx);
 
+    // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
+    $("pTitle").value = buildTwoLineTitleFromFixture(fx);
+
+
     return payload;
+
   }
 
   function scheduleFixturePreviewRefresh() {
@@ -1506,8 +1549,10 @@ async function deletePostById(id) {
       const snap = readSnapshotObj();
       if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
         renderMatchPreview(snap.fixture);
+        $("pTitle").value = buildTwoLineTitleFromFixture(snap.fixture);
         return;
       }
+
 
       // 아직 없으면 서버에서 가져와서 snapshot 채워주고 프리뷰 표시
       const fx = await fetchFixtureMeta(sport, fixtureKey);
@@ -1516,6 +1561,11 @@ async function deletePostById(id) {
       const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
       writeSnapshotObj(newSnap);
       renderMatchPreview(fx);
+
+      // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
+      $("pTitle").value = buildTwoLineTitleFromFixture(fx);
+
+
     }, 350);
   }
 
@@ -1581,6 +1631,41 @@ async function deletePostById(id) {
   }
   return fallback;
 }
+
+function fxPickId(obj, keys, fallback = "") {
+  for (const k of keys) {
+    if (!obj || obj[k] == null) continue;
+    const v = obj[k];
+
+    // number
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+
+    // numeric string
+    if (typeof v === "string") {
+      const s = v.trim();
+      if (s !== "" && Number.isFinite(Number(s))) return s;
+      continue;
+    }
+
+    // object: id 우선 (name은 무시)
+    if (typeof v === "object") {
+      if (v.id != null) {
+        const s = String(v.id).trim();
+        if (s !== "" && Number.isFinite(Number(s))) return s;
+      }
+      if (v.league_id != null) {
+        const s = String(v.league_id).trim();
+        if (s !== "" && Number.isFinite(Number(s))) return s;
+      }
+      if (v.fixture_id != null) {
+        const s = String(v.fixture_id).trim();
+        if (s !== "" && Number.isFinite(Number(s))) return s;
+      }
+    }
+  }
+  return fallback;
+}
+
 
 function fxPickLogo(row, side /* "home" | "away" */) {
   const r = row || {};
@@ -1777,7 +1862,7 @@ function filterFixtureRows(rows) {
   return (rows || []).filter(r => {
     // ✅ league_ids 필터(선택된 리그만)
     if (leagueSet && leagueSet.size > 0) {
-      const lid = Number(String(fxPick(r, ["league_id", "leagueId"], "")).trim());
+      const lid = Number(fxPickId(r, ["league_id", "leagueId", "league"], ""));
       if (!Number.isFinite(lid) || !leagueSet.has(lid)) return false;
     }
 
@@ -1798,6 +1883,7 @@ function filterFixtureRows(rows) {
 }
 
 
+
   // ─────────────────────────────────────
   // League pick (from loaded list) + pills
   // ─────────────────────────────────────
@@ -1813,7 +1899,7 @@ function filterFixtureRows(rows) {
     const map = new Map();
 
     for (const r of (_fxRows || [])) {
-      const idStr = fxPick(r, ["league_id", "leagueId"], "");
+      const idStr = fxPickId(r, ["league_id", "leagueId", "league"], "");
       const idNum = Number(String(idStr).trim());
       if (!Number.isFinite(idNum) || idNum <= 0) continue;
 
@@ -1855,6 +1941,7 @@ function filterFixtureRows(rows) {
 
     fxUpdateLeaguePills();
   }
+
 
 
   function fxUpdateLeaguePills() {
@@ -1993,9 +2080,11 @@ function filterFixtureRows(rows) {
 
     div.onclick = () => {
       if (!fixtureId) return alert("fixture_id를 찾을 수 없습니다. 서버 응답 필드 확인 필요");
+      if (!getEditorSport()) $("pSport").value = "football"; // 최소: 비어있으면 football
       $("pFixtureKey").value = fixtureId;
       scheduleFixturePreviewRefresh();
       closeFixturePicker();
+
     };
 
     box.appendChild(div);
