@@ -446,22 +446,23 @@ select option {
 
 
 
-    /* ✅ Fixtures Browser 필터: 1줄(기본) + 2줄(검색) + 버튼은 우측 고정 */
+    /* ✅ Fixtures Browser 필터: (From/To) + TZ + LeaguePick + Search + 버튼 우측 고정 */
     .fxControls {
       display: grid;
-      grid-template-columns: 180px 220px 1fr 160px;
+      grid-template-columns: 180px 180px 220px 1fr 160px;
       grid-template-areas:
-        "date tz leagues btn"
-        "search search search btn";
+        "from to tz league btn"
+        "search search search search btn";
       gap: 10px;
       align-items: end;
     }
 
     .fxControls .col { gap: 4px; min-width: 0; }
 
-    .fxColDate { grid-area: date; }
+    .fxColDate { grid-area: from; }
+    .fxColDateTo { grid-area: to; }
     .fxColTz { grid-area: tz; }
-    .fxColLeagues { grid-area: leagues; }
+    .fxColLeaguePick { grid-area: league; }
     .fxColSearch { grid-area: search; }
     .fxColBtn { grid-area: btn; align-self: stretch; }
 
@@ -475,6 +476,44 @@ select option {
       padding: 0 12px;
       box-sizing: border-box;
     }
+
+    /* ✅ League pick row */
+    .fxLeaguePickWrap {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      min-width: 0;
+    }
+    .fxLeaguePickWrap select {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .fxLeaguePills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+
+    .fxPillGroup {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line2);
+      background: rgba(255,255,255,0.03);
+      font-size: 12px;
+      color: var(--text);
+      user-select: none;
+    }
+    .fxPillX {
+      font-weight: 900;
+      cursor: pointer;
+      opacity: 0.75;
+    }
+    .fxPillX:hover { opacity: 1; }
 
     /* ✅ 불러오기 버튼도 인풋 높이와 동일 + 컬럼 꽉 채우기 */
     .fxControls .btn.fxBtn {
@@ -492,13 +531,15 @@ select option {
       .fxControls {
         grid-template-columns: 1fr 1fr;
         grid-template-areas:
-          "date tz"
-          "leagues leagues"
+          "from to"
+          "tz tz"
+          "league league"
           "search search"
           "btn btn";
       }
       .fxColBtn label { display:none; }
     }
+
 
 
 
@@ -839,8 +880,13 @@ select option {
     <div class="modalBody">
       <div class="fxControls">
         <div class="col fxColDate">
-          <label>Date</label>
+          <label>Date (From)</label>
           <input id="fxDate" type="date" />
+        </div>
+
+        <div class="col fxColDateTo">
+          <label>Date (To)</label>
+          <input id="fxDateTo" type="date" />
         </div>
 
         <div class="col fxColTz">
@@ -854,9 +900,23 @@ select option {
           </select>
         </div>
 
-        <div class="col fxColLeagues">
-          <label>League IDs (comma, optional)</label>
-          <input id="fxLeagueIds" placeholder="예: 39,140,78" />
+        <div class="col fxColLeaguePick">
+          <label>League Filter (from loaded list)</label>
+
+          <div class="fxLeaguePickWrap">
+            <select id="fxLeaguePick">
+              <option value="">(전체 리그)</option>
+            </select>
+
+            <button class="btn small" type="button" onclick="fxAddLeagueFromPick()">+</button>
+            <button class="btn small" type="button" onclick="fxRemoveLeagueFromPick()">-</button>
+            <button class="btn small" type="button" onclick="fxClearLeagueFilter()">ALL</button>
+          </div>
+
+          <div id="fxLeaguePills" class="fxLeaguePills"></div>
+
+          <!-- ✅ 선택된 league_ids는 여기(hidden)에 CSV로 저장 -->
+          <input id="fxLeagueIds" type="hidden" value="" />
         </div>
 
         <div class="col fxColSearch">
@@ -867,9 +927,9 @@ select option {
         <div class="col fxColBtn">
           <label>&nbsp;</label>
           <button class="btn fxBtn" type="button" onclick="loadFixtureBrowser()">불러오기</button>
-
         </div>
       </div>
+
 
 
       <div class="subtle" id="fxStatus" style="margin-top:10px;"></div>
@@ -1554,6 +1614,7 @@ function fxPickLogo(row, side /* "home" | "away" */) {
 
     // 기본값 세팅
     if ($("fxDate") && !$("fxDate").value) $("fxDate").value = todayYmdLocal();
+    if ($("fxDateTo") && !$("fxDateTo").value) $("fxDateTo").value = $("fxDate").value || todayYmdLocal();
     if ($("fxTz") && !$("fxTz").value) $("fxTz").value = "Asia/Seoul";
 
     fxSetStatus("");
@@ -1563,6 +1624,7 @@ function fxPickLogo(row, side /* "home" | "away" */) {
     // 바로 로드
     loadFixtureBrowser();
   }
+
 
   function closeFixturePicker() {
     hideFixtureModal();
@@ -1580,33 +1642,129 @@ function fxPickLogo(row, side /* "home" | "away" */) {
     });
   })();
 
-  async function fetchFixtureBrowserRows() {
-  const sport = (getEditorSport() || "football").toLowerCase(); // (현재는 서버에 sport 안 보냄. 유지)
-  const date = ($("fxDate").value || "").trim();
-  const tz = ($("fxTz").value || "Asia/Seoul").trim();
-  const leagueIds = ($("fxLeagueIds").value || "").trim();
+  // ─────────────────────────────────────
+  // Fixtures range helpers (from football_override)
+  // ─────────────────────────────────────
+  function normalizeLeagueIdsInput(raw) {
+    const s = String(raw || "").trim();
+    if (!s) return "";
+    const parts = s.split(",")
+      .map(x => String(x).trim())
+      .filter(Boolean)
+      .map(x => Number(x))
+      .filter(n => Number.isFinite(n) && n > 0);
 
-  const qs = new URLSearchParams();
-  if (date) qs.set("date", date);
-  if (tz) qs.set("timezone", tz);
-  if (leagueIds) qs.set("league_ids", leagueIds);
-
-  // ✅ q(fxSearch)는 서버가 안 받는 전제 → 보내지 않음
-
-  // ✅ adminUrl은 "한 번만"
-  const url = adminUrl("/api/fixtures_merged?" + qs.toString());
-
-  const r = await api(url, { method: "GET" });
-  setDebug(r);
-
-  if (r.status >= 400 || !r.data || !r.data.ok) {
-    const err = r.data ? JSON.stringify(r.data) : ("HTTP " + r.status);
-    throw new Error("fixtures browse 실패: " + err);
+    // unique + sort
+    const set = new Set(parts);
+    return Array.from(set).sort((a,b)=>a-b).join(",");
   }
 
-  const rows = r.data.rows || r.data.fixtures || r.data.data || [];
-  return Array.isArray(rows) ? rows : [];
-}
+  function parseLeagueIdsSet(raw) {
+    const norm = normalizeLeagueIdsInput(raw);
+    if (!norm) return null;
+    const set = new Set();
+    for (const x of norm.split(",")) {
+      const n = Number(String(x).trim());
+      if (Number.isFinite(n) && n > 0) set.add(n);
+    }
+    return set.size ? set : null;
+  }
+
+  function parseYmdToUtcDate(ymd) {
+    return new Date(String(ymd).trim() + "T00:00:00Z");
+  }
+
+  function fmtUtcDateToYmd(d) {
+    return d.toISOString().slice(0, 10);
+  }
+
+  function enumerateYmdRange(fromYmd, toYmd, maxDays = 31) {
+    const a = String(fromYmd || "").trim();
+    const b = String(toYmd || "").trim();
+    if (!a) return { ok:false, days:[], error:"from_date_required" };
+
+    const fromD = parseYmdToUtcDate(a);
+    const toD = parseYmdToUtcDate(b || a);
+
+    if (!Number.isFinite(fromD.getTime()) || !Number.isFinite(toD.getTime())) {
+      return { ok:false, days:[], error:"invalid_date" };
+    }
+
+    if (toD.getTime() < fromD.getTime()) {
+      return { ok:false, days:[], error:"to_before_from" };
+    }
+
+    const days = [];
+    let cur = fromD;
+    for (let i = 0; i < maxDays; i++) {
+      days.push(fmtUtcDateToYmd(cur));
+      if (fmtUtcDateToYmd(cur) === fmtUtcDateToYmd(toD)) break;
+      cur = new Date(cur.getTime() + 24 * 3600 * 1000);
+    }
+
+    if (days[days.length - 1] !== fmtUtcDateToYmd(toD)) {
+      return { ok:false, days:[], error:"range_too_long" };
+    }
+
+    return { ok:true, days, error:"" };
+  }
+
+  function buildFixturesQuery(dateOverride) {
+    const tz = ($("fxTz").value || "Asia/Seoul").trim();
+    const leagueIds = normalizeLeagueIdsInput($("fxLeagueIds").value || "");
+
+    const date = (dateOverride != null && String(dateOverride).trim() !== "")
+      ? String(dateOverride).trim()
+      : (($("fxDate").value || "").trim());
+
+    const qs = new URLSearchParams();
+    qs.set("date", date);
+    qs.set("timezone", tz);
+    if (leagueIds) qs.set("league_ids", leagueIds);
+    return qs;
+  }
+
+  async function fetchFixtureBrowserRows() {
+    const from = (($("fxDate").value || "").trim());
+    const to = (($("fxDateTo").value || "").trim()) || from;
+
+    if (!from) throw new Error("Date (From)를 선택하세요");
+
+    const range = enumerateYmdRange(from, to, 31);
+    if (!range.ok) throw new Error("기간 설정 오류: " + range.error + " (최대 31일)");
+
+    const days = range.days || [];
+
+    // fixture_id 기준 dedupe
+    const map = {}; // fixture_id -> row
+
+    for (let i = 0; i < days.length; i++) {
+      const day = days[i];
+      fxSetStatus(`fixtures 기간 조회중... (${i + 1}/${days.length}) ${day}`);
+
+      const qs = buildFixturesQuery(day);
+      const url = adminUrl("/api/fixtures_merged?" + qs.toString());
+
+      const r = await api(url, { method: "GET" });
+      setDebug(r);
+
+      if (r.status >= 400 || !r.data || !r.data.ok) {
+        const err = r.data ? JSON.stringify(r.data) : ("HTTP " + r.status);
+        throw new Error(`fixtures_merged 로드 실패 (${day}): ` + err);
+      }
+
+      const rows = r.data.rows || [];
+      for (const x of rows) {
+        if (!x) continue;
+        const fid = String(fxPick(x, ["fixture_id", "fixtureId", "id", "fixture"], ""));
+        if (!fid) continue;
+        map[fid] = x;
+      }
+    }
+
+    return Object.values(map);
+  }
+
 
   function getFxSearchQ() {
   return (($("fxSearch").value || "").trim().toLowerCase());
@@ -1614,9 +1772,18 @@ function fxPickLogo(row, side /* "home" | "away" */) {
 
 function filterFixtureRows(rows) {
   const q = getFxSearchQ();
-  if (!q) return rows || [];
+  const leagueSet = parseLeagueIdsSet(($("fxLeagueIds").value || ""));
 
   return (rows || []).filter(r => {
+    // ✅ league_ids 필터(선택된 리그만)
+    if (leagueSet && leagueSet.size > 0) {
+      const lid = Number(String(fxPick(r, ["league_id", "leagueId"], "")).trim());
+      if (!Number.isFinite(lid) || !leagueSet.has(lid)) return false;
+    }
+
+    // ✅ search 필터
+    if (!q) return true;
+
     const text = [
       fxPick(r, ["league_name", "league", "leagueName", "competition"], ""),
       fxPick(r, ["league_country", "country"], ""),
@@ -1631,6 +1798,146 @@ function filterFixtureRows(rows) {
 }
 
 
+  // ─────────────────────────────────────
+  // League pick (from loaded list) + pills
+  // ─────────────────────────────────────
+  let _fxLeagueNameById = {};
+
+  function fxRefreshLeaguePick() {
+    const sel = $("fxLeaguePick");
+    if (!sel) return;
+
+    const prev = (sel.value || "").trim();
+
+    // id -> { country, league, label }
+    const map = new Map();
+
+    for (const r of (_fxRows || [])) {
+      const idStr = fxPick(r, ["league_id", "leagueId"], "");
+      const idNum = Number(String(idStr).trim());
+      if (!Number.isFinite(idNum) || idNum <= 0) continue;
+
+      const league = (fxPick(r, ["league_name", "leagueName", "league"], "") || ("League " + idNum)).trim();
+      const country = (fxPick(r, ["league_country", "country"], "") || "").trim();
+
+      const base = country ? `${country} · ${league}` : league;
+      const label = `${base} (${idNum})`;
+
+      // 같은 id는 마지막 것으로 덮어쓰기
+      map.set(idNum, { country, league, label });
+    }
+
+    const entries = Array.from(map.entries()).sort((a, b) => {
+      const A = a[1] || {};
+      const B = b[1] || {};
+      const c1 = String(A.country || "").localeCompare(String(B.country || ""));
+      if (c1 !== 0) return c1;
+
+      const c2 = String(A.league || "").localeCompare(String(B.league || ""));
+      if (c2 !== 0) return c2;
+
+      return a[0] - b[0];
+    });
+
+    // pills에서 사용할 “label(이미 id 포함)”로 저장
+    _fxLeagueNameById = {};
+    for (const [id, obj] of entries) _fxLeagueNameById[id] = obj.label;
+
+    sel.innerHTML =
+      `<option value="">(전체 리그)</option>` +
+      entries.map(([id, obj]) =>
+        `<option value="${escapeHtml(String(id))}">${escapeHtml(obj.label)}</option>`
+      ).join("");
+
+    // 이전 선택 유지(가능하면)
+    if (prev && sel.querySelector(`option[value="${CSS.escape(prev)}"]`)) sel.value = prev;
+    else sel.value = "";
+
+    fxUpdateLeaguePills();
+  }
+
+
+  function fxUpdateLeaguePills() {
+    const box = $("fxLeaguePills");
+    const input = $("fxLeagueIds");
+    if (!box || !input) return;
+
+    const set = parseLeagueIdsSet(input.value || "");
+    box.innerHTML = "";
+
+    if (!set || set.size === 0) return;
+
+    const ids = Array.from(set).sort((a,b)=>a-b);
+    for (const id of ids) {
+      const label = _fxLeagueNameById[id] || ("League " + id + " (" + id + ")");
+
+      const pill = document.createElement("div");
+      pill.className = "fxPillGroup";
+      pill.innerHTML = `
+        <span>${escapeHtml(label)}</span>
+        <span class="fxPillX" title="remove">×</span>
+      `;
+
+      pill.querySelector(".fxPillX").onclick = () => {
+        const cur = parseLeagueIdsSet(input.value || "") || new Set();
+        cur.delete(id);
+        input.value = Array.from(cur).sort((a,b)=>a-b).join(",");
+        fxUpdateLeaguePills();
+        renderFixtureBrowserList(filterFixtureRows(_fxRows));
+      };
+      box.appendChild(pill);
+    }
+  }
+
+  function fxAddLeagueFromPick() {
+    const sel = $("fxLeaguePick");
+    const input = $("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = (sel.value || "").trim();
+    if (!v) return;
+
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return;
+
+    const set = parseLeagueIdsSet(input.value || "") || new Set();
+    set.add(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    fxUpdateLeaguePills();
+    renderFixtureBrowserList(filterFixtureRows(_fxRows));
+  }
+
+  function fxRemoveLeagueFromPick() {
+    const sel = $("fxLeaguePick");
+    const input = $("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = (sel.value || "").trim();
+    if (!v) return;
+
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return;
+
+    const set = parseLeagueIdsSet(input.value || "") || new Set();
+    set.delete(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    fxUpdateLeaguePills();
+    renderFixtureBrowserList(filterFixtureRows(_fxRows));
+  }
+
+  function fxClearLeagueFilter() {
+    const sel = $("fxLeaguePick");
+    const input = $("fxLeagueIds");
+    if (input) input.value = "";
+    if (sel) sel.value = "";
+    fxUpdateLeaguePills();
+    renderFixtureBrowserList(filterFixtureRows(_fxRows));
+  }
+
+
+
 
 
   function renderFixtureBrowserList(rows) {
@@ -1638,9 +1945,9 @@ function filterFixtureRows(rows) {
   box.innerHTML = "";
 
   const viewRows = rows || [];
-  fxSetStatus("rows: " + viewRows.length + " (클릭하면 Fixture Key에 자동 입력)");
 
   for (const r of viewRows) {
+
     const fixtureId = String(fxPick(r, ["fixture_id", "fixtureId", "id", "fixture"], ""));
 
     const league = String(fxPick(r, ["league_name", "league", "leagueName", "competition"], ""));
@@ -1699,7 +2006,7 @@ function filterFixtureRows(rows) {
 
 
   async function loadFixtureBrowser() {
-  fxSetStatus("불러오는 중...");
+  fxSetStatus("fixtures 불러오는 중...");
   $("fxList").innerHTML = "";
   try {
     const rows = await fetchFixtureBrowserRows();
@@ -1707,14 +2014,21 @@ function filterFixtureRows(rows) {
     // ✅ 원본 전체 rows는 보관
     _fxRows = rows || [];
 
-    // ✅ fxSearch는 클라에서 필터링
+    // ✅ NEW: 로드된 목록 기준으로 league 드롭다운 갱신
+    fxRefreshLeaguePick();
+
+    // ✅ 필터(league/search) 적용 후 렌더
     const filtered = filterFixtureRows(_fxRows);
     renderFixtureBrowserList(filtered);
+
+    fxSetStatus(`완료: 전체 ${_fxRows.length}개 · 표시 ${filtered.length}개 (클릭하면 Fixture Key에 자동 입력)`);
   } catch (e) {
     fxSetStatus("");
     alert(String(e.message || e));
   }
 }
+
+
 
 
   function scheduleFixtureBrowserReload() {
@@ -1821,12 +2135,17 @@ function filterFixtureRows(rows) {
 
   // ✅ Fixture Browser inputs -> debounce reload
   $("fxDate").addEventListener("change", () => scheduleFixtureBrowserReload());
+  $("fxDateTo").addEventListener("change", () => scheduleFixtureBrowserReload());
   $("fxTz").addEventListener("change", () => scheduleFixtureBrowserReload());
-  $("fxLeagueIds").addEventListener("input", () => scheduleFixtureBrowserReload());
+
+  // fxLeagueIds는 hidden이고 +/-/ALL로만 변경되므로 input 리스너 불필요
   $("fxSearch").addEventListener("input", () => {
-  const filtered = filterFixtureRows(_fxRows);
-  renderFixtureBrowserList(filtered);
-});
+    const filtered = filterFixtureRows(_fxRows);
+    renderFixtureBrowserList(filtered);
+    fxSetStatus(`완료: 전체 ${_fxRows.length}개 · 표시 ${filtered.length}개 (클릭하면 Fixture Key에 자동 입력)`);
+  });
+
+
 
 
   renderLangBox();
