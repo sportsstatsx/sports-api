@@ -1380,25 +1380,52 @@ if (awayLogo) {
     // ✅ 일반 날짜 조회로 들어오면 OVR 모드 OFF
     setOverrideMode(false);
 
-    const date = document.getElementById("fxDate").value;
-    if (!date) {
-      alert("Date를 선택하세요");
+    const from = (document.getElementById("fxDate")?.value || "").trim();
+    const to = (document.getElementById("fxDateTo")?.value || "").trim();
+
+    if (!from) {
+      alert("Date (From)를 선택하세요");
       return;
     }
 
-    const qs = buildFixturesQuery();
-
-    setStatusLine("fixtures 불러오는 중...");
-    // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용
-    const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
-
-    if (r.status >= 400 || !r.data || !r.data.ok) {
+    // ✅ from~to 범위(최대 31일) 지원 — OVR과 동일 로직
+    const range = enumerateYmdRange(from, to || from, 31);
+    if (!range.ok) {
       setStatusLine("");
-      alert("fixtures 로드 실패: " + JSON.stringify(r.data));
+      alert("기간 설정 오류: " + range.error + "\n\n(최대 31일까지만 지원)");
       return;
     }
 
-    currentFixtures = r.data.rows || [];
+    const days = range.days || [];
+
+    setStatusLine(`fixtures 기간 조회중... (0/${days.length})`);
+
+    // ✅ fixture_id 기준으로 dedupe (여러 날짜 합치기)
+    const map = {}; // fixture_id -> row
+
+    for (let i = 0; i < days.length; i++) {
+      const day = days[i];
+      setStatusLine(`fixtures 기간 조회중... (${i + 1}/${days.length}) ${day}`);
+
+      const qs = buildFixturesQuery(day);
+
+      // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용
+      const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
+
+      if (r.status >= 400 || !r.data || !r.data.ok) {
+        setStatusLine("");
+        alert(`fixtures_merged 로드 실패 (${day}): ` + JSON.stringify(r.data));
+        return;
+      }
+
+      const rows = r.data.rows || [];
+      for (const x of rows) {
+        if (!x) continue;
+        map[String(x.fixture_id)] = x;
+      }
+    }
+
+    currentFixtures = Object.values(map);
 
     // 선택 유지(저장/삭제 후 재선택을 위해)
     const keepId = selectedFixture ? String(selectedFixture.fixture_id) : "";
@@ -1433,6 +1460,7 @@ if (awayLogo) {
 
     showTab("now");
   }
+
 
   async function loadOverridesOnly() {
     // ✅ 토글: 이미 OVR 모드면 일반 날짜 조회로 복귀
