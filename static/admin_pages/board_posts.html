@@ -386,24 +386,35 @@ select option {
     .modal {
       position: fixed;
       inset: 0;
-      background: rgba(0,0,0,0.55);
+      /* ✅ 뒤 배경 더 확실히 눌러서 “반투명/비침” 느낌 제거 */
+      background: rgba(0,0,0,0.75);
       display: none;
       align-items: center;
       justify-content: center;
       padding: 18px;
       z-index: 9999;
     }
+
+    /* 라이트 테마에서는 오버레이가 너무 어둡지 않게 */
+    :root[data-theme="light"] .modal {
+      background: rgba(0,0,0,0.35);
+    }
+
     .modalCard {
       width: min(980px, 96vw);
       max-height: min(86vh, 860px);
-      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-      border: 1px solid var(--line);
+
+      /* ✅ 카드 자체를 “완전 불투명 패널”로 */
+      background: var(--panel);
+
+      border: 1px solid var(--line2);
       border-radius: var(--radius2);
       box-shadow: var(--shadow);
       overflow: hidden;
       display:flex;
       flex-direction: column;
     }
+
     .modalTop {
       display:flex;
       align-items:center;
@@ -411,17 +422,25 @@ select option {
       gap: 10px;
       padding: 12px 14px;
       border-bottom: 1px solid var(--line);
-      background: rgba(255,255,255,0.02);
+
+      /* ✅ 헤더도 solid */
+      background: var(--panel2);
     }
+
     .modalTitle {
       font-size: 14px;
       font-weight: 800;
       letter-spacing: 0.2px;
     }
+
     .modalBody {
       padding: 14px;
       overflow: auto;
+
+      /* ✅ 바디도 solid */
+      background: var(--panel);
     }
+
 
     .fxControls {
       display:grid;
@@ -447,14 +466,27 @@ select option {
       border: 1px solid var(--line);
       border-radius: 14px;
       padding: 10px 12px;
-      background: rgba(255,255,255,0.02);
+
+      /* ✅ 리스트 아이템을 solid 패널로 */
+      background: var(--panel2);
+
       cursor: pointer;
       display:flex;
       justify-content: space-between;
       gap: 12px;
       align-items: center;
     }
-    .fxItem:hover { border-color: rgba(255,255,255,0.25); }
+
+    .fxItem:hover {
+      border-color: rgba(255,255,255,0.28);
+      /* hover도 “하얗게 확 변하는” 느낌 말고 살짝만 */
+      background: rgba(255,255,255,0.04);
+    }
+
+    :root[data-theme="light"] .fxItem:hover {
+      background: rgba(0,0,0,0.03);
+    }
+
     .fxLeft {
       min-width: 0;
       flex: 1;
