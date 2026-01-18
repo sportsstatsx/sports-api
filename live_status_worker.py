@@ -268,6 +268,230 @@ def fetch_lineups(session: requests.Session, fixture_id: int) -> List[Dict[str, 
     data = api_get(session, "/fixtures/lineups", {"fixture": fixture_id})
     return (data.get("response") or []) if isinstance(data, dict) else []
 
+# ─────────────────────────────────────
+# Standings (Football) - FT 최초 관측 시 1회 갱신
+# ─────────────────────────────────────
+
+def fetch_standings(session: requests.Session, league_id: int, season: int) -> Dict[str, Any]:
+    return api_get(session, "/standings", {"league": int(league_id), "season": int(season)})
+
+
+def _db_table_columns(table_name: str) -> set:
+    """
+    standings 테이블 컬럼을 동적으로 확인해서,
+    환경별(컬럼 추가/누락) 차이로 워커가 죽지 않게 한다.
+    """
+    try:
+        # ✅ 상단 import 변경 없이, 함수 내부에서만 import
+        from db import fetch_all  # type: ignore
+    except Exception:
+        return set()
+
+    rows = fetch_all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s
+        """,
+        (table_name,),
+    )
+    cols = set()
+    for r in rows or []:
+        if isinstance(r, dict) and r.get("column_name"):
+            cols.add(r["column_name"])
+    return cols
+
+
+def _normalize_standings_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    /standings 응답을 standings 테이블 upsert용 row list로 평탄화.
+    표준 형태:
+      response[0].league.standings = [[...], [...]] (그룹/컨퍼런스/스테이지별)
+    """
+    out: List[Dict[str, Any]] = []
+    resp = (payload or {}).get("response") or []
+    if not isinstance(resp, list) or not resp:
+        return out
+
+    league = (resp[0] or {}).get("league") or {}
+    blocks = league.get("standings") or []
+    if not isinstance(blocks, list):
+        return out
+
+    for block in blocks:
+        if not isinstance(block, list):
+            continue
+        for row in block:
+            if not isinstance(row, dict):
+                continue
+
+            team = row.get("team") or {}
+            all_ = row.get("all") or {}
+            goals = all_.get("goals") or {}
+
+            team_name = safe_text(team.get("name")) or ""
+            team_name = team_name.strip()
+            if not team_name:
+                continue
+
+            rank = safe_int(row.get("rank")) or 0
+            played = safe_int(all_.get("played")) or 0
+            win = safe_int(all_.get("win")) or 0
+            draw = safe_int(all_.get("draw")) or 0
+            loss = safe_int(all_.get("lose")) or 0
+            gf = safe_int(goals.get("for")) or 0
+            ga = safe_int(goals.get("against")) or 0
+            gd = safe_int(row.get("goalsDiff"))
+            if gd is None:
+                gd = gf - ga
+            points = safe_int(row.get("points")) or 0
+
+            group_name = safe_text(row.get("group"))  # 일부 리그에서만
+            form = safe_text(row.get("form"))         # 일부 리그에서만
+
+            out.append(
+                {
+                    "team_name": team_name,
+                    "rank": rank,
+                    "played": played,
+                    "win": win,
+                    "draw": draw,
+                    "loss": loss,
+                    "gf": gf,
+                    "ga": ga,
+                    "gd": gd,
+                    "points": points,
+                    "group_name": group_name,
+                    "form": form,
+                }
+            )
+
+    return out
+
+
+def refresh_standings_for_league(
+    session: requests.Session,
+    league_id: int,
+    season: int,
+) -> None:
+    """
+    리그+시즌 standings를 받아 standings 테이블에 upsert.
+    ✅ 쿨다운(기본 5분)으로 FT 연속 처리/재시작에도 스팸 방지.
+    """
+    try:
+        cooldown = int(os.environ.get("STANDINGS_REFRESH_MIN_INTERVAL_SEC", "300"))
+    except Exception:
+        cooldown = 300
+    if cooldown < 30:
+        cooldown = 30
+
+    # 함수 attribute로 마지막 실행 ts 보관(전역 추가 없이)
+    last_map = getattr(refresh_standings_for_league, "_last_map", None)
+    if not isinstance(last_map, dict):
+        last_map = {}
+        setattr(refresh_standings_for_league, "_last_map", last_map)
+
+    key = (int(league_id), int(season))
+    now_ts = time.time()
+    last_ts = float(last_map.get(key) or 0.0)
+    if last_ts and (now_ts - last_ts) < cooldown:
+        return
+
+    cols = _db_table_columns("standings")
+    if not cols:
+        # 컬럼 조회 실패해도 최소 컬럼으로 시도할 수는 있지만,
+        # 여기선 안전하게 스킵(테이블 없거나 db 모듈 미스 등)
+        print(f"      [standings] skip: cannot read columns (table=standings)")
+        last_map[key] = now_ts
+        return
+
+    try:
+        payload = fetch_standings(session, league_id, season)
+    except Exception as e:
+        print(f"      [standings] fetch err league={league_id} season={season}: {e}", file=sys.stderr)
+        last_map[key] = now_ts
+        return
+
+    rows = _normalize_standings_rows(payload)
+    if not rows:
+        print(f"      [standings] empty league={league_id} season={season}")
+        last_map[key] = now_ts
+        return
+
+    base_cols = ["league_id", "season", "team_name", "rank", "played", "win", "draw", "loss", "gf", "ga", "gd", "points"]
+    opt_cols: List[str] = []
+    if "group_name" in cols:
+        opt_cols.append("group_name")
+    if "form" in cols:
+        opt_cols.append("form")
+
+    use_cols = base_cols + opt_cols
+
+    placeholders: List[str] = []
+    values: List[Any] = []
+    for r in rows:
+        placeholders.append("(" + ",".join(["%s"] * len(use_cols)) + ")")
+        for c in use_cols:
+            if c == "league_id":
+                values.append(int(league_id))
+            elif c == "season":
+                values.append(int(season))
+            else:
+                values.append(r.get(c))
+
+    set_parts: List[str] = []
+    for c in use_cols:
+        if c in ("league_id", "season", "team_name"):
+            continue
+        set_parts.append(f"{c}=EXCLUDED.{c}")
+
+    sql = f"""
+    INSERT INTO standings ({", ".join(use_cols)})
+    VALUES {", ".join(placeholders)}
+    ON CONFLICT (league_id, season, team_name)
+    DO UPDATE SET {", ".join(set_parts)}
+    """
+
+    try:
+        execute(sql, tuple(values))
+        print(f"      [standings] refreshed league={league_id} season={season} rows={len(rows)}")
+    except Exception as e:
+        print(f"      [standings] upsert err league={league_id} season={season}: {e}", file=sys.stderr)
+
+    last_map[key] = now_ts
+
+
+def refresh_standings_for_fixture(
+    session: requests.Session,
+    fixture_id: int,
+    league_id_hint: Optional[int] = None,
+    season_hint: Optional[int] = None,
+) -> None:
+    """
+    fixture_id 기준으로 league_id/season을 안정적으로 확보해서 standings refresh.
+    - hint가 있으면 우선 사용
+    - 없으면 matches에서 조회 (가장 확실)
+    """
+    lid = league_id_hint
+    sea = season_hint
+
+    if lid is None or sea is None:
+        row = fetch_one(
+            "SELECT league_id, season FROM matches WHERE fixture_id=%s",
+            (fixture_id,),
+        )
+        if isinstance(row, dict):
+            if lid is None:
+                lid = safe_int(row.get("league_id"))
+            if sea is None:
+                sea = safe_int(row.get("season"))
+
+    if lid is None or sea is None:
+        return
+
+    refresh_standings_for_league(session, int(lid), int(sea))
+
+
 
 # ─────────────────────────────────────
 # DB Dedupe Tables (추가 테이블 생성)
@@ -1513,12 +1737,12 @@ def run_once() -> None:
         )
         return row if isinstance(row, dict) else None
 
-    def _ensure_post_state(fixture_id: int, now_dt: dt.datetime) -> Dict[str, Any]:
+        def _ensure_post_state(fixture_id: int, now_dt: dt.datetime, item: Dict[str, Any]) -> Dict[str, Any]:
         st = _get_post_state(fixture_id)
         if st:
             return st
 
-        # 새로 FINISHED를 본 케이스: ft_seen_at을 지금으로 기록
+        # ✅ 새로 FINISHED를 본 케이스: ft_seen_at을 지금으로 기록
         execute(
             """
             INSERT INTO match_postmatch_states (fixture_id, ft_seen_at, did_60, did_30m, last_run_at, updated_at)
@@ -1527,8 +1751,19 @@ def run_once() -> None:
             """,
             (fixture_id, now_dt),
         )
+
+        # ✅ (추가) FT 최초 관측 시점에 standings 1회 갱신
+        try:
+            lg = item.get("league") or {}
+            lid_hint = safe_int(lg.get("id"))
+            season_hint = safe_int(lg.get("season"))
+            refresh_standings_for_fixture(s, fixture_id, lid_hint, season_hint)
+        except Exception as e:
+            print(f"      [standings] fixture_id={fixture_id} refresh err: {e}", file=sys.stderr)
+
         st2 = _get_post_state(fixture_id)
         return st2 if st2 else {"fixture_id": fixture_id, "ft_seen_at": now_dt, "did_60": False, "did_30m": False, "last_run_at": None}
+
 
     def _mark_post_done(fixture_id: int, *, did_60: bool, did_30m: bool) -> None:
         execute(
@@ -1566,9 +1801,20 @@ def run_once() -> None:
                 )
             else:
                 _mark_post_done(fixture_id, did_60=True, did_30m=True)
+
+            # ✅ (추가) 백필로 이미 끝난 경기라도, FINISHED로 최초 관측되는 순간 standings는 1회 갱신
+            try:
+                lg = item.get("league") or {}
+                lid_hint = safe_int(lg.get("id"))
+                season_hint = safe_int(lg.get("season"))
+                refresh_standings_for_fixture(s, fixture_id, lid_hint, season_hint)
+            except Exception as e:
+                print(f"      [standings] fixture_id={fixture_id} refresh err: {e}", file=sys.stderr)
+
             return
 
-        st = _ensure_post_state(fixture_id, now_dt)
+        # ✅ 여기서부터는 live worker가 postmatch 스케줄 관리
+        st = _ensure_post_state(fixture_id, now_dt, item)
 
         ft_seen_at = st.get("ft_seen_at")
         if isinstance(ft_seen_at, str):
@@ -1624,6 +1870,7 @@ def run_once() -> None:
                 """,
                 (fixture_id,),
             )
+
 
 
     for date_str in dates:
