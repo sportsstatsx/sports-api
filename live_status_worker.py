@@ -1632,53 +1632,6 @@ def maybe_sync_lineups(
 
         return
 
-            return
-
-        return
-
-    # INPLAY: 초반 재시도 (elapsed<=15)
-    if status_group == "INPLAY":
-        el = elapsed if elapsed is not None else 0
-        if 0 <= el <= 15:
-            # ✅ 과다 호출 방지: COOLDOWN + 최대 시도 횟수 상한
-            tries = int(st.get("inplay_tries") or 0)
-            if tries >= int(LINEUPS_INPLAY_MAX_TRIES):
-                return
-
-            if (now_ts - last_try) < COOLDOWN_SEC:
-                return
-
-            try:
-                st["last_try_ts"] = time.time()
-                st["inplay_tries"] = tries + 1
-
-                resp = fetch_lineups(session, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, nowu)
-                if ready:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) try={st['inplay_tries']} ready={ready}")
-            except Exception as e:
-                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
-
-            return
-
-        return
-
-    # INPLAY: 초반 재시도 (elapsed<=15)
-    if status_group == "INPLAY":
-        el = elapsed if elapsed is not None else 0
-        if 0 <= el <= 15:
-            if (now_ts - last_try) < COOLDOWN_SEC:
-                return
-            try:
-                st["last_try_ts"] = time.time()
-                resp = fetch_lineups(session, fixture_id)
-                ready = upsert_match_lineups(fixture_id, resp, nowu)
-                if ready:
-                    st["success"] = True
-                print(f"      [lineups] fixture_id={fixture_id} inplay(el={el}) ready={ready}")
-            except Exception as e:
-                print(f"      [lineups] fixture_id={fixture_id} inplay err: {e}", file=sys.stderr)
 
 
 # ─────────────────────────────────────
