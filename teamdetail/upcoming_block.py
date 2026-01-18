@@ -14,17 +14,15 @@ def build_upcoming_block(
     """
     Team Detail 화면의 'Upcoming fixtures' 섹션에 내려줄 데이터.
 
-    - recent_results_block 과 같은 matches / teams 스키마를 사용한다.
-    - 차이점:
-        * recent_results   : status_group = 'FINISHED'
-        * upcoming_fixtures: status_group <> 'FINISHED'  (아직 안 끝난 경기 전부)
+    - ✅ league_id 로 고정해서 "현재 선택한 리그" 기준으로만 보여준다.
+    - ✅ FINISHED 판정은 status_group / status / status_short 모두로 방어한다.
     """
 
     rows_db = fetch_all(
         """
         SELECT
-            m.fixture_id        AS fixture_id,       -- 각 경기의 fixture_id
-            m.league_id         AS league_id,        -- 각 경기의 league_id (리그/컵 섞여 있음)
+            m.fixture_id        AS fixture_id,
+            m.league_id         AS league_id,
             m.season            AS season,
             m.date_utc          AS date_utc,
             m.home_id           AS home_team_id,
@@ -34,17 +32,22 @@ def build_upcoming_block(
         FROM matches AS m
         JOIN teams   AS th ON th.id = m.home_id
         JOIN teams   AS ta ON ta.id = m.away_id
-        WHERE m.season = %s
+        WHERE m.league_id = %s
+          AND m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
-          -- ✅ 'FINISHED' 가 아닌 경기들 = 예정 / 진행중 / 연기 등
-          AND m.status_group <> 'FINISHED'
+          AND NOT (
+            lower(coalesce(m.status_group,'')) = 'finished'
+            OR coalesce(m.status,'') IN ('FT','AET','PEN')
+            OR coalesce(m.status_short,'') IN ('FT','AET','PEN')
+          )
         ORDER BY m.date_utc ASC
         LIMIT 50
         """,
         (
-            season,   # 1) WHERE m.season = %s
-            team_id,  # 2) WHERE m.home_id = %s
-            team_id,  # 3) WHERE m.away_id = %s
+            league_id,
+            season,
+            team_id,
+            team_id,
         ),
     )
 
