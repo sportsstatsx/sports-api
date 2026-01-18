@@ -28,7 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from db import execute  # dev 스키마 확정 → 런타임 schema 조회 불필요
+from db import execute, fetch_all  # dev 스키마 확정 → 런타임 schema 조회 불필요
+
 
 
 
@@ -383,6 +384,348 @@ def calc_red_cards_from_events(
             away_red += 1
 
     return home_red, away_red
+
+# ─────────────────────────────────────
+# FT 이후 타임라인 채우기 (정책: FT 감지 후 +60초 1회, +30분 1회)
+# - 기존 INPLAY 수집 방식은 건드리지 않음
+# - FINISHED일 때만 별도 동작
+# - 스키마 변경 없음(단, 상태 추적용 추가 테이블 1개 생성)
+# ─────────────────────────────────────
+
+def ensure_match_postmatch_timeline_state_table() -> None:
+    """
+    FT 최초 감지 시각과 2회 실행 여부를 저장.
+    - fixture_id 당 1줄
+    - 60초 후 1회, 30분 후 1회만 실행되게 제어
+    """
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS match_postmatch_timeline_state (
+            fixture_id        integer PRIMARY KEY,
+            ft_first_seen_utc  text,
+            done_60           integer,
+            done_30m          integer,
+            updated_utc       text
+        )
+        """
+    )
+
+
+def _get_table_columns(table_name: str) -> List[str]:
+    """
+    match_events / match_events_raw 컬럼이 환경마다 조금 다를 수 있어
+    존재하는 컬럼만 사용하도록 1회 조회 후 캐시.
+    (다른 수집 로직은 절대 건드리지 않음)
+    """
+    t = (table_name or "").strip().lower()
+    if not t:
+        return []
+
+    if not hasattr(_get_table_columns, "_cache"):
+        _get_table_columns._cache = {}  # type: ignore[attr-defined]
+    cache: Dict[str, List[str]] = _get_table_columns._cache  # type: ignore[attr-defined]
+
+    if t in cache:
+        return cache[t]
+
+    rows = fetch_all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = %s
+        ORDER BY ordinal_position
+        """,
+        (t,),
+    )
+    cols = []
+    for r in rows or []:
+        c = r.get("column_name")
+        if isinstance(c, str) and c:
+            cols.append(c.lower())
+    cache[t] = cols
+    return cols
+
+
+def _read_postmatch_state(fixture_id: int) -> Dict[str, Any] | None:
+    rows = fetch_all(
+        """
+        SELECT fixture_id, ft_first_seen_utc, done_60, done_30m, updated_utc
+        FROM match_postmatch_timeline_state
+        WHERE fixture_id = %s
+        """,
+        (fixture_id,),
+    )
+    return rows[0] if rows else None
+
+
+def _init_postmatch_state_if_missing(fixture_id: int, now: dt.datetime) -> Dict[str, Any]:
+    st = _read_postmatch_state(fixture_id)
+    if st:
+        return st
+
+    nowu = now.astimezone(dt.timezone.utc)
+    now_iso = iso_utc(nowu)
+
+    execute(
+        """
+        INSERT INTO match_postmatch_timeline_state (fixture_id, ft_first_seen_utc, done_60, done_30m, updated_utc)
+        VALUES (%s, %s, 0, 0, %s)
+        ON CONFLICT (fixture_id) DO NOTHING
+        """,
+        (fixture_id, now_iso, now_iso),
+    )
+    return _read_postmatch_state(fixture_id) or {
+        "fixture_id": fixture_id,
+        "ft_first_seen_utc": now_iso,
+        "done_60": 0,
+        "done_30m": 0,
+        "updated_utc": now_iso,
+    }
+
+
+def _mark_postmatch_done(fixture_id: int, which: str, now: dt.datetime) -> None:
+    nowu = now.astimezone(dt.timezone.utc)
+    now_iso = iso_utc(nowu)
+
+    if which == "60":
+        execute(
+            """
+            UPDATE match_postmatch_timeline_state
+            SET done_60 = 1, updated_utc = %s
+            WHERE fixture_id = %s
+              AND (done_60 IS DISTINCT FROM 1)
+            """,
+            (now_iso, fixture_id),
+        )
+    elif which == "30m":
+        execute(
+            """
+            UPDATE match_postmatch_timeline_state
+            SET done_30m = 1, updated_utc = %s
+            WHERE fixture_id = %s
+              AND (done_30m IS DISTINCT FROM 1)
+            """,
+            (now_iso, fixture_id),
+        )
+
+
+def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]], fetched_at: dt.datetime) -> None:
+    """
+    match_events_raw에 원본 배열 저장(스키마 차이를 흡수).
+    """
+    cols = set(_get_table_columns("match_events_raw"))
+
+    raw = json.dumps(events or [], ensure_ascii=False, separators=(",", ":"))
+
+    # 가능한 컬럼명 후보
+    col_data = "data_json" if "data_json" in cols else ("raw_json" if "raw_json" in cols else ("data" if "data" in cols else None))
+    col_fetched = "fetched_at" if "fetched_at" in cols else ("fetched_utc" if "fetched_utc" in cols else None)
+    col_updated = "updated_at" if "updated_at" in cols else ("updated_utc" if "updated_utc" in cols else None)
+
+    if not col_data:
+        # data 컬럼을 못 찾으면 raw 저장은 생략(타임라인 insert는 별도 진행)
+        return
+
+    nowu = fetched_at.astimezone(dt.timezone.utc)
+    ts_val = iso_utc(nowu)
+
+    # INSERT/UPDATE 구성
+    insert_cols = ["fixture_id", col_data]
+    insert_vals = [fixture_id, raw]
+
+    if col_fetched:
+        insert_cols.append(col_fetched)
+        insert_vals.append(ts_val)
+    if col_updated:
+        insert_cols.append(col_updated)
+        insert_vals.append(ts_val)
+
+    col_sql = ", ".join(insert_cols)
+    ph_sql = ", ".join(["%s"] * len(insert_cols))
+
+    # 업데이트는 data_json만 변경 시 수행(기존 스타일 유지)
+    if col_updated:
+        upd_set = f"{col_data} = EXCLUDED.{col_data}, {col_updated} = EXCLUDED.{col_updated}"
+        where_clause = f"match_events_raw.{col_data} IS DISTINCT FROM EXCLUDED.{col_data}"
+    else:
+        upd_set = f"{col_data} = EXCLUDED.{col_data}"
+        where_clause = f"match_events_raw.{col_data} IS DISTINCT FROM EXCLUDED.{col_data}"
+
+    execute(
+        f"""
+        INSERT INTO match_events_raw ({col_sql})
+        VALUES ({ph_sql})
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            {upd_set}
+        WHERE
+            {where_clause}
+        """,
+        tuple(insert_vals),
+    )
+
+
+def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any]]) -> int:
+    """
+    match_events를 fixture_id 단위로 '싹 교체'한다.
+    - 스키마에 존재하는 컬럼만 채움
+    - events가 비어있으면 기존 데이터를 지우지 않음(안전장치)
+    반환: insert된 row 수
+    """
+    if not events:
+        return 0
+
+    cols = set(_get_table_columns("match_events"))
+    if not cols:
+        return 0
+
+    # 최소 필수(있을 때만 사용)
+    def has(c: str) -> bool:
+        return c.lower() in cols
+
+    # 컬럼명 호환(둘 중 하나 존재)
+    col_extra = "extra" if has("extra") else ("time_extra" if has("time_extra") else None)
+
+    inserted = 0
+
+    # 기존 fixture 이벤트 삭제(교체)
+    execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
+
+    for ev in (events or []):
+        time_obj = ev.get("time") or {}
+        team_obj = ev.get("team") or {}
+        player_obj = ev.get("player") or {}
+        assist_obj = ev.get("assist") or {}
+
+        minute = safe_int(time_obj.get("elapsed")) or 0
+        extra = safe_int(time_obj.get("extra"))
+        type_raw = safe_text(ev.get("type"))
+        detail_raw = safe_text(ev.get("detail"))
+        comments_raw = safe_text(ev.get("comments"))
+
+        team_id = safe_int(team_obj.get("id"))
+        player_id = safe_int(player_obj.get("id"))
+        player_name = safe_text(player_obj.get("name"))
+
+        assist_id = safe_int(assist_obj.get("id"))
+        assist_name = safe_text(assist_obj.get("name"))
+
+        # SUB의 경우: API-Sports는 보통 player=OUT, assist=IN 으로 옴
+        player_in_id = assist_id
+        player_in_name = assist_name
+
+        ins_cols: List[str] = []
+        ins_vals: List[Any] = []
+
+        def add(c: str, v: Any) -> None:
+            if has(c):
+                ins_cols.append(c)
+                ins_vals.append(v)
+
+        add("fixture_id", fixture_id)
+        add("minute", minute)
+
+        if col_extra:
+            ins_cols.append(col_extra)
+            ins_vals.append(extra)
+
+        add("type", type_raw)
+        add("detail", detail_raw)
+        add("comments", comments_raw)
+
+        add("team_id", team_id)
+
+        add("player_id", player_id)
+        add("player_name", player_name)
+
+        add("assist_player_id", assist_id)
+        add("assist_name", assist_name)
+
+        add("player_in_id", player_in_id)
+        add("player_in_name", player_in_name)
+
+        if not ins_cols:
+            continue
+
+        col_sql = ", ".join(ins_cols)
+        ph_sql = ", ".join(["%s"] * len(ins_cols))
+
+        execute(
+            f"INSERT INTO match_events ({col_sql}) VALUES ({ph_sql})",
+            tuple(ins_vals),
+        )
+        inserted += 1
+
+    return inserted
+
+
+def maybe_sync_postmatch_timeline(
+    session: requests.Session,
+    fixture_id: int,
+    status_group: str,
+    now: dt.datetime,
+) -> None:
+    """
+    정책 고정:
+    - status_group == FINISHED 일 때만 동작
+    - FT 최초 감지 시각 기준
+      * +60초 1회
+      * +30분 1회
+    """
+    if status_group != "FINISHED":
+        return
+
+    st = _init_postmatch_state_if_missing(fixture_id, now)
+
+    ft_seen = st.get("ft_first_seen_utc")
+    try:
+        base = dt.datetime.fromisoformat(str(ft_seen).replace("Z", "+00:00"))
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=dt.timezone.utc)
+        else:
+            base = base.astimezone(dt.timezone.utc)
+    except Exception:
+        base = now.astimezone(dt.timezone.utc)
+
+    nowu = now.astimezone(dt.timezone.utc)
+
+    done_60 = int(st.get("done_60") or 0) == 1
+    done_30m = int(st.get("done_30m") or 0) == 1
+
+    # 1) +60초 1회
+    if (not done_60) and (nowu >= (base + dt.timedelta(seconds=60))):
+        events = fetch_events(session, fixture_id)
+        try:
+            upsert_match_events_raw(fixture_id, events, nowu)
+        except Exception:
+            pass
+
+        ins = 0
+        try:
+            ins = replace_match_events_for_fixture(fixture_id, events)
+        except Exception:
+            ins = 0
+
+        _mark_postmatch_done(fixture_id, "60", nowu)
+        print(f"      [postmatch_timeline] fixture_id={fixture_id} +60s events={len(events)} inserted={ins}")
+
+    # 2) +30분 1회
+    if (not done_30m) and (nowu >= (base + dt.timedelta(minutes=30))):
+        events = fetch_events(session, fixture_id)
+        try:
+            upsert_match_events_raw(fixture_id, events, nowu)
+        except Exception:
+            pass
+
+        ins = 0
+        try:
+            ins = replace_match_events_for_fixture(fixture_id, events)
+        except Exception:
+            ins = 0
+
+        _mark_postmatch_done(fixture_id, "30m", nowu)
+        print(f"      [postmatch_timeline] fixture_id={fixture_id} +30m events={len(events)} inserted={ins}")
+
 
 
 
@@ -924,7 +1267,9 @@ def run_once() -> None:
     # ✅ DDL은 워커 시작 시 1회만
     if not hasattr(run_once, "_ddl_done"):
         ensure_match_live_state_table()
+        ensure_match_postmatch_timeline_state_table()
         run_once._ddl_done = True  # type: ignore[attr-defined]
+
 
     dates = target_dates_for_live()
     now = now_utc()
@@ -1048,9 +1393,17 @@ def run_once() -> None:
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
+                    # ✅ FINISHED: 타임라인 채우기 정책(FT 감지 후 +60초 1회, +30분 1회)
+                    # - 기존 수집 방식은 그대로 두고, FINISHED에만 추가 동작
+                    try:
+                        maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
+                    except Exception as pm_err:
+                        print(f"      [postmatch_timeline] fixture_id={fixture_id} err: {pm_err}", file=sys.stderr)
+
                     # INPLAY 처리
                     if sg != "INPLAY":
                         continue
+
 
                     total_inplay += 1
 
