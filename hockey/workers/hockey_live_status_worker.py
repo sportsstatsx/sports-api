@@ -917,7 +917,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
     inplay_end = now + dt.timedelta(minutes=future_grace_min)
 
-    ns_grace_start = now - dt.timedelta(minutes=ns_grace_min)
 
     rows = hockey_fetch_all(
         """
@@ -947,8 +946,9 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
                 OR
 
-                -- ✅ 시작 직후 ns_grace_min 동안만 NS/TBD 허용
-                (COALESCE(g.status, '') IN ('NS','TBD') AND g.game_date >= %s)
+                -- ✅ NS/TBD가 오래 남는 리그가 있어 grace 제한 없이 in-play 윈도우 동안 유지
+                (COALESCE(g.status, '') IN ('NS','TBD'))
+
 
                 OR
 
@@ -967,9 +967,9 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             leagues,
             now, upcoming_end,
             inplay_start, inplay_end,
-            ns_grace_start,
             batch_limit,
         ),
+
     )
     return [dict(r) for r in rows]
 
