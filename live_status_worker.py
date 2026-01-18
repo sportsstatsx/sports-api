@@ -899,18 +899,26 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]]) -> No
 
 def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     """
-    ✅ 중복/타임라인 붕괴 근본 해결 (name-first stable key)
+    ✅ 완전체 이벤트 디듀프/수렴 (Goal / Card / Sub / VAR / 기타)
 
-    핵심 원인(지금까지 중복이 안 죽는 이유):
-      - 라이브 중 pid(player.id)가 나중에 채워지면 stable_base가 (name 기반 -> pid 기반)으로 바뀌어
-        기존 synthetic_id와 다른 새 synthetic_id가 생성됨 => 같은 이벤트가 2개 row로 공존
+    해결하는 중복 유형:
+      1) api_event_id 가 NULL(없음) → synthetic_id 생성된 뒤, 나중에 이름/ID/어시스트가 채워져 다시 내려오며 중복 생성
+      2) minute/extra가 소폭 보정되어 내려오며 다른 키로 굳는 문제
+      3) 동일 사건이 payload 형태만 달라져 반복 등장(assist 추가, player name 채움 등)
+      4) 워커 재시작/장애 후에도 기존 row로 수렴
 
-    해결:
-      - stable_base에서 "pid 우선"을 버리고 "name 우선"으로 고정
-        (name이 있으면 항상 name으로, name이 없을 때만 pid로)
-      - incoming_id(양수) 중복 정리는 '무조건 삭제'가 아니라
-        '현재 이벤트와 시그니처가 같은 경우에만' 삭제로 안전화
+    방식:
+      - 1차: key_map(기존 canonical_key)로 재사용
+      - 2차: incoming_id가 있으면(그리고 key_map에 있으면) 재사용
+      - 3차(핵심): match_events 테이블의 기존 row를 '시그니처 기반'으로 찾아 event_id를 재사용(unk→name 승격 포함)
+      - 최후: 새 synthetic_id 생성
     """
+
+    # 함수 내부 import (상단 import 변경 최소화)
+    try:
+        from db import fetch_all  # type: ignore
+    except Exception:
+        fetch_all = None  # type: ignore
 
     def _norm(s: Optional[str]) -> str:
         if not s:
@@ -977,6 +985,50 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             return False
         return p_id not in ids
 
+    def _who_name_first(pid: Optional[int], nm: str, unk_prefix: str = "who") -> str:
+        if nm:
+            return f"name:{nm}"
+        if pid is not None:
+            return f"pid:{int(pid)}"
+        return f"{unk_prefix}:unk"
+
+    def _build_stable_base(
+        ev_type_norm: str,
+        detail_norm: str,
+        minute: int,
+        t_id: Optional[int],
+        p_id: Optional[int],
+        a_id: Optional[int],
+        pname: str,
+        aname: str,
+        player_in_id: Optional[int],
+        player_in_name: Optional[str],
+    ) -> str:
+        mb = _minute_bucket10(minute)
+
+        if ev_type_norm == "goal":
+            kind = _goal_kind(detail_norm)
+            who = _who_name_first(p_id, pname, "who")
+            return f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
+
+        if ev_type_norm == "card":
+            ck = _card_kind(detail_norm)
+            who = _who_name_first(p_id, pname, "who")
+            return f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
+
+        if ev_type_norm in ("subst", "substitution", "sub"):
+            out_part = _who_name_first(p_id, pname, "out")
+            in_nm = _safe_name(player_in_name) if player_in_name else ""
+            in_part = _who_name_first(player_in_id, in_nm, "in")
+            return f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
+
+        if ev_type_norm == "var":
+            return f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
+
+        p_part = _who_name_first(p_id, pname, "p")
+        a_part = _who_name_first(a_id, aname, "a")
+        return f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
+
     # ───────────── key_map 1회 로드 ─────────────
     km_row = fetch_one(
         """
@@ -1025,36 +1077,6 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
     for b, arr in base_to_existing_ns.items():
         arr.sort()
 
-    # ───────────── Second Yellow 존재 시 같은 대상/근처 Red 스킵 ─────────────
-    second_yellow_keys: set = set()
-    for ev in events or []:
-        tm = ev.get("time") or {}
-        minute = safe_int(tm.get("elapsed"))
-        if minute is None:
-            continue
-        extra0 = int(safe_int(tm.get("extra")) or 0)
-        ev_type_norm = _norm(safe_text(ev.get("type")))
-        if ev_type_norm != "card":
-            continue
-        team = ev.get("team") or {}
-        player = ev.get("player") or {}
-        t_id = safe_int(team.get("id"))
-        p_id = safe_int(player.get("id"))
-        if t_id is None or p_id is None:
-            continue
-        detail_norm = _norm(safe_text(ev.get("detail")))
-        if detail_norm == "second yellow card":
-            second_yellow_keys.add((int(minute), int(extra0), int(t_id), int(p_id)))
-
-    # ───────────── 시간순 정렬 ─────────────
-    indexed = list(enumerate(events or []))
-    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
-    evs = [ev for _, ev in indexed]
-
-    seen_keys_in_tick: List[str] = []
-    base_seen_count: Dict[str, int] = {}
-    base_used_n: Dict[str, set] = {}
-
     def _set_primary_key(event_id: int, primary_key: str) -> None:
         if not primary_key:
             return
@@ -1084,50 +1106,197 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             if int(vid) == int(event_id) and k != primary_key:
                 del key_to_id[k]
 
-    def _build_stable_base(
+    # ───────────── 기존 DB events 로드 (핵심: 시그니처 병합용) ─────────────
+    existing: List[Dict[str, Any]] = []
+    if fetch_all is not None:
+        try:
+            existing = fetch_all(
+                """
+                SELECT
+                  id,
+                  team_id,
+                  player_id,
+                  type,
+                  detail,
+                  minute,
+                  extra,
+                  assist_player_id,
+                  assist_name,
+                  player_in_id,
+                  player_in_name
+                FROM match_events
+                WHERE fixture_id=%s
+                """,
+                (fixture_id,),
+            ) or []
+        except Exception:
+            existing = []
+    else:
+        existing = []
+
+    def _etype_norm(x: Any) -> str:
+        return _norm(safe_text(x) or "")
+
+    def _detail_norm(x: Any) -> str:
+        return _norm(safe_text(x) or "")
+
+    def _match_existing_event_id(
+        *,
+        used_ids_in_tick: set,
+        t_id: Optional[int],
         ev_type_norm: str,
         detail_norm: str,
         minute: int,
-        t_id: Optional[int],
+        extra0: int,
         p_id: Optional[int],
-        a_id: Optional[int],
         pname: str,
+        a_id: Optional[int],
         aname: str,
         player_in_id: Optional[int],
-        player_in_name: Optional[str],
-    ) -> str:
-        mb = _minute_bucket10(minute)
+        player_in_name_norm: str,
+    ) -> Optional[int]:
+        """
+        DB에 이미 있는 row 중, '같은 사건'으로 볼 수 있는 것을 찾아 id 재사용.
+        - unk → name/pid/assist 채워짐 케이스 병합
+        - minute 보정(±EVENT_MINUTE_CORR_ALLOW) 허용
+        - extra는 둘 다 값이 있으면 일치 요구, 한쪽이 NULL이면 허용
+        """
+        if not existing:
+            return None
 
-        # ✅ name-first: pname이 있으면 무조건 name으로, 없으면 pid로
-        def _who_name_first(pid: Optional[int], nm: str, unk_prefix: str = "who") -> str:
-            if nm:
-                return f"name:{nm}"
-            if pid is not None:
-                return f"pid:{int(pid)}"
-            return f"{unk_prefix}:unk"
+        # type별 kind
+        gk = _goal_kind(detail_norm) if ev_type_norm == "goal" else ""
+        ck = _card_kind(detail_norm) if ev_type_norm == "card" else ""
 
-        if ev_type_norm == "goal":
-            kind = _goal_kind(detail_norm)
-            who = _who_name_first(p_id, pname, "who")
-            return f"G|{fixture_id}|b{mb}|t{int(t_id or 0)}|{kind}|{who}"
+        best_id: Optional[int] = None
+        best_score = -1
 
-        if ev_type_norm == "card":
-            ck = _card_kind(detail_norm)
-            who = _who_name_first(p_id, pname, "who")
-            return f"C|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ck}|{who}"
+        for row in existing:
+            if not isinstance(row, dict):
+                continue
+            rid = safe_int(row.get("id"))
+            if rid is None:
+                continue
+            if rid in used_ids_in_tick:
+                continue
 
-        if ev_type_norm in ("subst", "substitution", "sub"):
-            out_part = _who_name_first(p_id, pname, "out")
-            in_nm = _safe_name(player_in_name) if player_in_name else ""
-            in_part = _who_name_first(player_in_id, in_nm, "in")
-            return f"S|{fixture_id}|b{mb}|t{int(t_id or 0)}|out:{out_part}|in:{in_part}"
+            rt = safe_int(row.get("team_id"))
+            if t_id is not None and rt is not None and int(rt) != int(t_id):
+                continue
 
-        if ev_type_norm == "var":
-            return f"V|{fixture_id}|b{mb}|t{int(t_id or 0)}|{detail_norm or 'var'}"
+            rtype_norm = _etype_norm(row.get("type"))
+            if rtype_norm != ev_type_norm:
+                continue
 
-        p_part = _who_name_first(p_id, pname, "p")
-        a_part = _who_name_first(a_id, aname, "a")
-        return f"E|{fixture_id}|b{mb}|t{int(t_id or 0)}|{ev_type_norm or 'e'}|{detail_norm or 'd'}|{p_part}|{a_part}"
+            rmin = safe_int(row.get("minute"))
+            if rmin is None:
+                continue
+            if abs(int(rmin) - int(minute)) > int(EVENT_MINUTE_CORR_ALLOW):
+                continue
+
+            rextra = safe_int(row.get("extra"))
+            if rextra is not None:
+                # DB에 extra가 이미 있으면, 들어오는 extra가 크게 다르면 제외
+                if int(rextra) != int(extra0):
+                    continue
+
+            rdetail_norm = _detail_norm(row.get("detail"))
+
+            # kind 일치(Goal/Card는 강제)
+            if ev_type_norm == "goal":
+                if _goal_kind(rdetail_norm) != gk:
+                    continue
+            if ev_type_norm == "card":
+                if _card_kind(rdetail_norm) != ck:
+                    continue
+
+            score = 0
+
+            # minute 가까울수록 가중
+            score += max(0, 20 - abs(int(rmin) - int(minute)) * 2)
+
+            # team 일치 가중
+            if t_id is not None and rt is not None and int(rt) == int(t_id):
+                score += 8
+
+            # player 매칭: 같으면 강하게, DB가 NULL이면 "승격 가능"으로 가중
+            rpid = safe_int(row.get("player_id"))
+            if p_id is not None and rpid is not None:
+                if int(p_id) == int(rpid):
+                    score += 40
+                else:
+                    # 같은 type/kind/team/minute라도 player_id가 다르면 다른 사건일 가능성 높음
+                    continue
+            elif p_id is not None and rpid is None:
+                score += 18  # ✅ unk→known 승격 케이스
+            elif p_id is None and rpid is not None:
+                # 들어오는 쪽이 비어있고 DB는 채워진 경우: 병합 가능(업데이트가 덜한 쪽)
+                score += 10
+            else:
+                score += 6
+
+            # assist / in-player 매칭(있으면 가중, DB NULL이면 승격 가중)
+            r_aid = safe_int(row.get("assist_player_id"))
+            if a_id is not None and r_aid is not None:
+                if int(a_id) == int(r_aid):
+                    score += 12
+                else:
+                    # assist가 다르면 다른 사건일 가능성. 단, DB가 비정상일 수도 있으니 바로 컷하진 않음.
+                    score -= 3
+            elif a_id is not None and r_aid is None:
+                score += 7
+
+            # substitution: in/out 둘 다가 중요
+            if ev_type_norm in ("subst", "substitution", "sub"):
+                r_in = safe_int(row.get("player_in_id"))
+                if player_in_id is not None and r_in is not None:
+                    if int(player_in_id) == int(r_in):
+                        score += 18
+                    else:
+                        continue
+                elif player_in_id is not None and r_in is None:
+                    score += 10
+
+            # detail 텍스트 자체가 같으면 추가 가중(표기 보정이 있을 수 있으니 강제는 아님)
+            if rdetail_norm and detail_norm and rdetail_norm == detail_norm:
+                score += 6
+
+            if score > best_score:
+                best_score = score
+                best_id = int(rid)
+
+        return best_id
+
+    # ───────────── Second Yellow 존재 시 같은 대상/근처 Red 스킵 ─────────────
+    second_yellow_keys: set = set()
+    for ev in events or []:
+        tm = ev.get("time") or {}
+        minute0 = safe_int(tm.get("elapsed"))
+        if minute0 is None:
+            continue
+        extra00 = int(safe_int(tm.get("extra")) or 0)
+        ev_type_norm0 = _norm(safe_text(ev.get("type")))
+        if ev_type_norm0 != "card":
+            continue
+        team0 = ev.get("team") or {}
+        player0 = ev.get("player") or {}
+        t0 = safe_int(team0.get("id"))
+        p0 = safe_int(player0.get("id"))
+        if t0 is None or p0 is None:
+            continue
+        d0 = _norm(safe_text(ev.get("detail")))
+        if d0 == "second yellow card":
+            second_yellow_keys.add((int(minute0), int(extra00), int(t0), int(p0)))
+
+    # ───────────── 시간순 정렬 ─────────────
+    indexed = list(enumerate(events or []))
+    indexed.sort(key=lambda pair: _time_key(pair[1], pair[0]))
+    evs = [ev for _, ev in indexed]
+
+    seen_keys_in_tick: List[str] = []
+    base_seen_count: Dict[str, int] = {}
+    base_used_n: Dict[str, set] = {}
+    used_event_ids_in_tick: set = set()  # ✅ DB 재매칭 시 동일 id 중복 사용 방지
 
     for ev in evs:
         team = ev.get("team") or {}
@@ -1169,6 +1338,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         if ev_type_norm in ("subst", "substitution", "sub"):
             player_in_id = a_id
             player_in_name = safe_text(assist.get("name"))
+        player_in_name_norm = _safe_name(player_in_name) if player_in_name else ""
 
         incoming_id = safe_int(ev.get("id"))
         id_key = f"ID|{fixture_id}|{int(incoming_id)}" if incoming_id is not None else ""
@@ -1197,12 +1367,14 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
         chosen_key = ""
         chosen_event_id: Optional[int] = None
 
+        # 1) exact key 재사용
         k_desired = f"{stable_base}|n:{desired_n}"
         if k_desired in key_to_id and desired_n not in used_set:
             chosen_key = k_desired
             chosen_event_id = int(key_to_id[k_desired])
             used_set.add(desired_n)
 
+        # 2) incoming_id 기반 재사용(있으면)
         if chosen_event_id is None and id_key and (id_key in key_to_id):
             chosen_event_id = int(key_to_id[id_key])
             if desired_n not in used_set:
@@ -1215,6 +1387,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                 chosen_key = f"{stable_base}|n:{nn}"
                 used_set.add(nn)
 
+        # 3) 같은 stable_base의 기존 n 재사용
         if chosen_event_id is None:
             existing_ns = base_to_existing_ns.get(stable_base) or []
             for n in existing_ns:
@@ -1227,12 +1400,36 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
                     used_set.add(int(n))
                     break
 
+        # 4) ✅ 핵심: DB 시그니처로 기존 row 병합(unk→name, assist 추가, minute 보정 포함)
+        if chosen_event_id is None:
+            reused = _match_existing_event_id(
+                used_ids_in_tick=used_event_ids_in_tick,
+                t_id=t_id,
+                ev_type_norm=ev_type_norm,
+                detail_norm=detail_norm,
+                minute=int(minute),
+                extra0=int(extra0),
+                p_id=p_id,
+                pname=pname,
+                a_id=a_id,
+                aname=aname,
+                player_in_id=player_in_id,
+                player_in_name_norm=player_in_name_norm,
+            )
+            if reused is not None:
+                chosen_event_id = int(reused)
+                chosen_key = k_desired
+                used_set.add(desired_n)
+
+        # 5) 새 synthetic id
         if chosen_event_id is None:
             chosen_key = k_desired
             chosen_event_id = _synthetic_id_from_key(chosen_key)
             used_set.add(desired_n)
 
         ev_id_used = int(chosen_event_id)
+        used_event_ids_in_tick.add(ev_id_used)
+
         primary_key = chosen_key
         seen_keys_in_tick.append(primary_key)
 
@@ -1404,6 +1601,7 @@ def upsert_match_events(fixture_id: int, events: List[Dict[str, Any]]) -> None:
             """,
             (fixture_id,),
         )
+
 
 
 
