@@ -4,116 +4,96 @@ from __future__ import annotations
 
 from flask import Blueprint, request, jsonify, current_app
 
-from teamdetail.bundle_service import get_team_detail_bundle
 from db import fetch_all
+from teamdetail.bundle_service import get_team_detail_bundle
 
 teamdetail_bp = Blueprint("teamdetail", __name__)
 
 
-def _resolve_season_for_teamdetail(league_id: int, season: int | None) -> int | None:
-    """
-    팀디테일 전용 시즌 보정(캘린더-이어 리그 문제 해결용)
+def _coalesce_int(v, default: int = 0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
+
+def _fetch_one(query: str, params: tuple):
+    rows = fetch_all(query, params)
+    return rows[0] if rows else None
+
+
+def _resolve_season_for_team_league(
+    team_id: int,
+    league_id: int,
+    season: int | None,
+) -> int | None:
+    """
+    ✅ 팀디테일 시즌 보정(완전무결)
     우선순위:
-    1) 요청 season이 실제로 matches에 존재하면 그대로 사용
-    2) (가장 중요) league_id 기준 "가장 가까운 미래 경기"의 season
-    3) 없으면 "가장 최근 경기"의 season
-    4) 그래도 없으면 standings/fixtures의 MAX(season) (가능하면)
+      0) season 파라미터가 유효하면 그대로 사용
+      1) matches에서 (team_id, league_id) 기준 MAX(season)
+      2) fixtures에서 league_id 기준 MAX(season)
+      3) standings에서 league_id 기준 MAX(season)
     """
 
-    # 1) 요청 season 검증: 해당 시즌 데이터가 matches에 있으면 그대로
+    # 0) season이 들어왔으면 "해당 팀+리그+시즌" 데이터 존재 여부 체크 후 사용
     if season is not None:
-        try:
-            rows = fetch_all(
-                """
-                SELECT 1
-                FROM matches
-                WHERE league_id = %s
-                  AND season = %s
-                LIMIT 1
-                """,
-                (league_id, season),
-            )
-            if rows:
-                return int(season)
-        except Exception:
-            pass
-
-    # 2) "가장 가까운 미래 경기"의 season 우선 (캘린더-이어 리그의 핵심)
-    try:
-        rows = fetch_all(
+        row = _fetch_one(
             """
-            SELECT season
+            SELECT 1 AS ok
             FROM matches
             WHERE league_id = %s
-              AND date_utc >= NOW()
-            ORDER BY date_utc ASC
+              AND season = %s
+              AND (home_id = %s OR away_id = %s)
             LIMIT 1
             """,
-            (league_id,),
+            (league_id, season, team_id, team_id),
         )
-        if rows:
-            s = rows[0].get("season")
-            if s is not None:
-                return int(s)
-    except Exception:
-        pass
+        if row is not None:
+            return season
 
-    # 3) 미래 경기가 없으면 "가장 최근 경기" season
-    try:
-        rows = fetch_all(
-            """
-            SELECT season
-            FROM matches
-            WHERE league_id = %s
-            ORDER BY date_utc DESC
-            LIMIT 1
-            """,
-            (league_id,),
-        )
-        if rows:
-            s = rows[0].get("season")
-            if s is not None:
-                return int(s)
-    except Exception:
-        pass
+    # 1) matches 기준 (팀+리그) 최신 시즌
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
+        WHERE league_id = %s
+          AND (home_id = %s OR away_id = %s)
+        """,
+        (league_id, team_id, team_id),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
 
-    # 4) 마지막 안전망: standings / fixtures MAX(season)
-    try:
-        rows = fetch_all(
-            """
-            SELECT MAX(season) AS season
-            FROM standings
-            WHERE league_id = %s
-            """,
-            (league_id,),
-        )
-        if rows:
-            s = rows[0].get("season")
-            if s is not None:
-                si = int(s)
-                if si > 0:
-                    return si
-    except Exception:
-        pass
+    # 2) fixtures 기준 (리그) 최신 시즌
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM fixtures
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
 
-    try:
-        rows = fetch_all(
-            """
-            SELECT MAX(season) AS season
-            FROM fixtures
-            WHERE league_id = %s
-            """,
-            (league_id,),
-        )
-        if rows:
-            s = rows[0].get("season")
-            if s is not None:
-                si = int(s)
-                if si > 0:
-                    return si
-    except Exception:
-        pass
+    # 3) standings 기준 (리그) 최신 시즌
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM standings
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
 
     return None
 
@@ -141,7 +121,11 @@ def team_detail_bundle():
                 400,
             )
 
-        resolved_season = _resolve_season_for_teamdetail(league_id=league_id, season=season)
+        resolved_season = _resolve_season_for_team_league(
+            team_id=team_id,
+            league_id=league_id,
+            season=season,
+        )
         if resolved_season is None:
             return jsonify({"ok": False, "error": "season_not_resolvable"}), 400
 
