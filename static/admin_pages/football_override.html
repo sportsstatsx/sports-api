@@ -1102,14 +1102,12 @@ if (awayLogo) {
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
 
-    // ✅ OVR 모드에서는 "선택된 경기의 날짜(해당 tz 기준)"로 raw 캐시 키를 잡는다
-    const date =
-      (overrideOnlyMode && selectedFixture && selectedFixture.date_utc)
-        ? ymdInTz(selectedFixture.date_utc, tz)
-        : (document.getElementById("fxDate").value || "");
+    // ✅ OVR 모드는 “현재 날짜 기준 필터링”으로 동작(서버 추가 없이 전체 날짜 무시 조회는 불가)
+    const date = (document.getElementById("fxDate").value || "");
 
     return `${date}__${tz}__${leagueIds}`;
   }
+
 
 
 
@@ -1117,11 +1115,8 @@ if (awayLogo) {
     const tz = document.getElementById("fxTz").value || "UTC";
     const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
 
-    // ✅ OVR 모드에서는 선택된 경기 날짜를 사용(선택 전이면 fxDate 사용)
-    const date =
-      (overrideOnlyMode && selectedFixture && selectedFixture.date_utc)
-        ? ymdInTz(selectedFixture.date_utc, tz)
-        : (document.getElementById("fxDate").value || "");
+    // ✅ OVR 모드도 “현재 선택한 Date”를 그대로 사용
+    const date = (document.getElementById("fxDate").value || "");
 
     const qs = new URLSearchParams();
     qs.set("date", date);
@@ -1129,6 +1124,7 @@ if (awayLogo) {
     if (leagueIds) qs.set("league_ids", leagueIds);
     return qs;
   }
+
 
 
 
@@ -1374,34 +1370,42 @@ if (awayLogo) {
   async function loadOverridesOnly() {
     // ✅ 토글: 이미 OVR 모드면 일반 날짜 조회로 복귀
     if (overrideOnlyMode) {
+      setOverrideMode(false);
       return loadFixtures();
     }
 
+    // ✅ 서버 추가 없이: “해당 날짜(date/tz/league_ids)에서 OVR만 보기”로 동작
     setOverrideMode(true);
 
-    setStatusLine("override 적용된 fixtures 전체 불러오는 중...");
-
-    // ✅ 서버에 이 endpoint가 있어야 함(아래 참고)
-    const r = await api(adminUrl(`/api/fixtures_overridden`), { method: "GET" });
-
-    if (r.status >= 400 || !r.data || !r.data.ok) {
-      setStatusLine("");
-      alert(
-        "override 목록 로드 실패: " + JSON.stringify(r.data) +
-        "\n\n필요 endpoint: GET " + adminUrl("/api/fixtures_overridden") +
-        "\n응답 예시: { ok:true, rows:[...fixtures_merged rows...] }"
-      );
+    const date = document.getElementById("fxDate").value;
+    if (!date) {
+      alert("Date를 선택하세요");
       setOverrideMode(false);
       return;
     }
 
-    currentFixtures = r.data.rows || [];
+    const qs = buildFixturesQuery();
+
+    setStatusLine("OVR만 보기(해당 날짜) 불러오는 중...");
+
+    // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용 후 프론트에서 _has_override만 필터
+    const r = await api(adminUrl(`/api/fixtures_merged?` + qs.toString()), { method: "GET" });
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      setStatusLine("");
+      alert("fixtures_merged 로드 실패: " + JSON.stringify(r.data));
+      setOverrideMode(false);
+      return;
+    }
+
+    const rows = r.data.rows || [];
+    currentFixtures = rows.filter(x => x && x._has_override === true);
 
     // 선택 초기화
     selectedFixture = null;
     renderSelectedSummary(null);
 
-    // raw 캐시 무효화
+    // raw 캐시 무효화(필터 변경될 수 있으니)
     rawFixturesMap = null;
     rawCacheKey = "";
 
@@ -1421,6 +1425,7 @@ if (awayLogo) {
     renderFixtures();
     showTab("now");
   }
+
 
 
 
