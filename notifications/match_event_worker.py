@@ -428,65 +428,28 @@ def load_match_labels(match_id: int) -> Dict[str, Any]:
 
 def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
     """
-    마지막 득점 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
-    - match_events 에서 type='Goal' 인 것만 대상으로,
-      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    ✅ 요구사항 반영:
+    - 득점 시각을 match_events에서 찾지 않는다.
+    - fixtures(=matches.elapsed)만 사용한다.
+    - extra(추가시간)는 fixtures에 없으니 0으로 둔다.
     """
-    row = fetch_one(
-        """
-        SELECT
-            minute,
-            COALESCE(extra, 0) AS extra
-        FROM match_events
-        WHERE fixture_id = %s
-          AND type = 'Goal'
-        ORDER BY minute DESC NULLS LAST,
-                 extra DESC NULLS LAST,
-                 id DESC
-        LIMIT 1
-        """,
-        (match_id,),
-    )
-
-    if not row or row["minute"] is None:
+    el = load_match_elapsed(match_id)
+    if el is None or el <= 0:
         return None
+    return {"minute": int(el), "extra": 0}
 
-    return {
-        "minute": int(row["minute"]),
-        "extra": int(row["extra"] or 0),
-    }
 
 def load_last_redcard_minute(match_id: int) -> Dict[str, int] | None:
     """
-    마지막 레드카드 이벤트의 시간(분 + 추가시간)을 가져오는 헬퍼.
-    - match_events 에서 type='Card'
-      AND detail IN ('Red Card', 'Second Yellow Card') 인 것만 대상으로,
-      분 내림차순 + extra 내림차순 + id 내림차순으로 한 개만 가져온다.
+    ✅ 요구사항 반영:
+    - 레드카드 시각도 match_events에서 찾지 않는다.
+    - fixtures(=matches.elapsed)만 사용한다.
     """
-    row = fetch_one(
-        """
-        SELECT
-            minute,
-            COALESCE(extra, 0) AS extra
-        FROM match_events
-        WHERE fixture_id = %s
-          AND type = 'Card'
-          AND detail IN ('Red Card', 'Second Yellow Card')
-        ORDER BY minute DESC NULLS LAST,
-                 extra DESC NULLS LAST,
-                 id DESC
-        LIMIT 1
-        """,
-        (match_id,),
-    )
-
-    if not row or row["minute"] is None:
+    el = load_match_elapsed(match_id)
+    if el is None or el <= 0:
         return None
+    return {"minute": int(el), "extra": 0}
 
-    return {
-        "minute": int(row["minute"]),
-        "extra": int(row["extra"] or 0),
-    }
 
 
 def load_new_goal_disallowed_events(match_id: int, last_event_id: int) -> List[Dict[str, Any]]:
@@ -975,21 +938,12 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         log.info("match_id=%s current state not found, skip", match_id)
         return
 
-    # ✅ 종료면: 알림 자체는 더 이상 안 보냄 + 플래그 잠금 + 포인터는 폭탄 방지용으로만 당김(VAR용)
+    # ✅ 종료면: 알림 자체는 더 이상 안 보냄 + 플래그 잠금
+    # (score/카드/킥오프/HT/FT 전부 fixtures 기반이라, match_events Goal 포인터는 불필요)
     if (current_raw.status or "") in ("FT", "AET"):
         save_state(current_raw)
 
-        gx = fetch_one(
-            """
-            SELECT COALESCE(MAX(id), 0) AS max_id
-            FROM match_events
-            WHERE fixture_id = %s
-              AND type = 'Goal'
-            """,
-            (match_id,),
-        )
-        max_goal_id = int(gx["max_id"] or 0) if gx else 0
-
+        # VAR(Goal Disallowed)만 기존대로 포인터 폭탄 방지용으로 당김
         vx = fetch_one(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id
@@ -1018,21 +972,12 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
               penalties_start_sent = TRUE,
               penalties_end_sent = TRUE,
 
-              last_goal_event_id = %s,
               last_goal_disallowed_event_id = %s,
-              last_goal_home_goals = %s,
-              last_goal_away_goals = %s,
 
               updated_at = NOW()
             WHERE match_id = %s
             """,
-            (
-                max_goal_id,
-                max_dis_id,
-                int(current_raw.home_goals),
-                int(current_raw.away_goals),
-                match_id,
-            ),
+            (max_dis_id, match_id),
         )
         return
 
@@ -1073,12 +1018,10 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             """
             UPDATE match_notification_state
             SET last_goal_disallowed_event_id = %s,
-                last_goal_home_goals = %s,
-                last_goal_away_goals = %s,
                 updated_at = NOW()
             WHERE match_id = %s
             """,
-            (max_dis_id, int(current_raw.home_goals), int(current_raw.away_goals), match_id),
+            (max_dis_id, match_id),
         )
         return
 
@@ -1098,7 +1041,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     elapsed = load_match_elapsed(match_id)
 
     # ==========================
-    # ✅ VAR: Goal Disallowed 처리 (이건 fixtures에 없으니 기존대로 match_events 사용)
+    # ✅ VAR: Goal Disallowed 처리 (fixtures에 없으니 match_events 유지)
     # ==========================
     try:
         st = fetch_one(
@@ -1158,7 +1101,6 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                         """,
                         (ev_id, match_id),
                     )
-                    last_dis_id = ev_id
 
                     if not tokens:
                         continue
@@ -1202,8 +1144,8 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     for event_type, extra in events:
         extra = dict(extra)
 
-        # ✅ score/redcard는 fixtures에 minute이 없으니 elapsed로만 보조 표기(가능할 때만)
-        if event_type == "score":
+        # ✅ score/redcard는 fixtures elapsed로만 분 표시
+        if event_type in ("score", "score_correction"):
             if elapsed is not None and elapsed > 0:
                 extra["goal_minute_str"] = f"{int(elapsed)}'"
         if event_type == "redcard":
@@ -1262,6 +1204,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
                 log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
 
     save_state(current)
+
 
 
 
