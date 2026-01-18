@@ -777,24 +777,75 @@ def main() -> None:
             try:
                 season_guess = pick_season_for_date(lid, target_date)
 
-                # ✅ standings는 league+season당 1회만 백필 (fixture마다 X)
+                # ✅ standings는 league+season 단위. season_guess가 틀릴 수 있어 fallback 시도
                 if season_guess is not None:
-                    skey = (int(lid), int(season_guess))
-                    need_st = force or (not has_standings(int(lid), int(season_guess)))
-                    if need_st and (skey not in fetched_standings_keys):
+                    # 후보 시즌: guess, guess+1, guess-1, 그리고 leagues API의 current 시즌(있으면)
+                    seasons_to_try: List[int] = []
+
+                    try:
+                        seasons_to_try.append(int(season_guess))
+                        seasons_to_try.append(int(season_guess) + 1)
+                        seasons_to_try.append(int(season_guess) - 1)
+
+                        # current 시즌 추가
+                        seasons_meta = fetch_league_seasons(int(lid))
+                        for sm in seasons_meta:
+                            if sm.get("current") is True and sm.get("year") is not None:
+                                try:
+                                    seasons_to_try.append(int(sm["year"]))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+                    # 정리(중복 제거 + 비정상 연도 제거)
+                    seasons_clean: List[int] = []
+                    seen = set()
+                    for y in seasons_to_try:
+                        if not isinstance(y, int):
+                            continue
+                        if y < 1900 or y > 2100:
+                            continue
+                        if y in seen:
+                            continue
+                        seen.add(y)
+                        seasons_clean.append(y)
+
+                    inserted = False
+
+                    for y in seasons_clean:
+                        skey = (int(lid), int(y))
+
+                        # 이미 이번 실행에서 성공적으로 넣은 시즌이면 스킵
+                        if skey in fetched_standings_keys:
+                            continue
+
+                        need_st = force or (not has_standings(int(lid), int(y)))
+                        if not need_st:
+                            # 이미 DB에 있으면 이번엔 굳이 안 받음
+                            fetched_standings_keys.add(skey)
+                            continue
+
                         try:
-                            st_rows = fetch_standings_from_api(int(lid), int(season_guess))
+                            st_rows = fetch_standings_from_api(int(lid), int(y))
                             if st_rows:
-                                upsert_standings_rows(int(lid), int(season_guess), st_rows)
+                                upsert_standings_rows(int(lid), int(y), st_rows)
                                 fetched_standings_keys.add(skey)
-                                print(f"    * standings league={lid} season={season_guess}: rows={len(st_rows)}")
+                                print(f"    * standings league={lid} season={y}: rows={len(st_rows)}")
+                                inserted = True
+                                break
                             else:
-                                print(f"    ! standings league={lid} season={season_guess}: empty response", file=sys.stderr)
-                                fetched_standings_keys.add(skey)  # 빈 응답도 중복 호출 방지
+                                # ✅ empty면 캐시로 막지 말고 다음 후보 시즌을 계속 시도
+                                print(f"    ! standings league={lid} season={y}: empty response", file=sys.stderr)
+                                continue
                         except Exception as se:
-                            print(f"    ! standings league={lid} season={season_guess} 에러: {se}", file=sys.stderr)
+                            print(f"    ! standings league={lid} season={y} 에러: {se}", file=sys.stderr)
+                            continue
+
+                    # inserted=False면 정말로 API에 standings가 없거나(컵 등) 시즌이 더 다를 수 있음
 
                 fixtures = fetch_fixtures_from_api(lid, target_date, season_guess)
+
                 print(f"  - date={target_date} league {lid}: season={season_guess} fixtures={len(fixtures)}")
 
 
