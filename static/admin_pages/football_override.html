@@ -338,9 +338,31 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         </div>
 
         <div style="min-width:260px; flex: 1 1 260px;">
-          <label class="muted">League IDs (comma, optional)</label>
-          <input id="fxLeagueIds" placeholder="예: 39,140,78"/>
+          <label class="muted">League Filter (from loaded list)</label>
+
+          <div class="row" style="gap:8px; align-items:flex-end;">
+            <div style="flex: 1 1 220px;">
+              <select id="fxLeaguePick">
+                <option value="">(리그 목록 로딩 전)</option>
+              </select>
+            </div>
+
+            <div style="flex: 1 1 220px;">
+              <input id="fxLeagueIds" placeholder="선택된 league_ids (자동)" readonly />
+            </div>
+
+            <div style="flex:0 0 auto; display:flex; gap:6px;">
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">추가</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">제거</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">전체</button>
+            </div>
+          </div>
+
+          <div class="muted mini" style="margin-top:6px;">
+            ※ 날짜로 불러온 리스트에 있는 리그만 드롭다운에 뜹니다. (추가/제거/전체로 필터 제어)
+          </div>
         </div>
+
 
         <div style="min-width:220px; flex: 1 1 220px;">
           <label class="muted">Search (team/league)</label>
@@ -800,6 +822,123 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     }
     return set.size ? set : null;
   }
+
+  // ─────────────────────────────────────
+  // League dropdown (from loaded fixtures)
+  // ─────────────────────────────────────
+
+  function fxRefreshLeaguePick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const prevSel = String(sel.value || "").trim();
+
+    // 현재 로드된 fixtures에서 league 목록 수집
+    const m = new Map(); // league_id -> {id,name,country}
+    for (const f of (currentFixtures || [])) {
+      const id = Number(f.league_id);
+      if (!Number.isFinite(id)) continue;
+      if (!m.has(id)) {
+        m.set(id, {
+          id,
+          name: (f.league_name || `League ${id}`),
+          country: (f.league_country || ""),
+        });
+      }
+    }
+
+    const arr = Array.from(m.values()).sort((a, b) => {
+      const an = String(a.name || "");
+      const bn = String(b.name || "");
+      const c = an.localeCompare(bn);
+      return c !== 0 ? c : (a.id - b.id);
+    });
+
+    // 옵션 재구성
+    sel.innerHTML = "";
+
+    const optAll = document.createElement("option");
+    optAll.value = "";
+    optAll.textContent = "(전체 리그)";
+    sel.appendChild(optAll);
+
+    if (!arr.length) {
+      const optNone = document.createElement("option");
+      optNone.value = "";
+      optNone.textContent = "(이 기간에 리그 없음)";
+      sel.appendChild(optNone);
+      sel.value = "";
+      // 로드된 게 없으면 필터도 비움
+      input.value = "";
+      return;
+    }
+
+    for (const x of arr) {
+      const opt = document.createElement("option");
+      opt.value = String(x.id);
+      opt.textContent = `${x.name}${x.country ? " · " + x.country : ""} · ${x.id}`;
+      sel.appendChild(opt);
+    }
+
+    // 선택 복원: 이전 선택이 아직 존재하면 유지, 아니면 비움
+    if (prevSel && arr.some(x => String(x.id) === prevSel)) sel.value = prevSel;
+    else sel.value = "";
+
+    // ✅ 편의: 현재 필터가 단일 리그면 드롭다운도 그 값으로 맞춤
+    const set = parseLeagueIdsSet(input.value || "");
+    if (set && set.size === 1) {
+      const only = Array.from(set)[0];
+      if (arr.some(x => x.id === only)) sel.value = String(only);
+    }
+  }
+
+  function fxAddLeagueFromPick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = String(sel.value || "").trim();
+    if (!v) return; // (전체 리그) 선택이면 아무것도 안 함
+
+    const set = parseLeagueIdsSet(input.value || "") || new Set();
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+
+    set.add(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    renderFixtures();
+  }
+
+  function fxRemoveLeagueFromPick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = String(sel.value || "").trim();
+    if (!v) return;
+
+    const set = parseLeagueIdsSet(input.value || "");
+    if (!set) return;
+
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+
+    set.delete(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    renderFixtures();
+  }
+
+  function fxClearLeagueFilter() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (input) input.value = "";
+    if (sel) sel.value = "";
+    renderFixtures();
+  }
+
 
   // ✅ innerHTML에 들어갈 값 최소 이스케이프(XSS 방어)
   function escapeHtml(s) {
@@ -1427,6 +1566,9 @@ if (awayLogo) {
 
     currentFixtures = Object.values(map);
 
+    // ✅ NEW: 날짜로 로드된 목록 기준으로 league 드롭다운 갱신
+    fxRefreshLeaguePick();
+
     // 선택 유지(저장/삭제 후 재선택을 위해)
     const keepId = selectedFixture ? String(selectedFixture.fixture_id) : "";
     selectedFixture = null;
@@ -1460,6 +1602,7 @@ if (awayLogo) {
 
     showTab("now");
   }
+
 
 
   async function loadOverridesOnly() {
@@ -1518,6 +1661,9 @@ if (awayLogo) {
 
     currentFixtures = Object.values(map);
 
+    // ✅ NEW: OVR 목록 기준으로도 league 드롭다운 갱신
+    fxRefreshLeaguePick();
+
     // 선택 초기화
     selectedFixture = null;
     renderSelectedSummary(null);
@@ -1542,6 +1688,7 @@ if (awayLogo) {
     renderFixtures();
     showTab("now");
   }
+
 
 
 
