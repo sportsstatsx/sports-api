@@ -1205,58 +1205,24 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             (match_id, last_dis_id),
         )
 
-        # (NEW) 새 이벤트가 없는데 current_raw 스코어와 누적 스코어가 다르면 "정정"이 발생한 것
+        # (NEW) 새 이벤트(Goal/Goal Disallowed)가 없는데 current_raw 스코어와 누적 스코어가 다르면
+        # 라이브 데이터 정정/보정(UPDATE)로 인한 흔들림일 가능성이 매우 높다.
+        # ✅ 푸시는 보내지 말고 "조용히" state만 current_raw로 동기화한다(스팸 방지).
         if (not new_goals_peek) and (not new_dis_peek):
             if (int(current_raw.home_goals) != int(g_home)) or (int(current_raw.away_goals) != int(g_away)):
-                tokens = get_tokens_for_event(match_id, "score_correction")
-                if tokens:
-                    extra_payload = {
-                        "old_home": int(g_home),
-                        "old_away": int(g_away),
-                        "new_home": int(current_raw.home_goals),
-                        "new_away": int(current_raw.away_goals),
-                    }
+                execute(
+                    """
+                    UPDATE match_notification_state
+                    SET last_goal_home_goals = %s,
+                        last_goal_away_goals = %s,
+                        updated_at = NOW()
+                    WHERE match_id = %s
+                    """,
+                    (int(current_raw.home_goals), int(current_raw.away_goals), match_id),
+                )
+                g_home = int(current_raw.home_goals)
+                g_away = int(current_raw.away_goals)
 
-                    corr_state = MatchState(
-                        match_id=current.match_id,
-                        status=current.status,
-                        home_goals=int(current_raw.home_goals),
-                        away_goals=int(current_raw.away_goals),
-                        home_red=current.home_red,
-                        away_red=current.away_red,
-                    )
-
-                    title, body = build_message("score_correction", corr_state, extra_payload, labels)
-                    data: Dict[str, Any] = {"match_id": match_id, "event_type": "score_correction"}
-                    data.update(extra_payload)
-
-                    batch_size = 500
-                    any_success = False
-                    for i in range(0, len(tokens), batch_size):
-                        batch = tokens[i : i + batch_size]
-                        try:
-                            resp = fcm.send_to_tokens(batch, title, body, data)
-                            any_success = True
-                            log.info("Sent score_correction notification for match %s to %s devices: %s", match_id, len(batch), resp)
-                        except Exception:
-                            log.exception("Failed to send score_correction notification for match %s", match_id)
-                            break
-
-                    if any_success:
-                        sent_score_correction = True
-                        # 정정 성공 시 누적 스코어를 즉시 동기화
-                        execute(
-                            """
-                            UPDATE match_notification_state
-                            SET last_goal_home_goals = %s,
-                                last_goal_away_goals = %s,
-                                updated_at = NOW()
-                            WHERE match_id = %s
-                            """,
-                            (int(current_raw.home_goals), int(current_raw.away_goals), match_id),
-                        )
-                        g_home = int(current_raw.home_goals)
-                        g_away = int(current_raw.away_goals)
 
         new_goals = fetch_all(
             """
