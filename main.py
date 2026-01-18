@@ -162,6 +162,47 @@ def _load_match_overrides(fixture_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         out[int(r["fixture_id"])] = r["patch"] or {}
     return out
 
+# ─────────────────────────────────────────
+# Optional table: match_live_state (있으면 INPLAY 빨간카드/등 표시를 더 싸게 처리)
+# - 테이블이 없으면 JOIN이 즉시 터지므로 존재 확인 후 fallback 한다.
+# ─────────────────────────────────────────
+_MATCH_LIVE_STATE_OK: bool | None = None
+
+def _match_live_state_available() -> bool:
+    global _MATCH_LIVE_STATE_OK
+    if _MATCH_LIVE_STATE_OK is not None:
+        return _MATCH_LIVE_STATE_OK
+
+    try:
+        row = fetch_one("SELECT to_regclass('public.match_live_state') AS t", ())
+        ok = bool(row and row.get("t"))
+        if ok:
+            _MATCH_LIVE_STATE_OK = True
+            return True
+    except Exception:
+        pass
+
+    # 없으면 생성 시도(권한/환경에 따라 실패할 수 있으니 try/except)
+    try:
+        execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_live_state (
+                fixture_id BIGINT PRIMARY KEY,
+                home_red   INTEGER DEFAULT 0,
+                away_red   INTEGER DEFAULT 0,
+                updated_utc TIMESTAMPTZ DEFAULT now()
+            )
+            """,
+            (),
+        )
+        row2 = fetch_one("SELECT to_regclass('public.match_live_state') AS t", ())
+        _MATCH_LIVE_STATE_OK = bool(row2 and row2.get("t"))
+        return _MATCH_LIVE_STATE_OK
+    except Exception:
+        _MATCH_LIVE_STATE_OK = False
+        return False
+
+
 
 # ─────────────────────────────────────────
 # Prometheus 메트릭
@@ -218,7 +259,15 @@ def _metrics_after_request(response):
     if not started:
         return response
 
-    endpoint = request.path
+    # ✅ 카디널리티 폭발 방지:
+    # - request.path 는 /api/x/12345 처럼 값이 무한히 늘어날 수 있음
+    # - url_rule.rule 은 /api/x/<int:id> 형태로 고정 라벨이 됨
+    if getattr(request, "url_rule", None) is not None and getattr(request.url_rule, "rule", None):
+        endpoint = request.url_rule.rule
+    else:
+        # fallback (정적 라우트/일부 상황)
+        endpoint = request.path
+
     method = request.method
     status_code = int(getattr(response, "status_code", 0) or 0)
     klass = _code_class(status_code)
@@ -243,6 +292,7 @@ def _metrics_after_request(response):
     return response
 
 
+
 @app.teardown_request
 def _metrics_teardown_request(exc):
     # 예외로 after_request가 안 타는 케이스 방어용 (대부분은 after_request가 실행됨)
@@ -260,6 +310,12 @@ def _metrics_teardown_request(exc):
 # ─────────────────────────────────────────
 ADMIN_PATH = (os.getenv("ADMIN_PATH", "") or "").strip().strip("/")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "") or ""
+
+# ADMIN_PATH가 비어있으면 "/{ADMIN_PATH}" == "/" 라우트가 되어 root("/")와 충돌할 수 있으므로
+# 비활성 상태에서도 충돌만은 피하도록 안전한 기본값을 부여한다.
+if not ADMIN_PATH:
+    ADMIN_PATH = "__admin__"
+
 
 
 def _admin_enabled() -> bool:
@@ -694,9 +750,9 @@ def admin_list_fixtures_merged():
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end   = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end   = local_end.astimezone(timezone.utc)
+    utc_end = local_end.astimezone(timezone.utc)
 
     params: List[Any] = [utc_start, utc_end]
     where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
@@ -710,6 +766,57 @@ def admin_list_fixtures_merged():
         params.append(league_id)
 
     where_sql = " AND ".join(where_clauses)
+
+    use_mls = _match_live_state_available()
+
+    red_detail_sql = "('Red Card','Second Yellow card','Second Yellow Card')"
+
+    if use_mls:
+        home_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.home_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS home_red_cards
+        """
+        away_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.away_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS away_red_cards
+        """
+        mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
+    else:
+        home_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS home_red_cards
+        """
+        away_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS away_red_cards
+        """
+        mls_join = ""
 
     sql = f"""
         SELECT
@@ -736,24 +843,13 @@ def admin_list_fixtures_merged():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
-            (
-                SELECT COUNT(*) FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.home_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS home_red_cards,
-            (
-                SELECT COUNT(*) FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.away_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS away_red_cards
+            {home_red_sql},
+            {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
     """
@@ -811,7 +907,6 @@ def admin_list_fixtures_merged():
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
         if patch and isinstance(patch, dict):
-            # ✅ 목록에는 큰 블록(timeline/insights_overall 등)이 붙지 않게, 필요한 키만 추려서 merge
             if isinstance(patch.get("header"), dict):
                 p2 = dict(patch.get("header") or {})
                 if "hidden" in patch:
@@ -836,6 +931,7 @@ def admin_list_fixtures_merged():
 
 
 
+
 @app.route(f"/{ADMIN_PATH}/api/fixtures_raw", methods=["GET"])
 @require_admin
 def admin_fixtures_raw():
@@ -844,8 +940,6 @@ def admin_fixtures_raw():
     - /api/fixtures 와 동일한 필터(date/timezone/league_ids) 사용
     - 단, match_overrides 병합/hidden 처리 없이 그대로 반환
     """
-
-    # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
     league_ids_raw = request.args.get("league_ids", type=str)
 
@@ -860,7 +954,6 @@ def admin_fixtures_raw():
             except ValueError:
                 continue
 
-    # 🔹 날짜 / 타임존
     date_str = request.args.get("date", type=str)
     tz_str = request.args.get("timezone", "UTC")
 
@@ -880,14 +973,12 @@ def admin_fixtures_raw():
         _admin_log("fixtures_raw_list", ok=False, status_code=400, detail={"error": "invalid date", "date": date_str})
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
-    # 날짜 생성
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end   = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
 
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end   = local_end.astimezone(timezone.utc)
+    utc_end = local_end.astimezone(timezone.utc)
 
-    # SQL
     params: List[Any] = [utc_start, utc_end]
     where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
 
@@ -900,6 +991,56 @@ def admin_fixtures_raw():
         params.append(league_id)
 
     where_sql = " AND ".join(where_clauses)
+
+    use_mls = _match_live_state_available()
+    red_detail_sql = "('Red Card','Second Yellow card','Second Yellow Card')"
+
+    if use_mls:
+        home_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.home_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS home_red_cards
+        """
+        away_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.away_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS away_red_cards
+        """
+        mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
+    else:
+        home_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS home_red_cards
+        """
+        away_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS away_red_cards
+        """
+        mls_join = ""
 
     sql = f"""
         SELECT
@@ -926,24 +1067,13 @@ def admin_fixtures_raw():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
-            (
-                SELECT COUNT(*) FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.home_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS home_red_cards,
-            (
-                SELECT COUNT(*) FROM match_events e
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.away_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS away_red_cards
+            {home_red_sql},
+            {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
     """
@@ -993,9 +1123,11 @@ def admin_fixtures_raw():
             "timezone": tz_str,
             "league_ids": league_ids_raw or "",
             "rows": len(fixtures),
+            "use_mls": use_mls,
         },
     )
     return jsonify({"ok": True, "rows": fixtures})
+
 
 
 
@@ -1009,8 +1141,6 @@ def list_fixtures():
     """
     사용자의 지역 날짜를 기반으로 경기 조회.
     """
-
-    # 🔹 리그 필터
     league_id = request.args.get("league_id", type=int)
     league_ids_raw = request.args.get("league_ids", type=str)
 
@@ -1025,7 +1155,6 @@ def list_fixtures():
             except ValueError:
                 continue
 
-    # 🔹 날짜 / 타임존
     date_str = request.args.get("date", type=str)
     tz_str = request.args.get("timezone", "UTC")
 
@@ -1042,14 +1171,12 @@ def list_fixtures():
     except ValueError:
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
-    # 날짜 생성
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end   = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
 
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end   = local_end.astimezone(timezone.utc)
+    utc_end = local_end.astimezone(timezone.utc)
 
-    # SQL
     params: List[Any] = [utc_start, utc_end]
     where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
 
@@ -1062,6 +1189,56 @@ def list_fixtures():
         params.append(league_id)
 
     where_sql = " AND ".join(where_clauses)
+
+    use_mls = _match_live_state_available()
+    red_detail_sql = "('Red Card','Second Yellow card','Second Yellow Card')"
+
+    if use_mls:
+        home_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.home_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS home_red_cards
+        """
+        away_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.away_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS away_red_cards
+        """
+        mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
+    else:
+        home_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS home_red_cards
+        """
+        away_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS away_red_cards
+        """
+        mls_join = ""
 
     sql = f"""
         SELECT
@@ -1088,28 +1265,16 @@ def list_fixtures():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
-            (
-                SELECT COUNT(*) FROM match_events e 
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.home_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS home_red_cards,
-            (
-                SELECT COUNT(*) FROM match_events e 
-                WHERE e.fixture_id = m.fixture_id
-                AND e.team_id = m.away_id
-                AND e.type = 'Card'
-                AND e.detail = 'Red Card'
-            ) AS away_red_cards
+            {home_red_sql},
+            {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
     """
-
 
     rows = fetch_all(sql, tuple(params))
 
@@ -1123,18 +1288,18 @@ def list_fixtures():
             "status_group": r["status_group"],
             "status": r["status"],
             "elapsed": r["elapsed"],
-            "status_long": r["status_long"],   # ✅ 추가
+            "status_long": r["status_long"],
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
-            "league_round": r["league_round"], # ✅ 추가
-            "venue_name": r["venue_name"],     # ✅ 추가
+            "league_round": r["league_round"],
+            "venue_name": r["venue_name"],
             "home": {
                 "id": r["home_id"],
                 "name": r["home_name"],
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
-                "ht": r["home_ht"],            # ✅ 추가
+                "ht": r["home_ht"],
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -1142,31 +1307,39 @@ def list_fixtures():
                 "name": r["away_name"],
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
-                "ht": r["away_ht"],            # ✅ 추가
+                "ht": r["away_ht"],
                 "red_cards": r["away_red_cards"],
             },
         })
 
-
-    # ✅ overrides 적용 (웹에서 수정된 값이 우선)
     fixture_ids = [f["fixture_id"] for f in fixtures]
     override_map = _load_match_overrides(fixture_ids)
+
+    # ✅ 리스트 API에서는 큰 블록이 붙지 않게 필요한 키만 허용
+    fixture_patch_keys = {
+        "fixture_id", "league_id", "season",
+        "date_utc", "kickoff_utc",
+        "status_group", "status", "elapsed", "minute", "status_long",
+        "league_round", "venue_name",
+        "league_name", "league_logo", "league_country",
+        "home", "away",
+        "hidden",
+    }
 
     merged = []
     for f in fixtures:
         patch = override_map.get(f["fixture_id"])
         if patch and isinstance(patch, dict):
-            # ✅ Admin과 동일: header 레이어가 있으면 header만 꺼내서 home/away 등을 덮어쓴다.
             if isinstance(patch.get("header"), dict):
                 p2 = dict(patch.get("header") or {})
                 if "hidden" in patch:
                     p2["hidden"] = patch.get("hidden")
             else:
-                p2 = patch
+                # ✅ 전체 patch merge 금지: allowed keys만 merge
+                p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
 
             f2 = _deep_merge(f, p2)
 
-            # hidden=true면 노출 제외(삭제 대신 숨김)
             if f2.get("hidden") is True:
                 continue
 
@@ -1175,6 +1348,8 @@ def list_fixtures():
             merged.append(f)
 
     return jsonify({"ok": True, "rows": merged})
+
+
 
 
 # ─────────────────────────────────────
@@ -1245,12 +1420,14 @@ def board_feed():
         where.append("fixture_key = %(fixture_key)s")
 
     # ✅ 언어권 필터만 적용
+    # - 레거시로 target_langs='{}'(빈 배열)로 저장된 글도 전세계 노출로 취급해야 함
     if lang_missing:
         # lang이 없으면 target_langs 지정 글은 숨기고, 전세계 글만 노출
-        where.append("(array_length(target_langs, 1) IS NULL)")
+        where.append("(array_length(target_langs, 1) IS NULL OR array_length(target_langs, 1) = 0)")
     else:
         where.append("""(
             array_length(target_langs, 1) IS NULL
+            OR array_length(target_langs, 1) = 0
             OR %(lang)s = ANY (SELECT LOWER(x) FROM unnest(target_langs) x)
         )""")
 
@@ -1310,6 +1487,7 @@ def board_feed():
 
 
 
+
 @app.get("/api/board/posts/<int:post_id>")
 def board_post_detail(post_id: int):
     # lang: query 우선, 없으면 Accept-Language 첫 토큰
@@ -1324,11 +1502,13 @@ def board_post_detail(post_id: int):
     where = ["status='published'", "id=%(id)s"]
 
     # ✅ 언어권만 적용
+    # - 레거시로 target_langs='{}'(빈 배열)로 저장된 글도 전세계 노출로 취급해야 함
     if lang_missing:
-        where.append("(array_length(target_langs, 1) IS NULL)")
+        where.append("(array_length(target_langs, 1) IS NULL OR array_length(target_langs, 1) = 0)")
     else:
         where.append("""(
             array_length(target_langs, 1) IS NULL
+            OR array_length(target_langs, 1) = 0
             OR %(lang)s = ANY (SELECT LOWER(x) FROM unnest(target_langs) x)
         )""")
 
@@ -1370,6 +1550,7 @@ def board_post_detail(post_id: int):
     except Exception as e:
         print(f"[/api/board/posts/<id>] failed: {e}", file=sys.stderr)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.get(f"/{ADMIN_PATH}/api/fixture_meta")
@@ -1584,9 +1765,22 @@ def admin_board_create_post():
 
     def arr_lower(xs):
         xs = xs or []
-        return [str(x).strip().lower() for x in xs if str(x).strip()]
+        out = []
+        for x in xs:
+            b = _lang_base(str(x))
+            if b:
+                out.append(b)
+        # 중복 제거(순서 유지)
+        seen = set()
+        uniq = []
+        for v in out:
+            if v in seen:
+                continue
+            seen.add(v)
+            uniq.append(v)
+        # ✅ 비어있으면 DB에는 NULL로 저장(전세계 노출)
+        return (uniq if len(uniq) > 0 else None)
 
-    # ✅ psycopg3 dict adapt 이슈 방지: jsonb 컬럼은 문자열(JSON)로 전달
     filters_obj = body.get("filters_json") or {}
     snapshot_obj = body.get("snapshot_json") or {}
 
@@ -1655,6 +1849,8 @@ def admin_board_create_post():
 
 
 
+
+
 @app.put(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
 @require_admin
 def admin_board_update_post(post_id: int):
@@ -1662,9 +1858,21 @@ def admin_board_update_post(post_id: int):
 
     def arr_lower(xs):
         xs = xs or []
-        return [str(x).strip().lower() for x in xs if str(x).strip()]
+        out = []
+        for x in xs:
+            b = _lang_base(str(x))
+            if b:
+                out.append(b)
+        seen = set()
+        uniq = []
+        for v in out:
+            if v in seen:
+                continue
+            seen.add(v)
+            uniq.append(v)
+        # ✅ 비어있으면 DB에는 NULL로 저장(전세계 노출)
+        return (uniq if len(uniq) > 0 else None)
 
-    # ✅ psycopg3 dict adapt 이슈 방지
     filters_obj = body.get("filters_json") or {}
     snapshot_obj = body.get("snapshot_json") or {}
 
@@ -1734,6 +1942,8 @@ def admin_board_update_post(post_id: int):
 
 
 
+
+
 @app.delete(f"/{ADMIN_PATH}/api/board/posts/<int:post_id>")
 @require_admin
 def admin_board_delete_post(post_id: int):
@@ -1766,44 +1976,6 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
