@@ -1493,15 +1493,46 @@ async function deletePostById(id) {
     return r.data.fixture || null;
   }
 
-  function buildSnapshotFromMeta(sport, fixtureKey, fx) {
-    // fx는 서버가 내려주는 fixture 객체 그대로 저장
-    return {
-      fixture: Object.assign({}, fx, {
+
+  function buildSnapshotFromMeta(sport, fixtureKey, fx, blocks) {
+    const out = {
+      fixture: Object.assign({}, fx || {}, {
         sport,
         fixture_key: fixtureKey,
-      })
+      }),
     };
+
+    // ✅ 서버가 내려준 블록들을 snapshot에 포함
+    if (blocks && typeof blocks === "object") {
+      if (blocks.insights_overall != null) out.insights_overall = blocks.insights_overall;
+      if (blocks.ai_predictions != null) out.ai_predictions = blocks.ai_predictions;
+      if (blocks.insights != null) out.insights = blocks.insights; // 혹시 키가 insights면 이것도 수용
+    }
+
+    return out;
   }
+
+
+  // ✅ NEW: 앱에 표시되는 AI Predictions / Insights 스냅샷을 서버에서 받아오기
+  // 기대 응답 형태:
+  // { ok:true, blocks: { insights_overall:{...}, ai_predictions:{...} } }
+  async function fetchMatchSnapshotBlocks(sport, fixtureKey) {
+    const qs = new URLSearchParams();
+    qs.set("sport", sport);
+    qs.set("fixture_key", fixtureKey);
+
+    // 🔥 서버에 이 엔드포인트가 있어야 함 (아래 3)에서 서버 패치 예시 제공)
+    const r = await api(adminUrl("/api/match_snapshot?" + qs.toString()), { method: "GET" });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      return null;
+    }
+
+    // blocks 안에 내려온다고 가정
+    return r.data.blocks || null;
+  }
+
 
   async function ensureFixtureSnapshot(payload) {
     // analysis + sport + fixture_key일 때만
@@ -1514,13 +1545,43 @@ async function deletePostById(id) {
     const snap = payload.snapshot_json || {};
     if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
       renderMatchPreview(snap.fixture);
+
+      // ✅ 이미 snapshot에 AI/Insights가 없을 수도 있으니, 있으면 그대로 두고
+      // 없으면 서버에서 추가로 채우기(실패해도 저장은 가능하게)
+      const hasAi = (snap && (snap.ai_predictions != null));
+      const hasIns = (snap && (snap.insights_overall != null || snap.insights != null));
+      if (hasAi && hasIns) return payload;
+
+      try {
+        const blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey);
+        if (blocks) {
+          const merged = Object.assign({}, snap);
+          if (blocks.insights_overall != null) merged.insights_overall = blocks.insights_overall;
+          if (blocks.ai_predictions != null) merged.ai_predictions = blocks.ai_predictions;
+          if (blocks.insights != null) merged.insights = blocks.insights;
+
+          payload.snapshot_json = merged;
+          writeSnapshotObj(merged);
+        }
+      } catch (e) {
+        // 조용히 무시 (fixture snapshot만으로도 저장은 되게)
+      }
+
       return payload;
     }
 
     const fx = await fetchFixtureMeta(sport, fixtureKey);
     if (!fx) throw new Error("fixture_meta not found");
 
-    const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+    // ✅ NEW: AI/Insights blocks도 같이 로드 시도
+    let blocks = null;
+    try {
+      blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey);
+    } catch (e) {
+      blocks = null;
+    }
+
+    const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx, blocks);
     payload.snapshot_json = newSnap;
 
     // textarea 동기화 + 프리뷰 렌더
@@ -1530,10 +1591,9 @@ async function deletePostById(id) {
     // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
     $("pTitle").value = buildTwoLineTitleFromFixture(fx);
 
-
     return payload;
-
   }
+
 
   function scheduleFixturePreviewRefresh() {
     if (_fixtureMetaTimer) clearTimeout(_fixtureMetaTimer);
@@ -1545,29 +1605,54 @@ async function deletePostById(id) {
       const fixtureKey = getEditorFixtureKey();
       if (!sport || !fixtureKey) return hideMatchPreview();
 
-      // snapshot이 이미 맞으면 그걸로 표시
       const snap = readSnapshotObj();
+
+      // snapshot이 이미 맞으면: 프리뷰/타이틀 표시 + (AI/Insights 없으면 추가 로드)
       if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
         renderMatchPreview(snap.fixture);
         $("pTitle").value = buildTwoLineTitleFromFixture(snap.fixture);
+
+        const hasAi = (snap && (snap.ai_predictions != null));
+        const hasIns = (snap && (snap.insights_overall != null || snap.insights != null));
+
+        if (!(hasAi && hasIns)) {
+          try {
+            const blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey);
+            if (blocks) {
+              const merged = Object.assign({}, snap);
+              if (blocks.insights_overall != null) merged.insights_overall = blocks.insights_overall;
+              if (blocks.ai_predictions != null) merged.ai_predictions = blocks.ai_predictions;
+              if (blocks.insights != null) merged.insights = blocks.insights;
+
+              writeSnapshotObj(merged);
+            }
+          } catch (e) {
+            // 무시
+          }
+        }
         return;
       }
 
-
-      // 아직 없으면 서버에서 가져와서 snapshot 채워주고 프리뷰 표시
+      // 아직 없으면 서버에서 가져와서 snapshot 채움
       const fx = await fetchFixtureMeta(sport, fixtureKey);
       if (!fx) return hideMatchPreview();
 
-      const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+      let blocks = null;
+      try {
+        blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey);
+      } catch (e) {
+        blocks = null;
+      }
+
+      const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx, blocks);
       writeSnapshotObj(newSnap);
       renderMatchPreview(fx);
 
       // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
       $("pTitle").value = buildTwoLineTitleFromFixture(fx);
-
-
     }, 350);
   }
+
 
   // ─────────────────────────────────────
   // Fixture Picker Modal (Fixtures Browser)
