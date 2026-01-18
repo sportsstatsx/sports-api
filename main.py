@@ -1778,8 +1778,8 @@ def admin_board_create_post():
                 continue
             seen.add(v)
             uniq.append(v)
-        # ✅ 비어있으면 DB에는 NULL로 저장(전세계 노출)
-        return (uniq if len(uniq) > 0 else None)
+        # ✅ 비어있으면 빈 배열로 저장(전세계 노출, NOT NULL 만족)
+        return uniq  # uniq는 비어있으면 []
 
     filters_obj = body.get("filters_json") or {}
     snapshot_obj = body.get("snapshot_json") or {}
@@ -1870,8 +1870,8 @@ def admin_board_update_post(post_id: int):
                 continue
             seen.add(v)
             uniq.append(v)
-        # ✅ 비어있으면 DB에는 NULL로 저장(전세계 노출)
-        return (uniq if len(uniq) > 0 else None)
+        # ✅ 비어있으면 빈 배열로 저장(전세계 노출, NOT NULL 만족)
+        return uniq  # uniq는 비어있으면 []
 
     filters_obj = body.get("filters_json") or {}
     snapshot_obj = body.get("snapshot_json") or {}
