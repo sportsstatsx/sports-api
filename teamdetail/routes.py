@@ -126,6 +126,13 @@ def team_detail_bundle():
             league_id=league_id,
             season=season,
         )
+
+        # ✅ 디버그 로그(한 번만 보고 지워도 됨)
+        current_app.logger.info(
+            "[team_detail_bundle] req team_id=%s league_id=%s season=%s -> resolved=%s",
+            team_id, league_id, season, resolved_season
+        )
+
         if resolved_season is None:
             return jsonify({"ok": False, "error": "season_not_resolvable"}), 400
 
@@ -140,3 +147,4 @@ def team_detail_bundle():
     except Exception as e:  # noqa: BLE001
         current_app.logger.exception("team_detail_bundle error")
         return jsonify({"ok": False, "error": str(e)}), 500
+
