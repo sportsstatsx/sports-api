@@ -46,9 +46,14 @@ DETECT_INTERVAL_SEC = int(os.environ.get("LIVE_DETECT_INTERVAL_SEC", "10"))
 # ✅ (B) 리그별 스캔 모드(/fixtures league/date 스캔) 기본 간격(초)
 DEFAULT_SCAN_INTERVAL_SEC = int(os.environ.get("DEFAULT_LIVE_FIXTURES_INTERVAL_SEC", "10"))
 
+# ✅ (B-2) 라이브가 0일 때(=watched_live=0)에도 "종료 반영/포스트매치"를 위해 느리게 스캔(초)
+# 기본 90초(60~120 권장). 필요하면 ENV로 조절.
+IDLE_SCAN_INTERVAL_SEC = int(os.environ.get("IDLE_LIVE_FIXTURES_INTERVAL_SEC", "90"))
+
 # ✅ (C) “핵심 리그는 5초” 같은 오버라이드 목록
 # 예) "39,140,135"  (여기에 포함된 리그만 5초)
 FAST_LEAGUES_ENV = os.environ.get("FAST_LIVE_LEAGUES", "")
+
 
 # (구버전 호환: 기존 INTERVAL_SEC는 더 이상 루프 sleep에 직접 쓰지 않음)
 INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", str(DETECT_INTERVAL_SEC)))
@@ -1350,22 +1355,28 @@ def run_once() -> int:
         if lid in watched:
             watched_live.append(it)
 
-    if not watched_live:
-        # ✅ 내 관심 리그 기준으로 라이브가 0이면 여기서 종료(리그별 스캔 안 함)
-        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → skip league/date scan")
-        return 0
+    idle_mode = False
 
-    live_league_ids: List[int] = []
-    seen_l = set()
-    for it in watched_live:
-        lg = it.get("league") or {}
-        lid = safe_int(lg.get("id"))
-        if lid is None:
-            continue
-        if lid in seen_l:
-            continue
-        seen_l.add(lid)
-        live_league_ids.append(lid)
+    if not watched_live:
+        # ✅ 라이브가 0이어도 종료하지 않는다.
+        #    - "종료(FT) 반영" 및 "FT 후 타임라인(+60s/+30m)" 트리거를 위해
+        #      league/date 스캔을 느린 간격으로 계속 수행한다.
+        idle_mode = True
+        live_league_ids = list(league_ids)
+        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → idle slow scan (leagues={len(live_league_ids)})")
+    else:
+        live_league_ids: List[int] = []
+        seen_l = set()
+        for it in watched_live:
+            lg = it.get("league") or {}
+            lid = safe_int(lg.get("id"))
+            if lid is None:
+                continue
+            if lid in seen_l:
+                continue
+            seen_l.add(lid)
+            live_league_ids.append(lid)
+
 
 
 
@@ -1399,8 +1410,14 @@ def run_once() -> int:
     for date_str in dates:
         for lid in live_league_ids:
 
-            # ✅ 리그별 스캔 간격: 기본 10초, FAST 리그는 5초
-            scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+            # ✅ 리그별 스캔 간격:
+            # - 평상시: 기본 DEFAULT(예:10초), FAST 리그는 5초
+            # - idle_mode(라이브 0): 모든 리그를 IDLE_SCAN_INTERVAL_SEC(기본 90초)로 느리게 스캔
+            if idle_mode:
+                scan_interval = IDLE_SCAN_INTERVAL_SEC
+            else:
+                scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+
             k_scan = (lid, date_str)
             last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
             if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
