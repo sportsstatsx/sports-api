@@ -827,28 +827,6 @@ select option {
           </div>
         </div>
 
-        <!-- ✅ NEW: Last-N Filter + Snapshot refresh -->
-        <div class="row" style="margin-top: 10px;">
-          <div class="col" style="min-width: 220px; flex:1;">
-            <label>Last-N Filter (Insights / AI)</label>
-            <select id="pLastN">
-              <option value="n3">Last 3</option>
-              <option value="n5">Last 5</option>
-              <option value="n7">Last 7</option>
-              <option value="n10">Last 10</option>
-              <option value="season_current">현재 시즌</option>
-              <option value="season_prev">직전 시즌</option>
-            </select>
-            <div class="subtle">✅ 선택된 경기의 “리그 기준”으로만 계산되어 스냅샷에 저장됩니다.</div>
-          </div>
-
-          <div class="col" style="min-width: 160px;">
-            <label>&nbsp;</label>
-            <button class="btn small" type="button" onclick="refreshSnapshotBlocks()">스냅샷 갱신</button>
-          </div>
-        </div>
-
-
         <div class="row" style="margin-top: 10px;">
           <div class="col" style="flex: 1;">
             <label>Summary (list에 뽑힐 짧은 요약)</label>
@@ -898,8 +876,39 @@ select option {
           <div class="hint" id="saveHint" style="margin-left:auto;"></div>
         </div>
 
+        <!-- ✅ MOVED: Last-N Filter + Snapshot refresh (Debug 바로 위) + Copy Debug -->
+        <div class="row" style="margin-top: 12px;">
+          <div class="col" style="min-width: 220px; flex:1;">
+            <label>Last-N Filter (Insights / AI)</label>
+            <select id="pLastN">
+              <option value="n3">Last 3</option>
+              <option value="n5">Last 5</option>
+              <option value="n7">Last 7</option>
+              <option value="n10">Last 10</option>
+              <option value="season_current">현재 시즌</option>
+              <option value="season_prev">직전 시즌</option>
+            </select>
+            <div class="subtle">✅ 선택된 경기의 “리그 기준”으로만 계산되어 스냅샷에 저장됩니다.</div>
+          </div>
+
+          <div class="col" style="min-width: 160px;">
+            <label>&nbsp;</label>
+            <button class="btn small" type="button" onclick="refreshSnapshotBlocks()">스냅샷 갱신</button>
+          </div>
+
+          <div class="col" style="min-width: 140px;">
+            <label>&nbsp;</label>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <button class="btn small" type="button" onclick="copyDebugBox()">Debug 복사</button>
+              <span id="debugCopyMsg" class="hint" style="display:none; white-space:nowrap;">복사됨 ✅</span>
+            </div>
+          </div>
+
+        </div>
+
         <div class="subtle">Debug</div>
         <div class="mono" id="debugBox">{}</div>
+
       </div>
     </div>
   </div>
@@ -1099,6 +1108,69 @@ function backToList() {
   setSaveHint("");
   loadPosts();
 }
+
+  let _debugCopyMsgTimer = null;
+
+  function showDebugCopyMsg(msg) {
+    const el = $("debugCopyMsg");
+    if (!el) return;
+
+    el.textContent = msg || "복사됨 ✅";
+    el.style.display = "inline";
+
+    if (_debugCopyMsgTimer) clearTimeout(_debugCopyMsgTimer);
+    _debugCopyMsgTimer = setTimeout(() => {
+      el.style.display = "none";
+    }, 2000);
+  }
+
+
+  async function copyDebugBox() {
+    const el = $("debugBox");
+    const text = (el && el.textContent) ? String(el.textContent) : "";
+
+    if (!text.trim()) {
+      alert("Debug 내용이 비어있습니다.");
+      return;
+    }
+
+    // 1) Clipboard API 우선
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        showDebugCopyMsg("복사됨 ✅");
+        return;
+
+      }
+    } catch (e) {
+      // fallback로 진행
+    }
+
+    // 2) Fallback: textarea + execCommand
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.style.top = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+
+      if (ok) {
+        showDebugCopyMsg("복사됨 ✅");
+      } else {
+
+        alert("복사 실패: 브라우저가 복사를 차단했습니다. (수동 선택 후 복사해주세요)");
+      }
+    } catch (e) {
+      alert("복사 실패: " + String(e));
+    }
+  }
+
 
 
 
