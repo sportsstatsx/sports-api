@@ -89,7 +89,7 @@ def route_hockey_games():
     order_sql = "ORDER BY game_date DESC" if live == 1 else "ORDER BY id DESC"
 
     # ✅ 디버그/확인용으로 필요한 최소 컬럼만 반환 (live_timer 포함)
-    sql = f"""
+    sql = """
         SELECT
             id,
             league_id,
@@ -109,27 +109,32 @@ def route_hockey_games():
                 -- (1) 현재 DB 실데이터: {"home":1,"away":4}
                 WHEN (score_json->>'home') ~ '^[0-9]+$' THEN (score_json->>'home')::int
                 -- (2) 혹시 중첩 구조가 올 경우 대비
-                WHEN (score_json #>> '{{home,total}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,total}}')::int
-                WHEN (score_json #>> '{{home,goals}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,goals}}')::int
-                WHEN (score_json #>> '{{home,score}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,score}}')::int
-                WHEN (score_json #>> '{{home,ft}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,ft}}')::int
+                WHEN (score_json #>> '{home,total}') ~ '^[0-9]+$' THEN (score_json #>> '{home,total}')::int
+                WHEN (score_json #>> '{home,goals}') ~ '^[0-9]+$' THEN (score_json #>> '{home,goals}')::int
+                WHEN (score_json #>> '{home,score}') ~ '^[0-9]+$' THEN (score_json #>> '{home,score}')::int
+                WHEN (score_json #>> '{home,ft}') ~ '^[0-9]+$' THEN (score_json #>> '{home,ft}')::int
                 ELSE NULL
             END AS home_score,
 
             CASE
                 WHEN (score_json->>'away') ~ '^[0-9]+$' THEN (score_json->>'away')::int
-                WHEN (score_json #>> '{{away,total}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,total}}')::int
-                WHEN (score_json #>> '{{away,goals}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,goals}}')::int
-                WHEN (score_json #>> '{{away,score}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,score}}')::int
-                WHEN (score_json #>> '{{away,ft}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,ft}}')::int
+                WHEN (score_json #>> '{away,total}') ~ '^[0-9]+$' THEN (score_json #>> '{away,total}')::int
+                WHEN (score_json #>> '{away,goals}') ~ '^[0-9]+$' THEN (score_json #>> '{away,goals}')::int
+                WHEN (score_json #>> '{away,score}') ~ '^[0-9]+$' THEN (score_json #>> '{away,score}')::int
+                WHEN (score_json #>> '{away,ft}') ~ '^[0-9]+$' THEN (score_json #>> '{away,ft}')::int
                 ELSE NULL
             END AS away_score
 
         FROM hockey_games
-        {where_sql}
-        {order_sql}
-        LIMIT %s
-    """
+    """.strip()
+
+    sql = "\n".join([
+        sql,
+        where_sql,
+        order_sql,
+        "LIMIT %s",
+    ])
+
 
     params.append(limit)
 
