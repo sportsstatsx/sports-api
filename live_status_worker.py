@@ -39,7 +39,25 @@ from db import execute, fetch_all  # dev 스키마 확정 → 런타임 schema �
 
 API_KEY = os.environ.get("APIFOOTBALL_KEY") or os.environ.get("API_FOOTBALL_KEY")
 LIVE_LEAGUES_ENV = os.environ.get("LIVE_LEAGUES", "")
-INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", "5"))  # ✅ fixtures 5초
+
+# ✅ (A) 라이브 감지 주기: live=all 호출 간격(초)
+DETECT_INTERVAL_SEC = int(os.environ.get("LIVE_DETECT_INTERVAL_SEC", "10"))
+
+# ✅ (B) 리그별 스캔 모드(/fixtures league/date 스캔) 기본 간격(초)
+DEFAULT_SCAN_INTERVAL_SEC = int(os.environ.get("DEFAULT_LIVE_FIXTURES_INTERVAL_SEC", "10"))
+
+# ✅ (B-2) 라이브가 0일 때(=watched_live=0)에도 "종료 반영/포스트매치"를 위해 느리게 스캔(초)
+# 기본 90초(60~120 권장). 필요하면 ENV로 조절.
+IDLE_SCAN_INTERVAL_SEC = int(os.environ.get("IDLE_LIVE_FIXTURES_INTERVAL_SEC", "90"))
+
+# ✅ (C) “핵심 리그는 5초” 같은 오버라이드 목록
+# 예) "39,140,135"  (여기에 포함된 리그만 5초)
+FAST_LEAGUES_ENV = os.environ.get("FAST_LIVE_LEAGUES", "")
+
+
+# (구버전 호환: 기존 INTERVAL_SEC는 더 이상 루프 sleep에 직접 쓰지 않음)
+INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", str(DETECT_INTERVAL_SEC)))
+
 
 BASE = "https://v3.football.api-sports.io"
 UA = "SportsStatsX-LiveWorker/1.0"
@@ -58,6 +76,10 @@ REQ_RETRIES = 2
 LAST_STATS_SYNC: Dict[int, float] = {}   # fixture_id -> last ts
 LAST_EVENTS_SYNC: Dict[int, float] = {}  # fixture_id -> last ts (events 30초 쿨다운)
 LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> {"slot60":bool,"slot10":bool,"success":bool}
+
+# ✅ 리그별 스캔 모드에서 /fixtures(league/date) 호출 간격 제어
+LAST_FIXTURES_SCAN_TS: Dict[Tuple[int, str], float] = {}
+
 
 
 
@@ -96,6 +118,39 @@ def parse_live_leagues(env: str) -> List[int]:
         seen.add(x)
         uniq.append(x)
     return uniq
+
+def parse_fast_leagues(env: str) -> List[int]:
+    env = (env or "").strip()
+    if not env:
+        return []
+    out: List[int] = []
+    for part in env.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    # 중복 제거(순서 유지)
+    seen = set()
+    uniq: List[int] = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq
+
+
+def fetch_live_all(session: requests.Session) -> List[Dict[str, Any]]:
+    """
+    ✅ live=all 지원 확인 완료.
+    - 전세계 라이브를 1콜로 조회
+    """
+    data = api_get(session, "/fixtures", {"live": "all"})
+    return (data.get("response") or []) if isinstance(data, dict) else []
+
 
 
 def target_dates_for_live() -> List[str]:
@@ -1175,14 +1230,11 @@ def maybe_sync_lineups(
 
     nowu = now.astimezone(dt.timezone.utc)
 
-    # ---- 공통: 과호출 방지 쿨다운(초) ----
-    # interval=10초라서, lineups는 20초 정도만 쉬어도 충분히 안정적
+    # ---- 과호출 방지 쿨다운(초) ----
+    # - UPCOMING(-60/-10)은 1회성 슬롯이므로 여기서는 쿨다운으로 막지 않는다.
+    # - INPLAY 재시도 구간에서만(last_try_ts 기반) 쿨다운을 적용한다.
     COOLDOWN_SEC = 20
-    now_ts = time.time()
-    last_try = float(st.get("last_try_ts") or 0.0)
-    if (now_ts - last_try) < COOLDOWN_SEC:
-        # 다만 UPCOMING 슬롯(-60/-10)은 1회성이라 쿨다운 걸리지 않게 아래에서 별도 처리
-        pass
+
 
     # ─────────────────────────────────────
     # UPCOMING: -60 / -10 슬롯은 1회만
@@ -1194,7 +1246,7 @@ def maybe_sync_lineups(
         if (59 <= mins <= 61) and not st.get("slot60"):
             st["slot60"] = True
             try:
-                st["last_try_ts"] = time.time()
+                # ✅ UPCOMING 슬롯은 INPLAY 쿨다운을 막지 않도록 last_try_ts를 찍지 않는다
                 resp = fetch_lineups(session, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, nowu)
 
@@ -1206,11 +1258,12 @@ def maybe_sync_lineups(
                 print(f"      [lineups] fixture_id={fixture_id} slot60 err: {e}", file=sys.stderr)
             return
 
+
         # -10 슬롯: 9~11분 사이
         if (9 <= mins <= 11) and not st.get("slot10"):
             st["slot10"] = True
             try:
-                st["last_try_ts"] = time.time()
+                # ✅ UPCOMING 슬롯은 INPLAY 쿨다운을 막지 않도록 last_try_ts를 찍지 않는다
                 resp = fetch_lineups(session, fixture_id)
                 ready = upsert_match_lineups(fixture_id, resp, nowu)
 
@@ -1221,6 +1274,7 @@ def maybe_sync_lineups(
             except Exception as e:
                 print(f"      [lineups] fixture_id={fixture_id} slot10 err: {e}", file=sys.stderr)
             return
+
 
         return
 
@@ -1254,15 +1308,16 @@ def maybe_sync_lineups(
 # 메인 1회 실행
 # ─────────────────────────────────────
 
-def run_once() -> None:
+def run_once() -> int:
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
-        return
+        return 0
 
     league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
     if not league_ids:
         print("[live_status_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
-        return
+        return 0
+
 
     # ✅ DDL은 워커 시작 시 1회만
     if not hasattr(run_once, "_ddl_done"):
@@ -1276,6 +1331,54 @@ def run_once() -> None:
     fetched_at = now
 
     s = _session()
+
+    # ─────────────────────────────────────
+    # (0) live=all 감지(10초마다 1회)
+    # - LIVE_LEAGUES에 포함된 리그의 라이브가 없으면,
+    #   리그별 /fixtures 스캔(league/date)을 아예 돌리지 않는다.
+    # ─────────────────────────────────────
+    live_items: List[Dict[str, Any]] = []
+    try:
+        live_items = fetch_live_all(s)
+    except Exception as e:
+        # 감지 실패 시에는 “안전하게” 스캔을 돌리지 않음(호출수 폭증 방지)
+        print(f"[live_detect] err: {e}", file=sys.stderr)
+        live_items = []
+
+    watched = set(league_ids)
+    watched_live: List[Dict[str, Any]] = []
+    for it in live_items or []:
+        lg = it.get("league") or {}
+        lid = safe_int(lg.get("id"))
+        if lid is None:
+            continue
+        if lid in watched:
+            watched_live.append(it)
+
+    idle_mode = False
+
+    if not watched_live:
+        # ✅ 라이브가 0이어도 종료하지 않는다.
+        #    - "종료(FT) 반영" 및 "FT 후 타임라인(+60s/+30m)" 트리거를 위해
+        #      league/date 스캔을 느린 간격으로 계속 수행한다.
+        idle_mode = True
+        live_league_ids = list(league_ids)
+        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → idle slow scan (leagues={len(live_league_ids)})")
+    else:
+        live_league_ids: List[int] = []
+        seen_l = set()
+        for it in watched_live:
+            lg = it.get("league") or {}
+            lid = safe_int(lg.get("id"))
+            if lid is None:
+                continue
+            if lid in seen_l:
+                continue
+            seen_l.add(lid)
+            live_league_ids.append(lid)
+
+
+
 
     # ─────────────────────────────────────
     # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
@@ -1298,13 +1401,32 @@ def run_once() -> None:
     total_fixtures = 0
     total_inplay = 0
 
+    fast_leagues = set(parse_fast_leagues(FAST_LEAGUES_ENV))
+
+
     # 이번 run에서 본 fixture들의 상태(캐시 prune에 사용)
     fixture_groups: Dict[int, str] = {}
 
     for date_str in dates:
-        for lid in league_ids:
+        for lid in live_league_ids:
+
+            # ✅ 리그별 스캔 간격:
+            # - 평상시: 기본 DEFAULT(예:10초), FAST 리그는 5초
+            # - idle_mode(라이브 0): 모든 리그를 IDLE_SCAN_INTERVAL_SEC(기본 90초)로 느리게 스캔
+            if idle_mode:
+                scan_interval = IDLE_SCAN_INTERVAL_SEC
+            else:
+                scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+
+            k_scan = (lid, date_str)
+            last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
+            if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
+                continue
+            LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
+
             fixtures: List[Dict[str, Any]] = []
             used_season: Optional[int] = None
+
 
             cache_key = (lid, date_str)
             cached = fc.get(cache_key)
@@ -1455,6 +1577,7 @@ def run_once() -> None:
         pass
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+    return total_inplay
 
 
 
@@ -1464,13 +1587,17 @@ def run_once() -> None:
 # ─────────────────────────────────────
 
 def loop() -> None:
-    print(f"[live_status_worker] start (interval={INTERVAL_SEC}s)")
+    print(
+        f"[live_status_worker] start (detect_interval={DETECT_INTERVAL_SEC}s, default_scan={DEFAULT_SCAN_INTERVAL_SEC}s, fast_leagues_env='{FAST_LEAGUES_ENV}')"
+    )
     while True:
         try:
             run_once()
         except Exception:
             traceback.print_exc()
-        time.sleep(INTERVAL_SEC)
+        # ✅ 항상 감지 주기로만 돈다 (IDLE 60초 같은 모드 없음)
+        time.sleep(DETECT_INTERVAL_SEC)
+
 
 
 if __name__ == "__main__":

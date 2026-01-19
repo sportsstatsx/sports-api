@@ -827,6 +827,28 @@ select option {
           </div>
         </div>
 
+        <!-- ✅ NEW: Last-N Filter + Snapshot refresh -->
+        <div class="row" style="margin-top: 10px;">
+          <div class="col" style="min-width: 220px; flex:1;">
+            <label>Last-N Filter (Insights / AI)</label>
+            <select id="pLastN">
+              <option value="n3">Last 3</option>
+              <option value="n5">Last 5</option>
+              <option value="n7">Last 7</option>
+              <option value="n10">Last 10</option>
+              <option value="season_current">현재 시즌</option>
+              <option value="season_prev">직전 시즌</option>
+            </select>
+            <div class="subtle">✅ 선택된 경기의 “리그 기준”으로만 계산되어 스냅샷에 저장됩니다.</div>
+          </div>
+
+          <div class="col" style="min-width: 160px;">
+            <label>&nbsp;</label>
+            <button class="btn small" type="button" onclick="refreshSnapshotBlocks()">스냅샷 갱신</button>
+          </div>
+        </div>
+
+
         <div class="row" style="margin-top: 10px;">
           <div class="col" style="flex: 1;">
             <label>Summary (list에 뽑힐 짧은 요약)</label>
@@ -1255,14 +1277,20 @@ function backToList() {
     $("pSummary").value = "";
     $("pContent").value = "";
     setSelectedLangs([]);
+
+    // ✅ 기본 filters/snapshot
     $("pFiltersJson").value = "{}";
     $("pSnapshotJson").value = "{}";
+
+    // ✅ NEW: Last-N 기본값
+    if ($("pLastN")) $("pLastN").value = "n5";
 
     // ✅ 매치 프리뷰 숨김
     hideMatchPreview();
 
     renderList();
   }
+
 
 
   function newPost() {
@@ -1292,17 +1320,35 @@ function backToList() {
 
     setSelectedLangs(row.target_langs || []);
 
+    // filters_json
+    let filtersObj = {};
     try {
       const fj = row.filters_json ?? {};
       $("pFiltersJson").value = (typeof fj === "string") ? fj : JSON.stringify(fj, null, 2);
+      filtersObj = (typeof fj === "string") ? (JSON.parse(fj || "{}") || {}) : (fj || {});
     } catch (e) {
       $("pFiltersJson").value = "{}";
+      filtersObj = {};
     }
+
+    // snapshot_json
     try {
       const sj = row.snapshot_json ?? {};
       $("pSnapshotJson").value = (typeof sj === "string") ? sj : JSON.stringify(sj, null, 2);
     } catch (e) {
       $("pSnapshotJson").value = "{}";
+    }
+
+    // ✅ NEW: Last-N UI <- filters_json 동기화
+    if ($("pLastN")) {
+      const v = String(filtersObj.last_n || "").trim();
+      if (v === "3" || v === "n3") $("pLastN").value = "n3";
+      else if (v === "5" || v === "n5") $("pLastN").value = "n5";
+      else if (v === "7" || v === "n7") $("pLastN").value = "n7";
+      else if (v === "10" || v === "n10") $("pLastN").value = "n10";
+      else if (v === "season_current") $("pLastN").value = "season_current";
+      else if (v === "season_prev") $("pLastN").value = "season_prev";
+      else $("pLastN").value = "n5"; // default
     }
 
     // ✅ 스냅샷 기반 프리뷰 렌더 (없으면 숨김)
@@ -1311,6 +1357,7 @@ function backToList() {
     setSaveHint("편집 중: #" + selectedId);
     renderList();
   }
+
 
 
   async function reloadSelected() {
@@ -1493,15 +1540,51 @@ async function deletePostById(id) {
     return r.data.fixture || null;
   }
 
-  function buildSnapshotFromMeta(sport, fixtureKey, fx) {
-    // fx는 서버가 내려주는 fixture 객체 그대로 저장
-    return {
-      fixture: Object.assign({}, fx, {
+
+  function buildSnapshotFromMeta(sport, fixtureKey, fx, blocks) {
+    const out = {
+      fixture: Object.assign({}, fx || {}, {
         sport,
         fixture_key: fixtureKey,
-      })
+      }),
     };
+
+    // ✅ 서버가 내려준 블록들을 snapshot에 포함
+    if (blocks && typeof blocks === "object") {
+      if (blocks.insights_overall != null) out.insights_overall = blocks.insights_overall;
+      if (blocks.ai_predictions != null) out.ai_predictions = blocks.ai_predictions;
+      if (blocks.insights != null) out.insights = blocks.insights; // 혹시 키가 insights면 이것도 수용
+    }
+
+    return out;
   }
+
+
+  // ✅ NEW: 앱에 표시되는 AI Predictions / Insights 스냅샷을 서버에서 받아오기
+  // 기대 응답 형태:
+  // { ok:true, blocks: { insights_overall:{...}, ai_predictions:{...} } }
+  async function fetchMatchSnapshotBlocks(sport, fixtureKey, filtersObj) {
+    // ✅ filters 포함해서 서버가 "리그 기준/last-n" 계산하도록 전달
+    const body = {
+      sport: String(sport || "").toLowerCase(),
+      fixture_key: String(fixtureKey || "").trim(),
+      filters: (filtersObj && typeof filtersObj === "object") ? filtersObj : {},
+    };
+
+    const r = await api(adminUrl("/api/match_snapshot"), {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    setDebug(r);
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      return null;
+    }
+
+    return r.data.blocks || null;
+  }
+
+
 
   async function ensureFixtureSnapshot(payload) {
     // analysis + sport + fixture_key일 때만
@@ -1511,63 +1594,280 @@ async function deletePostById(id) {
     const sport = String(payload.sport).toLowerCase();
     const fixtureKey = String(payload.fixture_key);
 
+    // ✅ filters_json에 last_n / scope(league) 강제 세팅
+    const filters = (payload.filters_json && typeof payload.filters_json === "object") ? payload.filters_json : {};
+
+    // last_n: UI 우선
+    const lastNUi = $("pLastN") ? String($("pLastN").value || "").trim() : "";
+    if (lastNUi) {
+      // "n3" -> "3", 시즌값은 그대로
+      if (lastNUi === "n3") filters.last_n = "3";
+      else if (lastNUi === "n5") filters.last_n = "5";
+      else if (lastNUi === "n7") filters.last_n = "7";
+      else if (lastNUi === "n10") filters.last_n = "10";
+      else if (lastNUi === "season_current") filters.last_n = "season_current";
+      else if (lastNUi === "season_prev") filters.last_n = "season_prev";
+    } else if (filters.last_n == null) {
+      filters.last_n = "5";
+    }
+
+    // ✅ 리그 기준 계산 강제 (선택된 경기의 리그만)
+    filters.scope = "league";
+
+    // snapshot이 이미 있는 경우: 거기서 league_id/season 확보
     const snap = payload.snapshot_json || {};
+    const snapFx = snap && snap.fixture ? snap.fixture : null;
+
+    // league_id / season 보강 (가능한 키 다 수용)
+    const leagueId =
+      (snapFx && snapFx.league && snapFx.league.id != null) ? snapFx.league.id :
+      (snapFx && snapFx.league_id != null) ? snapFx.league_id :
+      (snapFx && snapFx.leagueId != null) ? snapFx.leagueId :
+      null;
+
+    const season =
+      (snapFx && snapFx.season != null) ? snapFx.season :
+      (snapFx && snapFx.league && snapFx.league.season != null) ? snapFx.league.season :
+      null;
+
+    if (leagueId != null && filters.league_id == null) filters.league_id = leagueId;
+    if (season != null && filters.season == null) filters.season = season;
+
+    payload.filters_json = filters;
+    $("pFiltersJson").value = JSON.stringify(filters, null, 2);
+
+    // 1) snapshot에 fixture가 이미 맞게 있으면: 블록만 채우기
     if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
       renderMatchPreview(snap.fixture);
+
+      const hasAi = (snap && (snap.ai_predictions != null));
+      const hasIns = (snap && (snap.insights_overall != null || snap.insights != null));
+      if (hasAi && hasIns) return payload;
+
+      try {
+        const blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey, filters);
+        if (blocks) {
+          const merged = Object.assign({}, snap);
+          if (blocks.insights_overall != null) merged.insights_overall = blocks.insights_overall;
+          if (blocks.ai_predictions != null) merged.ai_predictions = blocks.ai_predictions;
+          if (blocks.insights != null) merged.insights = blocks.insights;
+
+          payload.snapshot_json = merged;
+          writeSnapshotObj(merged);
+        }
+      } catch (e) {
+        // 조용히 무시 (fixture snapshot만으로도 저장은 되게)
+      }
+
       return payload;
     }
 
+    // 2) snapshot에 fixture가 없으면: meta 먼저 채우고 -> blocks 채우기
     const fx = await fetchFixtureMeta(sport, fixtureKey);
     if (!fx) throw new Error("fixture_meta not found");
 
-    const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+    // meta 기반으로 league_id/season도 filters에 보강
+    const fxLeagueId = (fx && fx.league && fx.league.id != null) ? fx.league.id : (fx && fx.league_id != null ? fx.league_id : null);
+    const fxSeason = (fx && fx.season != null) ? fx.season : ((fx && fx.league && fx.league.season != null) ? fx.league.season : null);
+    if (fxLeagueId != null) filters.league_id = fxLeagueId;
+    if (fxSeason != null) filters.season = fxSeason;
+
+    payload.filters_json = filters;
+    $("pFiltersJson").value = JSON.stringify(filters, null, 2);
+
+    // blocks 로드
+    let blocks = null;
+    try {
+      blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey, filters);
+    } catch (e) {
+      blocks = null;
+    }
+
+    const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx, blocks);
     payload.snapshot_json = newSnap;
 
-    // textarea 동기화 + 프리뷰 렌더
     writeSnapshotObj(newSnap);
     renderMatchPreview(fx);
 
     // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
     $("pTitle").value = buildTwoLineTitleFromFixture(fx);
 
-
     return payload;
 
   }
 
+
+
   function scheduleFixturePreviewRefresh() {
     if (_fixtureMetaTimer) clearTimeout(_fixtureMetaTimer);
     _fixtureMetaTimer = setTimeout(async () => {
-      // category/sport/fixtureKey 조건 맞을 때만 시도
       if (getEditorCategory() !== "analysis") return hideMatchPreview();
 
       const sport = getEditorSport();
       const fixtureKey = getEditorFixtureKey();
       if (!sport || !fixtureKey) return hideMatchPreview();
 
-      // snapshot이 이미 맞으면 그걸로 표시
+      // ✅ filters 읽기 + last_n/scope 강제 반영
+      let filters = {};
+      try {
+        filters = JSON.parse(($("pFiltersJson").value || "").trim() || "{}") || {};
+      } catch (e) {
+        filters = {};
+      }
+
+      // last_n UI 반영
+      const lastNUi = $("pLastN") ? String($("pLastN").value || "").trim() : "";
+      if (lastNUi === "n3") filters.last_n = "3";
+      else if (lastNUi === "n5") filters.last_n = "5";
+      else if (lastNUi === "n7") filters.last_n = "7";
+      else if (lastNUi === "n10") filters.last_n = "10";
+      else if (lastNUi === "season_current") filters.last_n = "season_current";
+      else if (lastNUi === "season_prev") filters.last_n = "season_prev";
+      else if (filters.last_n == null) filters.last_n = "5";
+
+      // 리그 기준 강제
+      filters.scope = "league";
+
+      // snapshot 먼저 확인
       const snap = readSnapshotObj();
+
+      // ✅ snapshot이 이미 맞으면: 프리뷰/타이틀 표시 + (블록 없으면 filters 포함해서 추가 로드)
       if (snapshotHasFixtureFor(sport, fixtureKey, snap)) {
         renderMatchPreview(snap.fixture);
         $("pTitle").value = buildTwoLineTitleFromFixture(snap.fixture);
+
+        const leagueId =
+          (snap.fixture && snap.fixture.league && snap.fixture.league.id != null) ? snap.fixture.league.id :
+          (snap.fixture && snap.fixture.league_id != null) ? snap.fixture.league_id :
+          null;
+        const season =
+          (snap.fixture && snap.fixture.season != null) ? snap.fixture.season :
+          (snap.fixture && snap.fixture.league && snap.fixture.league.season != null) ? snap.fixture.league.season :
+          null;
+
+        if (leagueId != null) filters.league_id = leagueId;
+        if (season != null) filters.season = season;
+
+        $("pFiltersJson").value = JSON.stringify(filters, null, 2);
+
+        const hasAi = (snap && (snap.ai_predictions != null));
+        const hasIns = (snap && (snap.insights_overall != null || snap.insights != null));
+
+        if (!(hasAi && hasIns)) {
+          try {
+            const blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey, filters);
+            if (blocks) {
+              const merged = Object.assign({}, snap);
+              if (blocks.insights_overall != null) merged.insights_overall = blocks.insights_overall;
+              if (blocks.ai_predictions != null) merged.ai_predictions = blocks.ai_predictions;
+              if (blocks.insights != null) merged.insights = blocks.insights;
+
+              writeSnapshotObj(merged);
+            }
+          } catch (e) {
+            // 무시
+          }
+        }
         return;
       }
 
-
-      // 아직 없으면 서버에서 가져와서 snapshot 채워주고 프리뷰 표시
+      // ✅ snapshot에 fixture가 없으면: meta 로드 -> filters 보강 -> blocks 로드 -> snapshot 생성
       const fx = await fetchFixtureMeta(sport, fixtureKey);
       if (!fx) return hideMatchPreview();
 
-      const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx);
+      const fxLeagueId = (fx && fx.league && fx.league.id != null) ? fx.league.id : (fx && fx.league_id != null ? fx.league_id : null);
+      const fxSeason = (fx && fx.season != null) ? fx.season : ((fx && fx.league && fx.league.season != null) ? fx.league.season : null);
+      if (fxLeagueId != null) filters.league_id = fxLeagueId;
+      if (fxSeason != null) filters.season = fxSeason;
+
+      $("pFiltersJson").value = JSON.stringify(filters, null, 2);
+
+      let blocks = null;
+      try {
+        blocks = await fetchMatchSnapshotBlocks(sport, fixtureKey, filters);
+      } catch (e) {
+        blocks = null;
+      }
+
+      const newSnap = buildSnapshotFromMeta(sport, fixtureKey, fx, blocks);
       writeSnapshotObj(newSnap);
       renderMatchPreview(fx);
 
-      // ✅ 타이틀 2줄: 경기 선택/변경 시마다 무조건 덮어쓰기
       $("pTitle").value = buildTwoLineTitleFromFixture(fx);
-
-
     }, 350);
   }
+
+  async function refreshSnapshotBlocks() {
+    if (getEditorCategory() !== "analysis") return alert("analysis 글에서만 스냅샷 갱신을 사용합니다.");
+    const sport = getEditorSport();
+    const fixtureKey = getEditorFixtureKey();
+    if (!sport || !fixtureKey) return alert("sport / fixture_key를 먼저 선택하세요.");
+
+    // filters 읽기
+    let filters = {};
+    try {
+      filters = JSON.parse(($("pFiltersJson").value || "").trim() || "{}") || {};
+    } catch (e) {
+      filters = {};
+    }
+
+    // last_n UI 반영
+    const lastNUi = $("pLastN") ? String($("pLastN").value || "").trim() : "";
+    if (lastNUi === "n3") filters.last_n = "3";
+    else if (lastNUi === "n5") filters.last_n = "5";
+    else if (lastNUi === "n7") filters.last_n = "7";
+    else if (lastNUi === "n10") filters.last_n = "10";
+    else if (lastNUi === "season_current") filters.last_n = "season_current";
+    else if (lastNUi === "season_prev") filters.last_n = "season_prev";
+    else if (filters.last_n == null) filters.last_n = "5";
+
+    // 리그 기준 강제
+    filters.scope = "league";
+
+    // league_id/season 확보: snapshot fixture 우선, 없으면 meta 조회
+    const snap = readSnapshotObj();
+    let fx = (snap && snap.fixture) ? snap.fixture : null;
+
+    if (!fx || !fx.home || !fx.away) {
+      const meta = await fetchFixtureMeta(String(sport).toLowerCase(), String(fixtureKey));
+      if (!meta) return alert("fixture_meta not found");
+      fx = meta;
+    }
+
+    const fxLeagueId = (fx && fx.league && fx.league.id != null) ? fx.league.id : (fx && fx.league_id != null ? fx.league_id : null);
+    const fxSeason = (fx && fx.season != null) ? fx.season : ((fx && fx.league && fx.league.season != null) ? fx.league.season : null);
+    if (fxLeagueId != null) filters.league_id = fxLeagueId;
+    if (fxSeason != null) filters.season = fxSeason;
+
+    $("pFiltersJson").value = JSON.stringify(filters, null, 2);
+
+    const blocks = await fetchMatchSnapshotBlocks(String(sport).toLowerCase(), String(fixtureKey), filters);
+    if (!blocks) return alert("match_snapshot 로드 실패 (서버 응답 확인)");
+
+    // snapshot merge
+    const curSnap = readSnapshotObj();
+    const merged = Object.assign({}, curSnap);
+
+    // fixture도 없으면 채워주기
+    if (!merged.fixture || !merged.fixture.home || !merged.fixture.away) {
+      merged.fixture = Object.assign({}, fx, { sport: String(sport).toLowerCase(), fixture_key: String(fixtureKey) });
+    }
+
+    if (blocks.insights_overall != null) merged.insights_overall = blocks.insights_overall;
+    if (blocks.ai_predictions != null) merged.ai_predictions = blocks.ai_predictions;
+    if (blocks.insights != null) merged.insights = blocks.insights;
+
+    writeSnapshotObj(merged);
+
+    // 프리뷰/타이틀 동기화
+    renderMatchPreview(merged.fixture);
+    $("pTitle").value = buildTwoLineTitleFromFixture(merged.fixture);
+
+    alert("스냅샷 갱신 완료 ✅");
+  }
+
+
+
 
   // ─────────────────────────────────────
   // Fixture Picker Modal (Fixtures Browser)
@@ -2221,6 +2521,8 @@ function filterFixtureRows(rows) {
   $("pSport").addEventListener("change", () => scheduleFixturePreviewRefresh());
   $("pFixtureKey").addEventListener("input", () => scheduleFixturePreviewRefresh());
   $("pSnapshotJson").addEventListener("input", () => renderMatchPreviewFromSnapshot());
+  $("pLastN").addEventListener("change", () => scheduleFixturePreviewRefresh());
+
 
   // ✅ Fixture Browser inputs -> debounce reload
   $("fxDate").addEventListener("change", () => scheduleFixtureBrowserReload());

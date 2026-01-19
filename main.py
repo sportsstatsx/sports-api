@@ -412,6 +412,216 @@ def root_redirect():
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
 
+# ─────────────────────────────────────────
+# API: fixtures by ids (favorites refresh)
+# ─────────────────────────────────────────
+@app.route("/api/fixtures_by_ids", methods=["GET"])
+def fixtures_by_ids():
+    ids_raw = request.args.get("ids", type=str) or ""
+    live_only = (request.args.get("live", type=int) or 0) == 1
+    apply_override = (request.args.get("apply_override", type=int) or 1) == 1
+    include_hidden = (request.args.get("include_hidden", type=int) or 0) == 1
+
+    if not ids_raw.strip():
+        return jsonify({"ok": False, "error": "ids is required (comma-separated)"}), 400
+
+    # 입력 순서 유지 + 중복 제거
+    ordered_ids: List[int] = []
+    seen: set[int] = set()
+    for part in ids_raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            fid = int(part)
+        except Exception:
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        ordered_ids.append(fid)
+
+    if not ordered_ids:
+        return jsonify({"ok": False, "error": "no valid ids"}), 400
+
+    # 과도한 IN 방지 (필요하면 조정)
+    if len(ordered_ids) > 200:
+        return jsonify({"ok": False, "error": "too many ids (max 200)"}), 400
+
+    placeholders = ", ".join(["%s"] * len(ordered_ids))
+    params: List[Any] = list(ordered_ids)
+
+    where_clauses = [f"m.fixture_id IN ({placeholders})"]
+    if live_only:
+        where_clauses.append("m.status_group = 'INPLAY'")
+    where_sql = " AND ".join(where_clauses)
+
+    use_mls = _match_live_state_available()
+    red_detail_sql = "('Red Card','Second Yellow card','Second Yellow Card')"
+
+    if use_mls:
+        home_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.home_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS home_red_cards
+        """
+        away_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.away_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS away_red_cards
+        """
+        mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
+    else:
+        home_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS home_red_cards
+        """
+        away_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS away_red_cards
+        """
+        mls_join = ""
+
+    sql = f"""
+        SELECT
+            m.fixture_id,
+            m.league_id,
+            m.season,
+            m.date_utc,
+            m.status_group,
+            m.status,
+            m.elapsed,
+            m.status_long,
+            m.home_id,
+            m.away_id,
+            m.home_ft,
+            m.away_ft,
+            m.home_ht,
+            m.away_ht,
+            m.venue_name,
+            m.league_round,
+            th.name AS home_name,
+            ta.name AS away_name,
+            th.logo AS home_logo,
+            ta.logo AS away_logo,
+            l.name AS league_name,
+            l.logo AS league_logo,
+            l.country AS league_country,
+            {home_red_sql},
+            {away_red_sql}
+        FROM matches m
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
+        JOIN leagues l ON l.id = m.league_id
+        {mls_join}
+        WHERE {where_sql}
+        ORDER BY m.date_utc ASC
+    """
+
+    rows = fetch_all(sql, tuple(params))
+
+    base_map: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        fid = int(r["fixture_id"])
+        base_map[fid] = {
+            "fixture_id": r["fixture_id"],
+            "league_id": r["league_id"],
+            "season": r["season"],
+            "date_utc": r["date_utc"],
+            "status_group": r["status_group"],
+            "status": r["status"],
+            "elapsed": r["elapsed"],
+            "status_long": r["status_long"],
+            "league_name": r["league_name"],
+            "league_logo": r["league_logo"],
+            "league_country": r["league_country"],
+            "league_round": r["league_round"],
+            "venue_name": r["venue_name"],
+            "home": {
+                "id": r["home_id"],
+                "name": r["home_name"],
+                "logo": r["home_logo"],
+                "ft": r["home_ft"],
+                "ht": r["home_ht"],
+                "red_cards": r["home_red_cards"],
+            },
+            "away": {
+                "id": r["away_id"],
+                "name": r["away_name"],
+                "logo": r["away_logo"],
+                "ft": r["away_ft"],
+                "ht": r["away_ht"],
+                "red_cards": r["away_red_cards"],
+            },
+        }
+
+    fixture_patch_keys = {
+        "fixture_id", "league_id", "season",
+        "date_utc", "kickoff_utc",
+        "status_group", "status", "elapsed", "minute", "status_long",
+        "league_round", "venue_name",
+        "league_name", "league_logo", "league_country",
+        "home", "away",
+        "hidden",
+    }
+
+    merged_map: Dict[int, Dict[str, Any]] = dict(base_map)
+
+    if apply_override and base_map:
+        override_map = _load_match_overrides(list(base_map.keys()))
+        for fid, f in list(merged_map.items()):
+            patch = override_map.get(fid)
+            if patch and isinstance(patch, dict):
+                if isinstance(patch.get("header"), dict):
+                    p2 = dict(patch.get("header") or {})
+                    if "hidden" in patch:
+                        p2["hidden"] = patch.get("hidden")
+                else:
+                    p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
+
+                f2 = _deep_merge(f, p2)
+                f2["_has_override"] = True
+                merged_map[fid] = f2
+            else:
+                f["_has_override"] = False
+                merged_map[fid] = f
+
+    out_rows: List[Dict[str, Any]] = []
+    for fid in ordered_ids:
+        f = merged_map.get(fid)
+        if not f:
+            continue
+        if (not include_hidden) and bool(f.get("hidden")):
+            continue
+        out_rows.append(f)
+
+    return jsonify({"ok": True, "count": len(out_rows), "rows": out_rows})
+
+
 
 # ─────────────────────────────────────────
 # API: Prometheus metrics
@@ -1643,6 +1853,218 @@ def admin_fixture_meta():
     return jsonify({"ok": True, "fixture": fixture})
 
 
+@app.route(f"/{ADMIN_PATH}/api/match_snapshot", methods=["GET", "POST"])
+@require_admin
+def admin_match_snapshot():
+    """
+    Admin UI에서 analysis 글 작성 시,
+    (sport, fixture_key) 기반으로 insights_overall / ai_predictions 블록을 생성해 내려준다.
+
+    ✅ 지원:
+    - POST JSON (프론트 최신): { sport, fixture_key, filters: { scope:"league", last_n:"3|5|7|10|season_current|season_prev", league_id, season, comp } }
+    - GET query (레거시): ?sport=football&fixture_key=...&comp=All&last_n=10
+
+    ✅ 핵심 정책:
+    - scope는 무조건 "league"로 강제 (선택한 경기 리그 기준)
+    - last_n: 3/5/7/10 또는 season_current/season_prev 지원
+      * season_current: 해당 경기 season으로 계산
+      * season_prev: (해당 경기 season - 1)로 계산
+    """
+    # ── 1) 입력 파싱: POST 우선, 없으면 GET
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    if not isinstance(body, dict):
+        body = {}
+
+    if request.method == "POST":
+        sport = (body.get("sport") or "").strip().lower()
+        fixture_key = (body.get("fixture_key") or "").strip()
+        filters_in = body.get("filters") or {}
+    else:
+        sport = (request.args.get("sport") or "").strip().lower()
+        fixture_key = (request.args.get("fixture_key") or "").strip()
+        filters_in = {}
+
+    if not sport or not fixture_key:
+        return jsonify({"ok": False, "error": "sport_and_fixture_key_required"}), 400
+
+    if sport != "football":
+        return jsonify({"ok": False, "error": "sport_not_supported_yet"}), 400
+
+    try:
+        fixture_id = int(fixture_key)
+    except Exception:
+        return jsonify({"ok": False, "error": "fixture_key_must_be_int_for_football"}), 400
+
+    if not isinstance(filters_in, dict):
+        filters_in = {}
+
+    # ── 2) matches에서 기본 메타 확보 (league_id/season/home/away)
+    sql = """
+    SELECT
+      m.fixture_id,
+      m.league_id,
+      m.season,
+      m.date_utc,
+      m.home_id,
+      m.away_id
+    FROM matches m
+    WHERE m.fixture_id = %s
+    LIMIT 1
+    """
+    row = fetch_one(sql, (fixture_id,))
+    if not row:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+
+    def _to_iso(v):
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        try:
+            vv = v
+            if getattr(vv, "tzinfo", None) is None:
+                vv = vv.replace(tzinfo=timezone.utc)
+            return vv.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return str(v)
+
+    base_league_id = int(row.get("league_id") or 0)
+    base_season = int(row.get("season") or 0)
+
+    # ── 3) filters 정규화: 리그 기준 강제 + last_n(숫자/시즌모드) 처리
+    # comp
+    if request.method == "POST":
+        comp = str(filters_in.get("comp") or "All").strip() or "All"
+    else:
+        comp = (request.args.get("comp") or "All").strip() or "All"
+
+    # scope: 무조건 league 강제
+    scope = "league"
+
+    # league_id/season: filters가 오면 우선, 없으면 match 기준
+    try:
+        league_id = int(filters_in.get("league_id")) if filters_in.get("league_id") is not None else base_league_id
+    except Exception:
+        league_id = base_league_id
+
+    # last_n raw (POST는 filters, GET은 query)
+    if request.method == "POST":
+        last_n_raw = filters_in.get("last_n")
+    else:
+        last_n_raw = request.args.get("last_n")
+
+    last_n_mode = ""
+    last_n_val: int | None = None
+
+    # season_current / season_prev / n3/n5... / "3"
+    s = (str(last_n_raw).strip() if last_n_raw is not None else "")
+    s_low = s.lower()
+
+    if s_low in ("season_current", "current_season", "this_season"):
+        last_n_mode = "season_current"
+    elif s_low in ("season_prev", "prev_season", "previous_season", "last_season"):
+        last_n_mode = "season_prev"
+    else:
+        # "n5" 같은 형태도 허용
+        if s_low.startswith("n") and s_low[1:].isdigit():
+            s_low = s_low[1:]
+        try:
+            v = int(s_low) if s_low else 10
+        except Exception:
+            v = 10
+        v = max(3, min(v, 50))
+        last_n_val = v
+
+    # season 결정:
+    # - filters.season 있으면 우선
+    # - 없으면 base_season
+    # - last_n_mode가 season_prev면 season-1 적용
+    try:
+        season_in = int(filters_in.get("season")) if filters_in.get("season") is not None else base_season
+    except Exception:
+        season_in = base_season
+
+    if last_n_mode == "season_prev":
+        season = max(0, season_in - 1)
+    else:
+        season = season_in
+
+    # header.filters.last_n 형태:
+    # - 숫자 모드: int
+    # - 시즌 모드: "season_current" / "season_prev" 문자열 그대로 전달 (블록 쪽에서 해석 가능하게)
+    header_last_n: Any
+    if last_n_mode:
+        header_last_n = last_n_mode
+    else:
+        header_last_n = int(last_n_val or 10)
+
+    header = {
+        "fixture_id": int(row.get("fixture_id") or fixture_id),
+        "league_id": int(league_id or 0),
+        "season": int(season or 0),
+        "kickoff_utc": _to_iso(row.get("date_utc")),
+        "home": {"id": int(row.get("home_id") or 0)},
+        "away": {"id": int(row.get("away_id") or 0)},
+        "filters": {
+            "scope": scope,
+            "comp": comp,
+            "last_n": header_last_n,
+        },
+    }
+
+    # ── 4) 블록 생성 (지연 import)
+    try:
+        from matchdetail.insights_block import build_insights_overall_block
+        from matchdetail.ai_predictions_block import build_ai_predictions_block
+    except Exception as e:
+        _admin_log(
+            event_type="match_snapshot_import_fail",
+            ok=False,
+            status_code=500,
+            fixture_id=fixture_id,
+            detail={"error": str(e)},
+        )
+        return jsonify({"ok": False, "error": f"import_failed: {e}"}), 500
+
+    try:
+        insights_overall = build_insights_overall_block(header)
+        ai_predictions = build_ai_predictions_block(header, insights_overall)
+
+        _admin_log(
+            event_type="match_snapshot_ok",
+            ok=True,
+            status_code=200,
+            fixture_id=fixture_id,
+            detail={
+                "scope": scope,
+                "comp": comp,
+                "last_n": header_last_n,
+                "league_id": header.get("league_id"),
+                "season": header.get("season"),
+                "method": request.method,
+            },
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "blocks": {
+                    "insights_overall": insights_overall,
+                    "ai_predictions": ai_predictions,
+                },
+            }
+        )
+    except Exception as e:
+        _admin_log(
+            event_type="match_snapshot_fail",
+            ok=False,
+            status_code=500,
+            fixture_id=fixture_id,
+            detail={"error": str(e)},
+        )
+        raise
+
+
+
 
 # ─────────────────────────────────────
 # Board APIs (admin)
@@ -1976,6 +2398,11 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
+
+
+
+
 
 
 
