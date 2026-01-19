@@ -938,12 +938,130 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
         log.info("match_id=%s current state not found, skip", match_id)
         return
 
-    # ✅ 종료면: 알림 자체는 더 이상 안 보냄 + 플래그 잠금
-    # (score/카드/킥오프/HT/FT 전부 fixtures 기반이라, match_events Goal 포인터는 불필요)
+    # ✅ 종료(FT/AET)도 "종료 이벤트(ft/et_end/pen_end)"는 1회 발송 기회가 있어야 한다.
+    # 다만 워커가 오래 멈췄다 재개된 경우 kickoff/ht/2h 같은 "과거 단계 알림 폭탄"은 막는다.
     if (current_raw.status or "") in ("FT", "AET"):
-        save_state(current_raw)
+        last = load_last_state(match_id)
 
-        # VAR(Goal Disallowed)만 기존대로 포인터 폭탄 방지용으로 당김
+        # state row 없으면: 현재값으로 초기화 + 플래그 잠금만 하고 종료(늦은 구독/늦은 부팅 폭탄 방지)
+        state_exists = fetch_one(
+            """
+            SELECT 1 AS ok
+            FROM match_notification_state
+            WHERE match_id = %s
+            """,
+            (match_id,),
+        )
+        if not state_exists:
+            save_state(current_raw)
+
+            vx = fetch_one(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM match_events
+                WHERE fixture_id = %s
+                  AND type = 'Var'
+                  AND detail ILIKE 'Goal Disallowed%%'
+                """,
+                (match_id,),
+            )
+            max_dis_id = int(vx["max_id"] or 0) if vx else 0
+
+            execute(
+                """
+                UPDATE match_notification_state
+                SET
+                  kickoff_sent = TRUE,
+                  kickoff_10m_sent = TRUE,
+                  halftime_sent = TRUE,
+                  secondhalf_sent = TRUE,
+                  fulltime_sent = TRUE,
+                  extra_time_start_sent = TRUE,
+                  extra_time_halftime_sent = TRUE,
+                  extra_time_secondhalf_sent = TRUE,
+                  extra_time_end_sent = TRUE,
+                  penalties_start_sent = TRUE,
+                  penalties_end_sent = TRUE,
+
+                  last_goal_disallowed_event_id = %s,
+
+                  updated_at = NOW()
+                WHERE match_id = %s
+                """,
+                (max_dis_id, match_id),
+            )
+            return
+
+        # ✅ status/red 단조 보정(점수는 그대로)
+        current = apply_monotonic_state(last, current_raw)
+
+        # ✅ 종료 시점 이벤트만 추려서 발송(과거 단계 이벤트는 버림)
+        finish_events = [ev for ev in diff_events(last, current) if ev[0] in ("et_end", "pen_end", "ft")]
+
+        labels = load_match_labels(match_id)
+
+        flag_column_by_event: Dict[str, str] = {
+            "ft": "fulltime_sent",
+            "et_end": "extra_time_end_sent",
+            "pen_end": "penalties_end_sent",
+        }
+
+        for event_type, extra in finish_events:
+            extra = dict(extra)
+
+            flag_col = flag_column_by_event.get(event_type)
+            flag_was_set = False
+            if flag_col:
+                got = fetch_one(
+                    f"""
+                    UPDATE match_notification_state
+                    SET {flag_col} = TRUE
+                    WHERE match_id = %s
+                      AND {flag_col} = FALSE
+                    RETURNING 1 AS ok
+                    """,
+                    (match_id,),
+                )
+                if not got:
+                    continue
+                flag_was_set = True
+
+            tokens = get_tokens_for_event(match_id, event_type)
+            if not tokens:
+                continue
+
+            title, body = build_message(event_type, current, extra, labels)
+            data: Dict[str, Any] = {"match_id": match_id, "event_type": event_type}
+            data.update(extra)
+
+            batch_size = 500
+            send_failed = False
+            for i in range(0, len(tokens), batch_size):
+                batch = tokens[i : i + batch_size]
+                try:
+                    resp = fcm.send_to_tokens(batch, title, body, data)
+                    log.info("Sent %s notification for match %s to %s devices: %s", event_type, match_id, len(batch), resp)
+                except Exception:
+                    send_failed = True
+                    log.exception("Failed to send %s notification for match %s", event_type, match_id)
+                    break
+
+            if send_failed and flag_was_set and flag_col:
+                try:
+                    execute(
+                        f"""
+                        UPDATE match_notification_state
+                        SET {flag_col} = FALSE
+                        WHERE match_id = %s
+                        """,
+                        (match_id,),
+                    )
+                except Exception:
+                    log.exception("Failed to rollback flag %s for match %s after send failure", flag_col, match_id)
+
+        # ✅ 마지막으로 “잠금”(기존 의도 유지)
+        save_state(current)
+
         vx = fetch_one(
             """
             SELECT COALESCE(MAX(id), 0) AS max_id
@@ -980,6 +1098,7 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             (max_dis_id, match_id),
         )
         return
+
 
     last = load_last_state(match_id)
 
