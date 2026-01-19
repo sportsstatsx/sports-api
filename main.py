@@ -412,6 +412,216 @@ def root_redirect():
 def health():
     return jsonify({"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION})
 
+# ─────────────────────────────────────────
+# API: fixtures by ids (favorites refresh)
+# ─────────────────────────────────────────
+@app.route("/api/fixtures_by_ids", methods=["GET"])
+def fixtures_by_ids():
+    ids_raw = request.args.get("ids", type=str) or ""
+    live_only = (request.args.get("live", type=int) or 0) == 1
+    apply_override = (request.args.get("apply_override", type=int) or 1) == 1
+    include_hidden = (request.args.get("include_hidden", type=int) or 0) == 1
+
+    if not ids_raw.strip():
+        return jsonify({"ok": False, "error": "ids is required (comma-separated)"}), 400
+
+    # 입력 순서 유지 + 중복 제거
+    ordered_ids: List[int] = []
+    seen: set[int] = set()
+    for part in ids_raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            fid = int(part)
+        except Exception:
+            continue
+        if fid in seen:
+            continue
+        seen.add(fid)
+        ordered_ids.append(fid)
+
+    if not ordered_ids:
+        return jsonify({"ok": False, "error": "no valid ids"}), 400
+
+    # 과도한 IN 방지 (필요하면 조정)
+    if len(ordered_ids) > 200:
+        return jsonify({"ok": False, "error": "too many ids (max 200)"}), 400
+
+    placeholders = ", ".join(["%s"] * len(ordered_ids))
+    params: List[Any] = list(ordered_ids)
+
+    where_clauses = [f"m.fixture_id IN ({placeholders})"]
+    if live_only:
+        where_clauses.append("m.status_group = 'INPLAY'")
+    where_sql = " AND ".join(where_clauses)
+
+    use_mls = _match_live_state_available()
+    red_detail_sql = "('Red Card','Second Yellow card','Second Yellow Card')"
+
+    if use_mls:
+        home_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.home_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS home_red_cards
+        """
+        away_red_sql = f"""
+            CASE
+                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
+                ELSE (
+                    SELECT COUNT(*) FROM match_events e
+                    WHERE e.fixture_id = m.fixture_id
+                      AND e.team_id = m.away_id
+                      AND e.type = 'Card'
+                      AND e.detail IN {red_detail_sql}
+                )
+            END AS away_red_cards
+        """
+        mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
+    else:
+        home_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.home_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS home_red_cards
+        """
+        away_red_sql = f"""
+            (
+                SELECT COUNT(*) FROM match_events e
+                WHERE e.fixture_id = m.fixture_id
+                  AND e.team_id = m.away_id
+                  AND e.type = 'Card'
+                  AND e.detail IN {red_detail_sql}
+            ) AS away_red_cards
+        """
+        mls_join = ""
+
+    sql = f"""
+        SELECT
+            m.fixture_id,
+            m.league_id,
+            m.season,
+            m.date_utc,
+            m.status_group,
+            m.status,
+            m.elapsed,
+            m.status_long,
+            m.home_id,
+            m.away_id,
+            m.home_ft,
+            m.away_ft,
+            m.home_ht,
+            m.away_ht,
+            m.venue_name,
+            m.league_round,
+            th.name AS home_name,
+            ta.name AS away_name,
+            th.logo AS home_logo,
+            ta.logo AS away_logo,
+            l.name AS league_name,
+            l.logo AS league_logo,
+            l.country AS league_country,
+            {home_red_sql},
+            {away_red_sql}
+        FROM matches m
+        JOIN teams th ON th.id = m.home_id
+        JOIN teams ta ON ta.id = m.away_id
+        JOIN leagues l ON l.id = m.league_id
+        {mls_join}
+        WHERE {where_sql}
+        ORDER BY m.date_utc ASC
+    """
+
+    rows = fetch_all(sql, tuple(params))
+
+    base_map: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        fid = int(r["fixture_id"])
+        base_map[fid] = {
+            "fixture_id": r["fixture_id"],
+            "league_id": r["league_id"],
+            "season": r["season"],
+            "date_utc": r["date_utc"],
+            "status_group": r["status_group"],
+            "status": r["status"],
+            "elapsed": r["elapsed"],
+            "status_long": r["status_long"],
+            "league_name": r["league_name"],
+            "league_logo": r["league_logo"],
+            "league_country": r["league_country"],
+            "league_round": r["league_round"],
+            "venue_name": r["venue_name"],
+            "home": {
+                "id": r["home_id"],
+                "name": r["home_name"],
+                "logo": r["home_logo"],
+                "ft": r["home_ft"],
+                "ht": r["home_ht"],
+                "red_cards": r["home_red_cards"],
+            },
+            "away": {
+                "id": r["away_id"],
+                "name": r["away_name"],
+                "logo": r["away_logo"],
+                "ft": r["away_ft"],
+                "ht": r["away_ht"],
+                "red_cards": r["away_red_cards"],
+            },
+        }
+
+    fixture_patch_keys = {
+        "fixture_id", "league_id", "season",
+        "date_utc", "kickoff_utc",
+        "status_group", "status", "elapsed", "minute", "status_long",
+        "league_round", "venue_name",
+        "league_name", "league_logo", "league_country",
+        "home", "away",
+        "hidden",
+    }
+
+    merged_map: Dict[int, Dict[str, Any]] = dict(base_map)
+
+    if apply_override and base_map:
+        override_map = _load_match_overrides(list(base_map.keys()))
+        for fid, f in list(merged_map.items()):
+            patch = override_map.get(fid)
+            if patch and isinstance(patch, dict):
+                if isinstance(patch.get("header"), dict):
+                    p2 = dict(patch.get("header") or {})
+                    if "hidden" in patch:
+                        p2["hidden"] = patch.get("hidden")
+                else:
+                    p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
+
+                f2 = _deep_merge(f, p2)
+                f2["_has_override"] = True
+                merged_map[fid] = f2
+            else:
+                f["_has_override"] = False
+                merged_map[fid] = f
+
+    out_rows: List[Dict[str, Any]] = []
+    for fid in ordered_ids:
+        f = merged_map.get(fid)
+        if not f:
+            continue
+        if (not include_hidden) and bool(f.get("hidden")):
+            continue
+        out_rows.append(f)
+
+    return jsonify({"ok": True, "count": len(out_rows), "rows": out_rows})
+
+
 
 # ─────────────────────────────────────────
 # API: Prometheus metrics
@@ -2188,6 +2398,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
