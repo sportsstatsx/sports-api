@@ -104,8 +104,11 @@ def route_hockey_games():
             away_team_id,
             timezone,
 
-            -- ✅ score_json에서 점수만 경량 추출 (구조 차이 방어)
+            -- ✅ score_json 평면/중첩 구조 모두 방어
             CASE
+                -- (1) 현재 DB 실데이터: {"home":1,"away":4}
+                WHEN (score_json->>'home') ~ '^[0-9]+$' THEN (score_json->>'home')::int
+                -- (2) 혹시 중첩 구조가 올 경우 대비
                 WHEN (score_json #>> '{{home,total}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,total}}')::int
                 WHEN (score_json #>> '{{home,goals}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,goals}}')::int
                 WHEN (score_json #>> '{{home,score}}') ~ '^[0-9]+$' THEN (score_json #>> '{{home,score}}')::int
@@ -114,6 +117,7 @@ def route_hockey_games():
             END AS home_score,
 
             CASE
+                WHEN (score_json->>'away') ~ '^[0-9]+$' THEN (score_json->>'away')::int
                 WHEN (score_json #>> '{{away,total}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,total}}')::int
                 WHEN (score_json #>> '{{away,goals}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,goals}}')::int
                 WHEN (score_json #>> '{{away,score}}') ~ '^[0-9]+$' THEN (score_json #>> '{{away,score}}')::int
@@ -126,6 +130,7 @@ def route_hockey_games():
         {order_sql}
         LIMIT %s
     """
+
     params.append(limit)
 
 
