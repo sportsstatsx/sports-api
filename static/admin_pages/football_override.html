@@ -368,84 +368,75 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
 
 /* ─────────────────────────────────────
-   Fixtures filters clean layout (no clipping / nice wrapping)
+   Fixtures filters compact + ordered layout
+   (less vertical space / cleaner alignment)
    ───────────────────────────────────── */
 
 .fxFilters{
   display:grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap:12px;
-  align-items:stretch; /* ✅ 칸 높이 맞추고 내부에서 정렬 */
+  grid-template-columns: 160px 160px 220px 1fr;
+  grid-template-areas:
+    "from to tz actions"
+    "search league league actions";
+  gap:8px 10px;
+  align-items:end;
 }
 
-/* ✅ League Filter는 “전체 폭”으로 내려서 2번째 줄 고정 */
-.fxLeagueBlock{
-  grid-column: 1 / -1;
-}
+.fxFromBlock{ grid-area: from; }
+.fxToBlock{ grid-area: to; }
+.fxTzBlock{ grid-area: tz; }
+.fxActionsBlock{ grid-area: actions; }
+.fxSearchBlock{ grid-area: search; }
+.fxLeagueBlock{ grid-area: league; }
 
-/* ✅ Actions도 “전체 폭”으로 내려서 줄 겹침/클리핑 방지 */
-.fxActionsBlock{
-  grid-column: 1 / -1;
-}
-
-
-
-/* 각 칸: label + control 을 안정적으로 스택 */
 .fxFilters > div{
   display:flex;
   flex-direction:column;
-  gap:6px;
+  gap:4px;
   min-width:0;
 }
 
-/* ✅ 라벨: 2줄까지 자연 줄바꿈 + ! 아이콘 포함해도 안 겹치게 */
+/* 라벨: 1줄 고정 + 말줄임 (불필요한 높이 제거) */
 .fxFilters label{
   margin:0;
-  line-height:1.25;
-  min-height:32px;          /* 한 줄/두 줄 모두 안정적인 높이 */
+  line-height:1.1;
   display:flex;
-  align-items:flex-start;
+  align-items:center;
   justify-content:space-between;
-  gap:8px;
+  gap:6px;
 
-  white-space:normal;       /* ✅ nowrap 제거 */
-  overflow:hidden;          /* ✅ 너무 길면 2줄 넘어가는 것 방지용 (아래 clamp와 함께) */
-
-  /* ✅ 2줄까지만 보여주고 나머진 잘라냄 */
-  display:-webkit-box;
-  -webkit-line-clamp:2;
-  -webkit-box-orient:vertical;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
 }
 
-/* label 안에 들어가는 ! 아이콘 정렬 */
+/* helpIcon은 위아래로 튀지 않게 */
 .fxFilters label .helpIcon{
   margin-left:0;
   flex:0 0 auto;
-  align-self:flex-start;
 }
 
-/* 컨트롤 높이 통일 */
+/* 컨트롤: 높이/패딩 축소 */
 .fxFilters input,
 .fxFilters select{
-  min-height:36px;
+  min-height:32px;
+  padding:7px 10px !important;
+  border-radius:10px !important;
   box-sizing:border-box;
 }
 
-/* Actions: 기본은 2열, 좁으면 1열로 */
-.fxBtnRow{
+/* Actions: 세로 버튼(공간 덜 먹고 “항상 같은 자리”) */
+.fxBtnCol{
   display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:8px;
-  margin-top:auto;
+  grid-template-columns: 1fr;
+  gap:6px;
 }
-.fxBtnRow button{
-  min-height:36px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+.fxBtnCol button{
+  min-height:32px;
+  padding:7px 10px !important;
 }
 
-/* League: 기본은 한 줄(셀렉트 + 버튼들), 좁으면 세로로 */
+/* League: 한 줄(셀렉트 + 버튼들) 유지, 버튼 더 컴팩트 */
 .leagueBar{
   display:grid;
   grid-template-columns: 1fr auto;
@@ -461,40 +452,54 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   flex-wrap:nowrap;
 }
 .leagueBtns .btnsm{
-  min-height:36px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  min-height:32px;
   padding:0 10px;
 }
 
-/* pills 영역: 줄바꿈 안정 */
+/* pills: 한 줄에 최대한 붙게(공간 절약) */
 .leaguePills{
-  margin-top:6px;
-  min-height:18px;
+  margin-top:4px;
+  min-height:0;
   display:flex;
   flex-wrap:wrap;
-  gap:6px;
+  gap:4px;
 }
 .leaguePills .pill{
-  font-size:11px;
-  padding:2px 8px;
+  font-size:10px;
+  padding:1px 7px;
   border-radius:999px;
   border:1px solid var(--border2);
   color: var(--muted);
   background: transparent;
 }
 
-/* ✅ 화면이 좁아지면(겹침 방지) 필터/리그/버튼을 세로 스택 */
-@media (max-width: 760px){
-  .fxFilters{ grid-template-columns: 1fr; }
-
-  .fxBtnRow{ grid-template-columns: 1fr; }   /* 불러오기 / OVR 버튼 세로 */
-
-  .leagueBar{ grid-template-columns: 1fr; }  /* 리그 셀렉트 위, 버튼 아래 */
-  .leagueBtns{ flex-wrap:wrap; }             /* + − ALL 줄바꿈 허용 */
-  .leagueBtns .btnsm{ flex:1 1 60px; }       /* 버튼이 너무 작게 찌그러지는 것 방지 */
+/* 반응형: 2열 → 1열 */
+@media (max-width: 980px){
+  .fxFilters{
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "from to"
+      "tz actions"
+      "search search"
+      "league league";
+  }
 }
+@media (max-width: 640px){
+  .fxFilters{
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "from"
+      "to"
+      "tz"
+      "actions"
+      "search"
+      "league";
+  }
+  .leagueBar{ grid-template-columns: 1fr; }
+  .leagueBtns{ flex-wrap:wrap; }
+  .leagueBtns .btnsm{ flex:1 1 60px; }
+}
+
 
 
 /* ─────────────────────────────────────
@@ -650,17 +655,17 @@ textarea{
       <h2 data-help="fxBrowser">Fixtures Browser</h2>
 
       <div class="fxFilters">
-        <div>
+        <div class="fxFromBlock">
           <label class="muted" data-help="fxDateFrom">Date (From)</label>
           <input id="fxDate" type="date"/>
         </div>
 
-        <div>
+        <div class="fxToBlock">
           <label class="muted" data-help="fxDateTo">Date (To)</label>
           <input id="fxDateTo" type="date"/>
         </div>
 
-        <div>
+        <div class="fxTzBlock">
           <label class="muted" data-help="fxTz">Timezone</label>
           <select id="fxTz">
             <option value="Asia/Seoul">Asia/Seoul</option>
@@ -671,7 +676,20 @@ textarea{
           </select>
         </div>
 
-                <div class="fxLeagueBlock">
+        <div class="fxActionsBlock">
+          <label class="muted" data-help="fxActions">Actions</label>
+          <div class="fxBtnCol">
+            <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
+          </div>
+        </div>
+
+        <div class="fxSearchBlock">
+          <label class="muted" data-help="fxSearch">Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
+        </div>
+
+        <div class="fxLeagueBlock">
           <label class="muted" data-help="fxLeagueFilter">League Filter (from loaded list)</label>
 
           <div class="leagueBar">
@@ -684,7 +702,6 @@ textarea{
               <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()" data-help="btnFxLeagueRemove">−</button>
               <button class="btnsm" type="button" onclick="fxClearLeagueFilter()" data-help="btnFxLeagueAll">ALL</button>
             </div>
-
           </div>
 
           <div id="fxLeaguePills" class="leaguePills"></div>
@@ -692,22 +709,8 @@ textarea{
           <!-- ✅ 기능 유지용: 실제 필터 값은 이 hidden input에 유지 -->
           <input id="fxLeagueIds" type="hidden" />
         </div>
-
-
-        <div>
-          <label class="muted" data-help="fxSearch">Search (team/league)</label>
-          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
-        </div>
-
-        <div class="fxActionsBlock">
-          <label class="muted" data-help="fxActions">Actions</label>
-          <div class="fxBtnRow">
-            <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
-            <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
-          </div>
-        </div>
-
       </div>
+
 
 
       <div class="muted" style="margin-top:10px;" id="fxHint"></div>
