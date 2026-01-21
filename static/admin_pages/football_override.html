@@ -319,6 +319,38 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   background:var(--panel2);
 }
 
+/* ✅ HelpIcon alignment: title/label 오른쪽 끝에 고정 */
+h2[data-help],
+label[data-help]{
+  position:relative;
+  padding-right:24px; /* ! 자리 확보 */
+}
+
+/* h2/label 내부의 ! 아이콘을 우측 고정(줄바꿈/밀림 방지) */
+h2[data-help] .helpIcon,
+label[data-help] .helpIcon{
+  position:absolute;
+  right:0;
+  top:50%;
+  transform:translateY(-50%);
+  margin-left:0 !important; /* 기존 margin-left 무력화 */
+}
+
+/* ✅ 버튼도 아이콘을 "버튼 안"에 넣을 거라, 버튼 내부 정렬 안정화 */
+button[data-help]{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+
+/* 버튼 안 ! 는 텍스트 옆에 자연스럽게 */
+button[data-help] .helpIcon{
+  margin-left:6px !important;
+  position:static;
+  transform:none;
+}
+
+
 .helpPop{
   position:fixed;
   z-index:99999;
@@ -400,15 +432,12 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 .fxFilters label{
   margin:0;
   line-height:1.1;
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:6px;
-
+  display:block;            /* ✅ flex 제거: 흔들림/줄밀림 감소 */
   white-space:nowrap;
   overflow:hidden;
   text-overflow:ellipsis;
 }
+
 
 /* helpIcon은 위아래로 튀지 않게 */
 .fxFilters label .helpIcon{
@@ -425,16 +454,18 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   box-sizing:border-box;
 }
 
-/* Actions: 세로 버튼(공간 덜 먹고 “항상 같은 자리”) */
+/* Actions: 세로 버튼(더 컴팩트) */
 .fxBtnCol{
   display:grid;
   grid-template-columns: 1fr;
   gap:6px;
 }
 .fxBtnCol button{
-  min-height:32px;
-  padding:7px 10px !important;
+  min-height:30px;
+  padding:6px 9px !important;
+  font-size:12px !important;
 }
+
 
 /* League: 한 줄(셀렉트 + 버튼들) 유지, 버튼 더 컴팩트 */
 .leagueBar{
@@ -1782,26 +1813,16 @@ function openHelpPop(anchorEl, key){
 
 function attachHelpIcons(){
   // data-help 가진 요소에 ! 아이콘 자동 추가
-  // - 일반 요소(h2/label 등): 요소 내부 맨 오른쪽에 append
-  // - 버튼(button): 기본은 버튼 "바로 오른쪽" 형제 삽입
-  // - ✅ tabbtn(탭 버튼)은 레이아웃 깨짐 방지로 버튼 "내부"에 append
+  // ✅ 모든 요소(h2/label/button/tabbtn 포함)에 "내부 append"로 통일
+  //    → 버튼 옆에 형제로 붙어서 줄바꿈/아래 밀림 나는 문제 제거
   const nodes = document.querySelectorAll("[data-help]");
 
   nodes.forEach(el => {
     const key = el.getAttribute("data-help");
     if (!key || !HELP[key]) return;
 
-    const isButton = (el.tagName === "BUTTON");
-    const isTabBtn = isButton && el.classList && el.classList.contains("tabbtn");
-    const placeInside = (!isButton) || isTabBtn;
-
-    // ✅ 중복 방지
-    if (!placeInside) {
-      const next = el.nextElementSibling;
-      if (next && next.classList && next.classList.contains("helpIcon")) return;
-    } else {
-      if (el.querySelector && el.querySelector(".helpIcon")) return;
-    }
+    // ✅ 중복 방지(내부에 이미 있으면 스킵)
+    if (el.querySelector && el.querySelector(".helpIcon")) return;
 
     const icon = document.createElement("span");
     icon.className = "helpIcon";
@@ -1812,13 +1833,10 @@ function attachHelpIcons(){
       openHelpPop(icon, key);
     };
 
-    if (placeInside) {
-      el.appendChild(icon);
-    } else {
-      el.insertAdjacentElement("afterend", icon);
-    }
+    el.appendChild(icon);
   });
 }
+
 
 
 
