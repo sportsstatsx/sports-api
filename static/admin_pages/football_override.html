@@ -510,10 +510,11 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
             </select>
 
             <div class="leagueBtns">
-              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">+</button>
-              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">−</button>
-              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">ALL</button>
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()" data-help="btnFxLeagueAdd">+</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()" data-help="btnFxLeagueRemove">−</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()" data-help="btnFxLeagueAll">ALL</button>
             </div>
+
           </div>
 
           <div id="fxLeaguePills" class="leaguePills"></div>
@@ -530,9 +531,10 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         <div>
           <label class="muted" data-help="fxActions">Actions</label>
           <div class="fxBtnRow">
-            <button class="primary" onclick="loadFixtures()">불러오기</button>
-            <button id="btnOverridesOnly" onclick="loadOverridesOnly()">OVR만 보기</button>
+            <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
           </div>
+
         </div>
       </div>
 
@@ -544,14 +546,15 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       </div>
 
       <div class="tabs">
-        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')">현재(노출)</button>
-        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
-        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
-        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
-        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')">bundle(raw)</button>
-        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')">bundle(merged)</button>
-        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')">bundle diff</button>
+        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')" data-help="tabNow">현재(노출)</button>
+        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')" data-help="tabRaw">원본(raw)</button>
+        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')" data-help="tabPatch">override patch</button>
+        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')" data-help="tabDiff">diff</button>
+        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')" data-help="tabBundleRaw">bundle(raw)</button>
+        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')" data-help="tabBundleMerged">bundle(merged)</button>
+        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')" data-help="tabBundleDiff">bundle diff</button>
       </div>
+
 
       <div class="tabpane active" id="tab_now">
         <div class="muted">선택된 경기(override 반영 결과)</div>
@@ -629,11 +632,12 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           <div style="flex: 1 1 220px;">
             <label class="muted" data-help="quickActions">Quick actions</label>
             <div class="row" style="gap:8px;">
-              <button onclick="getOverride()">조회</button>
-              <button class="danger" onclick="deleteOverride()">삭제(원복)</button>
-              <button onclick="hideFixture()">숨김(hidden=true)</button>
-              <button onclick="unhideFixture()">숨김해제(hidden=false)</button>
+              <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
+              <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
+              <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
+              <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
             </div>
+
           </div>
         </div>
 
@@ -746,9 +750,10 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         </div>
 
         <div class="row" style="margin-top:10px;">
-          <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
-          <button onclick="upsertOverride()">저장(Upsert)</button>
+          <button class="primary" onclick="applyQuickEditToPatch()" data-help="btnApplyQuickEdit">Quick Edit → Patch JSON 반영</button>
+          <button onclick="upsertOverride()" data-help="btnUpsertOverride">저장(Upsert)</button>
         </div>
+
 
         <!-- Event Editor -->
         <div style="height:12px;"></div>
@@ -762,10 +767,11 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
               <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
             </div>
             <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btnsm" onclick="evtReloadFromBundle()">bundle에서 불러오기</button>
-              <button class="btnsm" onclick="evtApplyToPatch(false)">Patch에 반영</button>
-              <button class="btnsm danger" onclick="evtClearAll()">전체 삭제</button>
+              <button class="btnsm" onclick="evtReloadFromBundle()" data-help="btnEvtReload">bundle에서 불러오기</button>
+              <button class="btnsm" onclick="evtApplyToPatch(false)" data-help="btnEvtApply">Patch에 반영</button>
+              <button class="btnsm danger" onclick="evtClearAll()" data-help="btnEvtClear">전체 삭제</button>
             </div>
+
           </div>
 
           <div style="height:10px;"></div>
@@ -818,9 +824,10 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
             </div>
 
             <div style="grid-column: 1 / -1; display:flex; gap:8px;">
-              <button class="btnsm primary" onclick="evtAdd()">+ 이벤트 추가</button>
-              <button class="btnsm" onclick="evtSort()">정렬(시간순)</button>
+              <button class="btnsm primary" onclick="evtAdd()" data-help="btnEvtAdd">+ 이벤트 추가</button>
+              <button class="btnsm" onclick="evtSort()" data-help="btnEvtSort">정렬(시간순)</button>
             </div>
+
           </div>
 
           <div style="height:10px;"></div>
@@ -1380,7 +1387,169 @@ Extra(+): 추가시간(예: 2)
 `GOAL/RED/YELLOW/SUB 등 이벤트 종류입니다.
 PENALTY/OWN_GOAL은 UI 편의용 타입이고,
 저장 시 raw에는 GOAL + detail(“Penalty/Own Goal”)로 안전하게 기록합니다.`
-  }
+  },
+
+  // ===== Tabs (now/raw/patch/diff/bundle) =====
+  tabNow: {
+    title: "현재(노출)",
+    body:
+`fixtures_merged 기준 “현재 앱에 노출되는 형태”를 보여줍니다.
+override / hidden 등이 반영된 최종 결과(JSON)입니다.`
+  },
+  tabRaw: {
+    title: "원본(raw)",
+    body:
+`override 미적용 “원본 fixture”입니다.
+같은 경기라도 타임존/날짜 기준에 따라 raw 조회가 달라질 수 있어
+선택 경기의 날짜를 tz 기준으로 잡아 로드합니다.`
+  },
+  tabPatch: {
+    title: "override patch",
+    body:
+`현재 override에 저장된 “patch(부분 JSON)”입니다.
+오른쪽 Patch textarea 내용이 그대로 반영되어 표시됩니다.`
+  },
+  tabDiff: {
+    title: "diff",
+    body:
+`원본(raw) → 현재(노출) 변화 요약입니다.
+path 단위로 raw 값과 now 값을 비교해 줄 단위로 보여줍니다.`
+  },
+  tabBundleRaw: {
+    title: "bundle(raw)",
+    body:
+`match_detail_bundle를 override 미적용(apply_override=0)으로 호출한 결과입니다.
+Event Editor 자동 탐지/로드의 기준 데이터로도 사용됩니다.`
+  },
+  tabBundleMerged: {
+    title: "bundle(merged)",
+    body:
+`match_detail_bundle를 override 적용(apply_override=1)으로 호출한 결과입니다.
+Event Editor는 기본적으로 merged 우선으로 로드합니다.`
+  },
+  tabBundleDiff: {
+    title: "bundle diff",
+    body:
+`bundle(raw) → bundle(merged) 차이 요약입니다.
+bundle 안에서 override가 실제로 무엇을 바꿨는지 빠르게 확인합니다.`
+  },
+
+  // ===== Buttons (right-side ! on buttons) =====
+  btnLoadFixtures: {
+    title: "불러오기",
+    body:
+`from~to 기간의 fixtures_merged를 날짜별로 조회해 합칩니다.
+- fixture_id 기준으로 중복 제거(dedupe)
+- timezone / league_ids 파라미터 포함
+로드 후 리그 드롭다운 목록도 새로 구성됩니다.`
+  },
+
+    title: "불러오기",
+    body:
+`from~to 기간의 fixtures_merged를 날짜별로 조회해 합칩니다.
+- fixture_id 기준으로 중복 제거(dedupe)
+- timezone / league_ids 파라미터 포함
+로드 후 리그 드롭다운 목록도 새로 구성됩니다.`
+  },
+  btnOverridesOnly: {
+    title: "OVR만 보기",
+    body:
+`현재 기간(from~to)에서 override가 있는 경기만 모아봅니다.
+- 다시 누르면 일반 불러오기 모드로 복귀(토글)
+- 버튼 테두리(primary)로 현재 모드가 표시됩니다.`
+  },
+  btnFxLeagueAdd: {
+    title: "+ (리그 추가)",
+    body:
+`현재 선택된 리그를 league_ids 필터에 추가합니다.
+추가 즉시 UI 리스트가 필터링되어 보입니다(서버 재호출 없음).`
+  },
+  btnFxLeagueRemove: {
+    title: "− (리그 제거)",
+    body:
+`현재 선택된 리그를 league_ids 필터에서 제거합니다.
+제거 즉시 UI 리스트가 다시 렌더링됩니다.`
+  },
+  btnFxLeagueAll: {
+    title: "ALL (필터 초기화)",
+    body:
+`league_ids 필터를 비워서 전체 리그를 보이게 합니다.
+(서버가 league_ids를 무시해도 UI에서 강제 필터가 해제됩니다.)`
+  },
+
+  btnGetOverride: {
+    title: "조회",
+    body:
+`/api/overrides/{fixture_id} 를 호출해 현재 override patch를 불러옵니다.
+- patch가 있으면 textarea에 반영
+- 이후 비교뷰(raw/diff)와 bundle(raw/merged)도 갱신합니다.`
+  },
+  btnDeleteOverride: {
+    title: "삭제(원복)",
+    body:
+`override 레코드를 삭제해 원본으로 되돌립니다.
+성공하면 patch textarea를 비우고 목록을 재로드합니다.`
+  },
+  btnHideFixture: {
+    title: "숨김(hidden=true)",
+    body:
+`Patch JSON에 hidden:true 를 세팅합니다.
+즉시 적용은 아니고, 저장(Upsert)해야 실제 반영됩니다.`
+  },
+  btnUnhideFixture: {
+    title: "숨김해제(hidden=false)",
+    body:
+`Patch JSON에 hidden:false 를 세팅합니다.
+저장(Upsert) 전까지는 실제 노출 상태가 바뀌지 않습니다.`
+  },
+
+  btnApplyQuickEdit: {
+    title: "Quick Edit → Patch 반영",
+    body:
+`Quick Edit 입력값을 기준으로 “변경된 항목만” Patch JSON에 합칩니다.
+- status/status_group은 대문자 정규화
+- 점수(ft/ht)는 바뀐 값만 home/away에 부분 패치로 들어갑니다.`
+  },
+  btnUpsertOverride: {
+    title: "저장(Upsert)",
+    body:
+`현재 Patch JSON을 PUT으로 저장해 override를 즉시 적용합니다.
+- Patch가 빈 객체면 저장을 막습니다(OVR만 생기는 문제 방지)
+- 저장 성공 시 목록을 다시 불러와 merged 결과를 갱신합니다.`
+  },
+
+  btnEvtReload: {
+    title: "bundle에서 불러오기",
+    body:
+`bundle(raw/merged)를 기준으로 이벤트 배열 경로를 자동 탐지하고,
+선택된 경로의 이벤트 배열을 UI 편집 표로 로드합니다.`
+  },
+  btnEvtApply: {
+    title: "Patch에 반영",
+    body:
+`현재 UI의 이벤트 목록을 Patch JSON의 선택 경로에
+“배열 통째로” 덮어씌웁니다.
+저장은 아니므로 Upsert를 눌러야 적용됩니다.`
+  },
+  btnEvtClear: {
+    title: "전체 삭제",
+    body:
+`선택된 이벤트 배열을 빈 배열로 override합니다.
+저장(Upsert)하면 앱에서도 이벤트가 전부 사라집니다.`
+  },
+  btnEvtAdd: {
+    title: "+ 이벤트 추가",
+    body:
+`입력한 minute/extra/team/type/main/assist/detail로 이벤트를 추가합니다.
+- PENALTY/OWN_GOAL은 저장 시 GOAL + detail로 안전하게 기록합니다.`
+  },
+  btnEvtSort: {
+    title: "정렬(시간순)",
+    body:
+`minute → extra 순으로 오름차순 정렬합니다.
+정렬 후 Patch JSON에도 즉시 반영됩니다.`
+  },
+
 };
 
 let _helpPopEl = null;
@@ -1441,39 +1610,54 @@ function openHelpPop(anchorEl, key){
 }
 
 function attachHelpIcons(){
-  // data-help 가진 요소(타이틀/라벨 등)에 ! 버튼을 오른쪽에 붙임
+  // data-help 가진 요소에 ! 아이콘 자동 추가
+  // - 일반 요소(h2/label 등): 요소 내부 맨 오른쪽에 append
+  // - 버튼(button): 기본은 버튼 "바로 오른쪽" 형제 삽입
+  // - ✅ tabbtn(탭 버튼)은 레이아웃 깨짐 방지로 버튼 "내부"에 append
   const nodes = document.querySelectorAll("[data-help]");
+
   nodes.forEach(el => {
     const key = el.getAttribute("data-help");
     if (!key || !HELP[key]) return;
 
-    // 중복 방지
-    if (el.querySelector(".helpIcon")) return;
+    const isButton = (el.tagName === "BUTTON");
+    const isTabBtn = isButton && el.classList && el.classList.contains("tabbtn");
+    const placeInside = (!isButton) || isTabBtn;
 
-    const btn = document.createElement("span");
-    btn.className = "helpIcon";
-    btn.textContent = "!";
-    btn.title = "도움말";
-    btn.onclick = (e) => {
+    // ✅ 중복 방지
+    if (!placeInside) {
+      const next = el.nextElementSibling;
+      if (next && next.classList && next.classList.contains("helpIcon")) return;
+    } else {
+      if (el.querySelector && el.querySelector(".helpIcon")) return;
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "helpIcon";
+    icon.textContent = "!";
+    icon.title = "도움말";
+    icon.onclick = (e) => {
       e.stopPropagation();
-      openHelpPop(btn, key);
+      openHelpPop(icon, key);
     };
 
-    el.appendChild(btn);
+    if (placeInside) {
+      el.appendChild(icon);
+    } else {
+      el.insertAdjacentElement("afterend", icon);
+    }
   });
 }
+
+
 
 // DOM 준비 후 1회 부착
 document.addEventListener("DOMContentLoaded", () => {
   attachHelpIcons();
 });
-</script>
-
-
-
-
 
   function deepMerge(base, patch) {
+
     if (base && typeof base === "object" && !Array.isArray(base) &&
         patch && typeof patch === "object" && !Array.isArray(patch)) {
       const out = { ...base };
