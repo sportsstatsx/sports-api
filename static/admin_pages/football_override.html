@@ -406,13 +406,18 @@ button[data-help] .helpIcon{
 
 .fxFilters{
   display:grid;
-  grid-template-columns: 160px 160px 220px 1fr;
+
+  /* ✅ Actions 폭 고정(버튼 가로로 커지는 문제 해결) + Search를 1행으로 */
+  grid-template-columns: 160px 160px 220px minmax(240px, 1fr) 170px;
+
   grid-template-areas:
-    "from to tz actions"
-    "search league league actions";
+    "from to tz search actions"
+    "league league league league actions";
+
   gap:8px 10px;
   align-items:end;
 }
+
 
 .fxFromBlock{ grid-area: from; }
 .fxToBlock{ grid-area: to; }
@@ -460,11 +465,15 @@ button[data-help] .helpIcon{
   grid-template-columns: 1fr;
   gap:6px;
 }
+
+/* ✅ 버튼을 “작은 컨트롤” 느낌으로 */
 .fxBtnCol button{
-  min-height:30px;
-  padding:6px 9px !important;
+  min-height:28px;
+  padding:6px 8px !important;
   font-size:12px !important;
+  border-radius:10px !important;
 }
+
 
 
 /* League: 한 줄(셀렉트 + 버튼들) 유지, 버튼 더 컴팩트 */
@@ -510,11 +519,17 @@ button[data-help] .helpIcon{
     grid-template-columns: 1fr 1fr;
     grid-template-areas:
       "from to"
-      "tz actions"
-      "search search"
-      "league league";
+      "tz search"
+      "league league"
+      "actions actions";
+  }
+
+  /* ✅ 좁아지면 Actions 버튼 2개를 가로로 */
+  .fxBtnCol{
+    grid-template-columns: 1fr 1fr;
   }
 }
+
 @media (max-width: 640px){
   .fxFilters{
     grid-template-columns: 1fr;
@@ -522,14 +537,20 @@ button[data-help] .helpIcon{
       "from"
       "to"
       "tz"
-      "actions"
       "search"
-      "league";
+      "league"
+      "actions";
   }
+
+  .fxBtnCol{
+    grid-template-columns: 1fr 1fr; /* 모바일에서도 2개 나란히 */
+  }
+
   .leagueBar{ grid-template-columns: 1fr; }
   .leagueBtns{ flex-wrap:wrap; }
   .leagueBtns .btnsm{ flex:1 1 60px; }
 }
+
 
 
 
