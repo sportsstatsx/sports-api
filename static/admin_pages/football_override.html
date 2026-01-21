@@ -368,41 +368,58 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
 
 /* ─────────────────────────────────────
-   Fixtures filters compact layout (aligned)
+   Fixtures filters clean layout (no clipping / nice wrapping)
    ───────────────────────────────────── */
 
 .fxFilters{
   display:grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap:10px;
-  align-items:start;            /* ✅ end(아래정렬) → start(위정렬) */
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap:12px;
+  align-items:stretch; /* ✅ 칸 높이 맞추고 내부에서 정렬 */
 }
 
-/* ✅ 각 칸을 세로 스택으로 고정해서 라벨/컨트롤 라인 맞춤 */
+/* 각 칸: label + control 을 안정적으로 스택 */
 .fxFilters > div{
   display:flex;
   flex-direction:column;
+  gap:6px;
   min-width:0;
 }
 
-/* ✅ 라벨 높이 고정(줄바꿈 때문에 컨트롤 라인이 흔들리는 현상 방지) */
+/* ✅ 라벨: 2줄까지 자연 줄바꿈 + ! 아이콘 포함해도 안 겹치게 */
 .fxFilters label{
-  margin:0 0 6px 0;
-  line-height:1;
-  height:14px;
-  white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
+  margin:0;
+  line-height:1.25;
+  min-height:32px;          /* 한 줄/두 줄 모두 안정적인 높이 */
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:8px;
+
+  white-space:normal;       /* ✅ nowrap 제거 */
+  overflow:hidden;          /* ✅ 너무 길면 2줄 넘어가는 것 방지용 (아래 clamp와 함께) */
+
+  /* ✅ 2줄까지만 보여주고 나머진 잘라냄 */
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
 }
 
-/* ✅ 컨트롤(입력/셀렉트/버튼) 높이 통일 */
+/* label 안에 들어가는 ! 아이콘 정렬 */
+.fxFilters label .helpIcon{
+  margin-left:0;
+  flex:0 0 auto;
+  align-self:flex-start;
+}
+
+/* 컨트롤 높이 통일 */
 .fxFilters input,
 .fxFilters select{
   min-height:36px;
   box-sizing:border-box;
 }
 
-/* Actions 버튼 줄도 입력박스 높이와 맞추기 */
+/* Actions: 기본은 2열, 좁으면 1열로 */
 .fxBtnRow{
   display:grid;
   grid-template-columns: 1fr 1fr;
@@ -416,21 +433,20 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   justify-content:center;
 }
 
-/* League: select + 버튼들을 한 줄로 “같은 높이” */
+/* League: 기본은 한 줄(셀렉트 + 버튼들), 좁으면 세로로 */
 .leagueBar{
   display:grid;
   grid-template-columns: 1fr auto;
   gap:8px;
   align-items:stretch;
 }
-
-.leagueBar select{
-  min-width:0;
-}
+.leagueBar select{ min-width:0; }
 
 .leagueBtns{
   display:flex;
   gap:6px;
+  align-items:stretch;
+  flex-wrap:nowrap;
 }
 .leagueBtns .btnsm{
   min-height:36px;
@@ -440,7 +456,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   padding:0 10px;
 }
 
-/* pills가 없을 때도 높이 유지해서 아래 줄이 들쭉날쭉해 보이는 것 방지 */
+/* pills 영역: 줄바꿈 안정 */
 .leaguePills{
   margin-top:6px;
   min-height:18px;
@@ -448,7 +464,6 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   flex-wrap:wrap;
   gap:6px;
 }
-
 .leaguePills .pill{
   font-size:11px;
   padding:2px 8px;
@@ -457,6 +472,18 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   color: var(--muted);
   background: transparent;
 }
+
+/* ✅ 화면이 좁아지면(겹침 방지) 필터/리그/버튼을 세로 스택 */
+@media (max-width: 760px){
+  .fxFilters{ grid-template-columns: 1fr; }
+
+  .fxBtnRow{ grid-template-columns: 1fr; }   /* 불러오기 / OVR 버튼 세로 */
+
+  .leagueBar{ grid-template-columns: 1fr; }  /* 리그 셀렉트 위, 버튼 아래 */
+  .leagueBtns{ flex-wrap:wrap; }             /* + − ALL 줄바꿈 허용 */
+  .leagueBtns .btnsm{ flex:1 1 60px; }       /* 버튼이 너무 작게 찌그러지는 것 방지 */
+}
+
 
 /* ─────────────────────────────────────
    Layout sanity fixes (no overlap / no clipping)
