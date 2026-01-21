@@ -1079,58 +1079,58 @@ textarea{
           <div style="height:10px;"></div>
 
           <!-- Add row -->
-          <div class="grid2">
-            <div>
-              <label class="muted mini">Minute</label>
-              <input id="evtMin" type="number" placeholder="예: 57" />
-            </div>
-            <div>
-              <label class="muted mini">Extra(+)</label>
-              <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
-            </div>
+<div class="grid2">
+  <div>
+    <label class="muted mini" data-help="evtMinute">Minute</label>
+    <input id="evtMin" type="number" placeholder="예: 57" />
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtMinute">Extra(+)</label>
+    <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
+  </div>
 
-            <div>
-              <label class="muted mini">Team</label>
-              <select id="evtTeam">
-                <option value="">(none)</option>
-                <option value="home">home</option>
-                <option value="away">away</option>
-              </select>
-            </div>
-            <div>
-              <label class="muted mini">Type</label>
-              <select id="evtType">
-                <option value="GOAL">GOAL</option>
-                <option value="PENALTY">PENALTY</option>
-                <option value="OWN_GOAL">OWN_GOAL</option>
-                <option value="RED">RED</option>
-                <option value="YELLOW">YELLOW</option>
-                <option value="SUB">SUB</option>
-                <option value="OTHER">OTHER</option>
-              </select>
+  <div>
+    <label class="muted mini" data-help="evtTeam">Team</label>
+    <select id="evtTeam">
+      <option value="">(none)</option>
+      <option value="home">home</option>
+      <option value="away">away</option>
+    </select>
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtType">Type</label>
+    <select id="evtType">
+      <option value="GOAL">GOAL</option>
+      <option value="PENALTY">PENALTY</option>
+      <option value="OWN_GOAL">OWN_GOAL</option>
+      <option value="RED">RED</option>
+      <option value="YELLOW">YELLOW</option>
+      <option value="SUB">SUB</option>
+      <option value="OTHER">OTHER</option>
+    </select>
+  </div>
 
-            </div>
+  <div>
+    <label class="muted mini" data-help="evtPlayerMain">Player / Main</label>
+    <input id="evtPlayer" placeholder="예: Messi / Player name" />
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtAssistSub">Assist / SubOut</label>
+    <input id="evtAssist" placeholder="예: Assist / Sub out" />
+  </div>
 
-            <div>
-              <label class="muted mini">Player / Main</label>
-              <input id="evtPlayer" placeholder="예: Messi / Player name" />
-            </div>
-            <div>
-              <label class="muted mini">Assist / SubOut</label>
-              <input id="evtAssist" placeholder="예: Assist / Sub out" />
-            </div>
+  <div style="grid-column: 1 / -1;">
+    <label class="muted mini" data-help="evtDetail">Detail</label>
+    <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
+  </div>
 
-            <div style="grid-column: 1 / -1;">
-              <label class="muted mini">Detail</label>
-              <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
-            </div>
+  <div style="grid-column: 1 / -1; display:flex; gap:8px;">
+    <button class="btnsm primary" onclick="evtAdd()" data-help="btnEvtAdd">+ 이벤트 추가</button>
+    <button class="btnsm" onclick="evtSort()" data-help="btnEvtSort">정렬(시간순)</button>
+  </div>
 
-            <div style="grid-column: 1 / -1; display:flex; gap:8px;">
-              <button class="btnsm primary" onclick="evtAdd()" data-help="btnEvtAdd">+ 이벤트 추가</button>
-              <button class="btnsm" onclick="evtSort()" data-help="btnEvtSort">정렬(시간순)</button>
-            </div>
+</div>
 
-          </div>
 
           <div style="height:10px;"></div>
 
@@ -1690,6 +1690,32 @@ Extra(+): 추가시간(예: 2)
 PENALTY/OWN_GOAL은 UI 편의용 타입이고,
 저장 시 raw에는 GOAL + detail(“Penalty/Own Goal”)로 안전하게 기록합니다.`
   },
+    evtPlayerMain: {
+    title: "Player / Main",
+    body:
+`주요 선수/주요 텍스트 필드입니다.
+- GOAL: 득점자(또는 주 이벤트 대상)
+- SUB: 교체 IN(들어온 선수)
+- CARD: 카드 받은 선수
+timeline 스키마라면 line1에 저장됩니다.`
+  },
+  evtAssistSub: {
+    title: "Assist / SubOut",
+    body:
+`보조 선수/두번째 텍스트 필드입니다.
+- GOAL: assist(도움)
+- SUB: 교체 OUT(나간 선수)
+timeline 스키마라면 line2에 저장됩니다.`
+  },
+  evtDetail: {
+    title: "Detail",
+    body:
+`세부 설명 메모입니다.
+예: "Penalty", "2nd yellow", "Injury", "VAR" 등.
+PENALTY/OWN_GOAL 타입은 저장 시
+GOAL + detail로 안전하게 기록됩니다.`
+  },
+
 
   // ===== Tabs (now/raw/patch/diff/bundle) =====
   tabNow: {
@@ -2992,41 +3018,53 @@ if (awayLogo) {
   }
 
 
-  function evtRefreshPathSelect() {
-    const sel = document.getElementById("evtPath");
-    const hint = document.getElementById("evtHint");
-    sel.innerHTML = "";
+  function evtPathStorageKey(){
+  const fx = (selectedFixture && selectedFixture.fixture_id) ? String(selectedFixture.fixture_id) : "";
+  return fx ? ("SSX_EVT_PATH__" + fx) : "SSX_EVT_PATH__global";
+}
 
-    const cands = evtState.candidates || [];
-    if (!cands.length) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
-      sel.appendChild(opt);
-      evtState.path = "";
-      hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
-      return;
-    }
+function evtRefreshPathSelect() {
+  const sel = document.getElementById("evtPath");
+  const hint = document.getElementById("evtHint");
+  sel.innerHTML = "";
 
-    for (const c of cands) {
-      const opt = document.createElement("option");
-      opt.value = c.path;
-      opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
-      sel.appendChild(opt);
-    }
-
-    // 기존 선택 유지 시도
-    const keep = evtState.path && cands.find(x => x.path === evtState.path);
-    evtState.path = keep ? evtState.path : cands[0].path;
-    sel.value = evtState.path;
-
-    hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
-
-    sel.onchange = () => {
-      evtState.path = sel.value || "";
-      evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
-    };
+  const cands = evtState.candidates || [];
+  if (!cands.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
+    sel.appendChild(opt);
+    evtState.path = "";
+    hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
+    return;
   }
+
+  for (const c of cands) {
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
+    sel.appendChild(opt);
+  }
+
+  // ✅ 1) localStorage에 저장된 path 우선 복원
+  const saved = (localStorage.getItem(evtPathStorageKey()) || "").trim();
+  const savedOk = saved && cands.find(x => x.path === saved);
+
+  // ✅ 2) 없으면 기존 선택 유지 → 그래도 없으면 1번 후보
+  const keep = evtState.path && cands.find(x => x.path === evtState.path);
+
+  evtState.path = savedOk ? saved : (keep ? evtState.path : cands[0].path);
+  sel.value = evtState.path;
+
+  hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
+
+  sel.onchange = () => {
+    evtState.path = sel.value || "";
+    localStorage.setItem(evtPathStorageKey(), evtState.path); // ✅ fixture별 기억
+    evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
+  };
+}
+
 
   function evtNormalizeForUi(e) {
   // 다양한 스키마를 UI 공통 필드로 매핑(최대한 안전하게)
