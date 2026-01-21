@@ -378,6 +378,12 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   align-items:stretch; /* ✅ 칸 높이 맞추고 내부에서 정렬 */
 }
 
+/* ✅ League Filter는 “전체 폭”으로 내려서 2번째 줄 고정 */
+.fxLeagueBlock{
+  grid-column: 1 / -1;
+}
+
+
 /* 각 칸: label + control 을 안정적으로 스택 */
 .fxFilters > div{
   display:flex;
@@ -659,7 +665,7 @@ textarea{
           </select>
         </div>
 
-        <div>
+                <div class="fxLeagueBlock">
           <label class="muted" data-help="fxLeagueFilter">League Filter (from loaded list)</label>
 
           <div class="leagueBar">
@@ -680,6 +686,7 @@ textarea{
           <!-- ✅ 기능 유지용: 실제 필터 값은 이 hidden input에 유지 -->
           <input id="fxLeagueIds" type="hidden" />
         </div>
+
 
         <div>
           <label class="muted" data-help="fxSearch">Search (team/league)</label>
