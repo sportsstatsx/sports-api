@@ -458,6 +458,137 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   background: transparent;
 }
 
+/* ─────────────────────────────────────
+   Layout sanity fixes (no overlap / no clipping)
+   ───────────────────────────────────── */
+
+/* ✅ 상단 영역: 스크롤 시 겹침 방지 + 시각적으로 분리 */
+.top{
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border2);
+
+  /* body margin(12px)와 맞춰 header가 “바”처럼 보이게 */
+  margin: -12px -12px 12px -12px;
+  padding: 10px 12px;
+}
+
+/* ✅ 2컬럼 그리드: 너무 줄어들면 겹치지 말고 자동 스택 */
+.grid{
+  grid-template-columns: minmax(560px, 1.15fr) minmax(520px, 0.85fr);
+  gap: 14px;
+}
+@media (max-width: 1220px){
+  .grid{ grid-template-columns: 1fr; }
+}
+
+/* ✅ 카드 내부 overflow로 “글 잘림/겹침” 나는 것 방지 */
+.card{
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ✅ pre/textarea: 스크롤 영역으로 고정해서 레이아웃 밀림 방지 */
+pre.mono{
+  white-space: pre;
+  overflow: auto;
+  max-height: 360px;
+  padding: 10px;
+  border: 1px solid var(--border2);
+  border-radius: 12px;
+}
+textarea{
+  max-height: 320px;
+  resize: vertical;
+}
+
+/* ✅ 탭 버튼: 내부 요소(! 아이콘 포함) 때문에 줄/겹침 나지 않게 */
+.tabs{ gap: 8px; }
+.tabbtn{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ✅ 리스트 아이템: flex 대신 grid로 바꿔서 좌/우가 절대 겹치지 않게 */
+.item{
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 560px){
+  .item{ grid-template-columns: 1fr; }
+}
+
+/* 좌측(팀/리그) 영역은 줄어들어도 안전하게 말줄임 */
+.fxTeams{
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+.fxTeam{
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.fxTeamName{
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+@media (max-width: 560px){
+  .fxTeamName{ max-width: 160px; }
+}
+.fxLeagueLine{
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 우측(배지/스코어) 영역: 최소폭 확보 + 줄바꿈/정렬 안정화 */
+.fxRight{
+  min-width: 170px;
+  text-align: right;
+}
+@media (max-width: 560px){
+  .fxRight{ text-align: left; }
+}
+.fxBadges{
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+@media (max-width: 560px){
+  .fxBadges{ justify-content: flex-start; }
+}
+.fxScore{
+  margin-top: 6px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* ✅ 버튼들: 한 줄 과밀 방지(자동 그리드) */
+.btnGrid{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.btnGrid button{
+  width: 100%;
+  min-height: 36px;
+}
+
+/* row 안쪽 아이템이 폭 부족으로 튀는 케이스 방지 */
+.row > div{ min-width: 0; }
 
 
   </style>
@@ -631,14 +762,15 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           </div>
           <div style="flex: 1 1 220px;">
             <label class="muted" data-help="quickActions">Quick actions</label>
-            <div class="row" style="gap:8px;">
+
+            <div class="btnGrid">
               <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
               <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
               <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
               <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
             </div>
-
           </div>
+
         </div>
 
         <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
@@ -766,11 +898,14 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
               <select id="evtPath"></select>
               <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
             </div>
-            <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btnsm" onclick="evtReloadFromBundle()" data-help="btnEvtReload">bundle에서 불러오기</button>
-              <button class="btnsm" onclick="evtApplyToPatch(false)" data-help="btnEvtApply">Patch에 반영</button>
-              <button class="btnsm danger" onclick="evtClearAll()" data-help="btnEvtClear">전체 삭제</button>
+            <div style="flex:0 0 360px;">
+              <div class="btnGrid">
+                <button class="btnsm" onclick="evtReloadFromBundle()" data-help="btnEvtReload">bundle에서 불러오기</button>
+                <button class="btnsm" onclick="evtApplyToPatch(false)" data-help="btnEvtApply">Patch에 반영</button>
+                <button class="btnsm danger" onclick="evtClearAll()" data-help="btnEvtClear">전체 삭제</button>
+              </div>
             </div>
+
 
           </div>
 
@@ -1785,114 +1920,120 @@ document.addEventListener("DOMContentLoaded", () => {
 
 
   function renderFixtures() {
-    const list = document.getElementById("fxList");
-    list.innerHTML = "";
+  const list = document.getElementById("fxList");
+  if (!list) return;
+  list.innerHTML = "";
 
-    const q = (document.getElementById("fxSearch").value || "").trim().toLowerCase();
-    const leagueSet = parseLeagueIdsSet(document.getElementById("fxLeagueIds").value || "");
+  const q = (document.getElementById("fxSearch")?.value || "").trim().toLowerCase();
+  const leagueSet = parseLeagueIdsSet(document.getElementById("fxLeagueIds")?.value || "");
 
-    const filtered = currentFixtures.filter(f => {
-      // ✅ league_ids 강제 필터(서버가 무시해도 UI에서는 확실히 먹게)
-      if (leagueSet && !leagueSet.has(Number(f.league_id))) return false;
+  const filtered = (currentFixtures || []).filter(f => {
+    if (leagueSet && !leagueSet.has(Number(f.league_id))) return false;
 
-      // ✅ search 필터
-      if (!q) return true;
-      const s = [
-        f.league_name, f.league_country, f.league_round,
-        f.home?.name, f.away?.name,
-        String(f.fixture_id || "")
-      ].join(" ").toLowerCase();
-      return s.includes(q);
-    });
+    if (!q) return true;
+    const s = [
+      f.league_name, f.league_country, f.league_round,
+      f.home?.name, f.away?.name,
+      String(f.fixture_id || "")
+    ].join(" ").toLowerCase();
+    return s.includes(q);
+  });
 
-    filtered.sort((a,b) => {
-      const ka = statusOrderKey(a.status_group);
-      const kb = statusOrderKey(b.status_group);
-      if (ka !== kb) return ka - kb;
-      return String(a.date_utc||"").localeCompare(String(b.date_utc||""));
-    });
+  filtered.sort((a, b) => {
+    const ka = statusOrderKey(a.status_group);
+    const kb = statusOrderKey(b.status_group);
+    if (ka !== kb) return ka - kb;
+    return String(a.date_utc || "").localeCompare(String(b.date_utc || ""));
+  });
 
-    const tz = document.getElementById("fxTz").value || "UTC";
+  const tz = document.getElementById("fxTz")?.value || "UTC";
 
-    for (const f of filtered) {
-      const div = document.createElement("div");
-      const isHidden = (f.hidden === true);
+  for (const f of filtered) {
+    const div = document.createElement("div");
 
-      div.className =
-        "item" +
-        ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
-        (isHidden ? " hidden" : "");
+    const isHidden = (f.hidden === true);
+    div.className =
+      "item" +
+      ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
+      (isHidden ? " hidden" : "");
 
-      div.onclick = () => selectFixture(f.fixture_id);
+    div.onclick = () => selectFixture(f.fixture_id);
 
-      const when = fmtInTz(f.date_utc, tz);
-      const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
-      const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
+    const when = fmtInTz(f.date_utc, tz);
+    const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
+    const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
 
-      const isOvr = (f._has_override === true);
-      const sg = (f.status_group || "").toUpperCase();
+    const isOvr = (f._has_override === true);
+    const sg = (f.status_group || "").toUpperCase();
 
-      const badges = [
-        `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
-        isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
-        isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
-      ].filter(Boolean).join(" ");
+    const badges = [
+      `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
+      isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
+      isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
+    ].filter(Boolean).join(" ");
 
-      const hLogo = safeUrl(f.home?.logo);
-      const aLogo = safeUrl(f.away?.logo);
+    const hLogo = safeUrl(f.home?.logo);
+    const aLogo = safeUrl(f.away?.logo);
 
-      const homeLogo = hLogo
-        ? `<img src="${escapeAttr(hLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
-        : "";
-      const awayLogo = aLogo
-        ? `<img src="${escapeAttr(aLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
-        : "";
+    const homeLogo = hLogo
+      ? `<img src="${escapeAttr(hLogo)}" style="width:16px;height:16px;border-radius:4px;opacity:0.95;">`
+      : "";
+    const awayLogo = aLogo
+      ? `<img src="${escapeAttr(aLogo)}" style="width:16px;height:16px;border-radius:4px;opacity:0.95;">`
+      : "";
 
+    const leagueLine =
+      `${escapeHtml(f.league_name || "")}` +
+      `${f.league_country ? ` · ${escapeHtml(f.league_country)}` : ""}` +
+      `${f.league_round ? ` · ${escapeHtml(f.league_round)}` : ""}` +
+      `${Number.isFinite(Number(f.league_id)) ? ` · L:${escapeHtml(f.league_id)}` : ""}`;
 
+    div.innerHTML = `
+      <div style="min-width:0;">
+        <div class="small muted mono">${escapeHtml(when)}</div>
 
-      div.innerHTML = `
-        <div style="min-width:0;">
-          <div class="small muted mono">${when}</div>
+        <div class="k fxTeams">
+          <span class="fxTeam">
+            ${homeLogo}
+            <span class="fxTeamName">${escapeHtml(f.home?.name || "HOME")}</span>
+          </span>
 
-          <div class="k" style="display:flex; gap:8px; align-items:center; min-width:0;">
-            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
-              ${homeLogo}
-              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.home?.name || "HOME")}</span>
-            </span>
+          <span class="muted">vs</span>
 
-            <span class="muted" style="flex:0 0 auto;">vs</span>
-
-            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
-              ${awayLogo}
-              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.away?.name || "AWAY")}</span>
-            </span>
-          </div>
-
-          <div class="small muted" style="margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-            ${escapeHtml(f.league_name || "")}${f.league_country ? ` · ${escapeHtml(f.league_country)}` : ""}${f.league_round ? ` · ${escapeHtml(f.league_round)}` : ""}
-            ${Number.isFinite(Number(f.league_id)) ? ` · L:${escapeHtml(f.league_id)}` : ""}
-          </div>
+          <span class="fxTeam">
+            ${awayLogo}
+            <span class="fxTeamName">${escapeHtml(f.away?.name || "AWAY")}</span>
+          </span>
         </div>
 
-        <div class="right" style="flex:0 0 auto; min-width:140px;">
-          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges}</div>
-          <div class="mono" style="margin-top:6px; font-size:14px; font-weight:700;">${score}</div>
-          <div class="small muted mono">HT ${ht}</div>
+        <div class="small muted fxLeagueLine" style="margin-top:2px;">
+          ${leagueLine}
         </div>
-      `;
+      </div>
 
-      list.appendChild(div);
-    }
+      <div class="fxRight">
+        <div class="fxBadges">${badges}</div>
+        <div class="mono fxScore">${escapeHtml(score)}</div>
+        <div class="small muted mono">HT ${escapeHtml(ht)}</div>
+      </div>
+    `;
 
-    const total = currentFixtures.length;
-    const shown = filtered.length;
+    list.appendChild(div);
+  }
 
-    const normLeague = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
-    const leagueHint = normLeague ? ` · league_ids=${normLeague}` : "";
+  const total = (currentFixtures || []).length;
+  const shown = filtered.length;
 
-    document.getElementById("fxHint").textContent =
+  const normLeague = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds")?.value || "");
+  const leagueHint = normLeague ? ` · league_ids=${normLeague}` : "";
+
+  const fxHint = document.getElementById("fxHint");
+  if (fxHint) {
+    fxHint.textContent =
       `rows: ${shown} / ${total}${leagueHint} · 검색은 즉시 반영됩니다 · 클릭하면 원본/현재/차이까지 비교됩니다`;
   }
+}
+
 
 
   function fillQuickEditFromFixture(f) {
