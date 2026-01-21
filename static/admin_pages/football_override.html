@@ -3188,6 +3188,28 @@ if (awayLogo) {
   if (fxDateTo) fxDateTo.value = document.getElementById("fxDate").value;
   document.getElementById("fxTz").value = "Asia/Seoul";
 
+    // ✅ NEW: From 날짜가 To보다 이후로 바뀌면, To를 From과 동일하게 자동 보정
+  (function attachFxDateClamp(){
+    const fxFrom = document.getElementById("fxDate");
+    const fxTo   = document.getElementById("fxDateTo");
+    if (!fxFrom || !fxTo) return;
+
+    const clamp = () => {
+      const a = String(fxFrom.value || "").trim();
+      const b = String(fxTo.value || "").trim();
+      if (!a || !b) return;
+
+      // YYYY-MM-DD 문자열 비교로 OK
+      if (a > b) {
+        fxTo.value = a;
+      }
+    };
+
+    fxFrom.addEventListener("change", clamp);
+    fxFrom.addEventListener("input", clamp); // 일부 브라우저/UX에서 즉시 반영
+  })();
+
+
 
   // ✅ 필터/검색 즉시 반영 (서버 재호출 없이 UI 리스트만 갱신)
   (function attachFxLiveFilters(){
