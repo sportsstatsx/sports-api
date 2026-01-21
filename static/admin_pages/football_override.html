@@ -383,6 +383,12 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   grid-column: 1 / -1;
 }
 
+/* ✅ Actions도 “전체 폭”으로 내려서 줄 겹침/클리핑 방지 */
+.fxActionsBlock{
+  grid-column: 1 / -1;
+}
+
+
 
 /* 각 칸: label + control 을 안정적으로 스택 */
 .fxFilters > div{
@@ -693,14 +699,14 @@ textarea{
           <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
         </div>
 
-        <div>
+        <div class="fxActionsBlock">
           <label class="muted" data-help="fxActions">Actions</label>
           <div class="fxBtnRow">
             <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
             <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
           </div>
-
         </div>
+
       </div>
 
 
