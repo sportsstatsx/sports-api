@@ -688,7 +688,87 @@ textarea{
 /* row 안쪽 아이템이 폭 부족으로 튀는 케이스 방지 */
 .row > div{ min-width: 0; }
 
+/* ─────────────────────────────────────
+   Override Editor compact layout
+   ───────────────────────────────────── */
 
+.ovTop{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:10px 12px;
+  align-items:start;
+}
+
+.ovBox{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+
+/* Quick actions: 2x2 고정, 버튼/입력 높이 통일 */
+.ovActions .btnGrid{
+  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  gap:8px;
+}
+.ovActions .btnGrid button{
+  min-height:32px;
+  padding:7px 10px !important;
+  font-size:12px !important;
+  border-radius:10px !important;
+}
+
+/* Quick Edit 필드: 2열 그리드로 촘촘하게 */
+.ovFields{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:10px 12px;
+  align-items:start;
+}
+.ovField{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+
+/* Status preset row: select + input 한 줄 정렬 */
+.ovPresetRow{
+  display:grid;
+  grid-template-columns: 170px 1fr;
+  gap:8px;
+  align-items:stretch;
+}
+.ovPresetRow > *{ min-width:0; }
+
+/* 하단 액션(Apply/Upsert)도 버튼 크기 통일 */
+.ovBottomBtns{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:8px;
+}
+.ovBottomBtns button{
+  width:100%;
+  min-height:34px;
+  padding:8px 10px !important;
+  font-size:12px !important;
+}
+
+/* 입력 높이 살짝 컴팩트(Override 영역만) */
+.ovEditor input,
+.ovEditor select{
+  min-height:32px;
+  padding:7px 10px !important;
+}
+
+/* 반응형: 좁아지면 1열 스택 */
+@media (max-width: 980px){
+  .ovTop{ grid-template-columns: 1fr; }
+  .ovFields{ grid-template-columns: 1fr; }
+  .ovPresetRow{ grid-template-columns: 150px 1fr; }
+}
+
+    
   </style>
 </head>
 <body>
@@ -852,136 +932,126 @@ textarea{
         </div>
 
 
-        <div class="row">
-          <div style="flex: 1 1 220px;">
-            <label class="muted" data-help="fixtureId">Fixture ID</label>
-            <input id="fixtureId" placeholder="예: 123456"/>
-          </div>
-          <div style="flex: 1 1 220px;">
-            <label class="muted" data-help="quickActions">Quick actions</label>
+        <!-- ✅ Override Editor: compact wrapper -->
+        <div class="ovEditor">
 
-            <div class="btnGrid">
-              <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
-              <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
-              <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
-              <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
+          <div class="ovTop">
+            <div class="ovBox">
+              <label class="muted" data-help="fixtureId">Fixture ID</label>
+              <input id="fixtureId" placeholder="예: 123456"/>
+            </div>
+
+            <div class="ovBox ovActions">
+              <label class="muted" data-help="quickActions">Quick actions</label>
+              <div class="btnGrid">
+                <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
+                <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
+                <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
+                <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
+              </div>
             </div>
           </div>
 
+          <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
+
+          <div class="ovFields">
+            <div class="ovField">
+              <label class="muted" data-help="qeVenue">Venue</label>
+              <input id="qeVenue" placeholder="venue_name"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeRound">League Round</label>
+              <input id="qeRound" placeholder="league_round"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusLong">Status Long</label>
+              <input id="qeStatusLong" placeholder="status_long"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeElapsed">Elapsed</label>
+              <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusGroup">Status Group</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusGroupPreset">
+                  <option value="">(preset)</option>
+                  <option value="UPCOMING">UPCOMING</option>
+                  <option value="INPLAY">INPLAY</option>
+                  <option value="FINISHED">FINISHED</option>
+                  <option value="PST">PST</option>
+                  <option value="SUSP">SUSP</option>
+                  <option value="CANC">CANC</option>
+                  <option value="TBD">TBD</option>
+                </select>
+                <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatus">Status</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusPreset">
+                  <option value="">(preset)</option>
+                  <option value="NS">NS</option>
+                  <option value="1H">1H</option>
+                  <option value="HT">HT</option>
+                  <option value="2H">2H</option>
+                  <option value="ET">ET</option>
+                  <option value="BT">BT</option>
+                  <option value="P">P</option>
+                  <option value="FT">FT</option>
+                  <option value="AET">AET</option>
+                  <option value="PEN">PEN</option>
+                  <option value="SUSP">SUSP</option>
+                  <option value="INT">INT</option>
+                  <option value="PST">PST</option>
+                  <option value="CANC">CANC</option>
+                  <option value="ABD">ABD</option>
+                  <option value="AWD">AWD</option>
+                  <option value="WO">WO</option>
+                  <option value="LIVE">LIVE</option>
+                </select>
+                <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeFt">Home FT</label>
+              <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayFt">Away FT</label>
+              <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeHt">Home HT</label>
+              <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayHt">Away HT</label>
+              <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+            </div>
+          </div>
+
+          <div style="margin-top:10px;" class="ovBottomBtns">
+            <button class="primary" onclick="applyQuickEditToPatch()" data-help="btnApplyQuickEdit">
+              Quick Edit → Patch JSON 반영
+            </button>
+            <button onclick="upsertOverride()" data-help="btnUpsertOverride">
+              저장(Upsert)
+            </button>
+          </div>
+
         </div>
 
-        <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeVenue">Venue</label>
-            <input id="qeVenue" placeholder="venue_name"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeRound">League Round</label>
-            <input id="qeRound" placeholder="league_round"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeStatusLong">Status Long</label>
-            <input id="qeStatusLong" placeholder="status_long"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeElapsed">Elapsed</label>
-            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
-          </div>
-        </div>
-
-                <div class="row">
-  <div style="flex:1 1 220px;">
-    <label class="muted" data-help="qeStatusGroup">Status Group</label>
-
-    <!-- ✅ 프리셋 드롭다운(클릭하면 항상 선택지 표시) + 직접 입력(input)은 기존 id 유지 -->
-    <div class="row" style="gap:8px;">
-      <div style="flex:0 0 170px;">
-        <select id="qeStatusGroupPreset">
-          <option value="">(preset)</option>
-          <option value="UPCOMING">UPCOMING</option>
-          <option value="INPLAY">INPLAY</option>
-          <option value="FINISHED">FINISHED</option>
-          <option value="PST">PST</option>
-          <option value="SUSP">SUSP</option>
-          <option value="CANC">CANC</option>
-          <option value="TBD">TBD</option>
-        </select>
-      </div>
-      <div style="flex:1 1 auto;">
-        <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
-      </div>
-    </div>
-  </div>
-
-  <div style="flex:1 1 220px;">
-    <label class="muted" data-help="qeStatus">Status</label>
-
-    <!-- ✅ 프리셋 드롭다운 + 직접 입력(input)은 기존 id 유지 -->
-    <div class="row" style="gap:8px;">
-      <div style="flex:0 0 170px;">
-        <select id="qeStatusPreset">
-          <option value="">(preset)</option>
-          <option value="NS">NS</option>
-          <option value="1H">1H</option>
-          <option value="HT">HT</option>
-          <option value="2H">2H</option>
-          <option value="ET">ET</option>
-          <option value="BT">BT</option>
-          <option value="P">P</option>
-          <option value="FT">FT</option>
-          <option value="AET">AET</option>
-          <option value="PEN">PEN</option>
-          <option value="SUSP">SUSP</option>
-          <option value="INT">INT</option>
-          <option value="PST">PST</option>
-          <option value="CANC">CANC</option>
-          <option value="ABD">ABD</option>
-          <option value="AWD">AWD</option>
-          <option value="WO">WO</option>
-          <option value="LIVE">LIVE</option>
-        </select>
-      </div>
-      <div style="flex:1 1 auto;">
-        <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
-      </div>
-    </div>
-  </div>
-</div>
-
-
-
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeHomeFt">Home FT</label>
-            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
-          </div>
-          
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeAwayFt">Away FT</label>
-            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeHomeHt">Home HT</label>
-            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted" data-help="qeAwayHt">Away HT</label>
-            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
-          </div>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <button class="primary" onclick="applyQuickEditToPatch()" data-help="btnApplyQuickEdit">Quick Edit → Patch JSON 반영</button>
-          <button onclick="upsertOverride()" data-help="btnUpsertOverride">저장(Upsert)</button>
-        </div>
 
 
         <!-- Event Editor -->
