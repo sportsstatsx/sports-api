@@ -319,36 +319,35 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   background:var(--panel2);
 }
 
-/* ✅ HelpIcon alignment: title/label 오른쪽 끝에 고정 */
+/* ✅ HelpIcon: 타이틀/라벨 "텍스트 끝"에 바로 붙이기 */
 h2[data-help],
 label[data-help]{
-  position:relative;
-  padding-right:24px; /* ! 자리 확보 */
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  white-space:nowrap;
 }
 
-/* h2/label 내부의 ! 아이콘을 우측 고정(줄바꿈/밀림 방지) */
+/* ✅ h2/label 안의 ! 는 절대 positioning 금지(오른쪽 끝으로 튀는 문제 해결) */
 h2[data-help] .helpIcon,
 label[data-help] .helpIcon{
-  position:absolute;
-  right:0;
-  top:50%;
-  transform:translateY(-50%);
-  margin-left:0 !important; /* 기존 margin-left 무력화 */
+  position:static !important;
+  transform:none !important;
+  margin-left:6px !important;
 }
 
-/* ✅ 버튼도 아이콘을 "버튼 안"에 넣을 거라, 버튼 내부 정렬 안정화 */
+/* ✅ 버튼 내부 정렬은 유지 */
 button[data-help]{
   display:inline-flex;
   align-items:center;
   gap:6px;
 }
-
-/* 버튼 안 ! 는 텍스트 옆에 자연스럽게 */
 button[data-help] .helpIcon{
   margin-left:6px !important;
-  position:static;
-  transform:none;
+  position:static !important;
+  transform:none !important;
 }
+
 
 
 .helpPop{
@@ -407,7 +406,6 @@ button[data-help] .helpIcon{
 .fxFilters{
   display:grid;
 
-  /* ✅ Actions 폭 고정(버튼 가로로 커지는 문제 해결) + Search를 1행으로 */
   grid-template-columns: 160px 160px 220px minmax(240px, 1fr) 170px;
 
   grid-template-areas:
@@ -415,8 +413,11 @@ button[data-help] .helpIcon{
     "league league league league actions";
 
   gap:8px 10px;
-  align-items:end;
+
+  /* ✅ 행 기준을 위쪽으로 고정 → Actions가 아래로 밀려 보이는 현상 감소 */
+  align-items:start;
 }
+
 
 
 .fxFromBlock{ grid-area: from; }
@@ -437,18 +438,18 @@ button[data-help] .helpIcon{
 .fxFilters label{
   margin:0;
   line-height:1.1;
-  display:block;            /* ✅ flex 제거: 흔들림/줄밀림 감소 */
+  display:flex;             /* ✅ 텍스트 바로 옆에 ! 붙게 */
+  align-items:center;
+  gap:6px;
   white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
 }
 
-
-/* helpIcon은 위아래로 튀지 않게 */
+/* label 안 ! 는 타이틀 끝에 딱 붙이기 */
 .fxFilters label .helpIcon{
-  margin-left:0;
+  margin-left:0;            /* gap이 먹으니 0 */
   flex:0 0 auto;
 }
+
 
 /* 컨트롤: 높이/패딩 축소 */
 .fxFilters input,
@@ -468,11 +469,12 @@ button[data-help] .helpIcon{
 
 /* ✅ 버튼을 “작은 컨트롤” 느낌으로 */
 .fxBtnCol button{
-  min-height:28px;
-  padding:6px 8px !important;
+  min-height:32px;          /* ✅ input/select과 동일 높이 */
+  padding:7px 10px !important;
   font-size:12px !important;
   border-radius:10px !important;
 }
+
 
 
 
