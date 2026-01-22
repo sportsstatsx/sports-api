@@ -72,6 +72,8 @@ def hockey_list_fixtures():
     ) or []
 
     # ── overrides 로드
+    # DB: hockey_match_overrides(fixture_id PK) 이므로 fixture_id로 조회
+    # 현재 하키 game_id를 fixture_id로 동일 매핑해서 사용한다.
     override_map: dict[int, dict] = {}
     try:
         from hockey.hockey_db import hockey_fetch_all
@@ -80,14 +82,14 @@ def hockey_list_fixtures():
         if ids:
             placeholders = ",".join(["%s"] * len(ids))
             rows = hockey_fetch_all(
-                f"SELECT game_id, patch FROM hockey_match_overrides WHERE game_id IN ({placeholders})",
+                f"SELECT fixture_id, patch FROM hockey_match_overrides WHERE fixture_id IN ({placeholders})",
                 tuple(ids),
             ) or []
             for r in rows:
-                gid = r.get("game_id")
+                fid = r.get("fixture_id")
                 p = r.get("patch")
-                if isinstance(gid, int) and isinstance(p, dict):
-                    override_map[gid] = p
+                if isinstance(fid, int) and isinstance(p, dict):
+                    override_map[fid] = p
     except Exception:
         override_map = {}
 
@@ -109,7 +111,7 @@ def hockey_list_fixtures():
         hidden = False
 
         if isinstance(p, dict):
-            # header 기반이면 header만 병합(하키 fixtures 객체는 home/away/league가 루트에 있으니 그냥 병합해도 OK)
+            # header 기반이면 header만 병합
             if isinstance(p.get("header"), dict):
                 g2 = _deep_merge_local(g, p["header"])
                 hidden = bool(p.get("hidden", False))
@@ -124,7 +126,6 @@ def hockey_list_fixtures():
         if hidden and not include_hidden:
             continue
 
-        # hidden 값을 내려주면 앱에서도 디버그 가능
         if hidden:
             try:
                 g2["hidden"] = True
@@ -134,4 +135,5 @@ def hockey_list_fixtures():
         out_games.append(g2)
 
     return jsonify({"ok": True, "games": out_games})
+
 
