@@ -937,9 +937,10 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
               g.game_date >= %s
               AND g.game_date <= %s
               AND COALESCE(g.status, '') NOT IN (
-                'FT','AET','PEN','FIN','ENDED','END',
+                'FT','AET','AOT','PEN','FIN','ENDED','END',
                 'ABD','AW','CANC','POST','WO'
               )
+
               AND (
                 -- ✅ 보통 진행중 상태 (NS/TBD 제외)
                 COALESCE(g.status, '') NOT IN ('NS','TBD')
@@ -986,10 +987,12 @@ def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
 
     # 1) 명시적 종료/확정 상태
     if x in {
-        "FT", "AET", "PEN", "FIN", "END", "ENDED",
+        "FT", "AET", "AOT", "PEN",  # ✅ AOT 추가
+        "FIN", "END", "ENDED",
         "ABD", "AW", "CANC", "POST", "WO",
     }:
         return True
+
 
     # 2) 시간 기반 종료: 과거 경기인데 미시작/중단류 상태로 남아있는 경우
     #    (여기서 6시간은 너가 쿼리에서 쓰던 기준과 동일하게 맞춤)
