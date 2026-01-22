@@ -878,50 +878,51 @@ def admin_delete_override(fixture_id: int):
 # - key column: game_id (기본 가정)
 # ─────────────────────────────────────────
 
-from typing import Set
-
 def _hockey_load_overrides(game_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     """
     hockey_match_overrides에서 patch 로드
-    - 기본: (game_id, patch)
+    - DB key column: fixture_id (PK)
+    - UI/서비스 레이어에서는 game_id를 쓰지만, 현재 구조는
+      fixture_id == game_id 로 매핑해서 사용한다.
     """
     if not game_ids:
         return {}
 
     try:
-        # hockey_games_router가 쓰는 동일 헬퍼 사용
         from hockey.hockey_db import hockey_fetch_all
     except Exception:
         return {}
 
-    # IN (%s,%s,...) 형태로 안전하게 구성
     ids = list(dict.fromkeys([int(x) for x in game_ids if x is not None]))
     if not ids:
         return {}
 
     placeholders = ",".join(["%s"] * len(ids))
-    sql = f"SELECT game_id, patch FROM hockey_match_overrides WHERE game_id IN ({placeholders})"
+    sql = f"SELECT fixture_id, patch FROM hockey_match_overrides WHERE fixture_id IN ({placeholders})"
     rows = hockey_fetch_all(sql, tuple(ids)) or []
 
     out: Dict[int, Dict[str, Any]] = {}
     for r in rows:
         try:
-            gid = int(r.get("game_id"))
+            fid = int(r.get("fixture_id"))
         except Exception:
             continue
+
         p = r.get("patch")
         if isinstance(p, dict):
-            out[gid] = p
+            out[fid] = p
         else:
             # patch가 json string으로 들어오는 케이스도 방어
             try:
                 import json as _json
                 pp = _json.loads(p) if isinstance(p, str) else None
                 if isinstance(pp, dict):
-                    out[gid] = pp
+                    out[fid] = pp
             except Exception:
                 pass
+
     return out
+
 
 
 def _hockey_game_to_fixture_row(g: Dict[str, Any]) -> Dict[str, Any]:
@@ -1142,7 +1143,7 @@ def admin_hockey_get_override(game_id: int):
     try:
         from hockey.hockey_db import hockey_fetch_one
         row = hockey_fetch_one(
-            "SELECT patch, updated_at FROM hockey_match_overrides WHERE game_id = %s",
+            "SELECT patch, updated_at FROM hockey_match_overrides WHERE fixture_id = %s",
             (game_id,),
         )
     except Exception:
@@ -1151,7 +1152,15 @@ def admin_hockey_get_override(game_id: int):
     if not row:
         return jsonify({"ok": True, "game_id": game_id, "patch": None})
 
-    return jsonify({"ok": True, "game_id": game_id, "patch": row.get("patch"), "updated_at": row.get("updated_at")})
+    return jsonify(
+        {
+            "ok": True,
+            "game_id": game_id,
+            "patch": row.get("patch"),
+            "updated_at": row.get("updated_at"),
+        }
+    )
+
 
 
 @app.route(f"/{ADMIN_PATH}/api/hockey/overrides/<int:game_id>", methods=["PUT"])
@@ -1173,15 +1182,14 @@ def admin_hockey_upsert_override(game_id: int):
         hockey_execute = None
 
     if not hockey_execute:
-        # fallback: hockey_fetch_all만 있는 환경이면 최소 동작
         from hockey.hockey_db import hockey_fetch_all  # noqa
         return jsonify({"ok": False, "error": "hockey_execute not available"}), 500
 
     hockey_execute(
         """
-        INSERT INTO hockey_match_overrides (game_id, patch, updated_at)
+        INSERT INTO hockey_match_overrides (fixture_id, patch, updated_at)
         VALUES (%s, %s::jsonb, now())
-        ON CONFLICT (game_id)
+        ON CONFLICT (fixture_id)
         DO UPDATE SET patch = EXCLUDED.patch, updated_at = now()
         """,
         (game_id, json.dumps(patch, ensure_ascii=False)),
@@ -1189,16 +1197,18 @@ def admin_hockey_upsert_override(game_id: int):
     return jsonify({"ok": True, "game_id": game_id})
 
 
+
 @app.route(f"/{ADMIN_PATH}/api/hockey/overrides/<int:game_id>", methods=["DELETE"])
 @require_admin
 def admin_hockey_delete_override(game_id: int):
     try:
         from hockey.hockey_db import hockey_execute
-        hockey_execute("DELETE FROM hockey_match_overrides WHERE game_id = %s", (game_id,))
+        hockey_execute("DELETE FROM hockey_match_overrides WHERE fixture_id = %s", (game_id,))
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
     return jsonify({"ok": True, "game_id": game_id})
+
 
 
 @app.route(f"/{ADMIN_PATH}/api/hockey/game_detail_bundle", methods=["GET"])
@@ -2763,6 +2773,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
