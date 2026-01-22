@@ -937,9 +937,11 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
               g.game_date >= %s
               AND g.game_date <= %s
               AND COALESCE(g.status, '') NOT IN (
-                'FT','AET','AOT','PEN','FIN','ENDED','END',
+                'FT','AET','PEN','FIN','ENDED','END',
+                'AP','AOT',
                 'ABD','AW','CANC','POST','WO'
               )
+
 
               AND (
                 -- ✅ 보통 진행중 상태 (NS/TBD 제외)
