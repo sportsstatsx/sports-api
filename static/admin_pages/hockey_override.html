@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Hockey Override Editor</title>
+  <title>SportsStatsX Admin</title>
   <style>
     body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
     .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
@@ -403,7 +403,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   <div class="grid" style="margin-top:14px;">
     <!-- LEFT: Fixtures browser -->
     <div class="card">
-      <h2>Games Browser</h2>
+      <h2>Hockey Fixtures Browser</h2>
 
       <div class="fxFilters">
         <div>
@@ -522,7 +522,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       <div class="card" style="flex: 1 1 520px;">
         <h2>Hockey Override Editor</h2>
 
-        <!-- ✅ 선택 경기(하키) 요약(앱처럼 한눈에) -->
+        <!-- ✅ 선택 경기 요약(앱처럼 한눈에) -->
         <div id="selSummary" class="subcard" style="margin:8px 0 10px 0; display:none;">
           <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
             <div style="min-width:0;">
@@ -549,8 +549,8 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
         <div class="row">
           <div style="flex: 1 1 220px;">
-            <label class="muted">Fixture ID</label>
-            <input id="fixtureId" placeholder="예: 405228"/>
+            <label class="muted">Game ID</label>
+            <input id="fixtureId" placeholder="예: 123456"/>
           </div>
           <div style="flex: 1 1 220px;">
             <label class="muted">Quick actions</label>
@@ -566,12 +566,12 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
         <div class="row">
           <div style="flex:1 1 220px;">
-            <label class="muted">Venue</label>
-            <input id="qeVenue" placeholder="venue_name"/>
+            <label class="muted">Stage</label>
+            <input id="qeVenue" placeholder="stage (mapped to venue_name)"/>
           </div>
           <div style="flex:1 1 220px;">
-            <label class="muted">League Round</label>
-            <input id="qeRound" placeholder="league_round"/>
+            <label class="muted">Group</label>
+            <input id="qeRound" placeholder="group_name (mapped to league_round)"/>
           </div>
         </div>
 
@@ -581,8 +581,8 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
             <input id="qeStatusLong" placeholder="status_long"/>
           </div>
           <div style="flex:1 1 220px;">
-            <label class="muted">Elapsed</label>
-            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
+            <label class="muted">Live Timer</label>
+            <input id="qeElapsed" type="number" placeholder="live_timer (ex: 37)"/>
           </div>
         </div>
 
@@ -619,24 +619,17 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         <select id="qeStatusPreset">
           <option value="">(preset)</option>
           <option value="NS">NS</option>
-          <option value="1H">1H</option>
-          <option value="HT">HT</option>
-          <option value="2H">2H</option>
-          <option value="ET">ET</option>
-          <option value="BT">BT</option>
-          <option value="P">P</option>
+          <option value="1P">1P</option>
+          <option value="2P">2P</option>
+          <option value="3P">3P</option>
+          <option value="OT">OT</option>
+          <option value="SO">SO</option>
           <option value="FT">FT</option>
-          <option value="AET">AET</option>
-          <option value="PEN">PEN</option>
-          <option value="SUSP">SUSP</option>
-          <option value="INT">INT</option>
-          <option value="PST">PST</option>
-          <option value="CANC">CANC</option>
-          <option value="ABD">ABD</option>
-          <option value="AWD">AWD</option>
-          <option value="WO">WO</option>
           <option value="LIVE">LIVE</option>
-        </select>
+          <option value="PST">PST</option>
+          <option value="SUSP">SUSP</option>
+          <option value="CANC">CANC</option>
+</select>
       </div>
       <div style="flex:1 1 auto;">
         <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
@@ -650,24 +643,24 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
         <div class="row">
           <div style="flex:1 1 220px;">
-            <label class="muted">Home FT</label>
-            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+            <label class="muted">Home Score</label>
+            <input id="qeHomeFt" type="number" placeholder="home_score (mapped to home.ft)"/>
           </div>
           
           <div style="flex:1 1 220px;">
-            <label class="muted">Away FT</label>
-            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+            <label class="muted">Away Score</label>
+            <input id="qeAwayFt" type="number" placeholder="away_score (mapped to away.ft)"/>
           </div>
         </div>
 
         <div class="row">
           <div style="flex:1 1 220px;">
-            <label class="muted">Home HT</label>
-            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+            <label class="muted">Home P1 (optional)</label>
+            <input id="qeHomeHt" type="number" placeholder="home_p1 (optional → home.ht)"/>
           </div>
           <div style="flex:1 1 220px;">
-            <label class="muted">Away HT</label>
-            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+            <label class="muted">Away P1 (optional)</label>
+            <input id="qeAwayHt" type="number" placeholder="away_p1 (optional → away.ht)"/>
           </div>
         </div>
 
@@ -1590,8 +1583,8 @@ if (awayLogo) {
     qsMerged.set("apply_override", "1");
 
     // ✅ match_detail_bundle는 public endpoint이므로 publicApi 사용
-    const r1 = await publicApi(adminUrl("/api/hockey/match_detail_bundle?" + qsRaw.toString()));
-    const r2 = await publicApi(adminUrl("/api/hockey/match_detail_bundle?" + qsMerged.toString()));
+    const r1 = await publicApi(adminUrl("/api/hockey/game_detail_bundle?" + qsRaw.toString()));
+    const r2 = await publicApi(adminUrl("/api/hockey/game_detail_bundle?" + qsMerged.toString()));
 
 
     bundleRaw = (r1.status < 400 && r1.data && r1.data.ok) ? (r1.data.data || null) : null;
@@ -1996,9 +1989,9 @@ if (awayLogo) {
     let homePatch = null;
     let awayPatch = null;
 
-    if (!sameNum(hft, homeCur.ft)) { homePatch = homePatch || {}; homePatch["ft"] = hft; }
+    if (!sameNum(hft, homeCur.ft)) { homePatch = homePatch || {}; homePatch["ft"] = hft; homePatch["score"] = hft; }
     if (!sameNum(hht, homeCur.ht)) { homePatch = homePatch || {}; homePatch["ht"] = hht; }
-    if (!sameNum(aft, awayCur.ft)) { awayPatch = awayPatch || {}; awayPatch["ft"] = aft; }
+    if (!sameNum(aft, awayCur.ft)) { awayPatch = awayPatch || {}; awayPatch["ft"] = aft; awayPatch["score"] = aft; }
     if (!sameNum(aht, awayCur.ht)) { awayPatch = awayPatch || {}; awayPatch["ht"] = aht; }
 
     if (homePatch) p["home"] = deepMerge(p["home"] || {}, homePatch);
@@ -2012,7 +2005,8 @@ if (awayLogo) {
       return false;
     }
 
-    const merged = deepMerge(basePatch, p);
+    const _curHeader = (basePatch.header && typeof basePatch.header === "object") ? basePatch.header : {};
+    const merged = { ...basePatch, header: deepMerge(_curHeader, p) };
     document.getElementById("patch").value = JSON.stringify(merged, null, 2);
 
     if (!silent) setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
