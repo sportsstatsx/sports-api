@@ -357,12 +357,15 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
 def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
     x = (s or "").upper().strip()
 
+    # ✅ 하키 종료/확정 상태 (AOT 추가)
     if x in {
-        "FT", "AET", "PEN", "FIN", "END", "ENDED",
+        "FT", "AET", "AOT", "PEN",  # ✅ AOT 중요
+        "FIN", "END", "ENDED",
         "ABD", "AW", "CANC", "POST", "WO",
     }:
         return True
 
+    # 시간 기반 종료(보험)
     if isinstance(game_date, dt.datetime):
         try:
             age = _utc_now() - game_date
@@ -373,6 +376,7 @@ def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
             pass
 
     return False
+
 
 
 # ─────────────────────────────────────────
