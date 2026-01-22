@@ -3,11 +3,170 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Hockey Override</title>
+  <title>SportsStatsX Admin</title>
   <style>
     body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
     .muted { color:#666; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
     .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
+    .card h2 { margin:0 0 10px 0; font-size: 16px; }
+    input, textarea, button, select { font-size: 14px; }
+    input, textarea, select {
+      width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc;
+      background:#fff;
+    }
+    textarea { min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    button.primary { border-color:#000; }
+    button.danger { border-color:#d33; color:#d33; }
+    button.soft { opacity:0.9; }
+    .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:12px; align-items:start; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+
+    .listWrap{
+  max-height:560px;
+  overflow:auto;
+  border:1px solid var(--border2);
+  border-radius:10px;
+  background: var(--panel);
+}
+
+.item{
+  padding:10px 12px;
+  border-bottom:1px solid var(--border2);
+  cursor:pointer;
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+  background: transparent;
+}
+
+.item:hover{
+  background: var(--panel2);
+}
+
+.item.sel{
+  background: var(--sel);
+}
+
+.badge{
+  display:inline-block;
+  padding:2px 8px;
+  border:1px solid var(--border2);
+  border-radius:999px;
+  font-size:12px;
+  color: var(--text);
+  background: transparent;
+}
+
+.item.hidden{ opacity:0.55; }
+
+.badge.ovr{ border-color: var(--text); }
+.badge.hid{ border-color: var(--danger); color: var(--danger); }
+
+.right{ margin-left:auto; text-align:right; }
+.small{ font-size:12px; }
+.k{ font-weight:600; }
+.ok{ color: var(--ok); }
+.bad{ color: var(--danger); }
+
+.tabs{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:10px;
+}
+
+.tabbtn{
+  padding:8px 10px;
+  border-radius:999px;
+  border:1px solid var(--border2);
+  background: var(--panel);
+  color: var(--text);
+  cursor:pointer;
+  font-size:12px;
+}
+
+.tabbtn.active{
+  border-color: var(--text);
+}
+
+.tabpane{ display:none; margin-top:10px; }
+.tabpane.active{ display:block; }
+
+table{ width:100%; border-collapse:collapse; }
+
+th, td{
+  border-bottom:1px solid var(--border2);
+  padding:8px;
+  text-align:left;
+  vertical-align:top;
+}
+
+        /* ---- Event Editor ---- */
+    .subcard{
+      border:1px solid var(--border);
+      border-radius:12px;
+      padding:12px;
+      background:var(--panel);
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .subcard:hover{
+      /* 다크에서 hover 시 “하얗게” 튀는 케이스 방지: 배경은 유지하고 테두리만 강조 */
+      border-color:var(--border2);
+      background:var(--panel);
+    }
+
+
+
+    .subcard h3 { margin:0 0 10px 0; font-size:14px; }
+    .mini { font-size:12px; color:var(--muted); }
+
+    .btnsm{
+      padding:6px 10px;
+      border-radius:8px;
+      border:1px solid var(--border);
+      background:var(--panel);
+      color:var(--text);
+      cursor:pointer;
+      font-size:12px;
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .btnsm:hover{
+      background:var(--panel2);
+      border-color:var(--border2);
+    }
+    .btnsm.primary { border-color: var(--accent); }
+    .btnsm.danger  { border-color: var(--danger); color: var(--danger); }
+
+    .pill{
+      display:inline-block;
+      padding:2px 8px;
+      border:1px solid var(--border2);
+      border-radius:999px;
+      font-size:12px;
+      color:var(--muted);
+      background:transparent;
+    }
+
+    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    @media (max-width: 1100px) { .grid2 { grid-template-columns: 1fr; } }
+
+    .evtTable input, .evtTable select{
+      padding:8px;
+      font-size:12px;
+      background:var(--panel);
+      color:var(--text);
+      border:1px solid var(--border);
+    }
+    .evtTable th, .evtTable td{
+      border-bottom:1px solid var(--border);
+    }
+    .evtTable td { padding:6px; }
+
+
     /* ─────────────────────────────────────
    Theme (shared)
    ───────────────────────────────────── */
@@ -21,6 +180,10 @@
   --border2:#eee;
   --danger:#d33;
   --ok:#0a7;
+
+  /* ✅ 추가: UI 공통 */
+  --accent: var(--text);
+  --sel:#f3f6ff;     /* 선택 item 배경(라이트) */
 }
 html[data-theme="dark"]{
   --bg:#0b0c0f;
@@ -32,7 +195,12 @@ html[data-theme="dark"]{
   --border2:rgba(241,243,245,0.10);
   --danger:#ff6b6b;
   --ok:#53e0b2;
+
+  /* ✅ 추가: UI 공통 */
+  --accent: var(--text);
+  --sel: rgba(241,243,245,0.06); /* 선택 item 배경(다크) */
 }
+
 
 body{ background:var(--bg) !important; color:var(--text) !important; }
 .muted{ color:var(--muted) !important; }
@@ -59,14 +227,2438 @@ pre{
 .ok{ color:var(--ok) !important; }
 .bad{ color:var(--danger) !important; }
 
+/* ─────────────────────────────────────
+   Compact + App-like tweaks
+   ───────────────────────────────────── */
+
+body{
+  margin: 12px !important;
+  font-size: 13px;
+}
+
+h1{ font-size: 22px; }
+.card{ padding: 12px !important; border-radius: 14px !important; }
+.card h2{ font-size: 14px !important; margin: 0 0 8px 0 !important; }
+
+.row{ gap:10px !important; }
+.tabs{ gap:6px !important; margin-top:8px !important; }
+
+input, textarea, button, select{ font-size: 13px !important; }
+input, textarea, select{ padding: 8px !important; border-radius: 10px !important; }
+button{ padding: 8px 10px !important; border-radius: 10px !important; }
+
+.listWrap{
+  max-height: 520px !important; /* 살짝 줄여서 더 “앱”처럼 */
+}
+
+/* fixtures item 더 촘촘하게 */
+.item{ padding: 9px 10px !important; gap:10px !important; }
+.badge{ font-size: 11px !important; padding: 2px 7px !important; }
+
+/* Event table도 컴팩트 */
+.evtTable td{ padding: 5px !important; }
+.evtTable input, .evtTable select{
+  padding: 7px !important;
+  font-size: 12px !important;
+  border-radius: 10px !important;
+}
+
+/* ─────────────────────────────────────
+   Dark scrollbar fix (white scrollbar 제거)
+   ───────────────────────────────────── */
+
+/* Firefox */
+*{
+  scrollbar-width: thin;
+}
+html[data-theme="dark"] *{
+  scrollbar-color: rgba(241,243,245,0.25) rgba(241,243,245,0.06);
+}
+html:not([data-theme="dark"]) *{
+  scrollbar-color: rgba(0,0,0,0.25) rgba(0,0,0,0.06);
+}
+
+/* Chromium / WebKit */
+::-webkit-scrollbar{ width: 10px; height: 10px; }
+::-webkit-scrollbar-track{ background: rgba(0,0,0,0.06); }
+::-webkit-scrollbar-thumb{
+  background: rgba(0,0,0,0.22);
+  border-radius: 999px;
+  border: 2px solid rgba(0,0,0,0.06);
+}
+html[data-theme="dark"] ::-webkit-scrollbar-track{ background: rgba(241,243,245,0.06); }
+html[data-theme="dark"] ::-webkit-scrollbar-thumb{
+  background: rgba(241,243,245,0.20);
+  border: 2px solid rgba(241,243,245,0.06);
+}
+html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,243,245,0.28); }
+
+/* ─────────────────────────────────────
+   Fixtures filters compact layout (aligned)
+   ───────────────────────────────────── */
+
+.fxFilters{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap:10px;
+  align-items:start;            /* ✅ end(아래정렬) → start(위정렬) */
+}
+
+/* ✅ 각 칸을 세로 스택으로 고정해서 라벨/컨트롤 라인 맞춤 */
+.fxFilters > div{
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+}
+
+/* ✅ 라벨 높이 고정(줄바꿈 때문에 컨트롤 라인이 흔들리는 현상 방지) */
+.fxFilters label{
+  margin:0 0 6px 0;
+  line-height:1;
+  height:14px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+/* ✅ 컨트롤(입력/셀렉트/버튼) 높이 통일 */
+.fxFilters input,
+.fxFilters select{
+  min-height:36px;
+  box-sizing:border-box;
+}
+
+/* Actions 버튼 줄도 입력박스 높이와 맞추기 */
+.fxBtnRow{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:8px;
+  margin-top:auto;
+}
+.fxBtnRow button{
+  min-height:36px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+
+/* League: select + 버튼들을 한 줄로 “같은 높이” */
+.leagueBar{
+  display:grid;
+  grid-template-columns: 1fr auto;
+  gap:8px;
+  align-items:stretch;
+}
+
+.leagueBar select{
+  min-width:0;
+}
+
+.leagueBtns{
+  display:flex;
+  gap:6px;
+}
+.leagueBtns .btnsm{
+  min-height:36px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:0 10px;
+}
+
+/* pills가 없을 때도 높이 유지해서 아래 줄이 들쭉날쭉해 보이는 것 방지 */
+.leaguePills{
+  margin-top:6px;
+  min-height:18px;
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+}
+
+.leaguePills .pill{
+  font-size:11px;
+  padding:2px 8px;
+  border-radius:999px;
+  border:1px solid var(--border2);
+  color: var(--muted);
+  background: transparent;
+}
+
+
+
   </style>
 </head>
 <body>
-  <div class="card">
-    <h2 style="margin:0 0 8px 0;">hockey-override</h2>
-    <div class="muted">여기에 하키용 fixtures/override UI를 분리해서 붙이면 됨 (일단 placeholder)</div>
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">SportsStatsX Admin</h1>
+      <div class="muted">
+  경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+</div>
+
+    </div>
+    <div class="muted" id="statusLine"></div>
   </div>
+
+  <div class="grid" style="margin-top:14px;">
+    <!-- LEFT: Fixtures browser -->
+    <div class="card">
+      <h2>Games Browser</h2>
+
+      <div class="fxFilters">
+        <div>
+          <label class="muted">Date (From)</label>
+          <input id="fxDate" type="date"/>
+        </div>
+
+        <div>
+          <label class="muted">Date (To)</label>
+          <input id="fxDateTo" type="date"/>
+        </div>
+
+        <div>
+          <label class="muted">Timezone</label>
+          <select id="fxTz">
+            <option value="Asia/Seoul">Asia/Seoul</option>
+            <option value="UTC">UTC</option>
+            <option value="Europe/London">Europe/London</option>
+            <option value="America/New_York">America/New_York</option>
+            <option value="America/Los_Angeles">America/Los_Angeles</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="muted">League Filter (from loaded list)</label>
+
+          <div class="leagueBar">
+            <select id="fxLeaguePick">
+              <option value="">(전체 리그)</option>
+            </select>
+
+            <div class="leagueBtns">
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">+</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">−</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">ALL</button>
+            </div>
+          </div>
+
+          <div id="fxLeaguePills" class="leaguePills"></div>
+
+          <!-- ✅ 기능 유지용: 실제 필터 값은 이 hidden input에 유지 -->
+          <input id="fxLeagueIds" type="hidden" />
+        </div>
+
+        <div>
+          <label class="muted">Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
+        </div>
+
+        <div>
+          <label class="muted">Actions</label>
+          <div class="fxBtnRow">
+            <button class="primary" onclick="loadFixtures()">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()">OVR만 보기</button>
+          </div>
+        </div>
+      </div>
+
+
+      <div class="muted" style="margin-top:10px;" id="fxHint"></div>
+
+      <div class="listWrap" style="margin-top:10px;">
+        <div id="fxList"></div>
+      </div>
+
+      <div class="tabs">
+        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')">현재(노출)</button>
+        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
+        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
+        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
+        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')">bundle(raw)</button>
+        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')">bundle(merged)</button>
+        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')">bundle diff</button>
+      </div>
+
+      <div class="tabpane active" id="tab_now">
+        <div class="muted">선택된 경기(override 반영 결과)</div>
+        <pre class="mono" id="fxPreviewNow">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_raw">
+        <div class="muted">선택된 경기(override 미적용 원본)</div>
+        <pre class="mono" id="fxPreviewRaw">{}</pre>
+        <div class="muted" style="margin-top:8px;" id="rawHint"></div>
+      </div>
+
+      <div class="tabpane" id="tab_patch">
+        <div class="muted">현재 override patch</div>
+        <pre class="mono" id="fxPreviewPatch">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_diff">
+        <div class="muted">원본(raw) → 현재(노출) 변경 요약</div>
+        <pre class="mono" id="fxPreviewDiff">[]</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_raw">
+        <div class="muted">선택된 경기(bundle 원본: override 미적용)</div>
+        <pre class="mono" id="bundlePreviewRaw">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_merged">
+        <div class="muted">선택된 경기(bundle merged: override 적용)</div>
+        <pre class="mono" id="bundlePreviewMerged">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_diff">
+        <div class="muted">bundle(raw) → bundle(merged) 변경 요약</div>
+        <pre class="mono" id="bundlePreviewDiff">[]</pre>
+      </div>
+      
+    </div>
+
+    <!-- RIGHT: Editor + logs -->
+    <div class="row" style="align-items:stretch;">
+      <div class="card" style="flex: 1 1 520px;">
+        <h2>Hockey Override Editor</h2>
+
+        <!-- ✅ 선택 경기(하키) 요약(앱처럼 한눈에) -->
+        <div id="selSummary" class="subcard" style="margin:8px 0 10px 0; display:none;">
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
+            <div style="min-width:0;">
+              <div class="mini muted mono" id="selSummaryMeta"></div>
+              <div style="display:flex; gap:10px; align-items:center; margin-top:6px; flex-wrap:wrap;">
+                <div style="display:flex; gap:6px; align-items:center; min-width:0;">
+                  <img id="selHomeLogo" src="" style="width:18px;height:18px;border-radius:4px; display:none;">
+                  <span class="k" id="selHomeName" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"></span>
+                </div>
+                <span class="mono k" id="selScore" style="font-size:16px;"></span>
+                <div style="display:flex; gap:6px; align-items:center; min-width:0;">
+                  <img id="selAwayLogo" src="" style="width:18px;height:18px;border-radius:4px; display:none;">
+                  <span class="k" id="selAwayName" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"></span>
+                </div>
+              </div>
+            </div>
+            <div style="text-align:right;">
+              <div id="selBadges"></div>
+              <div class="mini muted mono" id="selHt"></div>
+            </div>
+          </div>
+        </div>
+
+
+        <div class="row">
+          <div style="flex: 1 1 220px;">
+            <label class="muted">Fixture ID</label>
+            <input id="fixtureId" placeholder="예: 405228"/>
+          </div>
+          <div style="flex: 1 1 220px;">
+            <label class="muted">Quick actions</label>
+            <div class="row" style="gap:8px;">
+              <button onclick="getOverride()">조회</button>
+              <button class="danger" onclick="deleteOverride()">삭제(원복)</button>
+              <button onclick="hideFixture()">숨김(hidden=true)</button>
+              <button onclick="unhideFixture()">숨김해제(hidden=false)</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Venue</label>
+            <input id="qeVenue" placeholder="venue_name"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">League Round</label>
+            <input id="qeRound" placeholder="league_round"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Status Long</label>
+            <input id="qeStatusLong" placeholder="status_long"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Elapsed</label>
+            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
+          </div>
+        </div>
+
+                <div class="row">
+  <div style="flex:1 1 220px;">
+    <label class="muted">Status Group</label>
+
+    <!-- ✅ 프리셋 드롭다운(클릭하면 항상 선택지 표시) + 직접 입력(input)은 기존 id 유지 -->
+    <div class="row" style="gap:8px;">
+      <div style="flex:0 0 170px;">
+        <select id="qeStatusGroupPreset">
+          <option value="">(preset)</option>
+          <option value="UPCOMING">UPCOMING</option>
+          <option value="INPLAY">INPLAY</option>
+          <option value="FINISHED">FINISHED</option>
+          <option value="PST">PST</option>
+          <option value="SUSP">SUSP</option>
+          <option value="CANC">CANC</option>
+          <option value="TBD">TBD</option>
+        </select>
+      </div>
+      <div style="flex:1 1 auto;">
+        <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+      </div>
+    </div>
+  </div>
+
+  <div style="flex:1 1 220px;">
+    <label class="muted">Status</label>
+
+    <!-- ✅ 프리셋 드롭다운 + 직접 입력(input)은 기존 id 유지 -->
+    <div class="row" style="gap:8px;">
+      <div style="flex:0 0 170px;">
+        <select id="qeStatusPreset">
+          <option value="">(preset)</option>
+          <option value="NS">NS</option>
+          <option value="1H">1H</option>
+          <option value="HT">HT</option>
+          <option value="2H">2H</option>
+          <option value="ET">ET</option>
+          <option value="BT">BT</option>
+          <option value="P">P</option>
+          <option value="FT">FT</option>
+          <option value="AET">AET</option>
+          <option value="PEN">PEN</option>
+          <option value="SUSP">SUSP</option>
+          <option value="INT">INT</option>
+          <option value="PST">PST</option>
+          <option value="CANC">CANC</option>
+          <option value="ABD">ABD</option>
+          <option value="AWD">AWD</option>
+          <option value="WO">WO</option>
+          <option value="LIVE">LIVE</option>
+        </select>
+      </div>
+      <div style="flex:1 1 auto;">
+        <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Home FT</label>
+            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+          </div>
+          
+          <div style="flex:1 1 220px;">
+            <label class="muted">Away FT</label>
+            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+          </div>
+        </div>
+
+        <div class="row">
+          <div style="flex:1 1 220px;">
+            <label class="muted">Home HT</label>
+            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+          </div>
+          <div style="flex:1 1 220px;">
+            <label class="muted">Away HT</label>
+            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px;">
+          <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
+          <button onclick="upsertOverride()">저장(Upsert)</button>
+        </div>
+
+        <!-- Event Editor -->
+        <div style="height:12px;"></div>
+        <div class="subcard">
+          <h3>Event Editor (Goals / Cards / Subs)</h3>
+
+          <div class="row" style="align-items:flex-end;">
+            <div style="flex:1 1 320px;">
+              <label class="muted mini">이벤트 배열 경로(자동 탐지)</label>
+              <select id="evtPath"></select>
+              <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
+            </div>
+            <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btnsm" onclick="evtReloadFromBundle()">bundle에서 불러오기</button>
+              <button class="btnsm" onclick="evtApplyToPatch(false)">Patch에 반영</button>
+              <button class="btnsm danger" onclick="evtClearAll()">전체 삭제</button>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+          <!-- Add row -->
+          <div class="grid2">
+            <div>
+              <label class="muted mini">Minute</label>
+              <input id="evtMin" type="number" placeholder="예: 57" />
+            </div>
+            <div>
+              <label class="muted mini">Extra(+)</label>
+              <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
+            </div>
+
+            <div>
+              <label class="muted mini">Team</label>
+              <select id="evtTeam">
+                <option value="">(none)</option>
+                <option value="home">home</option>
+                <option value="away">away</option>
+              </select>
+            </div>
+            <div>
+              <label class="muted mini">Type</label>
+              <select id="evtType">
+                <option value="GOAL">GOAL</option>
+                <option value="PENALTY">PENALTY</option>
+                <option value="OWN_GOAL">OWN_GOAL</option>
+                <option value="RED">RED</option>
+                <option value="YELLOW">YELLOW</option>
+                <option value="SUB">SUB</option>
+                <option value="OTHER">OTHER</option>
+              </select>
+
+            </div>
+
+            <div>
+              <label class="muted mini">Player / Main</label>
+              <input id="evtPlayer" placeholder="예: Messi / Player name" />
+            </div>
+            <div>
+              <label class="muted mini">Assist / SubOut</label>
+              <input id="evtAssist" placeholder="예: Assist / Sub out" />
+            </div>
+
+            <div style="grid-column: 1 / -1;">
+              <label class="muted mini">Detail</label>
+              <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
+            </div>
+
+            <div style="grid-column: 1 / -1; display:flex; gap:8px;">
+              <button class="btnsm primary" onclick="evtAdd()">+ 이벤트 추가</button>
+              <button class="btnsm" onclick="evtSort()">정렬(시간순)</button>
+            </div>
+          </div>
+
+          <div style="height:10px;"></div>
+
+          <div class="muted mini">이벤트 목록 (행 수정/삭제 가능) · 수정하면 Patch JSON에 자동 반영됩니다</div>
+          <div style="height:6px;"></div>
+
+          <table class="evtTable" style="width:100%; border-collapse:collapse;">
+            <thead>
+              <tr>
+                <th style="width:80px;">min</th>
+                <th style="width:80px;">extra(+)</th>
+                <th style="width:70px;">team</th>
+                <th style="width:90px;">type</th>
+                <th>main</th>
+                <th>assist/sub</th>
+                <th>detail</th>
+                <th style="width:80px;">del</th>
+
+              </tr>
+            </thead>
+            <tbody id="evtBody"></tbody>
+          </table>
+        </div>
+
+
+        <div style="height:10px;"></div>
+        <label class="muted">Patch JSON (부분만)</label>
+        <textarea id="patch" placeholder='예: { "venue_name": "Edited", "home": { "ft": 2 } }'></textarea>
+
+        <div id="ovResult" class="muted" style="margin-top:10px;"></div>
+      </div>
+
+      
+    </div>
+  </div>
+
 <script>
+  const adminPath = (location.pathname || "").replace(/^\/+/, "").split("/")[0] || "";
+  document.getElementById("adminPathText").textContent = "/" + adminPath;
+
+  const tokenKey = "SSX_ADMIN_TOKEN";
+  let selectedFixture = null;
+
+  let bundleRaw = null;
+  let bundleMerged = null;
+
+  // ✅ override-only 모드(날짜 무시하고 override 적용된 fixture만 전체 조회)
+  let overrideOnlyMode = false;
+
+  // 현재(노출) fixtures
+  let currentFixtures = [];
+
+  // 원본(raw) fixtures 캐시: 같은 필터(date/tz/league_ids) 기준으로 한 번만 가져오기
+  let rawCacheKey = "";
+  let rawFixturesMap = null;
+
+
+  function setStatusLine(msg) {
+    document.getElementById("statusLine").textContent = msg || "";
+  }
+
+  function logoutToken() {
+    localStorage.removeItem(tokenKey);
+    alert("토큰을 삭제했습니다. 다음 admin API 호출 시 다시 입력합니다.");
+  }
+
+  function adminHeaders() {
+    const t = localStorage.getItem(tokenKey) || "";
+    return {
+      "Content-Type": "application/json",
+      "X-Admin-Token": t,
+    };
+  }
+
+  function ensureToken() {
+    let t = localStorage.getItem(tokenKey);
+    if (!t) {
+      t = prompt("관리자 토큰(ADMIN_TOKEN)을 입력하세요");
+      if (t) localStorage.setItem(tokenKey, t);
+    }
+    return t;
+  }
+
+  function adminUrl(path) {
+    return "/" + adminPath + path;
+  }
+
+  async function api(path, opt={}, _retried=false) {
+  const t = ensureToken();
+  if (!t) {
+    // 사용자가 토큰 입력을 취소한 경우: 호출 중단
+    return { status: 0, data: { ok: false, error: "no_admin_token" } };
+  }
+
+  const res = await fetch(path, {
+    ...opt,
+    headers: { ...(opt.headers||{}), ...adminHeaders() },
+  });
+
+  // ✅ 토큰이 틀렸거나 만료(401/403)면: 토큰 삭제 → 재입력 → 1회 재시도
+  if ((res.status === 401 || res.status === 403) && !_retried) {
+    localStorage.removeItem(tokenKey);
+    const t2 = ensureToken();
+    if (!t2) {
+      return { status: res.status, data: { ok: false, error: "no_admin_token_retry" } };
+    }
+    return api(path, opt, true);
+  }
+
+  const txt = await res.text();
+  let data = null;
+  try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+  return { status: res.status, data };
+}
+
+
+
+  async function publicApi(path) {
+    const res = await fetch(path);
+    const txt = await res.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+    return { status: res.status, data };
+  }
+
+  function setOv(msg, ok=true) {
+  const el = document.getElementById("ovResult");
+  const safe = escapeHtml(msg);
+  el.innerHTML = ok ? `<span class="ok">${safe}</span>` : `<span class="bad">${safe}</span>`;
+}
+
+
+  function safeNum(v) {
+    if (v === "" || v === null || v === undefined) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function normalizeLeagueIdsInput(v) {
+    // "39, 140,78,,  " -> "39,140,78"
+    const s = String(v || "").trim();
+    if (!s) return "";
+    return s
+      .split(",")
+      .map(x => x.trim())
+      .filter(Boolean)
+      .join(",");
+  }
+
+  function parseLeagueIdsSet(v) {
+    const norm = normalizeLeagueIdsInput(v);
+    if (!norm) return null;
+    const set = new Set();
+    for (const p of norm.split(",")) {
+      const n = Number(String(p).trim());
+      if (Number.isFinite(n)) set.add(n);
+    }
+    return set.size ? set : null;
+  }
+
+
+  function fxUpdateLeaguePills() {
+    const box = document.getElementById("fxLeaguePills");
+    const input = document.getElementById("fxLeagueIds");
+    if (!box || !input) return;
+
+    const set = parseLeagueIdsSet(input.value || "");
+    box.innerHTML = "";
+
+    if (!set || set.size === 0) {
+      const d = document.createElement("span");
+      d.className = "pill";
+      d.textContent = "(전체 리그)";
+      box.appendChild(d);
+      return;
+    }
+
+    const ids = Array.from(set).sort((a,b)=>a-b);
+
+    // 너무 길어지면 앞부분만 보여주고 count로 표시
+    const maxShow = 10;
+    const shown = ids.slice(0, maxShow);
+    for (const id of shown) {
+      const p = document.createElement("span");
+      p.className = "pill";
+      p.textContent = String(id);
+      box.appendChild(p);
+    }
+
+    if (ids.length > maxShow) {
+      const more = document.createElement("span");
+      more.className = "pill";
+      more.textContent = `+${ids.length - maxShow}`;
+      box.appendChild(more);
+    }
+  }
+
+
+  // ─────────────────────────────────────
+  // League dropdown (from loaded fixtures)
+  // ─────────────────────────────────────
+
+  function fxRefreshLeaguePick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const prevSel = String(sel.value || "").trim();
+
+    // 현재 로드된 fixtures에서 league 목록 수집
+    const m = new Map(); // league_id -> {id,name,country}
+    for (const f of (currentFixtures || [])) {
+      const id = Number(f.league_id);
+      if (!Number.isFinite(id)) continue;
+      if (!m.has(id)) {
+        m.set(id, {
+          id,
+          name: (f.league_name || `League ${id}`),
+          country: (f.league_country || ""),
+        });
+      }
+    }
+
+    const arr = Array.from(m.values()).sort((a, b) => {
+      const an = String(a.name || "");
+      const bn = String(b.name || "");
+      const c = an.localeCompare(bn);
+      return c !== 0 ? c : (a.id - b.id);
+    });
+
+    sel.innerHTML = "";
+
+    const optAll = document.createElement("option");
+    optAll.value = "";
+    optAll.textContent = "(전체 리그)";
+    sel.appendChild(optAll);
+
+    if (!arr.length) {
+      const optNone = document.createElement("option");
+      optNone.value = "";
+      optNone.textContent = "(이 기간에 리그 없음)";
+      sel.appendChild(optNone);
+      sel.value = "";
+      input.value = "";
+      fxUpdateLeaguePills();
+      return;
+    }
+
+    for (const x of arr) {
+      const opt = document.createElement("option");
+      opt.value = String(x.id);
+      opt.textContent = `${x.name}${x.country ? " · " + x.country : ""} · ${x.id}`;
+      sel.appendChild(opt);
+    }
+
+    // 선택 복원
+    if (prevSel && arr.some(x => String(x.id) === prevSel)) sel.value = prevSel;
+    else sel.value = "";
+
+    // 단일 필터면 드롭다운도 맞춤
+    const set = parseLeagueIdsSet(input.value || "");
+    if (set && set.size === 1) {
+      const only = Array.from(set)[0];
+      if (arr.some(x => x.id === only)) sel.value = String(only);
+    }
+
+    fxUpdateLeaguePills();
+  }
+
+
+  function fxAddLeagueFromPick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = String(sel.value || "").trim();
+    if (!v) return;
+
+    const set = parseLeagueIdsSet(input.value || "") || new Set();
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+
+    set.add(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    fxUpdateLeaguePills();
+    renderFixtures();
+  }
+
+
+  function fxRemoveLeagueFromPick() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (!sel || !input) return;
+
+    const v = String(sel.value || "").trim();
+    if (!v) return;
+
+    const set = parseLeagueIdsSet(input.value || "");
+    if (!set) return;
+
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+
+    set.delete(n);
+    input.value = Array.from(set).sort((a,b)=>a-b).join(",");
+
+    fxUpdateLeaguePills();
+    renderFixtures();
+  }
+
+
+  function fxClearLeagueFilter() {
+    const sel = document.getElementById("fxLeaguePick");
+    const input = document.getElementById("fxLeagueIds");
+    if (input) input.value = "";
+    if (sel) sel.value = "";
+    fxUpdateLeaguePills();
+    renderFixtures();
+  }
+
+
+
+  // ✅ innerHTML에 들어갈 값 최소 이스케이프(XSS 방어)
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+function escapeAttr(s) {
+  // 속성값(src 등)에 안전하게 넣기 위한 최소 처리
+  // ✅ 개행/제어문자 때문에 attribute 깨지는 케이스 방지
+  return escapeHtml(String(s ?? "").replace(/[\r\n\t]/g, " "));
+}
+
+// ✅ img src 등 URL은 http/https만 허용(깨진 값/위험 스킴 방지)
+function safeUrl(u) {
+  const s = String(u ?? "").trim();
+  if (!s) return "";
+  try {
+    const url = new URL(s, location.origin);
+    if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+    return "";
+  } catch (e) {
+    return "";
+  }
+}
+
+
+
+
+  function deepMerge(base, patch) {
+    if (base && typeof base === "object" && !Array.isArray(base) &&
+        patch && typeof patch === "object" && !Array.isArray(patch)) {
+      const out = { ...base };
+      for (const k of Object.keys(patch)) {
+        out[k] = deepMerge(out[k], patch[k]);
+      }
+      return out;
+    }
+    return patch;
+  }
+
+  function isoDateLocal() {
+    const d = new Date();
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth()+1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function parseYmdToUtcDate(ymd) {
+    // "YYYY-MM-DD" -> Date(UTC 기준)
+    // ✅ 로컬 타임존 영향 제거용: 항상 Z로 고정
+    return new Date(String(ymd).trim() + "T00:00:00Z");
+  }
+
+  function fmtUtcDateToYmd(d) {
+    // Date -> "YYYY-MM-DD"
+    return d.toISOString().slice(0, 10);
+  }
+
+  function enumerateYmdRange(fromYmd, toYmd, maxDays = 31) {
+    const a = String(fromYmd || "").trim();
+    const b = String(toYmd || "").trim();
+    if (!a) return { ok:false, days:[], error:"from_date_required" };
+
+    const fromD = parseYmdToUtcDate(a);
+    const toD = parseYmdToUtcDate(b || a);
+
+    if (!Number.isFinite(fromD.getTime()) || !Number.isFinite(toD.getTime())) {
+      return { ok:false, days:[], error:"invalid_date" };
+    }
+
+    // ✅ 뒤집혔으면 swap
+    let start = fromD;
+    let end = toD;
+    if (end.getTime() < start.getTime()) {
+      const tmp = start; start = end; end = tmp;
+    }
+
+    const days = [];
+    let cur = start;
+    for (let i=0; i<maxDays; i++) {
+      days.push(fmtUtcDateToYmd(cur));
+      if (fmtUtcDateToYmd(cur) === fmtUtcDateToYmd(end)) break;
+      cur = new Date(cur.getTime() + 86400000); // +1 day
+    }
+
+    // ✅ maxDays 초과 감지(끝까지 못 감)
+    if (days[days.length-1] !== fmtUtcDateToYmd(end)) {
+      return { ok:false, days:[], error:`range_too_large(max=${maxDays})` };
+    }
+
+    return { ok:true, days, error:null };
+  }
+
+
+  function fmtInTz(dateUtcStr, tz) {
+    try {
+      const d = new Date(dateUtcStr);
+      return d.toLocaleString("sv-SE", { timeZone: tz, hour12: false }).replace(" ", " ");
+    } catch (e) {
+      return dateUtcStr || "";
+    }
+  }
+
+  function ymdInTz(dateUtcStr, tz) {
+    // dateUtcStr(UTC) -> tz 기준 YYYY-MM-DD
+    try {
+      const d = new Date(dateUtcStr);
+      const parts = new Intl.DateTimeFormat("sv-SE", {
+        timeZone: tz,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).formatToParts(d);
+      const y = parts.find(p => p.type === "year")?.value || "1970";
+      const m = parts.find(p => p.type === "month")?.value || "01";
+      const da = parts.find(p => p.type === "day")?.value || "01";
+      return `${y}-${m}-${da}`;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function setOverrideMode(on) {
+    overrideOnlyMode = !!on;
+
+    const btn = document.getElementById("btnOverridesOnly");
+    if (btn) {
+      // ✅ 켜짐 표시(테두리 강조)
+      btn.classList.toggle("primary", overrideOnlyMode);
+      btn.textContent = overrideOnlyMode ? "OVR 보기중" : "OVR만 보기";
+      btn.title = overrideOnlyMode ? "클릭하면 일반 날짜 조회로 돌아갑니다" : "override 적용된 fixture만 전체 조회";
+    }
+
+    // raw 캐시 무효화(모드가 바뀌면 key 의미가 달라짐)
+    rawFixturesMap = null;
+    rawCacheKey = "";
+  }
+
+
+  function statusOrderKey(sg) {
+  const v = (sg || "").toUpperCase();
+  if (v === "INPLAY" || v.includes("LIVE")) return 0;
+  if (v === "UPCOMING" || v === "NS") return 1;
+  if (v === "FINISHED" || v.includes("FT")) return 9;
+  // 나머지(PST/SUSP/CANC/TBD 등)는 중간
+  return 5;
+}
+
+
+
+  function showTab(name) {
+    const names = ["now","raw","patch","diff","bundle_raw","bundle_merged","bundle_diff"];
+    for (const n of names) {
+      const pane = document.getElementById("tab_" + n);
+      const btn = document.getElementById("tab_" + n + "_btn");
+      if (pane) pane.classList.toggle("active", n === name);
+      if (btn) btn.classList.toggle("active", n === name);
+    }
+  }
+
+
+  function renderFixtures() {
+    const list = document.getElementById("fxList");
+    list.innerHTML = "";
+
+    const q = (document.getElementById("fxSearch").value || "").trim().toLowerCase();
+    const leagueSet = parseLeagueIdsSet(document.getElementById("fxLeagueIds").value || "");
+
+    const filtered = currentFixtures.filter(f => {
+      // ✅ league_ids 강제 필터(서버가 무시해도 UI에서는 확실히 먹게)
+      if (leagueSet && !leagueSet.has(Number(f.league_id))) return false;
+
+      // ✅ search 필터
+      if (!q) return true;
+      const s = [
+        f.league_name, f.league_country, f.league_round,
+        f.home?.name, f.away?.name,
+        String(f.fixture_id || "")
+      ].join(" ").toLowerCase();
+      return s.includes(q);
+    });
+
+    filtered.sort((a,b) => {
+      const ka = statusOrderKey(a.status_group);
+      const kb = statusOrderKey(b.status_group);
+      if (ka !== kb) return ka - kb;
+      return String(a.date_utc||"").localeCompare(String(b.date_utc||""));
+    });
+
+    const tz = document.getElementById("fxTz").value || "UTC";
+
+    for (const f of filtered) {
+      const div = document.createElement("div");
+      const isHidden = (f.hidden === true);
+
+      div.className =
+        "item" +
+        ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
+        (isHidden ? " hidden" : "");
+
+      div.onclick = () => selectFixture(f.fixture_id);
+
+      const when = fmtInTz(f.date_utc, tz);
+      const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
+      const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
+
+      const isOvr = (f._has_override === true);
+      const sg = (f.status_group || "").toUpperCase();
+
+      const badges = [
+        `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
+        isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
+        isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
+      ].filter(Boolean).join(" ");
+
+      const hLogo = safeUrl(f.home?.logo);
+      const aLogo = safeUrl(f.away?.logo);
+
+      const homeLogo = hLogo
+        ? `<img src="${escapeAttr(hLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
+        : "";
+      const awayLogo = aLogo
+        ? `<img src="${escapeAttr(aLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
+        : "";
+
+
+
+      div.innerHTML = `
+        <div style="min-width:0;">
+          <div class="small muted mono">${when}</div>
+
+          <div class="k" style="display:flex; gap:8px; align-items:center; min-width:0;">
+            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
+              ${homeLogo}
+              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.home?.name || "HOME")}</span>
+            </span>
+
+            <span class="muted" style="flex:0 0 auto;">vs</span>
+
+            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
+              ${awayLogo}
+              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.away?.name || "AWAY")}</span>
+            </span>
+          </div>
+
+          <div class="small muted" style="margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+            ${escapeHtml(f.league_name || "")}${f.league_country ? ` · ${escapeHtml(f.league_country)}` : ""}${f.league_round ? ` · ${escapeHtml(f.league_round)}` : ""}
+            ${Number.isFinite(Number(f.league_id)) ? ` · L:${escapeHtml(f.league_id)}` : ""}
+          </div>
+        </div>
+
+        <div class="right" style="flex:0 0 auto; min-width:140px;">
+          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges}</div>
+          <div class="mono" style="margin-top:6px; font-size:14px; font-weight:700;">${score}</div>
+          <div class="small muted mono">HT ${ht}</div>
+        </div>
+      `;
+
+      list.appendChild(div);
+    }
+
+    const total = currentFixtures.length;
+    const shown = filtered.length;
+
+    const normLeague = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
+    const leagueHint = normLeague ? ` · league_ids=${normLeague}` : "";
+
+    document.getElementById("fxHint").textContent =
+      `rows: ${shown} / ${total}${leagueHint} · 검색은 즉시 반영됩니다 · 클릭하면 원본/현재/차이까지 비교됩니다`;
+  }
+
+
+  function fillQuickEditFromFixture(f) {
+    document.getElementById("qeVenue").value = f.venue_name ?? "";
+    document.getElementById("qeRound").value = f.league_round ?? "";
+    document.getElementById("qeStatusLong").value = f.status_long ?? "";
+    document.getElementById("qeElapsed").value = (f.elapsed ?? "") === null ? "" : (f.elapsed ?? "");
+    document.getElementById("qeStatusGroup").value = f.status_group ?? "";
+    document.getElementById("qeStatus").value = f.status ?? "";
+    document.getElementById("qeStatusGroupPreset").value = (f.status_group ?? "").toUpperCase();
+    document.getElementById("qeStatusPreset").value = (f.status ?? "").toUpperCase();
+
+
+    document.getElementById("qeHomeFt").value = (f.home?.ft ?? "") === null ? "" : (f.home?.ft ?? "");
+    document.getElementById("qeAwayFt").value = (f.away?.ft ?? "") === null ? "" : (f.away?.ft ?? "");
+    document.getElementById("qeHomeHt").value = (f.home?.ht ?? "") === null ? "" : (f.home?.ht ?? "");
+    document.getElementById("qeAwayHt").value = (f.away?.ht ?? "") === null ? "" : (f.away?.ht ?? "");
+  }
+
+  function renderSelectedSummary(f) {
+    const box = document.getElementById("selSummary");
+    if (!box) return;
+
+    if (!f) {
+      box.style.display = "none";
+      return;
+    }
+
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const when = fmtInTz(f.date_utc, tz);
+
+    const sg = (f.status_group || "").toUpperCase();
+    const isOvr = (f._has_override === true);
+    const isHidden = (f.hidden === true);
+
+    const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
+    const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
+
+    document.getElementById("selSummaryMeta").textContent =
+      `${when} · ${f.league_name || ""}${f.league_round ? " · " + f.league_round : ""} · L:${f.league_id ?? "-"}`;
+
+    const homeLogo = document.getElementById("selHomeLogo");
+    const awayLogo = document.getElementById("selAwayLogo");
+
+   if (homeLogo) {
+  const u = safeUrl(f.home?.logo);
+  if (u) { homeLogo.src = u; homeLogo.style.display = ""; }
+  else { homeLogo.style.display = "none"; }
+}
+if (awayLogo) {
+  const u = safeUrl(f.away?.logo);
+  if (u) { awayLogo.src = u; awayLogo.style.display = ""; }
+  else { awayLogo.style.display = "none"; }
+}
+
+
+    document.getElementById("selHomeName").textContent = f.home?.name || "HOME";
+    document.getElementById("selAwayName").textContent = f.away?.name || "AWAY";
+    document.getElementById("selScore").textContent = score;
+    document.getElementById("selHt").textContent = `HT ${ht}`;
+
+    const badges = [
+      `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
+      isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
+      isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
+    ].filter(Boolean).join(" ");
+
+
+    document.getElementById("selBadges").innerHTML = badges;
+
+    box.style.display = "";
+  }
+
+
+
+  function getFilterKey() {
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
+
+    // ✅ Raw 비교는 "선택된 경기의 날짜(해당 tz 기준)"로 잡아야 기간 조회에서도 정확함
+    const date =
+      (selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
+
+    return `${date}__${tz}__${leagueIds}`;
+  }
+
+
+
+
+
+  function buildFixturesQuery(dateOverride) {
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const leagueIds = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
+
+    const date = (dateOverride != null && String(dateOverride).trim() !== "")
+      ? String(dateOverride).trim()
+      : (document.getElementById("fxDate").value || "");
+
+    const qs = new URLSearchParams();
+    qs.set("date", date);
+    qs.set("timezone", tz);
+    if (leagueIds) qs.set("league_ids", leagueIds);
+    return qs;
+  }
+
+
+
+
+
+  async function ensureRawLoaded() {
+    const key = getFilterKey();
+    if (rawFixturesMap && rawCacheKey === key) return true;
+
+    rawFixturesMap = null;
+    rawCacheKey = key;
+
+    const tz = document.getElementById("fxTz").value || "UTC";
+    const dateForRaw =
+      (selectedFixture && selectedFixture.date_utc)
+        ? ymdInTz(selectedFixture.date_utc, tz)
+        : (document.getElementById("fxDate").value || "");
+
+    const qs = buildFixturesQuery(dateForRaw);
+
+    document.getElementById("rawHint").textContent = "원본(raw) 불러오는 중...";
+    const r = await api(adminUrl(`/api/hockey/fixtures_raw?` + qs.toString()), { method: "GET" });
+
+    if (r.status >= 400 || !r.data || !r.data.ok) {
+      document.getElementById("rawHint").textContent = "원본(raw) 로드 실패: " + JSON.stringify(r.data);
+      return false;
+    }
+
+    const rows = r.data.rows || [];
+    const m = {};
+    for (const x of rows) {
+      m[String(x.fixture_id)] = x;
+    }
+    rawFixturesMap = m;
+    document.getElementById("rawHint").textContent = `원본(raw) rows: ${rows.length}`;
+    return true;
+  }
+
+
+  function diffObjects(a, b, path="", out=[]) {
+    // a=raw, b=current
+    const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+    const isArr = v => Array.isArray(v);
+
+    if (isObj(a) && isObj(b)) {
+      const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+      for (const k of keys) {
+        if (String(k).startsWith("_")) continue; // 내부 메타키 제외
+        diffObjects(a[k], b[k], path ? (path + "." + k) : k, out);
+      }
+      return out;
+    }
+
+    if (isArr(a) || isArr(b)) {
+      const sa = JSON.stringify(a);
+      const sb = JSON.stringify(b);
+      if (sa !== sb) out.push({ path, raw: a, now: b });
+      return out;
+    }
+
+    // primitive / null / undefined
+    if ((a ?? null) !== (b ?? null)) out.push({ path, raw: a, now: b });
+    return out;
+  }
+
+  function updateComparisonViews() {
+    // 현재(노출)
+    document.getElementById("fxPreviewNow").textContent = JSON.stringify(selectedFixture || {}, null, 2);
+
+    // patch는 textarea 기준
+    let patchObj = null;
+    try {
+      patchObj = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!patchObj || typeof patchObj !== "object") patchObj = {};
+    } catch (e) {
+      patchObj = { _error: "patch JSON parse failed" };
+    }
+    document.getElementById("fxPreviewPatch").textContent = JSON.stringify(patchObj, null, 2);
+
+    // raw + diff
+    const raw = rawFixturesMap ? rawFixturesMap[String(selectedFixture?.fixture_id)] : null;
+    document.getElementById("fxPreviewRaw").textContent = JSON.stringify(raw || {}, null, 2);
+
+    if (raw && selectedFixture) {
+      const diffs = diffObjects(raw, selectedFixture, "", []).slice(0, 200);
+
+      const lines = diffs.map(d => {
+        const a = JSON.stringify(d.raw);
+        const b = JSON.stringify(d.now);
+        return `${d.path}: ${a} -> ${b}`;
+      });
+
+      document.getElementById("fxPreviewDiff").textContent =
+        lines.length ? lines.join("\n") : "(변경 없음)";
+    } else {
+      document.getElementById("fxPreviewDiff").textContent = "(비교 데이터 없음)";
+    }
+
+  }
+
+    async function loadBundleViews() {
+    if (!selectedFixture) {
+      document.getElementById("bundlePreviewRaw").textContent = "{}";
+      document.getElementById("bundlePreviewMerged").textContent = "{}";
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+      bundleRaw = null;
+      bundleMerged = null;
+      return;
+    }
+
+    const fx = selectedFixture.fixture_id;
+    const lg = selectedFixture.league_id;
+    const se = selectedFixture.season;
+
+    if (fx == null || lg == null || se == null) {
+      document.getElementById("bundlePreviewRaw").textContent = "{}";
+      document.getElementById("bundlePreviewMerged").textContent = "{}";
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+      bundleRaw = null;
+      bundleMerged = null;
+      return;
+    }
+
+    const base = new URLSearchParams({
+      fixture_id: String(fx),
+      league_id: String(lg),
+      season: String(se),
+    });
+
+    // raw (override 미적용)
+    const qsRaw = new URLSearchParams(base);
+    qsRaw.set("apply_override", "0");
+
+    // merged (override 적용)
+    const qsMerged = new URLSearchParams(base);
+    qsMerged.set("apply_override", "1");
+
+    // ✅ match_detail_bundle는 public endpoint이므로 publicApi 사용
+    const r1 = await publicApi(adminUrl("/api/match_detail_bundle?" + qsRaw.toString()));
+    const r2 = await publicApi(adminUrl("/api/match_detail_bundle?" + qsMerged.toString()));
+
+
+    bundleRaw = (r1.status < 400 && r1.data && r1.data.ok) ? (r1.data.data || null) : null;
+    bundleMerged = (r2.status < 400 && r2.data && r2.data.ok) ? (r2.data.data || null) : null;
+
+    document.getElementById("bundlePreviewRaw").textContent =
+      JSON.stringify(bundleRaw || { _error: "raw load failed", status: r1.status, data: r1.data }, null, 2);
+
+    document.getElementById("bundlePreviewMerged").textContent =
+      JSON.stringify(bundleMerged || { _error: "merged load failed", status: r2.status, data: r2.data }, null, 2);
+
+    if (bundleRaw && bundleMerged) {
+      const diffs = diffObjects(bundleRaw, bundleMerged, "", []).slice(0, 300);
+      const lines = diffs.map(d => `${d.path}: ${JSON.stringify(d.raw)} -> ${JSON.stringify(d.now)}`);
+      document.getElementById("bundlePreviewDiff").textContent =
+        lines.length ? lines.join("\n") : "(변경 없음)";
+    } else {
+      document.getElementById("bundlePreviewDiff").textContent = "[]";
+    }
+    evtReloadFromBundle();
+  }
+
+
+
+  async function selectFixture(fixtureId) {
+    const f = currentFixtures.find(x => String(x.fixture_id) === String(fixtureId));
+    if (!f) return;
+
+    selectedFixture = f;
+
+    // ✅ 앱처럼: 오른쪽에 “선택 경기 요약” 먼저 갱신
+    renderSelectedSummary(f);
+
+    renderFixtures();
+
+    document.getElementById("fixtureId").value = String(f.fixture_id);
+    fillQuickEditFromFixture(f);
+
+    setStatusLine(`선택: fixture_id=${f.fixture_id}`);
+
+    // override 조회(그리고 patch textarea 채움)
+    await getOverride();
+
+    // raw 로드 후 비교 뷰 갱신
+    const ok = await ensureRawLoaded();
+    if (!ok) {
+      rawFixturesMap = rawFixturesMap || null;
+    }
+    updateComparisonViews();
+    // ⚠️ loadBundleViews()는 getOverride()에서 처리 (중복 호출 방지)
+  }
+
+
+
+  async function loadFixtures() {
+    // ✅ 일반 날짜 조회로 들어오면 OVR 모드 OFF
+    setOverrideMode(false);
+
+    const from = (document.getElementById("fxDate")?.value || "").trim();
+    const to = (document.getElementById("fxDateTo")?.value || "").trim();
+
+    if (!from) {
+      alert("Date (From)를 선택하세요");
+      return;
+    }
+
+    // ✅ from~to 범위(최대 31일) 지원 — OVR과 동일 로직
+    const range = enumerateYmdRange(from, to || from, 31);
+    if (!range.ok) {
+      setStatusLine("");
+      alert("기간 설정 오류: " + range.error + "\n\n(최대 31일까지만 지원)");
+      return;
+    }
+
+    const days = range.days || [];
+
+    setStatusLine(`fixtures 기간 조회중... (0/${days.length})`);
+
+    // ✅ fixture_id 기준으로 dedupe (여러 날짜 합치기)
+    const map = {}; // fixture_id -> row
+
+    for (let i = 0; i < days.length; i++) {
+      const day = days[i];
+      setStatusLine(`fixtures 기간 조회중... (${i + 1}/${days.length}) ${day}`);
+
+      const qs = buildFixturesQuery(day);
+
+      // ✅ 관리자용 merged(override 반영 + hidden 포함) 사용
+      const r = await api(adminUrl(`/api/hockey/fixtures_merged?` + qs.toString()), { method: "GET" });
+
+      if (r.status >= 400 || !r.data || !r.data.ok) {
+        setStatusLine("");
+        alert(`fixtures_merged 로드 실패 (${day}): ` + JSON.stringify(r.data));
+        return;
+      }
+
+      const rows = r.data.rows || [];
+      for (const x of rows) {
+        if (!x) continue;
+        map[String(x.fixture_id)] = x;
+      }
+    }
+
+    currentFixtures = Object.values(map);
+
+    // ✅ NEW: 날짜로 로드된 목록 기준으로 league 드롭다운 갱신
+    fxRefreshLeaguePick();
+
+    // 선택 유지(저장/삭제 후 재선택을 위해)
+    const keepId = selectedFixture ? String(selectedFixture.fixture_id) : "";
+    selectedFixture = null;
+    renderSelectedSummary(null);
+
+    // raw 캐시 무효화(필터 변경될 수 있으니)
+    rawFixturesMap = null;
+    rawCacheKey = "";
+
+    document.getElementById("fxPreviewNow").textContent = "{}";
+    document.getElementById("fxPreviewRaw").textContent = "{}";
+    document.getElementById("fxPreviewPatch").textContent = "{}";
+    document.getElementById("fxPreviewDiff").textContent = "[]";
+    document.getElementById("rawHint").textContent = "";
+
+    // ✅ bundle 프리뷰도 초기화(선택이 해제되었는데 이전 데이터가 남는 문제 방지)
+    document.getElementById("bundlePreviewRaw").textContent = "{}";
+    document.getElementById("bundlePreviewMerged").textContent = "{}";
+    document.getElementById("bundlePreviewDiff").textContent = "[]";
+    bundleRaw = null;
+    bundleMerged = null;
+
+    setStatusLine("");
+    renderFixtures();
+
+    // ✅ 가능하면 이전 선택 재선택
+    if (keepId) {
+      const exists = currentFixtures.find(x => String(x.fixture_id) === keepId);
+      if (exists) await selectFixture(keepId);
+    }
+
+    showTab("now");
+  }
+
+
+
+  async function loadOverridesOnly() {
+    // ✅ 토글: 이미 OVR 모드면 일반 날짜 조회로 복귀
+    if (overrideOnlyMode) {
+      setOverrideMode(false);
+      return loadFixtures();
+    }
+
+    setOverrideMode(true);
+
+    const from = document.getElementById("fxDate").value;
+    const to = (document.getElementById("fxDateTo")?.value || "").trim();
+
+    if (!from) {
+      alert("Date (From)를 선택하세요");
+      setOverrideMode(false);
+      return;
+    }
+
+    const range = enumerateYmdRange(from, to || from, 31);
+    if (!range.ok) {
+      setStatusLine("");
+      alert("기간 설정 오류: " + range.error + "\n\n(최대 31일까지만 지원)");
+      setOverrideMode(false);
+      return;
+    }
+
+    const days = range.days;
+
+    setStatusLine(`OVR 기간 조회중... (0/${days.length})`);
+
+    const map = {}; // fixture_id -> row (dedupe)
+
+    for (let i=0; i<days.length; i++) {
+      const day = days[i];
+      setStatusLine(`OVR 기간 조회중... (${i+1}/${days.length}) ${day}`);
+
+      const qs = buildFixturesQuery(day);
+      const r = await api(adminUrl(`/api/hockey/fixtures_merged?` + qs.toString()), { method: "GET" });
+
+      if (r.status >= 400 || !r.data || !r.data.ok) {
+        setStatusLine("");
+        alert(`fixtures_merged 로드 실패 (${day}): ` + JSON.stringify(r.data));
+        setOverrideMode(false);
+        return;
+      }
+
+      const rows = r.data.rows || [];
+      for (const x of rows) {
+        if (!x) continue;
+        if (x._has_override !== true) continue;
+        map[String(x.fixture_id)] = x;
+      }
+    }
+
+    currentFixtures = Object.values(map);
+
+    // ✅ NEW: OVR 목록 기준으로도 league 드롭다운 갱신
+    fxRefreshLeaguePick();
+
+    // 선택 초기화
+    selectedFixture = null;
+    renderSelectedSummary(null);
+
+    // raw 캐시 무효화
+    rawFixturesMap = null;
+    rawCacheKey = "";
+
+    document.getElementById("fxPreviewNow").textContent = "{}";
+    document.getElementById("fxPreviewRaw").textContent = "{}";
+    document.getElementById("fxPreviewPatch").textContent = "{}";
+    document.getElementById("fxPreviewDiff").textContent = "[]";
+    document.getElementById("rawHint").textContent = "";
+
+    document.getElementById("bundlePreviewRaw").textContent = "{}";
+    document.getElementById("bundlePreviewMerged").textContent = "{}";
+    document.getElementById("bundlePreviewDiff").textContent = "[]";
+    bundleRaw = null;
+    bundleMerged = null;
+
+    setStatusLine("");
+    renderFixtures();
+    showTab("now");
+  }
+
+
+
+
+
+
+
+  async function getOverride() {
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "GET" });
+    if (r.status < 400 && r.data) {
+      const p = r.data.patch;
+      if (p && typeof p === "object") {
+        document.getElementById("patch").value = JSON.stringify(p, null, 2);
+        setOv(`override 존재 · status=${r.status}`, true);
+      } else {
+        document.getElementById("patch").value = "{}";
+        setOv(`override 없음 · status=${r.status}`, true);
+      }
+
+      updateComparisonViews();
+      await loadBundleViews();
+    } else {
+      setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, false);
+      await loadBundleViews();
+    }
+  }
+
+  async function upsertOverride() {
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    applyQuickEditToPatch({ silent: true, onlyIfChanged: true });
+    // evtApplyToPatch(true);  // ✅ 제거: 저장 직전에 Event Editor 내용으로 patch를 강제 덮어쓰지 않음
+
+
+
+    let patch = null;
+    try {
+      patch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) patch = {};
+    } catch (e) {
+      return setOv("Patch JSON 파싱 실패", false);
+    }
+
+    // ✅ 변경이 없으면 저장 막기(빈 patch로 override 만들어서 OVR 생기는 문제 방지)
+    if (Object.keys(patch).length === 0) {
+      return setOv("변경사항이 없습니다. (Patch JSON이 비어있어서 저장하지 않았습니다)", false);
+    }
+
+    const ok = confirm("저장(Upsert)할까요? (override가 즉시 적용됩니다)");
+    if (!ok) return;
+
+    const r = await api(adminUrl(`/api/overrides/${id}`), {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    });
+    setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
+
+    if (r.status < 400) {
+      // 저장 후 현재 목록 새로고침(노출 결과 갱신)
+      await loadFixtures();
+    }
+  }
+
+
+  async function deleteOverride() {
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) return setOv("fixture_id가 필요합니다", false);
+
+    const ok = confirm("삭제(원복)할까요? (override가 제거되고 원본으로 돌아갑니다)");
+    if (!ok) return;
+
+    const r = await api(adminUrl(`/api/overrides/${id}`), { method: "DELETE" });
+    setOv(`status=${r.status} · ${JSON.stringify(r.data)}`, r.status < 400);
+
+    if (r.status < 400) {
+      document.getElementById("patch").value = "";
+      updateComparisonViews();
+      await loadFixtures();
+    }
+  }
+
+    // ✅ 프리셋 select → input 값 자동 반영(기존 JS는 input(id=qeStatusGroup/qeStatus)만 읽으므로 안전)
+  (function(){
+    const sgPreset = document.getElementById("qeStatusGroupPreset");
+    const stPreset = document.getElementById("qeStatusPreset");
+    const sgInput  = document.getElementById("qeStatusGroup");
+    const stInput  = document.getElementById("qeStatus");
+
+    if (sgPreset && sgInput) {
+      sgPreset.addEventListener("change", () => { sgInput.value = sgPreset.value || ""; });
+    }
+    if (stPreset && stInput) {
+      stPreset.addEventListener("change", () => { stInput.value = stPreset.value || ""; });
+    }
+
+    const up = (el) => {
+      if (!el) return;
+      el.addEventListener("blur", () => { el.value = String(el.value || "").trim().toUpperCase(); });
+    };
+    up(sgInput);
+    up(stInput);
+  })();
+
+
+  function applyQuickEditToPatch(opts = {}) {
+    const silent = (opts && opts.silent === true);
+    const onlyIfChanged = (opts && opts.onlyIfChanged === true);
+
+    const id = document.getElementById("fixtureId").value.trim();
+    if (!id) {
+      if (!silent) setOv("fixture_id가 필요합니다", false);
+      return false;
+    }
+
+    // selectedFixture(현재 노출/override 반영 상태) 기준으로 "변경된 항목만" patch에 넣는다
+    const cur = selectedFixture || {};
+
+    const normStr = (x) => (x == null ? "" : String(x)).trim();
+    const normUpper = (x) => {
+      const s = normStr(x);
+      return s === "" ? "" : s.toUpperCase();
+    };
+
+    const sameStr = (a, b) => normStr(a) === normStr(b);
+    const sameUpper = (a, b) => normUpper(a) === normUpper(b);
+
+    const normNum = (x) => {
+      const s = String(x ?? "").trim();
+      if (s === "") return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    };
+    const sameNum = (a, b) => (a ?? null) === (b ?? null);
+
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    const p = {};
+
+    const v  = normStr(document.getElementById("qeVenue").value);
+    const r  = normStr(document.getElementById("qeRound").value);
+    const sl = normStr(document.getElementById("qeStatusLong").value);
+    const el = normNum(document.getElementById("qeElapsed").value);
+
+    // ✅ StatusGroup/Status는 blur 이벤트에 의존하지 말고 여기서 안전하게 대문자 정규화
+    const sg = normUpper(document.getElementById("qeStatusGroup").value);
+    const st = normUpper(document.getElementById("qeStatus").value);
+
+    if (!sameStr(v,  cur.venue_name))   p["venue_name"] = v;
+    if (!sameStr(r,  cur.league_round)) p["league_round"] = r;
+    if (!sameStr(sl, cur.status_long))  p["status_long"] = sl;
+    if (!sameNum(el, cur.elapsed))      p["elapsed"] = el;
+
+    // ✅ 비교도 대문자 기준으로 수행(대소문자 차이로 쓸데없는 diff/patch 방지)
+    if (!sameUpper(sg, cur.status_group)) p["status_group"] = sg;
+    if (!sameUpper(st, cur.status))       p["status"] = st;
+
+    const hft = normNum(document.getElementById("qeHomeFt").value);
+    const aft = normNum(document.getElementById("qeAwayFt").value);
+    const hht = normNum(document.getElementById("qeHomeHt").value);
+    const aht = normNum(document.getElementById("qeAwayHt").value);
+
+    const homeCur = cur.home || {};
+    const awayCur = cur.away || {};
+
+    let homePatch = null;
+    let awayPatch = null;
+
+    if (!sameNum(hft, homeCur.ft)) { homePatch = homePatch || {}; homePatch["ft"] = hft; }
+    if (!sameNum(hht, homeCur.ht)) { homePatch = homePatch || {}; homePatch["ht"] = hht; }
+    if (!sameNum(aft, awayCur.ft)) { awayPatch = awayPatch || {}; awayPatch["ft"] = aft; }
+    if (!sameNum(aht, awayCur.ht)) { awayPatch = awayPatch || {}; awayPatch["ht"] = aht; }
+
+    if (homePatch) p["home"] = deepMerge(p["home"] || {}, homePatch);
+    if (awayPatch) p["away"] = deepMerge(p["away"] || {}, awayPatch);
+
+    if (!basePatch.fixture_id) basePatch.fixture_id = Number(id);
+
+    const hasAny = Object.keys(p).length > 0;
+    if (!hasAny && onlyIfChanged) {
+      if (!silent) setOv("Quick Edit 변경사항이 없습니다.", true);
+      return false;
+    }
+
+    const merged = deepMerge(basePatch, p);
+    document.getElementById("patch").value = JSON.stringify(merged, null, 2);
+
+    if (!silent) setOv("Quick Edit 값을 Patch JSON에 반영했습니다(아직 저장 전).", true);
+
+    updateComparisonViews();
+    return true;
+  }
+
+
+
+  // ─────────────────────────────────────
+  // Event Editor (Goals/Cards/Subs) - bundle에서 이벤트 배열 경로 자동 탐지 후 배열 통째로 override
+  // ─────────────────────────────────────
+
+  let evtState = {
+    path: "",        // 선택된 이벤트 배열 경로 (예: "timeline.events" 같은 형태)
+    candidates: [],  // {path, score, sample}
+    events: [],      // 편집 중인 이벤트 배열(원본 객체 유지)
+  };
+
+  function isObj(v){ return v && typeof v === "object" && !Array.isArray(v); }
+
+  function deepClone(v) {
+    try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; }
+  }
+
+  function getByPath(obj, path) {
+    if (!obj || !path) return undefined;
+    const parts = String(path).split(".").filter(Boolean);
+    let cur = obj;
+    for (const p of parts) {
+      if (!cur) return undefined;
+      cur = cur[p];
+    }
+    return cur;
+  }
+
+  function setByPath(obj, path, value) {
+    const parts = String(path).split(".").filter(Boolean);
+    if (!parts.length) return obj;
+    let cur = obj;
+    for (let i=0;i<parts.length;i++) {
+      const k = parts[i];
+      const last = (i === parts.length-1);
+      if (last) {
+        cur[k] = value;
+      } else {
+        if (!isObj(cur[k])) cur[k] = {};
+        cur = cur[k];
+      }
+    }
+    return obj;
+  }
+
+  function evtScoreArray(arr) {
+    // 이벤트 배열 후보인지 점수화(휴리스틱)
+    if (!Array.isArray(arr) || arr.length < 1) return 0;
+
+    let score = 0;
+    const n = Math.min(arr.length, 30);
+    for (let i=0;i<n;i++) {
+      const e = arr[i];
+      if (!isObj(e)) continue;
+
+      const keys = Object.keys(e);
+      const hasType = keys.some(k => ["type","event_type","kind","detail","name"].includes(k));
+      const hasTime = keys.some(k => ["time","minute","min","elapsed","elapsed_min","elapsedMinute"].includes(k));
+      const hasTeam = keys.some(k => ["team","team_id","teamId","side"].includes(k));
+
+      // ✅ timeline 스키마(line1/line2 등)도 player 힌트로 인정
+      const hasPlayer = keys.some(k => ["player","player_name","playerName","assist","sub_in","sub_out","line1","line2"].includes(k));
+
+      // ✅ timeline 전용 키가 있으면 후보일 확률이 높아서 가산점
+      const hasTimelineKeys = keys.some(k => ["minute_label","minute_extra","side_home","snapshot_score","id_stable"].includes(k));
+
+      if (hasType) score += 2;
+      if (hasTime) score += 3;
+      if (hasTeam) score += 1;
+      if (hasPlayer) score += 1;
+      if (hasTimelineKeys) score += 2;
+    }
+    // 길이가 너무 길면(배당/통계 배열 등) 오탐 방지용 가산/감산
+    if (arr.length >= 5) score += 2;
+    if (arr.length > 200) score -= 3;
+    return score;
+  }
+
+
+  function evtFindCandidates(root) {
+    const out = [];
+    const seen = new Set();
+    const stack = [{ obj: root, path: "" }];
+
+    while (stack.length) {
+      const { obj, path } = stack.pop();
+      if (!obj) continue;
+
+      if (Array.isArray(obj)) {
+        const sc = evtScoreArray(obj);
+
+        // ✅ (root_array) 후보는 UI에 노출하지 않음
+        // 이유: upsertOverride()가 patch JSON을 object만 허용(배열은 저장 실패) → 불일치/혼란 방지
+        if (sc >= 8 && path) {
+          const p = path;
+          if (!seen.has(p)) {
+            seen.add(p);
+            out.push({
+              path: p,
+              score: sc,
+              sample: obj.slice(0, 2),
+              len: obj.length,
+            });
+          }
+        }
+
+        // 배열 내부도 탐색(객체면)
+        for (let i=0;i<Math.min(obj.length, 30);i++) {
+          const v = obj[i];
+          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: path }); // path 유지
+        }
+        continue;
+      }
+
+      if (isObj(obj)) {
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          const p2 = path ? (path + "." + k) : k;
+          if (isObj(v) || Array.isArray(v)) stack.push({ obj: v, path: p2 });
+        }
+      }
+    }
+
+    out.sort((a,b) => b.score - a.score);
+    return out.slice(0, 12);
+  }
+
+
+  function evtRefreshPathSelect() {
+    const sel = document.getElementById("evtPath");
+    const hint = document.getElementById("evtHint");
+    sel.innerHTML = "";
+
+    const cands = evtState.candidates || [];
+    if (!cands.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
+      sel.appendChild(opt);
+      evtState.path = "";
+      hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
+      return;
+    }
+
+    for (const c of cands) {
+      const opt = document.createElement("option");
+      opt.value = c.path;
+      opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
+      sel.appendChild(opt);
+    }
+
+    // 기존 선택 유지 시도
+    const keep = evtState.path && cands.find(x => x.path === evtState.path);
+    evtState.path = keep ? evtState.path : cands[0].path;
+    sel.value = evtState.path;
+
+    hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
+
+    sel.onchange = () => {
+      evtState.path = sel.value || "";
+      evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
+    };
+  }
+
+  function evtNormalizeForUi(e) {
+  // 다양한 스키마를 UI 공통 필드로 매핑(최대한 안전하게)
+  const o = isObj(e) ? e : {};
+  const pick = (...ks) => {
+    for (const k of ks) if (o[k] !== undefined && o[k] !== null) return o[k];
+    return "";
+  };
+
+  const rawType = String(pick("type","event_type","kind","name") || "").toUpperCase();
+  const minute = pick("minute","min","elapsed","elapsed_min","elapsedMinute");
+  const extra = pick("minute_extra","extra","stoppage","added","extra_time");
+
+  const team = pick("side","team","team_id","teamId","team_key","teamSide");
+
+  const main = pick("line1","player","player_name","playerName","main","scorer","sub_in");
+  const extraMain = pick("line2","assist","assist_name","assistName","sub_out","second_player");
+
+  const detail = pick("detail","comment","reason","note","event_detail");
+  const detailStr = String(detail || "").toLowerCase();
+
+  // ✅ UI 타입 결정:
+  // - raw가 이미 PENALTY/OWN_GOAL이면 그대로
+  // - raw가 GOAL인데 detail에 penalty/own goal 힌트가 있으면 UI에서 PENALTY/OWN_GOAL로 표시
+  let uiType = rawType || "OTHER";
+  if (uiType === "GOAL") {
+    const isPen =
+      detailStr.includes("pen") ||
+      detailStr.includes("pk") ||
+      detailStr.includes("penalty");
+    const isOg =
+      detailStr.includes("own goal") ||
+      detailStr.includes("og") ||
+      detailStr.includes("자책");
+    if (isPen) uiType = "PENALTY";
+    else if (isOg) uiType = "OWN_GOAL";
+  }
+
+  const toNumOrBlank = (v) => {
+    if (v === "" || v === null || v === undefined) return "";
+    const n = Number(v);
+    return Number.isFinite(n) ? n : "";
+  };
+
+  return {
+    _raw: o,
+    ui_min: toNumOrBlank(minute),
+    ui_extra: toNumOrBlank(extra),
+    ui_team: String(team || "").toLowerCase(),
+    ui_type: uiType || "OTHER",
+    ui_main: String(main || ""),
+    ui_extraMain: String(extraMain || ""),
+    ui_detail: String(detail || ""),
+  };
+}
+
+
+
+  function evtApplyUiToRaw(row) {
+
+  // UI 필드를 원본 객체에 최대한 무해하게 반영(없던 키는 "event_admin" 네임스페이스로 보관)
+  const r = row._raw || {};
+  if (!isObj(r)) return row;
+
+  const setPref = (keys, val) => {
+    for (const k of keys) {
+      if (r[k] !== undefined) { r[k] = val; return true; }
+    }
+    return false;
+  };
+
+  // minute/extra
+  const minVal = (row.ui_min === "" || row.ui_min === null || row.ui_min === undefined) ? null : Number(row.ui_min);
+  const exVal  = (row.ui_extra === "" || row.ui_extra === null || row.ui_extra === undefined) ? null : Number(row.ui_extra);
+
+  if (!setPref(["minute","min","elapsed","elapsed_min","elapsedMinute"], minVal)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.minute = minVal;
+  }
+  if (!setPref(["minute_extra","extra","stoppage","added","extra_time"], exVal)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.extra = exVal;
+  }
+
+  if (r["minute_label"] !== undefined) {
+    const m = (minVal == null ? null : Number(minVal));
+    const e = (exVal == null ? null : Number(exVal));
+    r["minute_label"] = (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+  }
+
+  // ✅ type: UI에서 PENALTY/OWN_GOAL 선택해도 raw는 최대한 안전하게 GOAL로 저장
+  let uiType = String(row.ui_type || "OTHER").toUpperCase();
+  let storeType = uiType;
+  let forcedDetail = null;
+
+  if (uiType === "PENALTY") {
+    storeType = "GOAL";
+    forcedDetail = "Penalty";
+  } else if (uiType === "OWN_GOAL") {
+    storeType = "GOAL";
+    forcedDetail = "Own Goal";
+  }
+
+  if (!setPref(["type","event_type","kind","name"], storeType)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.type = storeType;
+  }
+
+  // team/side (+ side_home 동기화)
+  const sideVal = String(row.ui_team || "");
+  if (!setPref(["side","team","team_key","teamSide"], sideVal)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.team = sideVal;
+  }
+  if (r["side_home"] !== undefined) {
+    r["side_home"] = (String(sideVal).toLowerCase() === "home");
+  }
+
+  // main/assist
+  if (!setPref(["line1","player","player_name","playerName","main","scorer","sub_in"], row.ui_main)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.main = row.ui_main;
+  }
+  if (!setPref(["line2","assist","assist_name","assistName","sub_out","second_player"], row.ui_extraMain)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.extraMain = row.ui_extraMain;
+  }
+
+  // detail
+  let detailVal = String(row.ui_detail || "");
+  if ((detailVal.trim() === "") && forcedDetail) detailVal = forcedDetail;
+
+  if (!setPref(["detail","comment","reason","note","event_detail"], detailVal)) {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.detail = detailVal;
+  }
+
+  // ✅ UI 서브타입은 event_admin.subtype로도 보관(있으면 디버깅 편함)
+  if (uiType === "PENALTY" || uiType === "OWN_GOAL") {
+    r.event_admin = r.event_admin || {};
+    r.event_admin.subtype = uiType;
+  }
+
+  return row;
+}
+
+
+  function evtRender() {
+    const body = document.getElementById("evtBody");
+    body.innerHTML = "";
+
+    const rows = evtState.events || [];
+    for (let i=0;i<rows.length;i++) {
+      const row = rows[i];
+      const tr = document.createElement("tr");
+
+      tr.innerHTML = `
+        <td><input type="number" value="${row.ui_min ?? ""}" data-k="ui_min" style="width:70px;"></td>
+        <td><input type="number" value="${row.ui_extra ?? ""}" data-k="ui_extra" style="width:70px;"></td>
+        <td>
+          <select data-k="ui_team">
+            <option value="" ${row.ui_team===""?"selected":""}>(none)</option>
+            <option value="home" ${row.ui_team==="home"?"selected":""}>home</option>
+            <option value="away" ${row.ui_team==="away"?"selected":""}>away</option>
+          </select>
+        </td>
+        <td>
+          <select data-k="ui_type">
+            <option value="GOAL" ${row.ui_type==="GOAL"?"selected":""}>GOAL</option>
+            <option value="PENALTY" ${row.ui_type==="PENALTY"?"selected":""}>PENALTY</option>
+            <option value="OWN_GOAL" ${row.ui_type==="OWN_GOAL"?"selected":""}>OWN_GOAL</option>
+            <option value="RED" ${row.ui_type==="RED"?"selected":""}>RED</option>
+            <option value="YELLOW" ${row.ui_type==="YELLOW"?"selected":""}>YELLOW</option>
+            <option value="SUB" ${row.ui_type==="SUB"?"selected":""}>SUB</option>
+            <option value="OTHER" ${row.ui_type==="OTHER"?"selected":""}>OTHER</option>
+          </select>
+
+        </td>
+        <td><input value="${escapeAttr(row.ui_main || "")}" data-k="ui_main" placeholder="main" style="width:100%;"></td>
+        <td><input value="${escapeAttr(row.ui_extraMain || "")}" data-k="ui_extraMain" placeholder="assist/sub out" style="width:100%;"></td>
+        <td><input value="${escapeAttr(row.ui_detail || "")}" data-k="ui_detail" placeholder="detail" style="width:100%;"></td>
+
+        <td><button class="btnsm danger" data-act="del">삭제</button></td>
+      `;
+
+
+      // onchange: state 갱신 + patch 반영
+      tr.querySelectorAll("input,select").forEach(el => {
+        el.onchange = () => {
+            const k = el.getAttribute("data-k");
+            if (!k) return;
+
+            if (k === "ui_min") row.ui_min = (el.value === "" ? "" : Number(el.value));
+            else if (k === "ui_extra") row.ui_extra = (el.value === "" ? "" : Number(el.value)); // ✅ 추가
+            else if (k === "ui_team") row.ui_team = String(el.value || "");
+            else if (k === "ui_type") row.ui_type = String(el.value || "OTHER");
+            else if (k === "ui_main") row.ui_main = String(el.value || "");
+            else if (k === "ui_extraMain") row.ui_extraMain = String(el.value || "");
+            else if (k === "ui_detail") row.ui_detail = String(el.value || "");
+
+            evtApplyUiToRaw(row);
+            evtApplyToPatch(true);
+          };
+        });
+
+
+      tr.querySelector('[data-act="del"]').onclick = () => {
+        evtState.events.splice(i, 1);
+        evtApplyToPatch(true);
+        evtRender();
+      };
+
+      body.appendChild(tr);
+    }
+  }
+
+  function evtLoadFromBundleCurrent() {
+    const hint = document.getElementById("evtHint");
+    const src = bundleMerged || bundleRaw;
+    if (!src) {
+      hint.textContent = "bundle 데이터가 없습니다. (왼쪽에서 경기 선택 후 bundle 탭이 로드되어야 함)";
+      evtState.events = [];
+      evtRender();
+      return;
+    }
+
+    const path = evtState.path || "";
+    if (!path) {
+      hint.textContent = "이벤트 배열 경로가 비어있습니다. 후보 선택을 확인하세요.";
+      evtState.events = [];
+      evtRender();
+      return;
+    }
+
+    // ✅ root_array 지원: bundle 자체가 배열인 경우 로드 허용
+    let arr = null;
+    if (path === "(root_array)") {
+      if (Array.isArray(src)) {
+        arr = src;
+      } else {
+        hint.textContent = "선택 경로가 (root_array)이지만 bundle root가 배열이 아닙니다.";
+        evtState.events = [];
+        evtRender();
+        return;
+      }
+    } else {
+      arr = getByPath(src, path);
+      if (!Array.isArray(arr)) {
+        hint.textContent = `선택한 경로에 배열이 없습니다: ${path}`;
+        evtState.events = [];
+        evtRender();
+        return;
+      }
+    }
+
+
+    // UI row로 변환
+    evtState.events = arr.map(e => evtNormalizeForUi(e));
+    hint.textContent = `로드됨: ${path} (len=${arr.length})`;
+    evtRender();
+  }
+
+  function evtReloadFromBundle() {
+    evtState.candidates = evtFindCandidates(bundleMerged || bundleRaw);
+    evtRefreshPathSelect();
+    evtLoadFromBundleCurrent();
+  }
+
+  function evtSort() {
+    evtState.events.sort((a,b) => {
+      const am = (a.ui_min === "" ? 9999 : Number(a.ui_min));
+      const bm = (b.ui_min === "" ? 9999 : Number(b.ui_min));
+      if (am !== bm) return am - bm;
+      const ae = (a.ui_extra === "" ? 0 : Number(a.ui_extra));
+      const be = (b.ui_extra === "" ? 0 : Number(b.ui_extra));
+      return ae - be;
+    });
+    evtApplyToPatch(true);
+    evtRender();
+  }
+
+  function evtAdd() {
+  const min = document.getElementById("evtMin").value;
+  const ex = document.getElementById("evtExtra").value;
+  const team = document.getElementById("evtTeam").value;
+  const type = document.getElementById("evtType").value;
+  const main = document.getElementById("evtPlayer").value;
+  const extraMain = document.getElementById("evtAssist").value;
+  const detail = document.getElementById("evtDetail").value;
+
+  const p = (evtState.path || "").toLowerCase();
+  const pLast = p.split(".").filter(Boolean).pop() || "";
+
+  // ✅ UI type(PENALTY/OWN_GOAL)는 raw에선 안전하게 GOAL + detail로 저장
+  const uiType = String(type || "OTHER").toUpperCase();
+  let storeType = uiType;
+  let forcedDetail = null;
+
+  if (uiType === "PENALTY") {
+    storeType = "GOAL";
+    forcedDetail = "Penalty";
+  } else if (uiType === "OWN_GOAL") {
+    storeType = "GOAL";
+    forcedDetail = "Own Goal";
+  }
+
+  let raw = null;
+
+  if (pLast === "timeline") {
+    const m = (min === "" ? null : Number(min));
+    const e = (ex === "" ? null : Number(ex));
+    const side = String(team || "");
+
+    const minuteLabel =
+      (m == null) ? "" : (e == null ? `${m}’` : `${m}’+${e}`);
+
+    const finalDetail =
+      (String(detail || "").trim() === "" && forcedDetail) ? forcedDetail : (String(detail || "").trim() === "" ? null : String(detail || ""));
+
+    raw = {
+      id_stable: `admin-${Date.now()}`,
+      line1: String(main || ""),
+      line2: (String(extraMain || "").trim() === "" ? null : String(extraMain || "")),
+      minute: m,
+      minute_extra: e,
+      minute_label: minuteLabel,
+      period: "",
+      side: side,
+      side_home: (side === "home"),
+      snapshot_score: null,
+      type: String(storeType || "OTHER"),
+      detail: finalDetail,
+      event_admin: (uiType === "PENALTY" || uiType === "OWN_GOAL") ? { subtype: uiType } : undefined,
+    };
+
+    // event_admin가 undefined면 제거(깔끔)
+    if (raw.event_admin === undefined) delete raw.event_admin;
+
+  } else {
+    raw = {
+      event_admin: {
+        minute: min === "" ? null : Number(min),
+        extra: ex === "" ? null : Number(ex),
+        team,
+        type: storeType,
+        subtype: (uiType === "PENALTY" || uiType === "OWN_GOAL") ? uiType : null,
+        main,
+        extraMain,
+        detail: (String(detail || "").trim() === "" && forcedDetail) ? forcedDetail : detail,
+      }
+    };
+  }
+
+  const row = evtNormalizeForUi(raw);
+  row.ui_min = (min === "" ? "" : Number(min));
+  row.ui_extra = (ex === "" ? "" : Number(ex));
+  row.ui_team = String(team || "");
+  row.ui_type = uiType;
+  row.ui_main = String(main || "");
+  row.ui_extraMain = String(extraMain || "");
+  row.ui_detail = (String(detail || "").trim() === "" && forcedDetail) ? forcedDetail : String(detail || "");
+
+  evtApplyUiToRaw(row);
+
+  evtState.events.push(row);
+  evtSort();
+
+  document.getElementById("evtPlayer").value = "";
+  document.getElementById("evtAssist").value = "";
+  document.getElementById("evtDetail").value = "";
+}
+
+
+  function evtClearAll() {
+    const ok = confirm("이벤트를 전부 삭제할까요? (해당 배열을 빈 배열로 override)");
+    if (!ok) return;
+    evtState.events = [];
+    evtApplyToPatch(false);
+    evtRender();
+  }
+
+  function evtApplyToPatch(silent=true) {
+    // 현재 evtState.events를 patch JSON에 "선택된 경로"로 세팅
+    const path = evtState.path || "";
+    if (!path || path === "(root_array)") {
+      if (!silent) setOv("이벤트 배열 경로가 비어있습니다. (자동 탐지/선택 확인)", false);
+      return false;
+    }
+
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    const arr = evtState.events.map(r => r._raw || {});
+    // 배열은 통째로 replace
+    setByPath(basePatch, path, arr);
+
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+    if (!silent) setOv(`이벤트를 Patch에 반영했습니다: ${path} (len=${arr.length})`, true);
+
+    updateComparisonViews();
+    return true;
+  }
+
+
+
+  async function hideFixture() {
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    basePatch.hidden = true; // 또는 false
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+
+    setOv("hidden=true 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
+    updateComparisonViews();
+  }
+
+
+  async function unhideFixture() {
+    let basePatch = {};
+    try {
+      basePatch = JSON.parse(document.getElementById("patch").value || "{}");
+      if (!basePatch || typeof basePatch !== "object" || Array.isArray(basePatch)) basePatch = {};
+    } catch (e) {
+      basePatch = {};
+    }
+
+    basePatch.hidden = false;
+    document.getElementById("patch").value = JSON.stringify(basePatch, null, 2);
+
+    setOv("hidden=false 패치를 세팅했습니다. 저장(Upsert) 누르면 적용됩니다.", true);
+    updateComparisonViews();
+  }
+
+
+  document.getElementById("fxDate").value = isoDateLocal();
+  const fxDateTo = document.getElementById("fxDateTo");
+  if (fxDateTo) fxDateTo.value = document.getElementById("fxDate").value;
+  document.getElementById("fxTz").value = "Asia/Seoul";
+
+
+  // ✅ 필터/검색 즉시 반영 (서버 재호출 없이 UI 리스트만 갱신)
+  (function attachFxLiveFilters(){
+    const fxSearch = document.getElementById("fxSearch");
+    const fxLeague = document.getElementById("fxLeagueIds");
+    const fxTz = document.getElementById("fxTz");
+
+    if (fxSearch) fxSearch.addEventListener("input", () => renderFixtures());
+    if (fxLeague) fxLeague.addEventListener("input", () => renderFixtures());
+    if (fxTz) fxTz.addEventListener("change", () => renderFixtures());
+
+    // league_ids 입력값은 blur 시 정규화해서 “서버 쿼리도 안정화”
+    if (fxLeague) fxLeague.addEventListener("blur", () => {
+      fxLeague.value = normalizeLeagueIdsInput(fxLeague.value || "");
+      renderFixtures();
+    });
+  })();
+
+
+  loadFixtures();
+</script>
+  
+  
+
+  <script>
 (function(){
   const themeKey = "SSX_ADMIN_THEME";
 
