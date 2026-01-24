@@ -304,6 +304,7 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
     has_et = (status_u in ("AET", "PEN", "ET")) or (elapsed >= 105)
 
     for idx, r in enumerate(rows):
+        db_id = int(r.get("id") or 0)  # ✅ 정렬 tie-break용(숫자)
         minute = int(r.get("minute") or 0)
         detail = r.get("detail") or ""
         type_raw = r.get("type") or ""
@@ -386,21 +387,23 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             line1 = who or "Card"
 
         elif t_canon == "RED_CARD_CANCELLED":
-            # ✅ VAR로 인해 "레드카드가 취소됨" (노출)
             who = name_for(player_id)
             line1 = " ".join([x for x in [who, "Red card cancelled"] if x]) if who else "Red card cancelled"
 
         else:
-            # CANCELLED_GOAL 등 기타
             who = name_for(player_id)
             if t_canon == "CANCELLED_GOAL":
                 line1 = " ".join([x for x in [who, "Goal cancelled"] if x])
             else:
                 line1 = who or (detail or "Event")
 
+        # ✅ id_stable은 UI key용으로만 사용 (정렬에는 절대 사용하지 않음)
+        #   db_id가 있으면 db_id 기반으로 만들어두면 디버깅도 쉬움
+        id_stable = f"{fixture_id}-{db_id}" if db_id > 0 else f"{fixture_id}-{idx}"
+
         events.append(
             {
-                "id_stable": f"{fixture_id}-{idx}",
+                "id_stable": id_stable,
                 "minute": minute,
                 "minute_label": label,
                 "side": side,
@@ -411,14 +414,22 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "snapshot_score": snapshot_score,
                 "period": period,
                 "minute_extra": minute_extra,
+                # ✅ 정렬/검증용 내부 값
+                "_db_id": db_id,
+                "_idx": idx,
             }
         )
 
     # Kotlin 과 동일한 정렬 규칙
     order_map = {"H1": 0, "H2": 1, "ET": 2, "PEN": 3}
 
-    type_order = {
+    # ✅ 같은 시각(분/추가시간)에서 타입 우선순위 명시
+    # - 카드 흐름 고정: YELLOW -> RED (그리고 취소는 맨 뒤)
+    type_rank = {
         "PEN_MISSED": -1,
+        "YELLOW": 10,
+        "RED": 11,
+        "RED_CARD_CANCELLED": 12,
     }
 
     def _sort_time_key(e: Dict[str, Any]) -> tuple[int, int]:
@@ -432,15 +443,24 @@ def build_timeline_block(header: Dict[str, Any]) -> List[Dict[str, Any]]:
             return 90, x
         return m, x
 
+    # ✅ 절대 문자열로 tie-break 하지 말 것
+    # - 마지막은 DB id(정수) -> 없으면 idx(정수)
     events.sort(
         key=lambda e: (
-            order_map.get(e["period"], 9),
+            order_map.get(e.get("period"), 9),
             *_sort_time_key(e),
-            type_order.get(e["type"], 0),
-            e["id_stable"],
+            type_rank.get(e.get("type"), 100),
+            int(e.get("_db_id") or 0),
+            int(e.get("_idx") or 0),
         )
     )
 
+    # 내부 키 제거(클라에 보내지 않게)
+    for e in events:
+        e.pop("_db_id", None)
+        e.pop("_idx", None)
+
     return events
+
 
 
