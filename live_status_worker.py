@@ -79,6 +79,12 @@ LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> {"slot60":bool,"s
 # ✅ 리그별 스캔 모드에서 /fixtures(league/date) 호출 간격 제어
 LAST_FIXTURES_SCAN_TS: Dict[Tuple[int, str], float] = {}
 
+# ✅ 최근에 라이브였던 리그를 잠깐 더 "빠르게" 스캔해서 FT 반영 누락 방지
+# - live=all 에서 리그가 빠지는 순간(막 종료)에도 /fixtures 스캔을 유지하기 위함
+RECENT_LIVE_LEAGUE_TS: Dict[int, float] = {}
+RECENT_LIVE_LEAGUE_TTL_SEC = int(os.environ.get("RECENT_LIVE_LEAGUE_TTL_SEC", "3600"))  # 기본 1시간
+
+
 
 
 
@@ -1344,6 +1350,8 @@ def run_once() -> int:
 
     watched = set(league_ids)
     watched_live: List[Dict[str, Any]] = []
+    live_league_set: set[int] = set()
+
     for it in live_items or []:
         lg = it.get("league") or {}
         lid = safe_int(lg.get("id"))
@@ -1351,25 +1359,28 @@ def run_once() -> int:
             continue
         if lid in watched:
             watched_live.append(it)
+            live_league_set.add(lid)
 
-    idle_mode = False
+    now_ts = time.time()
 
-    if not watched_live:
-        idle_mode = True
-        live_league_ids = list(league_ids)
+    # ✅ 최근 라이브 리그 TTL 갱신/정리
+    for lid in live_league_set:
+        RECENT_LIVE_LEAGUE_TS[lid] = now_ts
+    for lid, ts in list(RECENT_LIVE_LEAGUE_TS.items()):
+        if (now_ts - float(ts or 0.0)) > RECENT_LIVE_LEAGUE_TTL_SEC:
+            RECENT_LIVE_LEAGUE_TS.pop(lid, None)
+
+    idle_mode = (len(live_league_set) == 0)
+
+    # ✅ 핵심 변경:
+    # "라이브 리그만 스캔"하지 않고, watched 리그 전체는 항상 스캔 유지
+    live_league_ids = list(league_ids)
+
+    if idle_mode:
         print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → idle slow scan (leagues={len(live_league_ids)})")
     else:
-        live_league_ids = []
-        seen_l = set()
-        for it in watched_live:
-            lg = it.get("league") or {}
-            lid = safe_int(lg.get("id"))
-            if lid is None:
-                continue
-            if lid in seen_l:
-                continue
-            seen_l.add(lid)
-            live_league_ids.append(lid)
+        print(f"[live_detect] watched_live_leagues={len(live_league_set)} (live_all={len(live_items)}) → scan all watched leagues={len(live_league_ids)}")
+
 
     # ─────────────────────────────────────
     # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
@@ -1399,7 +1410,16 @@ def run_once() -> int:
             if idle_mode:
                 scan_interval = IDLE_SCAN_INTERVAL_SEC
             else:
-                scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+                # ✅ 라이브 중이거나 "최근 라이브였던" 리그는 빠르게 스캔
+                recent_live = float(RECENT_LIVE_LEAGUE_TS.get(lid) or 0.0)
+                is_hot = (lid in live_league_set) or ((now_ts - recent_live) <= RECENT_LIVE_LEAGUE_TTL_SEC)
+
+                if is_hot:
+                    scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+                else:
+                    # ✅ 지금은 라이브가 아니어도 FT/포스트매치 반영을 위해 느리게는 계속 스캔
+                    scan_interval = IDLE_SCAN_INTERVAL_SEC
+
 
             k_scan = (lid, date_str)
             last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
