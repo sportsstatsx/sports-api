@@ -161,17 +161,39 @@ def fetch_live_all(session: requests.Session) -> List[Dict[str, Any]]:
 
 def target_dates_for_live() -> List[str]:
     """
-    기본은 UTC 오늘.
-    (새벽 시간대 경기 누락 방지를 위해 필요하면 UTC 어제도 같이 조회)
+    ✅ 날짜 범위 확장 (FT 반영 누락 방지 핵심)
+
+    /fixtures?league=...&date=... 는 보통 "킥오프 날짜(UTC)" 기준으로 묶이는 경우가 있어
+    경기 종료가 다음날로 넘어가도 "어제 date" 쪽에서만 잡히는 케이스가 생길 수 있음.
+
+    정책:
+    - 기본: UTC 어제 + 오늘은 항상 조회
+    - 추가(옵션): UTC 21~23시는 "내일"도 같이 조회 (자정 근처 경기/시간대 꼬임 방어)
     """
     now = now_utc()
     today = now.date()
-    dates = [today.isoformat()]
 
-    # UTC 00~03시는 어제 경기(자정 넘어가는 경기)가 INPLAY/FT로 남아있을 가능성이 높음
-    if now.hour <= 3:
-        dates.insert(0, (today - dt.timedelta(days=1)).isoformat())
-    return dates
+    # ✅ 기본: 어제 + 오늘 항상 포함
+    dates = [
+        (today - dt.timedelta(days=1)).isoformat(),
+        today.isoformat(),
+    ]
+
+    # ✅ 옵션: UTC 밤(21~23시)에는 내일도 포함(자정 넘어가는 경기/스케줄 꼬임 방어)
+    # - 너무 과하게 늘리면 API 콜 증가하므로 시간대 제한을 둠
+    if now.hour >= 21:
+        dates.append((today + dt.timedelta(days=1)).isoformat())
+
+    # 중복 제거(순서 유지)
+    seen = set()
+    uniq: List[str] = []
+    for d in dates:
+        if d in seen:
+            continue
+        seen.add(d)
+        uniq.append(d)
+    return uniq
+
 
 
 def map_status_group(short_code: Optional[str]) -> str:
