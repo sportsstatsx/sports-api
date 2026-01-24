@@ -99,159 +99,6 @@ def get_subscribed_matches() -> List[int]:
     )
     return [int(r["match_id"]) for r in rows]
 
-def calc_score_from_db_events(
-    rows: List[Dict[str, Any]],
-    home_id: int,
-    away_id: int,
-    hint_home_ft: int,
-    hint_away_ft: int,
-) -> Tuple[int, int]:
-    """
-    DB의 match_events(Goal/Var)로부터 타임라인 규칙 기반 스코어를 계산.
-    - Missed Penalty 제외
-    - Var(Goal Disallowed/Cancelled/No Goal)로 직전 골 취소 처리(보수적)
-    - Own Goal은 team_id를 반대로 뒤집어 1점 처리(타임라인과 동일한 의도)
-    """
-    def _norm(s: Any) -> str:
-        if s is None:
-            return ""
-        x = str(s).lower().strip()
-        x = " ".join(x.split())
-        return x
-
-    invalid_markers = ("cancel", "disallow", "no goal", "offside", "foul", "annul", "null")
-
-    # goals: {team_id, is_og, minute, extra, cancelled}
-    goals: List[Dict[str, Any]] = []
-
-    # 이미 rows가 정렬되어 들어온다고 가정(혹시 몰라 한번 더)
-    def _key(r: Dict[str, Any]) -> Tuple[int, int, int]:
-        m = r.get("minute")
-        e = r.get("extra")
-        i = r.get("id")
-        mm = int(m) if m is not None else 10**9
-        ee = int(e) if e is not None else 0
-        ii = int(i) if i is not None else 0
-        return (mm, ee, ii)
-
-    evs = sorted(rows or [], key=_key)
-
-    def _add_goal(r: Dict[str, Any]) -> None:
-        detail = _norm(r.get("detail"))
-
-        # 실축PK 제외
-        if "missed penalty" in detail:
-            return
-        if ("miss" in detail) and ("pen" in detail):
-            return
-
-        # Goal.detail에 취소/무효 문구가 붙는(드문) 케이스 방어(OG는 예외)
-        if any(m in detail for m in invalid_markers) and ("own goal" not in detail):
-            return
-
-        tid = r.get("team_id")
-        if tid is None:
-            return
-        team_id = int(tid)
-
-        minute = int(r.get("minute") or 0) if r.get("minute") is not None else 0
-        extra = int(r.get("extra") or 0)
-
-        is_og = ("own goal" in detail)
-
-        goals.append(
-            {
-                "team_id": team_id,
-                "is_og": bool(is_og),
-                "minute": minute,
-                "extra": extra,
-                "cancelled": False,
-            }
-        )
-
-    def _apply_var(r: Dict[str, Any]) -> None:
-        detail = _norm(r.get("detail"))
-        if not detail:
-            return
-
-        is_disallow = ("goal disallowed" in detail) or ("goal cancelled" in detail) or ("no goal" in detail)
-        if not is_disallow:
-            return
-
-        var_team_id = r.get("team_id")
-        var_team_id = int(var_team_id) if var_team_id is not None else None
-        var_minute = r.get("minute")
-        if var_minute is None:
-            return
-        var_elapsed = int(var_minute)
-
-        # 보수적 취소: 같은 분(우선) -> +-1 -> +-2 범위에서 직전 골 취소
-        def _pick_cancel_idx(max_delta: int) -> int | None:
-            best: int | None = None
-            for i in range(len(goals) - 1, -1, -1):
-                g = goals[i]
-                if g.get("cancelled"):
-                    continue
-                g_el = g.get("minute")
-                if g_el is None:
-                    continue
-                if abs(int(g_el) - var_elapsed) > max_delta:
-                    continue
-
-                if var_team_id is not None:
-                    if int(g.get("team_id")) == var_team_id:
-                        return i
-                    if best is None:
-                        best = i
-                else:
-                    return i
-            return best
-
-        idx = _pick_cancel_idx(0)
-        if idx is None:
-            idx = _pick_cancel_idx(1)
-        if idx is None:
-            idx = _pick_cancel_idx(2)
-
-        if idx is not None:
-            goals[idx]["cancelled"] = True
-
-    for r in evs:
-        t = _norm(r.get("type"))
-        if t == "goal":
-            _add_goal(r)
-        elif t == "var":
-            _apply_var(r)
-
-    def _sum_scores() -> Tuple[int, int]:
-        h = 0
-        a = 0
-        for g in goals:
-            if g.get("cancelled"):
-                continue
-            tid = int(g.get("team_id"))
-            is_og = bool(g.get("is_og"))
-
-            scoring_tid = tid
-            if is_og:
-                if tid == home_id:
-                    scoring_tid = away_id
-                elif tid == away_id:
-                    scoring_tid = home_id
-
-            if scoring_tid == home_id:
-                h += 1
-            elif scoring_tid == away_id:
-                a += 1
-        return h, a
-
-    h, a = _sum_scores()
-
-    # hint는 "OG flip 방향이 섞이는 공급자 케이스"까지 완벽히 잡으려면 필요하지만,
-    # 지금은 알림 worker에서 타임라인과 동일하게 OG를 반대로 처리하는 게 1차 목표라
-    # hint는 참고용으로만 둔다(필요 시 여기서 분기 확장 가능).
-    return h, a
-
 
 
 def load_current_match_state(match_id: int) -> MatchState | None:
@@ -428,39 +275,11 @@ def load_match_labels(match_id: int) -> Dict[str, Any]:
 
 
 
-
-def load_last_goal_minute(match_id: int) -> Dict[str, int] | None:
-    """
-    ✅ 요구사항 반영:
-    - 득점 시각을 match_events에서 찾지 않는다.
-    - fixtures(=matches.elapsed)만 사용한다.
-    - extra(추가시간)는 fixtures에 없으니 0으로 둔다.
-    """
-    el = load_match_elapsed(match_id)
-    if el is None or el <= 0:
-        return None
-    return {"minute": int(el), "extra": 0}
-
-
-def load_last_redcard_minute(match_id: int) -> Dict[str, int] | None:
-    """
-    ✅ 요구사항 반영:
-    - 레드카드 시각도 match_events에서 찾지 않는다.
-    - fixtures(=matches.elapsed)만 사용한다.
-    """
-    el = load_match_elapsed(match_id)
-    if el is None or el <= 0:
-        return None
-    return {"minute": int(el), "extra": 0}
-
-
-
 def apply_monotonic_state(
     last: MatchState | None,
     current: MatchState,
-    *,
-    allow_goal_decrease: bool = False,
 ) -> MatchState:
+
     if last is None:
         return current
 
@@ -803,13 +622,22 @@ def maybe_send_kickoff_10m(fcm: FCMClient, match: MatchState) -> None:
 
     try:
         kickoff_dt = datetime.fromisoformat(str(row["date_utc"]))
+        # ✅ tz 없는 datetime(naive)로 들어오는 경우 방지
+        if kickoff_dt.tzinfo is None:
+            kickoff_dt = kickoff_dt.replace(tzinfo=timezone.utc)
     except Exception:
         return
 
     now_utc = datetime.now(timezone.utc)
-    diff_sec = (kickoff_dt - now_utc).total_seconds()
+    try:
+        diff_sec = (kickoff_dt - now_utc).total_seconds()
+    except Exception:
+        # ✅ 혹시라도 tz 혼종이면 안전하게 스킵
+        return
+
     if not (0 <= diff_sec <= 600):
         return
+
 
     state_row = fetch_one(
         """
@@ -1211,12 +1039,17 @@ def run_forever(interval_seconds: int = 10) -> None:
             penalties_end_sent = rank >= 80     # FT/AET면 승부차기도 이미 끝났다고 간주(FT에서만 true 의미)
             fulltime_sent = rank >= 80
 
+            # ✅ kickoff_10m도 재배포 직후 "잠금" 처리
+            # - 재배포 시점이 킥오프 10분 전 구간에 걸리면 원치 않는 알림이 튈 수 있음
+            kickoff_10m_sent = kickoff_sent  # 킥오프가 이미 진행/진입이면 10분전은 의미 없음
+
             execute(
                 """
                 UPDATE match_notification_state
                 SET
                   last_goal_disallowed_event_id = 0,
 
+                  kickoff_10m_sent = %s,
                   kickoff_sent = %s,
                   halftime_sent = %s,
                   secondhalf_sent = %s,
@@ -1230,6 +1063,7 @@ def run_forever(interval_seconds: int = 10) -> None:
                 WHERE match_id = %s
                 """,
                 (
+                    bool(kickoff_10m_sent),
                     bool(kickoff_sent),
                     bool(halftime_sent),
                     bool(secondhalf_sent),
@@ -1238,10 +1072,10 @@ def run_forever(interval_seconds: int = 10) -> None:
                     bool(penalties_start_sent),
                     bool(penalties_end_sent),
                     bool(fulltime_sent),
-
                     match_id,
                 ),
             )
+
     except Exception:
         log.exception("Bootstrap failed (will continue normal loop)")
 
