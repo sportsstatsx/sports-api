@@ -1421,7 +1421,13 @@ def run_once() -> int:
     fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
 
     SEASON_TTL = 60 * 60
-    NOFIX_TTL = 60 * 10
+
+    # ✅ NOFIX를 바로 10분 박제하면 "일시적 빈 응답"에 FT를 놓칠 수 있음
+    # - 1~2번 빈 응답은 흔들림으로 보고 짧게 재시도
+    # - 연속 3번 이상일 때만 nofix로 취급
+    NOFIX_TTL_SOFT = 60        # 1분: 재시도 유도
+    NOFIX_TTL_HARD = 60 * 10   # 10분: 정말 없을 때만
+
 
     now_ts = time.time()
     for k, v in list(fc.items()):
@@ -1462,10 +1468,20 @@ def run_once() -> int:
             used_season: Optional[int] = None
 
             cache_key = (lid, date_str)
+
+            # ✅ 이 리그가 "라이브/최근라이브"면 nofix 박제 금지
+            recent_live = float(RECENT_LIVE_LEAGUE_TS.get(lid) or 0.0)
+            is_hot = (lid in live_league_set) or ((now_ts - recent_live) <= RECENT_LIVE_LEAGUE_TTL_SEC)
+
             cached = fc.get(cache_key)
             if cached and float(cached.get("exp") or 0) >= now_ts:
-                if cached.get("no") is True:
+                # miss 카운트(연속 빈 응답)
+                miss = int(cached.get("miss") or 0)
+
+                # ✅ nofix는 "연속 3회 이상" + "hot 아님"일 때만 스킵
+                if (cached.get("no") is True) and (miss >= 3) and (not is_hot):
                     continue
+
                 cached_season = cached.get("season")
                 if isinstance(cached_season, int):
                     try:
@@ -1473,27 +1489,47 @@ def run_once() -> int:
                         if rows:
                             fixtures = rows
                             used_season = cached_season
+                            # ✅ 성공하면 miss 리셋
+                            fc[cache_key] = {"season": cached_season, "no": False, "miss": 0, "exp": now_ts + SEASON_TTL}
                         else:
-                            fc.pop(cache_key, None)
+                            # ✅ 빈 응답이면 miss 증가(일시 흔들림 가능)
+                            miss2 = miss + 1
+                            # hot이면 hard 박제 금지(짧게 재시도)
+                            exp = now_ts + (NOFIX_TTL_SOFT if is_hot else (NOFIX_TTL_HARD if miss2 >= 3 else NOFIX_TTL_SOFT))
+                            fc[cache_key] = {"season": cached_season, "no": (miss2 >= 3 and not is_hot), "miss": miss2, "exp": exp}
                     except Exception as e:
+                        # ✅ 에러는 nofix로 박제하지 말고 캐시 제거(다음 루프 재시도)
                         fc.pop(cache_key, None)
                         print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
             if used_season is None:
+                found_any = False
+                last_err = None
                 for season in infer_season_candidates(date_str):
                     try:
                         rows = fetch_fixtures(s, lid, date_str, season)
                         if rows:
                             fixtures = rows
                             used_season = season
-                            fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
+                            found_any = True
+                            fc[cache_key] = {"season": season, "no": False, "miss": 0, "exp": now_ts + SEASON_TTL}
                             break
                     except Exception as e:
+                        last_err = e
                         print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
 
-            if used_season is None:
-                fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
-                continue
+                if not found_any and used_season is None:
+                    # ✅ 어떤 시즌도 못 찾았는데, 이게 '진짜 무경기'인지 '일시 빈 응답'인지 구분이 필요
+                    prev = fc.get(cache_key) or {}
+                    miss = int(prev.get("miss") or 0) + 1
+
+                    # hot이면 절대 hard nofix로 박제 금지(짧게 재시도)
+                    exp = now_ts + (NOFIX_TTL_SOFT if is_hot else (NOFIX_TTL_HARD if miss >= 3 else NOFIX_TTL_SOFT))
+                    fc[cache_key] = {"season": None, "no": (miss >= 3 and not is_hot), "miss": miss, "exp": exp}
+
+                    # ✅ 지금은 스킵 (다음 run에서 다시 시도하게 됨)
+                    continue
+
 
             total_fixtures += len(fixtures)
             print(f"[fixtures] league={lid} date={date_str} season={used_season} count={len(fixtures)}")
