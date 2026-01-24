@@ -79,12 +79,6 @@ LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> {"slot60":bool,"s
 # ✅ 리그별 스캔 모드에서 /fixtures(league/date) 호출 간격 제어
 LAST_FIXTURES_SCAN_TS: Dict[Tuple[int, str], float] = {}
 
-# ✅ 최근에 라이브였던 리그를 잠깐 더 "빠르게" 스캔해서 FT 반영 누락 방지
-# - live=all 에서 리그가 빠지는 순간(막 종료)에도 /fixtures 스캔을 유지하기 위함
-RECENT_LIVE_LEAGUE_TS: Dict[int, float] = {}
-RECENT_LIVE_LEAGUE_TTL_SEC = int(os.environ.get("RECENT_LIVE_LEAGUE_TTL_SEC", "3600"))  # 기본 1시간
-
-
 
 
 
@@ -159,44 +153,19 @@ def fetch_live_all(session: requests.Session) -> List[Dict[str, Any]]:
 
 
 
-def target_dates_for_live(live_items: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+def target_dates_for_live() -> List[str]:
     """
-    FT 누락 방지용 날짜 선택(호출 증가 최소화 버전)
-
-    핵심:
-    - 기본은 UTC "어제 + 오늘"만 스캔 (이 조합이 '90분쯤 응답에서 경기 사라짐'을 막는 핵심)
-    - '내일'은 호출을 크게 늘릴 수 있어 제거
-    - 대신 live=all(또는 watched_live)에서 실제로 라이브로 잡힌 경기들의 fixture.date(UTC)에서
-      YYYY-MM-DD 를 추출해 그 날짜만 추가 스캔 (필요할 때만)
+    기본은 UTC 오늘.
+    (새벽 시간대 경기 누락 방지를 위해 필요하면 UTC 어제도 같이 조회)
     """
     now = now_utc()
     today = now.date()
+    dates = [today.isoformat()]
 
-    dates: List[str] = [
-        (today - dt.timedelta(days=1)).isoformat(),
-        today.isoformat(),
-    ]
-
-    # live_items에서 kickoff UTC 날짜를 추출해서 추가(필요한 날짜만)
-    if live_items:
-        for it in live_items:
-            fx = it.get("fixture") or {}
-            d = safe_text(fx.get("date")) or ""
-            # "2026-01-25T..." 형태에서 날짜만
-            if len(d) >= 10 and d[4] == "-" and d[7] == "-":
-                dates.append(d[:10])
-
-    # 중복 제거(순서 유지)
-    seen = set()
-    uniq: List[str] = []
-    for d in dates:
-        if d in seen:
-            continue
-        seen.add(d)
-        uniq.append(d)
-    return uniq
-
-
+    # UTC 00~03시는 어제 경기(자정 넘어가는 경기)가 INPLAY/FT로 남아있을 가능성이 높음
+    if now.hour <= 3:
+        dates.insert(0, (today - dt.timedelta(days=1)).isoformat())
+    return dates
 
 
 def map_status_group(short_code: Optional[str]) -> str:
@@ -1357,6 +1326,7 @@ def run_once() -> int:
         ensure_match_postmatch_timeline_state_table()
         run_once._ddl_done = True  # type: ignore[attr-defined]
 
+    dates = target_dates_for_live()
     now = now_utc()
     fetched_at = now
 
@@ -1372,45 +1342,30 @@ def run_once() -> int:
         print(f"[live_detect] err: {e}", file=sys.stderr)
         live_items = []
 
-    # ✅ 날짜 범위 결정은 live=all 이후에 한다 (호출 증가 최소화 + 필요한 날짜만 추가)
-    # - watched_live(필터된 라이브) 기준으로 넣는 게 가장 안전/절약
-    # - 아직 watched_live가 아래에서 만들어지니, 여기선 일단 live_items 전체를 넣고
-    #   실제 스캔 리그는 어차피 watched league로 제한되어 호출 폭증은 없음
-    dates = target_dates_for_live(live_items)
-
-
     watched = set(league_ids)
-    watched_live: List[Dict[str, Any]] = []
-    live_league_set: set[int] = set()
 
+    # ✅ live=all에서 "현재 라이브가 있는 watched 리그"만 별도로 추출
+    live_lids: set[int] = set()
     for it in live_items or []:
         lg = it.get("league") or {}
         lid = safe_int(lg.get("id"))
         if lid is None:
             continue
         if lid in watched:
-            watched_live.append(it)
-            live_league_set.add(lid)
+            live_lids.add(lid)
 
-    now_ts = time.time()
-
-    # ✅ 최근 라이브 리그 TTL 갱신/정리
-    for lid in live_league_set:
-        RECENT_LIVE_LEAGUE_TS[lid] = now_ts
-    for lid, ts in list(RECENT_LIVE_LEAGUE_TS.items()):
-        if (now_ts - float(ts or 0.0)) > RECENT_LIVE_LEAGUE_TTL_SEC:
-            RECENT_LIVE_LEAGUE_TS.pop(lid, None)
-
-    idle_mode = (len(live_league_set) == 0)
-
-    # ✅ 핵심 변경:
-    # "라이브 리그만 스캔"하지 않고, watched 리그 전체는 항상 스캔 유지
+    # ✅ 항상 watched 전체를 스캔한다.
+    # - 라이브가 있는 리그: 빠르게
+    # - 라이브가 없는 리그: 느리게(FT/포스트매치 반영용)
     live_league_ids = list(league_ids)
 
+    # idle_mode는 "전체 watched 중 라이브가 0개냐"를 의미로만 남겨둠(로그용)
+    idle_mode = (len(live_lids) == 0)
+
     if idle_mode:
-        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → idle slow scan (leagues={len(live_league_ids)})")
+        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → all leagues slow scan mode")
     else:
-        print(f"[live_detect] watched_live_leagues={len(live_league_set)} (live_all={len(live_items)}) → scan all watched leagues={len(live_league_ids)}")
+        print(f"[live_detect] watched_live={len(live_lids)} (live_all={len(live_items)}) → mixed scan (live fast / non-live slow)")
 
 
     # ─────────────────────────────────────
@@ -1421,13 +1376,7 @@ def run_once() -> int:
     fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
 
     SEASON_TTL = 60 * 60
-
-    # ✅ NOFIX를 바로 10분 박제하면 "일시적 빈 응답"에 FT를 놓칠 수 있음
-    # - 1~2번 빈 응답은 흔들림으로 보고 짧게 재시도
-    # - 연속 3번 이상일 때만 nofix로 취급
-    NOFIX_TTL_SOFT = 60        # 1분: 재시도 유도
-    NOFIX_TTL_HARD = 60 * 10   # 10분: 정말 없을 때만
-
+    NOFIX_TTL = 60 * 10
 
     now_ts = time.time()
     for k, v in list(fc.items()):
@@ -1444,18 +1393,13 @@ def run_once() -> int:
     for date_str in dates:
         for lid in live_league_ids:
 
-            if idle_mode:
-                scan_interval = IDLE_SCAN_INTERVAL_SEC
+            # ✅ 리그별로:
+            # - 지금 라이브가 있는 리그는 빠르게
+            # - 라이브가 없는 리그는 FT/포스트매치 반영을 위해 느리게
+            if lid in live_lids:
+                scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
             else:
-                # ✅ 라이브 중이거나 "최근 라이브였던" 리그는 빠르게 스캔
-                recent_live = float(RECENT_LIVE_LEAGUE_TS.get(lid) or 0.0)
-                is_hot = (lid in live_league_set) or ((now_ts - recent_live) <= RECENT_LIVE_LEAGUE_TTL_SEC)
-
-                if is_hot:
-                    scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
-                else:
-                    # ✅ 지금은 라이브가 아니어도 FT/포스트매치 반영을 위해 느리게는 계속 스캔
-                    scan_interval = IDLE_SCAN_INTERVAL_SEC
+                scan_interval = IDLE_SCAN_INTERVAL_SEC
 
 
             k_scan = (lid, date_str)
@@ -1468,20 +1412,10 @@ def run_once() -> int:
             used_season: Optional[int] = None
 
             cache_key = (lid, date_str)
-
-            # ✅ 이 리그가 "라이브/최근라이브"면 nofix 박제 금지
-            recent_live = float(RECENT_LIVE_LEAGUE_TS.get(lid) or 0.0)
-            is_hot = (lid in live_league_set) or ((now_ts - recent_live) <= RECENT_LIVE_LEAGUE_TTL_SEC)
-
             cached = fc.get(cache_key)
             if cached and float(cached.get("exp") or 0) >= now_ts:
-                # miss 카운트(연속 빈 응답)
-                miss = int(cached.get("miss") or 0)
-
-                # ✅ nofix는 "연속 3회 이상" + "hot 아님"일 때만 스킵
-                if (cached.get("no") is True) and (miss >= 3) and (not is_hot):
+                if cached.get("no") is True:
                     continue
-
                 cached_season = cached.get("season")
                 if isinstance(cached_season, int):
                     try:
@@ -1489,47 +1423,27 @@ def run_once() -> int:
                         if rows:
                             fixtures = rows
                             used_season = cached_season
-                            # ✅ 성공하면 miss 리셋
-                            fc[cache_key] = {"season": cached_season, "no": False, "miss": 0, "exp": now_ts + SEASON_TTL}
                         else:
-                            # ✅ 빈 응답이면 miss 증가(일시 흔들림 가능)
-                            miss2 = miss + 1
-                            # hot이면 hard 박제 금지(짧게 재시도)
-                            exp = now_ts + (NOFIX_TTL_SOFT if is_hot else (NOFIX_TTL_HARD if miss2 >= 3 else NOFIX_TTL_SOFT))
-                            fc[cache_key] = {"season": cached_season, "no": (miss2 >= 3 and not is_hot), "miss": miss2, "exp": exp}
+                            fc.pop(cache_key, None)
                     except Exception as e:
-                        # ✅ 에러는 nofix로 박제하지 말고 캐시 제거(다음 루프 재시도)
                         fc.pop(cache_key, None)
                         print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
             if used_season is None:
-                found_any = False
-                last_err = None
                 for season in infer_season_candidates(date_str):
                     try:
                         rows = fetch_fixtures(s, lid, date_str, season)
                         if rows:
                             fixtures = rows
                             used_season = season
-                            found_any = True
-                            fc[cache_key] = {"season": season, "no": False, "miss": 0, "exp": now_ts + SEASON_TTL}
+                            fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
                             break
                     except Exception as e:
-                        last_err = e
                         print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
 
-                if not found_any and used_season is None:
-                    # ✅ 어떤 시즌도 못 찾았는데, 이게 '진짜 무경기'인지 '일시 빈 응답'인지 구분이 필요
-                    prev = fc.get(cache_key) or {}
-                    miss = int(prev.get("miss") or 0) + 1
-
-                    # hot이면 절대 hard nofix로 박제 금지(짧게 재시도)
-                    exp = now_ts + (NOFIX_TTL_SOFT if is_hot else (NOFIX_TTL_HARD if miss >= 3 else NOFIX_TTL_SOFT))
-                    fc[cache_key] = {"season": None, "no": (miss >= 3 and not is_hot), "miss": miss, "exp": exp}
-
-                    # ✅ 지금은 스킵 (다음 run에서 다시 시도하게 됨)
-                    continue
-
+            if used_season is None:
+                fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
+                continue
 
             total_fixtures += len(fixtures)
             print(f"[fixtures] league={lid} date={date_str} season={used_season} count={len(fixtures)}")
