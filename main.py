@@ -872,6 +872,381 @@ def admin_delete_override(fixture_id: int):
     _admin_log("override_delete", ok=True, status_code=200, fixture_id=fixture_id)
     return jsonify({"ok": True, "fixture_id": fixture_id})
 
+# ─────────────────────────────────────────
+# Admin API: Hockey overrides + fixtures(raw/merged) + bundle
+# - DB: hockey_match_overrides
+# - key column: game_id (기본 가정)
+# ─────────────────────────────────────────
+
+def _hockey_load_overrides(game_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    hockey_match_overrides에서 patch 로드
+    - DB key column: fixture_id (PK)
+    - UI/서비스 레이어에서는 game_id를 쓰지만, 현재 구조는
+      fixture_id == game_id 로 매핑해서 사용한다.
+    """
+    if not game_ids:
+        return {}
+
+    try:
+        from hockey.hockey_db import hockey_fetch_all
+    except Exception:
+        return {}
+
+    ids = list(dict.fromkeys([int(x) for x in game_ids if x is not None]))
+    if not ids:
+        return {}
+
+    placeholders = ",".join(["%s"] * len(ids))
+    sql = f"SELECT fixture_id, patch FROM hockey_match_overrides WHERE fixture_id IN ({placeholders})"
+    rows = hockey_fetch_all(sql, tuple(ids)) or []
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        try:
+            fid = int(r.get("fixture_id"))
+        except Exception:
+            continue
+
+        p = r.get("patch")
+        if isinstance(p, dict):
+            out[fid] = p
+        else:
+            # patch가 json string으로 들어오는 케이스도 방어
+            try:
+                import json as _json
+                pp = _json.loads(p) if isinstance(p, str) else None
+                if isinstance(pp, dict):
+                    out[fid] = pp
+            except Exception:
+                pass
+
+    return out
+
+
+
+def _hockey_game_to_fixture_row(g: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    /api/hockey/fixtures 의 game 객체를 football_override UI가 쓰는 row 형태로 변환
+    - fixture_id == game_id 로 맞춤(프론트 수정 최소화)
+    """
+    league = g.get("league") or {}
+    home = g.get("home") or {}
+    away = g.get("away") or {}
+
+    game_id = g.get("game_id")
+    league_id = g.get("league_id") or league.get("id")
+    season = g.get("season")
+    date_utc = g.get("date_utc")
+
+    status = (g.get("status") or "").strip().upper()
+    status_long = g.get("status_long") or ""
+
+    # hockey status_group 대충 3그룹만: NS / LIVE / FINISHED
+    if status in ("NS",):
+        status_group = "NS"
+    elif status in ("FT", "AET", "PEN"):
+        status_group = "FINISHED"
+    elif status in ("P1", "P2", "P3", "BT", "OT", "SO"):
+        status_group = "LIVE"
+    else:
+        status_group = status or ""
+
+    # score는 UI quick-edit가 ft를 쓰므로 ft/score 둘 다 세팅
+    hscore = home.get("score")
+    ascore = away.get("score")
+
+    row = {
+        "fixture_id": int(game_id) if game_id is not None else None,
+        "league_id": int(league_id) if league_id is not None else None,
+        "season": int(season) if season is not None else None,
+        "date_utc": date_utc,
+        "kickoff_utc": date_utc,   # UI에서 비교용으로만 쓰이니 동일값
+        "status_group": status_group,
+        "status": status,
+        "elapsed": None,
+        "minute": None,
+        "status_long": status_long,
+        "league_round": "",
+        "venue_name": "",
+        "league_name": league.get("name") or "",
+        "league_logo": league.get("logo"),
+        "league_country": league.get("country") or "",
+        "home": {
+            "id": home.get("id"),
+            "name": home.get("name") or "",
+            "logo": home.get("logo"),
+            "ft": hscore,
+            "ht": None,
+            "score": hscore,
+            "red_cards": 0,
+        },
+        "away": {
+            "id": away.get("id"),
+            "name": away.get("name") or "",
+            "logo": away.get("logo"),
+            "ft": ascore,
+            "ht": None,
+            "score": ascore,
+            "red_cards": 0,
+        },
+        "hidden": False,
+    }
+    return row
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/fixtures_raw", methods=["GET"])
+@require_admin
+def admin_hockey_fixtures_raw():
+    """
+    ✅ 하키 원본(raw) fixtures (override/hidden 미적용)
+    - hockey_fixtures_router와 동일한 date/timezone/league_ids 해석
+    """
+    from hockey.services.hockey_fixtures_service import hockey_get_fixtures_by_utc_range
+
+    league_id = request.args.get("league_id", type=int)
+    league_ids_raw = request.args.get("league_ids", type=str)
+    league_ids: List[int] = []
+    if league_ids_raw:
+        for part in league_ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                league_ids.append(int(part))
+            except ValueError:
+                continue
+
+    date_str = request.args.get("date", type=str)
+    tz_str = request.args.get("timezone", "UTC")
+
+    if not date_str:
+        return jsonify({"ok": False, "error": "date is required (YYYY-MM-DD)"}), 400
+
+    try:
+        user_tz = pytz.timezone(tz_str)
+    except Exception:
+        return jsonify({"ok": False, "error": f"Invalid timezone: {tz_str}"}), 400
+
+    try:
+        local_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
+
+    # ✅ 하키 정식과 동일: [local_start, next_day_start)
+    local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
+    local_next_day_start = local_start + timedelta(days=1)
+    utc_start = local_start.astimezone(timezone.utc)
+    utc_end = local_next_day_start.astimezone(timezone.utc)
+
+    games = hockey_get_fixtures_by_utc_range(
+        utc_start=utc_start,
+        utc_end=utc_end,
+        league_ids=league_ids,
+        league_id=league_id,
+    )
+
+    rows = [_hockey_game_to_fixture_row(g) for g in (games or [])]
+    return jsonify({"ok": True, "rows": rows})
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/fixtures_merged", methods=["GET"])
+@require_admin
+def admin_hockey_fixtures_merged():
+    """
+    ✅ 하키 merged fixtures (override 반영 + hidden 포함)
+    - UI 배지용: _has_override 포함
+    """
+    from hockey.services.hockey_fixtures_service import hockey_get_fixtures_by_utc_range
+
+    league_id = request.args.get("league_id", type=int)
+    league_ids_raw = request.args.get("league_ids", type=str)
+    league_ids: List[int] = []
+    if league_ids_raw:
+        for part in league_ids_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                league_ids.append(int(part))
+            except ValueError:
+                continue
+
+    date_str = request.args.get("date", type=str)
+    tz_str = request.args.get("timezone", "UTC")
+
+    if not date_str:
+        return jsonify({"ok": False, "error": "date is required (YYYY-MM-DD)"}), 400
+
+    try:
+        user_tz = pytz.timezone(tz_str)
+    except Exception:
+        return jsonify({"ok": False, "error": f"Invalid timezone: {tz_str}"}), 400
+
+    try:
+        local_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
+
+    local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
+    local_next_day_start = local_start + timedelta(days=1)
+    utc_start = local_start.astimezone(timezone.utc)
+    utc_end = local_next_day_start.astimezone(timezone.utc)
+
+    games = hockey_get_fixtures_by_utc_range(
+        utc_start=utc_start,
+        utc_end=utc_end,
+        league_ids=league_ids,
+        league_id=league_id,
+    )
+
+    rows = [_hockey_game_to_fixture_row(g) for g in (games or [])]
+    ids = [r["fixture_id"] for r in rows if r.get("fixture_id") is not None]
+    override_map = _hockey_load_overrides(ids)
+
+    fixture_patch_keys = {
+        "fixture_id", "league_id", "season",
+        "date_utc", "kickoff_utc",
+        "status_group", "status", "elapsed", "minute", "status_long",
+        "league_round", "venue_name",
+        "league_name", "league_logo", "league_country",
+        "home", "away",
+        "hidden",
+    }
+
+    merged: List[Dict[str, Any]] = []
+    for f in rows:
+        fid = f.get("fixture_id")
+        patch = override_map.get(fid) if fid is not None else None
+
+        if patch and isinstance(patch, dict):
+            if isinstance(patch.get("header"), dict):
+                p2 = dict(patch.get("header") or {})
+                if "hidden" in patch:
+                    p2["hidden"] = patch.get("hidden")
+            else:
+                p2 = {k: v for k, v in patch.items() if k in fixture_patch_keys}
+
+            f2 = _deep_merge(f, p2)
+            f2["_has_override"] = True
+            merged.append(f2)
+        else:
+            f["_has_override"] = False
+            merged.append(f)
+
+    return jsonify({"ok": True, "rows": merged})
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/overrides/<int:game_id>", methods=["GET"])
+@require_admin
+def admin_hockey_get_override(game_id: int):
+    try:
+        from hockey.hockey_db import hockey_fetch_one
+        row = hockey_fetch_one(
+            "SELECT patch, updated_at FROM hockey_match_overrides WHERE fixture_id = %s",
+            (game_id,),
+        )
+    except Exception:
+        row = None
+
+    if not row:
+        return jsonify({"ok": True, "game_id": game_id, "patch": None})
+
+    return jsonify(
+        {
+            "ok": True,
+            "game_id": game_id,
+            "patch": row.get("patch"),
+            "updated_at": row.get("updated_at"),
+        }
+    )
+
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/overrides/<int:game_id>", methods=["PUT"])
+@require_admin
+def admin_hockey_upsert_override(game_id: int):
+    patch = request.get_json(silent=True)
+    if not isinstance(patch, dict):
+        return jsonify({"ok": False, "error": "patch must be a JSON object"}), 400
+
+    # football과 동일: timeline -> header(ft/ht/score/red_cards) 동기화 시도(없으면 그냥 통과)
+    try:
+        _admin_sync_header_from_timeline_patch(patch)
+    except Exception:
+        pass
+
+    try:
+        from hockey.hockey_db import hockey_execute
+    except Exception:
+        hockey_execute = None
+
+    if not hockey_execute:
+        from hockey.hockey_db import hockey_fetch_all  # noqa
+        return jsonify({"ok": False, "error": "hockey_execute not available"}), 500
+
+    hockey_execute(
+        """
+        INSERT INTO hockey_match_overrides (fixture_id, patch, updated_at)
+        VALUES (%s, %s::jsonb, now())
+        ON CONFLICT (fixture_id)
+        DO UPDATE SET patch = EXCLUDED.patch, updated_at = now()
+        """,
+        (game_id, json.dumps(patch, ensure_ascii=False)),
+    )
+    return jsonify({"ok": True, "game_id": game_id})
+
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/overrides/<int:game_id>", methods=["DELETE"])
+@require_admin
+def admin_hockey_delete_override(game_id: int):
+    try:
+        from hockey.hockey_db import hockey_execute
+        hockey_execute("DELETE FROM hockey_match_overrides WHERE fixture_id = %s", (game_id,))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "game_id": game_id})
+
+
+
+@app.route(f"/{ADMIN_PATH}/api/hockey/game_detail_bundle", methods=["GET"])
+def admin_hockey_game_detail_bundle():
+    """
+    ✅ football_override의 match_detail_bundle와 동일 컨셉(하지만 하키용)
+    - public endpoint (UI에서 publicApi로 호출)
+    - apply_override=0/1 지원
+    """
+    game_id = request.args.get("fixture_id", type=int) or request.args.get("game_id", type=int)
+    apply_override = request.args.get("apply_override", default="1")
+    apply_override = str(apply_override).strip() != "0"
+
+    if not game_id:
+        return jsonify({"ok": False, "error": "fixture_id(game_id) required"}), 400
+
+    from hockey.services.hockey_matchdetail_service import hockey_get_game_detail
+    base = hockey_get_game_detail(int(game_id))
+
+    # base가 {ok:true, data:{...}} 형태면 data만 쓰고, 아니면 통째로
+    data = base.get("data") if isinstance(base, dict) and "data" in base else base
+
+    if apply_override:
+        patch = _hockey_load_overrides([int(game_id)]).get(int(game_id))
+        if isinstance(patch, dict):
+            if isinstance(patch.get("header"), dict) and isinstance(data, dict):
+                # header가 있으면 header 우선 병합
+                if isinstance(data.get("header"), dict):
+                    data["header"] = _deep_merge(data["header"], patch["header"])
+                else:
+                    data["header"] = patch["header"]
+                if "hidden" in patch:
+                    data["hidden"] = patch.get("hidden")
+            elif isinstance(data, dict):
+                data = _deep_merge(data, patch)
+
+    return jsonify({"ok": True, "data": data})
+
 
 @app.route(f"/{ADMIN_PATH}/api/logs", methods=["GET"])
 @require_admin
@@ -2398,6 +2773,8 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
+
 
 
 

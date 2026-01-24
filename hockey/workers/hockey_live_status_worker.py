@@ -938,8 +938,11 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
               AND g.game_date <= %s
               AND COALESCE(g.status, '') NOT IN (
                 'FT','AET','PEN','FIN','ENDED','END',
+                'AP','AOT',
                 'ABD','AW','CANC','POST','WO'
               )
+
+
               AND (
                 -- ✅ 보통 진행중 상태 (NS/TBD 제외)
                 COALESCE(g.status, '') NOT IN ('NS','TBD')
@@ -976,20 +979,29 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
 
 def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
-    """
-    ✅ 워커 관점 '종료' 판정(중요):
-    - 명시적 종료 상태는 즉시 종료로 본다.
-    - 과거 경기인데 NS/TBD/SUSP/INT/DELAYED 같은 상태로 남아있으면
-      라이브로 다시 바뀔 가능성이 사실상 없으므로 '종료'로 본다(시간 기반 종료).
-    """
     x = (s or "").upper().strip()
 
-    # 1) 명시적 종료/확정 상태
+    # ✅ API-Sports hockey 종료/확정 상태 보강
     if x in {
         "FT", "AET", "PEN", "FIN", "END", "ENDED",
+        "AP",   # After Penalties ✅ 핵심
+        "AOT",  # After Overtime
         "ABD", "AW", "CANC", "POST", "WO",
     }:
         return True
+
+    if isinstance(game_date, dt.datetime):
+        try:
+            age = _utc_now() - game_date
+            if age > dt.timedelta(hours=6):
+                if x in {"NS", "TBD", "SUSP", "INT", "DELAYED"}:
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 
     # 2) 시간 기반 종료: 과거 경기인데 미시작/중단류 상태로 남아있는 경우
     #    (여기서 6시간은 너가 쿼리에서 쓰던 기준과 동일하게 맞춤)

@@ -294,98 +294,481 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb{
 html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,243,245,0.28); }
 
 /* ─────────────────────────────────────
-   Fixtures filters compact layout (aligned)
+   Help Tooltip ( ! 아이콘 )
+   ───────────────────────────────────── */
+.helpIcon{
+  margin-left:8px;
+  width:18px;
+  height:18px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:999px;
+  border:1px solid var(--border2);
+  background:transparent;
+  color:var(--muted);
+  font-size:12px;
+  font-weight:700;
+  line-height:1;
+  cursor:pointer;
+  user-select:none;
+}
+.helpIcon:hover{
+  border-color:var(--border);
+  color:var(--text);
+  background:var(--panel2);
+}
+
+/* ✅ HelpIcon: 타이틀/라벨 "텍스트 끝"에 바로 붙이기 */
+h2[data-help],
+label[data-help]{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  white-space:nowrap;
+}
+
+/* ✅ h2/label 안의 ! 는 절대 positioning 금지(오른쪽 끝으로 튀는 문제 해결) */
+h2[data-help] .helpIcon,
+label[data-help] .helpIcon{
+  position:static !important;
+  transform:none !important;
+  margin-left:6px !important;
+}
+
+/* ✅ 버튼 내부 정렬은 유지 */
+button[data-help]{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+button[data-help] .helpIcon{
+  margin-left:6px !important;
+  position:static !important;
+  transform:none !important;
+}
+
+
+
+.helpPop{
+  position:fixed;
+  z-index:99999;
+  max-width:min(420px, calc(100vw - 24px));
+  min-width:260px;
+  background:var(--panel);
+  color:var(--text);
+  border:1px solid var(--border);
+  border-radius:14px;
+  box-shadow: 0 18px 60px rgba(0,0,0,0.35);
+  padding:12px 12px 10px 12px;
+}
+.helpPop .hTitle{
+  font-size:13px;
+  font-weight:800;
+  margin:0 0 8px 0;
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  align-items:center;
+}
+.helpPop .hClose{
+  border:1px solid var(--border2);
+  background:transparent;
+  color:var(--muted);
+  border-radius:10px;
+  padding:5px 8px;
+  cursor:pointer;
+  font-size:12px;
+}
+.helpPop .hClose:hover{
+  background:var(--panel2);
+  color:var(--text);
+  border-color:var(--border);
+}
+.helpPop .hBody{
+  font-size:12px;
+  line-height:1.45;
+  color:var(--text);
+  white-space:pre-line;
+}
+.helpPop .hHint{
+  margin-top:8px;
+  font-size:11px;
+  color:var(--muted);
+}
+
+
+/* ─────────────────────────────────────
+   Fixtures filters compact + ordered layout
+   (less vertical space / cleaner alignment)
    ───────────────────────────────────── */
 
 .fxFilters{
   display:grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap:10px;
-  align-items:start;            /* ✅ end(아래정렬) → start(위정렬) */
+
+  grid-template-columns: 160px 160px 220px minmax(240px, 1fr) 170px;
+
+  grid-template-areas:
+    "from to tz search actions"
+    "league league league league actions";
+
+  gap:8px 10px;
+
+  /* ✅ 행 기준을 위쪽으로 고정 → Actions가 아래로 밀려 보이는 현상 감소 */
+  align-items:start;
 }
 
-/* ✅ 각 칸을 세로 스택으로 고정해서 라벨/컨트롤 라인 맞춤 */
+
+
+.fxFromBlock{ grid-area: from; }
+.fxToBlock{ grid-area: to; }
+.fxTzBlock{ grid-area: tz; }
+.fxActionsBlock{ grid-area: actions; }
+.fxSearchBlock{ grid-area: search; }
+.fxLeagueBlock{ grid-area: league; }
+
 .fxFilters > div{
   display:flex;
   flex-direction:column;
+  gap:4px;
   min-width:0;
 }
 
-/* ✅ 라벨 높이 고정(줄바꿈 때문에 컨트롤 라인이 흔들리는 현상 방지) */
+/* 라벨: 1줄 고정 + 말줄임 (불필요한 높이 제거) */
 .fxFilters label{
-  margin:0 0 6px 0;
-  line-height:1;
-  height:14px;
+  margin:0;
+  line-height:1.1;
+  display:flex;             /* ✅ 텍스트 바로 옆에 ! 붙게 */
+  align-items:center;
+  gap:6px;
   white-space:nowrap;
-  overflow:hidden;
-  text-overflow:ellipsis;
 }
 
-/* ✅ 컨트롤(입력/셀렉트/버튼) 높이 통일 */
+/* label 안 ! 는 타이틀 끝에 딱 붙이기 */
+.fxFilters label .helpIcon{
+  margin-left:0;            /* gap이 먹으니 0 */
+  flex:0 0 auto;
+}
+
+
+/* 컨트롤: 높이/패딩 축소 */
 .fxFilters input,
 .fxFilters select{
-  min-height:36px;
+  min-height:32px;
+  padding:7px 10px !important;
+  border-radius:10px !important;
   box-sizing:border-box;
 }
 
-/* Actions 버튼 줄도 입력박스 높이와 맞추기 */
-.fxBtnRow{
+/* Actions: 세로 버튼(더 컴팩트) */
+.fxBtnCol{
   display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:8px;
-  margin-top:auto;
-}
-.fxBtnRow button{
-  min-height:36px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  grid-template-columns: 1fr;
+  gap:6px;
 }
 
-/* League: select + 버튼들을 한 줄로 “같은 높이” */
+/* ✅ 버튼을 “작은 컨트롤” 느낌으로 */
+.fxBtnCol button{
+  min-height:32px;          /* ✅ input/select과 동일 높이 */
+  padding:7px 10px !important;
+  font-size:12px !important;
+  border-radius:10px !important;
+}
+
+
+
+
+/* League: 한 줄(셀렉트 + 버튼들) 유지, 버튼 더 컴팩트 */
 .leagueBar{
   display:grid;
   grid-template-columns: 1fr auto;
   gap:8px;
   align-items:stretch;
 }
-
-.leagueBar select{
-  min-width:0;
-}
+.leagueBar select{ min-width:0; }
 
 .leagueBtns{
   display:flex;
   gap:6px;
+  align-items:stretch;
+  flex-wrap:nowrap;
 }
 .leagueBtns .btnsm{
-  min-height:36px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+  min-height:32px;
   padding:0 10px;
 }
 
-/* pills가 없을 때도 높이 유지해서 아래 줄이 들쭉날쭉해 보이는 것 방지 */
+/* pills: 한 줄에 최대한 붙게(공간 절약) */
 .leaguePills{
-  margin-top:6px;
-  min-height:18px;
+  margin-top:4px;
+  min-height:0;
   display:flex;
   flex-wrap:wrap;
-  gap:6px;
+  gap:4px;
 }
-
 .leaguePills .pill{
-  font-size:11px;
-  padding:2px 8px;
+  font-size:10px;
+  padding:1px 7px;
   border-radius:999px;
   border:1px solid var(--border2);
   color: var(--muted);
   background: transparent;
 }
 
+/* 반응형: 2열 → 1열 */
+@media (max-width: 980px){
+  .fxFilters{
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "from to"
+      "tz search"
+      "league league"
+      "actions actions";
+  }
+
+  /* ✅ 좁아지면 Actions 버튼 2개를 가로로 */
+  .fxBtnCol{
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 640px){
+  .fxFilters{
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "from"
+      "to"
+      "tz"
+      "search"
+      "league"
+      "actions";
+  }
+
+  .fxBtnCol{
+    grid-template-columns: 1fr 1fr; /* 모바일에서도 2개 나란히 */
+  }
+
+  .leagueBar{ grid-template-columns: 1fr; }
+  .leagueBtns{ flex-wrap:wrap; }
+  .leagueBtns .btnsm{ flex:1 1 60px; }
+}
 
 
+
+
+/* ─────────────────────────────────────
+   Layout sanity fixes (no overlap / no clipping)
+   ───────────────────────────────────── */
+
+/* ✅ 상단 영역: 스크롤 시 겹침 방지 + 시각적으로 분리 */
+.top{
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border2);
+
+  /* body margin(12px)와 맞춰 header가 “바”처럼 보이게 */
+  margin: -12px -12px 12px -12px;
+  padding: 10px 12px;
+}
+
+/* ✅ 2컬럼 그리드: 너무 줄어들면 겹치지 말고 자동 스택 */
+.grid{
+  grid-template-columns: minmax(560px, 1.15fr) minmax(520px, 0.85fr);
+  gap: 14px;
+}
+@media (max-width: 1220px){
+  .grid{ grid-template-columns: 1fr; }
+}
+
+/* ✅ 카드 내부 overflow로 “글 잘림/겹침” 나는 것 방지 */
+.card{
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* ✅ pre/textarea: 스크롤 영역으로 고정해서 레이아웃 밀림 방지 */
+pre.mono{
+  white-space: pre;
+  overflow: auto;
+  max-height: 360px;
+  padding: 10px;
+  border: 1px solid var(--border2);
+  border-radius: 12px;
+}
+textarea{
+  max-height: 320px;
+  resize: vertical;
+}
+
+/* ✅ 탭 버튼: 내부 요소(! 아이콘 포함) 때문에 줄/겹침 나지 않게 */
+.tabs{ gap: 8px; }
+.tabbtn{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* ✅ 리스트 아이템: flex 대신 grid로 바꿔서 좌/우가 절대 겹치지 않게 */
+.item{
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 560px){
+  .item{ grid-template-columns: 1fr; }
+}
+
+/* 좌측(팀/리그) 영역은 줄어들어도 안전하게 말줄임 */
+.fxTeams{
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+.fxTeam{
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.fxTeamName{
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+@media (max-width: 560px){
+  .fxTeamName{ max-width: 160px; }
+}
+.fxLeagueLine{
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 우측(배지/스코어) 영역: 최소폭 확보 + 줄바꿈/정렬 안정화 */
+.fxRight{
+  min-width: 170px;
+  text-align: right;
+}
+@media (max-width: 560px){
+  .fxRight{ text-align: left; }
+}
+.fxBadges{
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+@media (max-width: 560px){
+  .fxBadges{ justify-content: flex-start; }
+}
+.fxScore{
+  margin-top: 6px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* ✅ 버튼들: 한 줄 과밀 방지(자동 그리드) */
+.btnGrid{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 8px;
+}
+.btnGrid button{
+  width: 100%;
+  min-height: 36px;
+}
+
+/* row 안쪽 아이템이 폭 부족으로 튀는 케이스 방지 */
+.row > div{ min-width: 0; }
+
+/* ─────────────────────────────────────
+   Override Editor compact layout
+   ───────────────────────────────────── */
+
+.ovTop{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:10px 12px;
+  align-items:start;
+}
+
+.ovBox{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+
+/* Quick actions: 2x2 고정, 버튼/입력 높이 통일 */
+.ovActions .btnGrid{
+  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  gap:8px;
+}
+.ovActions .btnGrid button{
+  min-height:32px;
+  padding:7px 10px !important;
+  font-size:12px !important;
+  border-radius:10px !important;
+}
+
+/* Quick Edit 필드: 2열 그리드로 촘촘하게 */
+.ovFields{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:10px 12px;
+  align-items:start;
+}
+.ovField{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+
+/* Status preset row: select + input 한 줄 정렬 */
+.ovPresetRow{
+  display:grid;
+  grid-template-columns: 170px 1fr;
+  gap:8px;
+  align-items:stretch;
+}
+.ovPresetRow > *{ min-width:0; }
+
+/* 하단 액션(Apply/Upsert)도 버튼 크기 통일 */
+.ovBottomBtns{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap:8px;
+}
+.ovBottomBtns button{
+  width:100%;
+  min-height:34px;
+  padding:8px 10px !important;
+  font-size:12px !important;
+}
+
+/* 입력 높이 살짝 컴팩트(Override 영역만) */
+.ovEditor input,
+.ovEditor select{
+  min-height:32px;
+  padding:7px 10px !important;
+}
+
+/* 반응형: 좁아지면 1열 스택 */
+@media (max-width: 980px){
+  .ovTop{ grid-template-columns: 1fr; }
+  .ovFields{ grid-template-columns: 1fr; }
+  .ovPresetRow{ grid-template-columns: 150px 1fr; }
+}
+
+    
   </style>
 </head>
 <body>
@@ -403,21 +786,21 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
   <div class="grid" style="margin-top:14px;">
     <!-- LEFT: Fixtures browser -->
     <div class="card">
-      <h2>Fixtures Browser</h2>
+      <h2 data-help="fxBrowser">Fixtures Browser</h2>
 
       <div class="fxFilters">
-        <div>
-          <label class="muted">Date (From)</label>
+        <div class="fxFromBlock">
+          <label class="muted" data-help="fxDateFrom">Date (From)</label>
           <input id="fxDate" type="date"/>
         </div>
 
-        <div>
-          <label class="muted">Date (To)</label>
+        <div class="fxToBlock">
+          <label class="muted" data-help="fxDateTo">Date (To)</label>
           <input id="fxDateTo" type="date"/>
         </div>
 
-        <div>
-          <label class="muted">Timezone</label>
+        <div class="fxTzBlock">
+          <label class="muted" data-help="fxTz">Timezone</label>
           <select id="fxTz">
             <option value="Asia/Seoul">Asia/Seoul</option>
             <option value="UTC">UTC</option>
@@ -427,8 +810,21 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           </select>
         </div>
 
-        <div>
-          <label class="muted">League Filter (from loaded list)</label>
+        <div class="fxActionsBlock">
+          <label class="muted" data-help="fxActions">Actions</label>
+          <div class="fxBtnCol">
+            <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
+          </div>
+        </div>
+
+        <div class="fxSearchBlock">
+          <label class="muted" data-help="fxSearch">Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
+        </div>
+
+        <div class="fxLeagueBlock">
+          <label class="muted" data-help="fxLeagueFilter">League Filter (from loaded list)</label>
 
           <div class="leagueBar">
             <select id="fxLeaguePick">
@@ -436,9 +832,9 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
             </select>
 
             <div class="leagueBtns">
-              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()">+</button>
-              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()">−</button>
-              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()">ALL</button>
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()" data-help="btnFxLeagueAdd">+</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()" data-help="btnFxLeagueRemove">−</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()" data-help="btnFxLeagueAll">ALL</button>
             </div>
           </div>
 
@@ -447,20 +843,8 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
           <!-- ✅ 기능 유지용: 실제 필터 값은 이 hidden input에 유지 -->
           <input id="fxLeagueIds" type="hidden" />
         </div>
-
-        <div>
-          <label class="muted">Search (team/league)</label>
-          <input id="fxSearch" placeholder="예: Arsenal / LaLiga"/>
-        </div>
-
-        <div>
-          <label class="muted">Actions</label>
-          <div class="fxBtnRow">
-            <button class="primary" onclick="loadFixtures()">불러오기</button>
-            <button id="btnOverridesOnly" onclick="loadOverridesOnly()">OVR만 보기</button>
-          </div>
-        </div>
       </div>
+
 
 
       <div class="muted" style="margin-top:10px;" id="fxHint"></div>
@@ -470,14 +854,15 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
       </div>
 
       <div class="tabs">
-        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')">현재(노출)</button>
-        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')">원본(raw)</button>
-        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')">override patch</button>
-        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')">diff</button>
-        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')">bundle(raw)</button>
-        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')">bundle(merged)</button>
-        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')">bundle diff</button>
+        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')" data-help="tabNow">현재(노출)</button>
+        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')" data-help="tabRaw">원본(raw)</button>
+        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')" data-help="tabPatch">override patch</button>
+        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')" data-help="tabDiff">diff</button>
+        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')" data-help="tabBundleRaw">bundle(raw)</button>
+        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')" data-help="tabBundleMerged">bundle(merged)</button>
+        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')" data-help="tabBundleDiff">bundle diff</button>
       </div>
+
 
       <div class="tabpane active" id="tab_now">
         <div class="muted">선택된 경기(override 반영 결과)</div>
@@ -520,7 +905,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
     <!-- RIGHT: Editor + logs -->
     <div class="row" style="align-items:stretch;">
       <div class="card" style="flex: 1 1 520px;">
-        <h2>Override Editor</h2>
+        <h2 data-help="ovEditor">Override Editor</h2>
 
         <!-- ✅ 선택 경기 요약(앱처럼 한눈에) -->
         <div id="selSummary" class="subcard" style="margin:8px 0 10px 0; display:none;">
@@ -547,207 +932,205 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
         </div>
 
 
-        <div class="row">
-          <div style="flex: 1 1 220px;">
-            <label class="muted">Fixture ID</label>
-            <input id="fixtureId" placeholder="예: 123456"/>
-          </div>
-          <div style="flex: 1 1 220px;">
-            <label class="muted">Quick actions</label>
-            <div class="row" style="gap:8px;">
-              <button onclick="getOverride()">조회</button>
-              <button class="danger" onclick="deleteOverride()">삭제(원복)</button>
-              <button onclick="hideFixture()">숨김(hidden=true)</button>
-              <button onclick="unhideFixture()">숨김해제(hidden=false)</button>
+        <!-- ✅ Override Editor: compact wrapper -->
+        <div class="ovEditor">
+
+          <div class="ovTop">
+            <div class="ovBox">
+              <label class="muted" data-help="fixtureId">Fixture ID</label>
+              <input id="fixtureId" placeholder="예: 123456"/>
+            </div>
+
+            <div class="ovBox ovActions">
+              <label class="muted" data-help="quickActions">Quick actions</label>
+              <div class="btnGrid">
+                <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
+                <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
+                <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
+                <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
+              </div>
             </div>
           </div>
+
+          <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
+
+          <div class="ovFields">
+            <div class="ovField">
+              <label class="muted" data-help="qeVenue">Venue</label>
+              <input id="qeVenue" placeholder="venue_name"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeRound">League Round</label>
+              <input id="qeRound" placeholder="league_round"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusLong">Status Long</label>
+              <input id="qeStatusLong" placeholder="status_long"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeElapsed">Elapsed</label>
+              <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusGroup">Status Group</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusGroupPreset">
+                  <option value="">(preset)</option>
+                  <option value="UPCOMING">UPCOMING</option>
+                  <option value="INPLAY">INPLAY</option>
+                  <option value="FINISHED">FINISHED</option>
+                  <option value="PST">PST</option>
+                  <option value="SUSP">SUSP</option>
+                  <option value="CANC">CANC</option>
+                  <option value="TBD">TBD</option>
+                </select>
+                <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatus">Status</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusPreset">
+                  <option value="">(preset)</option>
+                  <option value="NS">NS</option>
+                  <option value="1H">1H</option>
+                  <option value="HT">HT</option>
+                  <option value="2H">2H</option>
+                  <option value="ET">ET</option>
+                  <option value="BT">BT</option>
+                  <option value="P">P</option>
+                  <option value="FT">FT</option>
+                  <option value="AET">AET</option>
+                  <option value="PEN">PEN</option>
+                  <option value="SUSP">SUSP</option>
+                  <option value="INT">INT</option>
+                  <option value="PST">PST</option>
+                  <option value="CANC">CANC</option>
+                  <option value="ABD">ABD</option>
+                  <option value="AWD">AWD</option>
+                  <option value="WO">WO</option>
+                  <option value="LIVE">LIVE</option>
+                </select>
+                <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeFt">Home FT</label>
+              <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayFt">Away FT</label>
+              <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeHt">Home HT</label>
+              <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayHt">Away HT</label>
+              <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+            </div>
+          </div>
+
+          <div style="margin-top:10px;" class="ovBottomBtns">
+            <button class="primary" onclick="applyQuickEditToPatch()" data-help="btnApplyQuickEdit">
+              Quick Edit → Patch JSON 반영
+            </button>
+            <button onclick="upsertOverride()" data-help="btnUpsertOverride">
+              저장(Upsert)
+            </button>
+          </div>
+
         </div>
 
-        <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Venue</label>
-            <input id="qeVenue" placeholder="venue_name"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">League Round</label>
-            <input id="qeRound" placeholder="league_round"/>
-          </div>
-        </div>
 
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Status Long</label>
-            <input id="qeStatusLong" placeholder="status_long"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">Elapsed</label>
-            <input id="qeElapsed" type="number" placeholder="elapsed (ex: 57)"/>
-          </div>
-        </div>
-
-                <div class="row">
-  <div style="flex:1 1 220px;">
-    <label class="muted">Status Group</label>
-
-    <!-- ✅ 프리셋 드롭다운(클릭하면 항상 선택지 표시) + 직접 입력(input)은 기존 id 유지 -->
-    <div class="row" style="gap:8px;">
-      <div style="flex:0 0 170px;">
-        <select id="qeStatusGroupPreset">
-          <option value="">(preset)</option>
-          <option value="UPCOMING">UPCOMING</option>
-          <option value="INPLAY">INPLAY</option>
-          <option value="FINISHED">FINISHED</option>
-          <option value="PST">PST</option>
-          <option value="SUSP">SUSP</option>
-          <option value="CANC">CANC</option>
-          <option value="TBD">TBD</option>
-        </select>
-      </div>
-      <div style="flex:1 1 auto;">
-        <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
-      </div>
-    </div>
-  </div>
-
-  <div style="flex:1 1 220px;">
-    <label class="muted">Status</label>
-
-    <!-- ✅ 프리셋 드롭다운 + 직접 입력(input)은 기존 id 유지 -->
-    <div class="row" style="gap:8px;">
-      <div style="flex:0 0 170px;">
-        <select id="qeStatusPreset">
-          <option value="">(preset)</option>
-          <option value="NS">NS</option>
-          <option value="1H">1H</option>
-          <option value="HT">HT</option>
-          <option value="2H">2H</option>
-          <option value="ET">ET</option>
-          <option value="BT">BT</option>
-          <option value="P">P</option>
-          <option value="FT">FT</option>
-          <option value="AET">AET</option>
-          <option value="PEN">PEN</option>
-          <option value="SUSP">SUSP</option>
-          <option value="INT">INT</option>
-          <option value="PST">PST</option>
-          <option value="CANC">CANC</option>
-          <option value="ABD">ABD</option>
-          <option value="AWD">AWD</option>
-          <option value="WO">WO</option>
-          <option value="LIVE">LIVE</option>
-        </select>
-      </div>
-      <div style="flex:1 1 auto;">
-        <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
-      </div>
-    </div>
-  </div>
-</div>
-
-
-
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Home FT</label>
-            <input id="qeHomeFt" type="number" placeholder="home.ft"/>
-          </div>
-          
-          <div style="flex:1 1 220px;">
-            <label class="muted">Away FT</label>
-            <input id="qeAwayFt" type="number" placeholder="away.ft"/>
-          </div>
-        </div>
-
-        <div class="row">
-          <div style="flex:1 1 220px;">
-            <label class="muted">Home HT</label>
-            <input id="qeHomeHt" type="number" placeholder="home.ht"/>
-          </div>
-          <div style="flex:1 1 220px;">
-            <label class="muted">Away HT</label>
-            <input id="qeAwayHt" type="number" placeholder="away.ht"/>
-          </div>
-        </div>
-
-        <div class="row" style="margin-top:10px;">
-          <button class="primary" onclick="applyQuickEditToPatch()">Quick Edit → Patch JSON 반영</button>
-          <button onclick="upsertOverride()">저장(Upsert)</button>
-        </div>
 
         <!-- Event Editor -->
         <div style="height:12px;"></div>
         <div class="subcard">
-          <h3>Event Editor (Goals / Cards / Subs)</h3>
+          <h3 data-help="evtEditor">Event Editor (Goals / Cards / Subs)</h3>
 
           <div class="row" style="align-items:flex-end;">
             <div style="flex:1 1 320px;">
-              <label class="muted mini">이벤트 배열 경로(자동 탐지)</label>
+              <label class="muted mini" data-help="evtPath">이벤트 배열 경로(자동 탐지)</label>
               <select id="evtPath"></select>
               <div class="muted mini" id="evtHint" style="margin-top:6px;"></div>
             </div>
-            <div style="flex:0 0 auto; display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btnsm" onclick="evtReloadFromBundle()">bundle에서 불러오기</button>
-              <button class="btnsm" onclick="evtApplyToPatch(false)">Patch에 반영</button>
-              <button class="btnsm danger" onclick="evtClearAll()">전체 삭제</button>
+            <div style="flex:0 0 360px;">
+              <div class="btnGrid">
+                <button class="btnsm" onclick="evtReloadFromBundle()" data-help="btnEvtReload">bundle에서 불러오기</button>
+                <button class="btnsm" onclick="evtApplyToPatch(false)" data-help="btnEvtApply">Patch에 반영</button>
+                <button class="btnsm danger" onclick="evtClearAll()" data-help="btnEvtClear">전체 삭제</button>
+              </div>
             </div>
+
+
           </div>
 
           <div style="height:10px;"></div>
 
           <!-- Add row -->
-          <div class="grid2">
-            <div>
-              <label class="muted mini">Minute</label>
-              <input id="evtMin" type="number" placeholder="예: 57" />
-            </div>
-            <div>
-              <label class="muted mini">Extra(+)</label>
-              <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
-            </div>
+<div class="grid2">
+  <div>
+    <label class="muted mini" data-help="evtMinute">Minute</label>
+    <input id="evtMin" type="number" placeholder="예: 57" />
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtMinute">Extra(+)</label>
+    <input id="evtExtra" type="number" placeholder="예: 2 (없으면 비움)" />
+  </div>
 
-            <div>
-              <label class="muted mini">Team</label>
-              <select id="evtTeam">
-                <option value="">(none)</option>
-                <option value="home">home</option>
-                <option value="away">away</option>
-              </select>
-            </div>
-            <div>
-              <label class="muted mini">Type</label>
-              <select id="evtType">
-                <option value="GOAL">GOAL</option>
-                <option value="PENALTY">PENALTY</option>
-                <option value="OWN_GOAL">OWN_GOAL</option>
-                <option value="RED">RED</option>
-                <option value="YELLOW">YELLOW</option>
-                <option value="SUB">SUB</option>
-                <option value="OTHER">OTHER</option>
-              </select>
+  <div>
+    <label class="muted mini" data-help="evtTeam">Team</label>
+    <select id="evtTeam">
+      <option value="">(none)</option>
+      <option value="home">home</option>
+      <option value="away">away</option>
+    </select>
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtType">Type</label>
+    <select id="evtType">
+      <option value="GOAL">GOAL</option>
+      <option value="PENALTY">PENALTY</option>
+      <option value="OWN_GOAL">OWN_GOAL</option>
+      <option value="RED">RED</option>
+      <option value="YELLOW">YELLOW</option>
+      <option value="SUB">SUB</option>
+      <option value="OTHER">OTHER</option>
+    </select>
+  </div>
 
-            </div>
+  <div>
+    <label class="muted mini" data-help="evtPlayerMain">Player / Main</label>
+    <input id="evtPlayer" placeholder="예: Messi / Player name" />
+  </div>
+  <div>
+    <label class="muted mini" data-help="evtAssistSub">Assist / SubOut</label>
+    <input id="evtAssist" placeholder="예: Assist / Sub out" />
+  </div>
 
-            <div>
-              <label class="muted mini">Player / Main</label>
-              <input id="evtPlayer" placeholder="예: Messi / Player name" />
-            </div>
-            <div>
-              <label class="muted mini">Assist / SubOut</label>
-              <input id="evtAssist" placeholder="예: Assist / Sub out" />
-            </div>
+  <div style="grid-column: 1 / -1;">
+    <label class="muted mini" data-help="evtDetail">Detail</label>
+    <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
+  </div>
 
-            <div style="grid-column: 1 / -1;">
-              <label class="muted mini">Detail</label>
-              <input id="evtDetail" placeholder="예: Penalty / 2nd yellow / Injury / Note" />
-            </div>
+  <div style="grid-column: 1 / -1; display:flex; gap:8px;">
+    <button class="btnsm primary" onclick="evtAdd()" data-help="btnEvtAdd">+ 이벤트 추가</button>
+    <button class="btnsm" onclick="evtSort()" data-help="btnEvtSort">정렬(시간순)</button>
+  </div>
 
-            <div style="grid-column: 1 / -1; display:flex; gap:8px;">
-              <button class="btnsm primary" onclick="evtAdd()">+ 이벤트 추가</button>
-              <button class="btnsm" onclick="evtSort()">정렬(시간순)</button>
-            </div>
-          </div>
+</div>
+
 
           <div style="height:10px;"></div>
 
@@ -774,7 +1157,7 @@ html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover{ background: rgba(241,24
 
 
         <div style="height:10px;"></div>
-        <label class="muted">Patch JSON (부분만)</label>
+        <label class="muted" data-help="patchJson">Patch JSON (부분만)</label>
         <textarea id="patch" placeholder='예: { "venue_name": "Edited", "home": { "ft": 2 } }'></textarea>
 
         <div id="ovResult" class="muted" style="margin-top:10px;"></div>
@@ -1100,10 +1483,489 @@ function safeUrl(u) {
   }
 }
 
+/* ─────────────────────────────────────
+   Help system: data-help="key" 붙은 타이틀에 ! 아이콘 자동 추가
+   ───────────────────────────────────── */
+const HELP = {
+  // ===== Fixtures Browser =====
+  fxBrowser: {
+    title: "Fixtures Browser",
+    body:
+`왼쪽은 경기 목록(merged 기준) 탐색기입니다.
+- 불러오기: 기간(from~to)로 fixtures_merged를 조회합니다.
+- OVR만 보기: 같은 기간 중 override가 있는 경기만 모아봅니다.
+목록 클릭 시 오른쪽 편집기와 하단 비교 탭이 함께 갱신됩니다.`
+  },
+  fxDateFrom: {
+    title: "Date (From)",
+    body:
+`조회 시작 날짜입니다.
+from~to 범위를 최대 31일까지 지원합니다.
+from만 있으면 하루 조회, to까지 있으면 기간 조회로 동작합니다.`
+  },
+  fxDateTo: {
+    title: "Date (To)",
+    body:
+`조회 종료 날짜입니다.
+비워두면 from과 동일하게 처리됩니다.
+from보다 이전 날짜를 넣으면 자동으로 swap(뒤집기)해서 처리합니다.`
+  },
+  fxTz: {
+    title: "Timezone",
+    body:
+`표시/비교 기준 타임존입니다.
+- 리스트 시간 표시(fmtInTz)
+- raw 비교 날짜 산출(ymdInTz)
+- 서버 조회 파라미터 timezone
+에 사용됩니다.`
+  },
+  fxLeagueFilter: {
+    title: "League Filter",
+    body:
+`로드된 fixtures에서 리그 목록을 만들고 UI 필터링합니다.
+- + : 선택 리그를 필터에 추가
+- − : 선택 리그를 필터에서 제거
+- ALL : 전체 리그(필터 초기화)
+아래 pill은 현재 league_ids 상태입니다.
+※ 서버가 league_ids를 무시해도 UI에서 한 번 더 강제 필터합니다.`
+  },
+  fxSearch: {
+    title: "Search (team/league)",
+    body:
+`서버 재호출 없이 목록을 즉시 필터링합니다.
+팀/리그/라운드/국가/fixture_id를 합쳐서 부분검색합니다.`
+  },
+  fxActions: {
+    title: "Actions",
+    body:
+`불러오기:
+- from~to 각 날짜를 순회하며 fixtures_merged를 합칩니다(중복 fixture_id는 dedupe).
+OVR만 보기:
+- 같은 방식으로 조회하되 _has_override=true 인 경기만 모읍니다.
+버튼 테두리(primary)로 모드가 표시됩니다.`
+  },
+
+  // ===== Override Editor =====
+  ovEditor: {
+    title: "Override Editor",
+    body:
+`오른쪽은 선택한 fixture의 override patch를 편집/저장합니다.
+- 조회: /api/overrides/{id} 로 patch를 읽어 textarea에 반영
+- 저장(Upsert): patch가 비어있으면 저장을 막고, 저장 후 목록을 재로딩합니다
+- 삭제(원복): override 레코드를 삭제하고 원본으로 되돌립니다.`
+  },
+  fixtureId: {
+    title: "Fixture ID",
+    body:
+`override를 적용할 대상 경기의 fixture_id 입니다.
+왼쪽 목록에서 경기를 클릭하면 자동으로 채워집니다.`
+  },
+  quickActions: {
+    title: "Quick actions",
+    body:
+`조회: 현재 override patch 조회
+삭제(원복): override 제거(원본 복구)
+숨김(hidden=true): patch에 hidden:true 세팅(저장 전)
+숨김해제(hidden=false): patch에 hidden:false 세팅(저장 전)`
+  },
+  qeVenue: {
+    title: "Venue",
+    body:
+`경기장 이름(venue_name) 오버라이드입니다.
+비워두면 변경하지 않도록 patch에는 '변경된 항목만' 들어가게 설계되어 있습니다.`
+  },
+  qeRound: {
+    title: "League Round",
+    body:
+`리그 라운드 표기(league_round) 오버라이드입니다.
+앱/리스트에 보이는 라운드 텍스트를 강제로 바꿀 때 사용합니다.`
+  },
+  qeStatusLong: {
+    title: "Status Long",
+    body:
+`status_long(문장형 상태) 오버라이드입니다.
+예: "Second Half", "Match Finished" 같은 표시용 텍스트.`
+  },
+  qeElapsed: {
+    title: "Elapsed",
+    body:
+`경과 분(elapsed) 오버라이드입니다.
+리스트/상세에서 진행 분 표시를 보정할 때 사용합니다.`
+  },
+  qeStatusGroup: {
+    title: "Status Group",
+    body:
+`상태 그룹(status_group)입니다.
+UPCOMING / INPLAY / FINISHED / PST / SUSP / CANC / TBD 등.
+프리셋 드롭다운 선택 시 input에 자동 반영되고,
+저장 시 대문자로 정규화해서 불필요한 diff를 줄입니다.`
+  },
+  qeStatus: {
+    title: "Status",
+    body:
+`짧은 상태 코드(status)입니다.
+NS/1H/HT/2H/FT/ET/PEN/PST/CANC 등.
+프리셋 → input 자동 반영, 저장 시 대문자 정규화합니다.`
+  },
+  qeHomeFt: {
+    title: "Home FT",
+    body:
+`홈팀 풀타임 득점(home.ft) 오버라이드입니다.
+원본과 다를 때만 patch에 들어가도록 설계되어 있습니다.`
+  },
+  qeAwayFt: {
+    title: "Away FT",
+    body:
+`원정팀 풀타임 득점(away.ft) 오버라이드입니다.`
+  },
+  qeHomeHt: {
+    title: "Home HT",
+    body:
+`홈팀 하프타임 득점(home.ht) 오버라이드입니다.`
+  },
+  qeAwayHt: {
+    title: "Away HT",
+    body:
+`원정팀 하프타임 득점(away.ht) 오버라이드입니다.`
+  },
+  patchJson: {
+    title: "Patch JSON (부분만)",
+    body:
+`override에 저장될 JSON patch 입니다.
+- object만 허용됩니다(배열 root는 저장 불가).
+- Quick Edit / Event Editor가 여기에 반영됩니다.
+- 저장 전에는 적용되지 않습니다(Upsert 필요).`
+  },
+
+  // ===== Event Editor =====
+  evtEditor: {
+    title: "Event Editor (Goals / Cards / Subs)",
+    body:
+`득점/카드/교체 이벤트 배열을 편집해 patch로 덮어씁니다.
+bundle(raw/merged)에서 이벤트 배열 경로를 자동 탐지하고,
+선택된 경로의 배열을 UI로 로드해서 수정/추가/삭제합니다.`
+  },
+  evtPath: {
+    title: "이벤트 배열 경로(자동 탐지)",
+    body:
+`bundle 구조를 훑어서 '이벤트 배열'로 보이는 배열 후보를 점수화해 보여줍니다.
+가장 점수 높은 후보가 자동 선택되며,
+경로를 바꾸면 해당 경로의 배열을 다시 로드합니다.`
+  },
+  evtReload: {
+    title: "bundle에서 불러오기",
+    body:
+`현재 선택된 fixture의 bundle(raw/merged)에서 이벤트 배열을 다시 읽어옵니다.
+(override 저장 전이라면 merged/raw 상태에 따라 내용이 달라질 수 있습니다.)`
+  },
+  evtApply: {
+    title: "Patch에 반영",
+    body:
+`현재 UI 이벤트 목록을 Patch JSON의 선택 경로에 '배열 통째로' 세팅합니다.
+즉시 저장되는 건 아니며, Upsert를 눌러야 적용됩니다.`
+  },
+  evtClear: {
+    title: "전체 삭제",
+    body:
+`선택된 이벤트 배열을 빈 배열로 override합니다.
+주의: 저장(Upsert)하면 앱에서도 이벤트가 모두 사라집니다.`
+  },
+  evtMinute: {
+    title: "Minute / Extra(+)",
+    body:
+`Minute: 기본 시간(예: 57)
+Extra(+): 추가시간(예: 2)
+정렬(시간순)은 minute → extra 순으로 오름차순 정렬합니다.`
+  },
+  evtTeam: {
+    title: "Team",
+    body:
+`home/away 어느 팀 이벤트인지 표시합니다.
+타임라인 스키마가 있는 경우 side_home 같은 키도 같이 동기화합니다.`
+  },
+  evtType: {
+    title: "Type",
+    body:
+`GOAL/RED/YELLOW/SUB 등 이벤트 종류입니다.
+PENALTY/OWN_GOAL은 UI 편의용 타입이고,
+저장 시 raw에는 GOAL + detail(“Penalty/Own Goal”)로 안전하게 기록합니다.`
+  },
+    evtPlayerMain: {
+    title: "Player / Main",
+    body:
+`주요 선수/주요 텍스트 필드입니다.
+- GOAL: 득점자(또는 주 이벤트 대상)
+- SUB: 교체 IN(들어온 선수)
+- CARD: 카드 받은 선수
+timeline 스키마라면 line1에 저장됩니다.`
+  },
+  evtAssistSub: {
+    title: "Assist / SubOut",
+    body:
+`보조 선수/두번째 텍스트 필드입니다.
+- GOAL: assist(도움)
+- SUB: 교체 OUT(나간 선수)
+timeline 스키마라면 line2에 저장됩니다.`
+  },
+  evtDetail: {
+    title: "Detail",
+    body:
+`세부 설명 메모입니다.
+예: "Penalty", "2nd yellow", "Injury", "VAR" 등.
+PENALTY/OWN_GOAL 타입은 저장 시
+GOAL + detail로 안전하게 기록됩니다.`
+  },
 
 
+  // ===== Tabs (now/raw/patch/diff/bundle) =====
+  tabNow: {
+    title: "현재(노출)",
+    body:
+`fixtures_merged 기준 “현재 앱에 노출되는 형태”를 보여줍니다.
+override / hidden 등이 반영된 최종 결과(JSON)입니다.`
+  },
+  tabRaw: {
+    title: "원본(raw)",
+    body:
+`override 미적용 “원본 fixture”입니다.
+같은 경기라도 타임존/날짜 기준에 따라 raw 조회가 달라질 수 있어
+선택 경기의 날짜를 tz 기준으로 잡아 로드합니다.`
+  },
+  tabPatch: {
+    title: "override patch",
+    body:
+`현재 override에 저장된 “patch(부분 JSON)”입니다.
+오른쪽 Patch textarea 내용이 그대로 반영되어 표시됩니다.`
+  },
+  tabDiff: {
+    title: "diff",
+    body:
+`원본(raw) → 현재(노출) 변화 요약입니다.
+path 단위로 raw 값과 now 값을 비교해 줄 단위로 보여줍니다.`
+  },
+  tabBundleRaw: {
+    title: "bundle(raw)",
+    body:
+`match_detail_bundle를 override 미적용(apply_override=0)으로 호출한 결과입니다.
+Event Editor 자동 탐지/로드의 기준 데이터로도 사용됩니다.`
+  },
+  tabBundleMerged: {
+    title: "bundle(merged)",
+    body:
+`match_detail_bundle를 override 적용(apply_override=1)으로 호출한 결과입니다.
+Event Editor는 기본적으로 merged 우선으로 로드합니다.`
+  },
+  tabBundleDiff: {
+    title: "bundle diff",
+    body:
+`bundle(raw) → bundle(merged) 차이 요약입니다.
+bundle 안에서 override가 실제로 무엇을 바꿨는지 빠르게 확인합니다.`
+  },
+
+  // ===== Buttons (right-side ! on buttons) =====
+  btnLoadFixtures: {
+    title: "불러오기",
+    body:
+`from~to 기간의 fixtures_merged를 날짜별로 조회해 합칩니다.
+- fixture_id 기준으로 중복 제거(dedupe)
+- timezone / league_ids 파라미터 포함
+로드 후 리그 드롭다운 목록도 새로 구성됩니다.`
+  },
+
+  btnOverridesOnly: {
+    title: "OVR만 보기",
+    body:
+`현재 기간(from~to)에서 override가 있는 경기만 모아봅니다.
+- 다시 누르면 일반 불러오기 모드로 복귀(토글)
+- 버튼 테두리(primary)로 현재 모드가 표시됩니다.`
+  },
+  btnFxLeagueAdd: {
+    title: "+ (리그 추가)",
+    body:
+`현재 선택된 리그를 league_ids 필터에 추가합니다.
+추가 즉시 UI 리스트가 필터링되어 보입니다(서버 재호출 없음).`
+  },
+  btnFxLeagueRemove: {
+    title: "− (리그 제거)",
+    body:
+`현재 선택된 리그를 league_ids 필터에서 제거합니다.
+제거 즉시 UI 리스트가 다시 렌더링됩니다.`
+  },
+  btnFxLeagueAll: {
+    title: "ALL (필터 초기화)",
+    body:
+`league_ids 필터를 비워서 전체 리그를 보이게 합니다.
+(서버가 league_ids를 무시해도 UI에서 강제 필터가 해제됩니다.)`
+  },
+
+  btnGetOverride: {
+    title: "조회",
+    body:
+`/api/overrides/{fixture_id} 를 호출해 현재 override patch를 불러옵니다.
+- patch가 있으면 textarea에 반영
+- 이후 비교뷰(raw/diff)와 bundle(raw/merged)도 갱신합니다.`
+  },
+  btnDeleteOverride: {
+    title: "삭제(원복)",
+    body:
+`override 레코드를 삭제해 원본으로 되돌립니다.
+성공하면 patch textarea를 비우고 목록을 재로드합니다.`
+  },
+  btnHideFixture: {
+    title: "숨김(hidden=true)",
+    body:
+`Patch JSON에 hidden:true 를 세팅합니다.
+즉시 적용은 아니고, 저장(Upsert)해야 실제 반영됩니다.`
+  },
+  btnUnhideFixture: {
+    title: "숨김해제(hidden=false)",
+    body:
+`Patch JSON에 hidden:false 를 세팅합니다.
+저장(Upsert) 전까지는 실제 노출 상태가 바뀌지 않습니다.`
+  },
+
+  btnApplyQuickEdit: {
+    title: "Quick Edit → Patch 반영",
+    body:
+`Quick Edit 입력값을 기준으로 “변경된 항목만” Patch JSON에 합칩니다.
+- status/status_group은 대문자 정규화
+- 점수(ft/ht)는 바뀐 값만 home/away에 부분 패치로 들어갑니다.`
+  },
+  btnUpsertOverride: {
+    title: "저장(Upsert)",
+    body:
+`현재 Patch JSON을 PUT으로 저장해 override를 즉시 적용합니다.
+- Patch가 빈 객체면 저장을 막습니다(OVR만 생기는 문제 방지)
+- 저장 성공 시 목록을 다시 불러와 merged 결과를 갱신합니다.`
+  },
+
+  btnEvtReload: {
+    title: "bundle에서 불러오기",
+    body:
+`bundle(raw/merged)를 기준으로 이벤트 배열 경로를 자동 탐지하고,
+선택된 경로의 이벤트 배열을 UI 편집 표로 로드합니다.`
+  },
+  btnEvtApply: {
+    title: "Patch에 반영",
+    body:
+`현재 UI의 이벤트 목록을 Patch JSON의 선택 경로에
+“배열 통째로” 덮어씌웁니다.
+저장은 아니므로 Upsert를 눌러야 적용됩니다.`
+  },
+  btnEvtClear: {
+    title: "전체 삭제",
+    body:
+`선택된 이벤트 배열을 빈 배열로 override합니다.
+저장(Upsert)하면 앱에서도 이벤트가 전부 사라집니다.`
+  },
+  btnEvtAdd: {
+    title: "+ 이벤트 추가",
+    body:
+`입력한 minute/extra/team/type/main/assist/detail로 이벤트를 추가합니다.
+- PENALTY/OWN_GOAL은 저장 시 GOAL + detail로 안전하게 기록합니다.`
+  },
+  btnEvtSort: {
+    title: "정렬(시간순)",
+    body:
+`minute → extra 순으로 오름차순 정렬합니다.
+정렬 후 Patch JSON에도 즉시 반영됩니다.`
+  },
+
+};
+
+let _helpPopEl = null;
+
+function closeHelpPop(){
+  if (_helpPopEl && _helpPopEl.parentNode) _helpPopEl.parentNode.removeChild(_helpPopEl);
+  _helpPopEl = null;
+}
+
+function openHelpPop(anchorEl, key){
+  const h = HELP[key];
+  if (!h) return;
+
+  closeHelpPop();
+
+  const pop = document.createElement("div");
+  pop.className = "helpPop";
+  pop.innerHTML = `
+    <div class="hTitle">
+      <span>${escapeHtml(h.title || "도움말")}</span>
+      <button class="hClose" type="button">닫기</button>
+    </div>
+    <div class="hBody">${escapeHtml(h.body || "")}</div>
+    <div class="hHint">Tip: 같은 항목은 ! 아이콘으로 언제든 다시 확인</div>
+  `;
+
+  document.body.appendChild(pop);
+  _helpPopEl = pop;
+
+  const rect = anchorEl.getBoundingClientRect();
+  const pad = 10;
+
+  // 기본: 아이콘 오른쪽 아래
+  let left = rect.left + window.scrollX + 22;
+  let top  = rect.top  + window.scrollY + 22;
+
+  // 화면 밖이면 보정
+  const pr = pop.getBoundingClientRect();
+  const maxLeft = window.scrollX + window.innerWidth - pr.width - pad;
+  const maxTop  = window.scrollY + window.innerHeight - pr.height - pad;
+
+  left = Math.max(window.scrollX + pad, Math.min(left, maxLeft));
+  top  = Math.max(window.scrollY + pad, Math.min(top, maxTop));
+
+  pop.style.left = left + "px";
+  pop.style.top  = top + "px";
+
+  pop.querySelector(".hClose").onclick = closeHelpPop;
+
+  // 바깥 클릭 닫기
+  setTimeout(() => {
+    window.addEventListener("mousedown", onOutside, { once:true });
+  }, 0);
+
+  function onOutside(ev){
+    if (!pop.contains(ev.target)) closeHelpPop();
+  }
+}
+
+function attachHelpIcons(){
+  // data-help 가진 요소에 ! 아이콘 자동 추가
+  // ✅ 모든 요소(h2/label/button/tabbtn 포함)에 "내부 append"로 통일
+  //    → 버튼 옆에 형제로 붙어서 줄바꿈/아래 밀림 나는 문제 제거
+  const nodes = document.querySelectorAll("[data-help]");
+
+  nodes.forEach(el => {
+    const key = el.getAttribute("data-help");
+    if (!key || !HELP[key]) return;
+
+    // ✅ 중복 방지(내부에 이미 있으면 스킵)
+    if (el.querySelector && el.querySelector(".helpIcon")) return;
+
+    const icon = document.createElement("span");
+    icon.className = "helpIcon";
+    icon.textContent = "!";
+    icon.title = "도움말";
+    icon.onclick = (e) => {
+      e.stopPropagation();
+      openHelpPop(icon, key);
+    };
+
+    el.appendChild(icon);
+  });
+}
+
+
+
+
+// DOM 준비 후 1회 부착
+document.addEventListener("DOMContentLoaded", () => {
+  attachHelpIcons();
+});
 
   function deepMerge(base, patch) {
+
     if (base && typeof base === "object" && !Array.isArray(base) &&
         patch && typeof patch === "object" && !Array.isArray(patch)) {
       const out = { ...base };
@@ -1238,114 +2100,120 @@ function safeUrl(u) {
 
 
   function renderFixtures() {
-    const list = document.getElementById("fxList");
-    list.innerHTML = "";
+  const list = document.getElementById("fxList");
+  if (!list) return;
+  list.innerHTML = "";
 
-    const q = (document.getElementById("fxSearch").value || "").trim().toLowerCase();
-    const leagueSet = parseLeagueIdsSet(document.getElementById("fxLeagueIds").value || "");
+  const q = (document.getElementById("fxSearch")?.value || "").trim().toLowerCase();
+  const leagueSet = parseLeagueIdsSet(document.getElementById("fxLeagueIds")?.value || "");
 
-    const filtered = currentFixtures.filter(f => {
-      // ✅ league_ids 강제 필터(서버가 무시해도 UI에서는 확실히 먹게)
-      if (leagueSet && !leagueSet.has(Number(f.league_id))) return false;
+  const filtered = (currentFixtures || []).filter(f => {
+    if (leagueSet && !leagueSet.has(Number(f.league_id))) return false;
 
-      // ✅ search 필터
-      if (!q) return true;
-      const s = [
-        f.league_name, f.league_country, f.league_round,
-        f.home?.name, f.away?.name,
-        String(f.fixture_id || "")
-      ].join(" ").toLowerCase();
-      return s.includes(q);
-    });
+    if (!q) return true;
+    const s = [
+      f.league_name, f.league_country, f.league_round,
+      f.home?.name, f.away?.name,
+      String(f.fixture_id || "")
+    ].join(" ").toLowerCase();
+    return s.includes(q);
+  });
 
-    filtered.sort((a,b) => {
-      const ka = statusOrderKey(a.status_group);
-      const kb = statusOrderKey(b.status_group);
-      if (ka !== kb) return ka - kb;
-      return String(a.date_utc||"").localeCompare(String(b.date_utc||""));
-    });
+  filtered.sort((a, b) => {
+    const ka = statusOrderKey(a.status_group);
+    const kb = statusOrderKey(b.status_group);
+    if (ka !== kb) return ka - kb;
+    return String(a.date_utc || "").localeCompare(String(b.date_utc || ""));
+  });
 
-    const tz = document.getElementById("fxTz").value || "UTC";
+  const tz = document.getElementById("fxTz")?.value || "UTC";
 
-    for (const f of filtered) {
-      const div = document.createElement("div");
-      const isHidden = (f.hidden === true);
+  for (const f of filtered) {
+    const div = document.createElement("div");
 
-      div.className =
-        "item" +
-        ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
-        (isHidden ? " hidden" : "");
+    const isHidden = (f.hidden === true);
+    div.className =
+      "item" +
+      ((selectedFixture && selectedFixture.fixture_id === f.fixture_id) ? " sel" : "") +
+      (isHidden ? " hidden" : "");
 
-      div.onclick = () => selectFixture(f.fixture_id);
+    div.onclick = () => selectFixture(f.fixture_id);
 
-      const when = fmtInTz(f.date_utc, tz);
-      const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
-      const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
+    const when = fmtInTz(f.date_utc, tz);
+    const score = `${f.home?.ft ?? "-"} : ${f.away?.ft ?? "-"}`;
+    const ht = `${f.home?.ht ?? "-"} : ${f.away?.ht ?? "-"}`;
 
-      const isOvr = (f._has_override === true);
-      const sg = (f.status_group || "").toUpperCase();
+    const isOvr = (f._has_override === true);
+    const sg = (f.status_group || "").toUpperCase();
 
-      const badges = [
-        `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
-        isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
-        isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
-      ].filter(Boolean).join(" ");
+    const badges = [
+      `<span class="badge mono">${escapeHtml(sg || "?")}</span>`,
+      isOvr ? `<span class="badge mono ovr">OVR</span>` : ``,
+      isHidden ? `<span class="badge mono hid">HIDDEN</span>` : ``,
+    ].filter(Boolean).join(" ");
 
-      const hLogo = safeUrl(f.home?.logo);
-      const aLogo = safeUrl(f.away?.logo);
+    const hLogo = safeUrl(f.home?.logo);
+    const aLogo = safeUrl(f.away?.logo);
 
-      const homeLogo = hLogo
-        ? `<img src="${escapeAttr(hLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
-        : "";
-      const awayLogo = aLogo
-        ? `<img src="${escapeAttr(aLogo)}" style="width:16px;height:16px;border-radius:4px;vertical-align:-3px;opacity:0.95;">`
-        : "";
+    const homeLogo = hLogo
+      ? `<img src="${escapeAttr(hLogo)}" style="width:16px;height:16px;border-radius:4px;opacity:0.95;">`
+      : "";
+    const awayLogo = aLogo
+      ? `<img src="${escapeAttr(aLogo)}" style="width:16px;height:16px;border-radius:4px;opacity:0.95;">`
+      : "";
 
+    const leagueLine =
+      `${escapeHtml(f.league_name || "")}` +
+      `${f.league_country ? ` · ${escapeHtml(f.league_country)}` : ""}` +
+      `${f.league_round ? ` · ${escapeHtml(f.league_round)}` : ""}` +
+      `${Number.isFinite(Number(f.league_id)) ? ` · L:${escapeHtml(f.league_id)}` : ""}`;
 
+    div.innerHTML = `
+      <div style="min-width:0;">
+        <div class="small muted mono">${escapeHtml(when)}</div>
 
-      div.innerHTML = `
-        <div style="min-width:0;">
-          <div class="small muted mono">${when}</div>
+        <div class="k fxTeams">
+          <span class="fxTeam">
+            ${homeLogo}
+            <span class="fxTeamName">${escapeHtml(f.home?.name || "HOME")}</span>
+          </span>
 
-          <div class="k" style="display:flex; gap:8px; align-items:center; min-width:0;">
-            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
-              ${homeLogo}
-              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.home?.name || "HOME")}</span>
-            </span>
+          <span class="muted">vs</span>
 
-            <span class="muted" style="flex:0 0 auto;">vs</span>
-
-            <span style="display:flex; gap:6px; align-items:center; min-width:0;">
-              ${awayLogo}
-              <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;">${escapeHtml(f.away?.name || "AWAY")}</span>
-            </span>
-          </div>
-
-          <div class="small muted" style="margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-            ${escapeHtml(f.league_name || "")}${f.league_country ? ` · ${escapeHtml(f.league_country)}` : ""}${f.league_round ? ` · ${escapeHtml(f.league_round)}` : ""}
-            ${Number.isFinite(Number(f.league_id)) ? ` · L:${escapeHtml(f.league_id)}` : ""}
-          </div>
+          <span class="fxTeam">
+            ${awayLogo}
+            <span class="fxTeamName">${escapeHtml(f.away?.name || "AWAY")}</span>
+          </span>
         </div>
 
-        <div class="right" style="flex:0 0 auto; min-width:140px;">
-          <div style="display:flex; gap:6px; justify-content:flex-end; flex-wrap:wrap;">${badges}</div>
-          <div class="mono" style="margin-top:6px; font-size:14px; font-weight:700;">${score}</div>
-          <div class="small muted mono">HT ${ht}</div>
+        <div class="small muted fxLeagueLine" style="margin-top:2px;">
+          ${leagueLine}
         </div>
-      `;
+      </div>
 
-      list.appendChild(div);
-    }
+      <div class="fxRight">
+        <div class="fxBadges">${badges}</div>
+        <div class="mono fxScore">${escapeHtml(score)}</div>
+        <div class="small muted mono">HT ${escapeHtml(ht)}</div>
+      </div>
+    `;
 
-    const total = currentFixtures.length;
-    const shown = filtered.length;
+    list.appendChild(div);
+  }
 
-    const normLeague = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds").value || "");
-    const leagueHint = normLeague ? ` · league_ids=${normLeague}` : "";
+  const total = (currentFixtures || []).length;
+  const shown = filtered.length;
 
-    document.getElementById("fxHint").textContent =
+  const normLeague = normalizeLeagueIdsInput(document.getElementById("fxLeagueIds")?.value || "");
+  const leagueHint = normLeague ? ` · league_ids=${normLeague}` : "";
+
+  const fxHint = document.getElementById("fxHint");
+  if (fxHint) {
+    fxHint.textContent =
       `rows: ${shown} / ${total}${leagueHint} · 검색은 즉시 반영됩니다 · 클릭하면 원본/현재/차이까지 비교됩니다`;
   }
+}
+
 
 
   function fillQuickEditFromFixture(f) {
@@ -2150,41 +3018,53 @@ if (awayLogo) {
   }
 
 
-  function evtRefreshPathSelect() {
-    const sel = document.getElementById("evtPath");
-    const hint = document.getElementById("evtHint");
-    sel.innerHTML = "";
+  function evtPathStorageKey(){
+  const fx = (selectedFixture && selectedFixture.fixture_id) ? String(selectedFixture.fixture_id) : "";
+  return fx ? ("SSX_EVT_PATH__" + fx) : "SSX_EVT_PATH__global";
+}
 
-    const cands = evtState.candidates || [];
-    if (!cands.length) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
-      sel.appendChild(opt);
-      evtState.path = "";
-      hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
-      return;
-    }
+function evtRefreshPathSelect() {
+  const sel = document.getElementById("evtPath");
+  const hint = document.getElementById("evtHint");
+  sel.innerHTML = "";
 
-    for (const c of cands) {
-      const opt = document.createElement("option");
-      opt.value = c.path;
-      opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
-      sel.appendChild(opt);
-    }
-
-    // 기존 선택 유지 시도
-    const keep = evtState.path && cands.find(x => x.path === evtState.path);
-    evtState.path = keep ? evtState.path : cands[0].path;
-    sel.value = evtState.path;
-
-    hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
-
-    sel.onchange = () => {
-      evtState.path = sel.value || "";
-      evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
-    };
+  const cands = evtState.candidates || [];
+  if (!cands.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(이벤트 배열을 자동 탐지하지 못했습니다. Patch JSON에 수동으로 넣어야 할 수 있어요)";
+    sel.appendChild(opt);
+    evtState.path = "";
+    hint.textContent = "bundle 구조에서 이벤트 배열 후보를 못 찾음";
+    return;
   }
+
+  for (const c of cands) {
+    const opt = document.createElement("option");
+    opt.value = c.path;
+    opt.textContent = `${c.path} (len=${c.len}, score=${c.score})`;
+    sel.appendChild(opt);
+  }
+
+  // ✅ 1) localStorage에 저장된 path 우선 복원
+  const saved = (localStorage.getItem(evtPathStorageKey()) || "").trim();
+  const savedOk = saved && cands.find(x => x.path === saved);
+
+  // ✅ 2) 없으면 기존 선택 유지 → 그래도 없으면 1번 후보
+  const keep = evtState.path && cands.find(x => x.path === evtState.path);
+
+  evtState.path = savedOk ? saved : (keep ? evtState.path : cands[0].path);
+  sel.value = evtState.path;
+
+  hint.textContent = "가장 점수 높은 후보가 자동 선택됩니다. 맞는 경로가 아니면 드롭다운에서 바꾸세요.";
+
+  sel.onchange = () => {
+    evtState.path = sel.value || "";
+    localStorage.setItem(evtPathStorageKey(), evtState.path); // ✅ fixture별 기억
+    evtLoadFromBundleCurrent(); // 경로 바꾸면 해당 경로의 이벤트를 다시 로드
+  };
+}
+
 
   function evtNormalizeForUi(e) {
   // 다양한 스키마를 UI 공통 필드로 매핑(최대한 안전하게)
@@ -2633,6 +3513,28 @@ if (awayLogo) {
   const fxDateTo = document.getElementById("fxDateTo");
   if (fxDateTo) fxDateTo.value = document.getElementById("fxDate").value;
   document.getElementById("fxTz").value = "Asia/Seoul";
+
+    // ✅ NEW: From 날짜가 To보다 이후로 바뀌면, To를 From과 동일하게 자동 보정
+  (function attachFxDateClamp(){
+    const fxFrom = document.getElementById("fxDate");
+    const fxTo   = document.getElementById("fxDateTo");
+    if (!fxFrom || !fxTo) return;
+
+    const clamp = () => {
+      const a = String(fxFrom.value || "").trim();
+      const b = String(fxTo.value || "").trim();
+      if (!a || !b) return;
+
+      // YYYY-MM-DD 문자열 비교로 OK
+      if (a > b) {
+        fxTo.value = a;
+      }
+    };
+
+    fxFrom.addEventListener("change", clamp);
+    fxFrom.addEventListener("input", clamp); // 일부 브라우저/UX에서 즉시 반영
+  })();
+
 
 
   // ✅ 필터/검색 즉시 반영 (서버 재호출 없이 UI 리스트만 갱신)

@@ -601,24 +601,28 @@ def build_hockey_message(
     away_name = str(g.get("away_name") or "Away")
     score_line = f"{home_name} {home} : {away} {away_name}"
 
+    # ✅ period는 유지, minute은 무시
+    prefix = period.strip() if period else ""
+
     if event_type == "goal":
         who = team_name or "Goal"
-
-        # ✅ period는 유지, minute은 무시
-        prefix = period.strip() if period else ""
-
-        if prefix:
-            title = f"🏒 {prefix} {who} Goal!"
-        else:
-            title = f"🏒 {who} Goal!"
-
+        title = f"🏒 {prefix} {who} Goal!" if prefix else f"🏒 {who} Goal!"
         body = score_line
         if tag:
             body = f"{score_line}\n{tag}"
-
         return (title, body)
 
-
+    # ✅ 정정/취소 알림 추가 (점수 감소 기반)
+    if event_type == "score_corrected":
+        who = (team_name or "").strip()
+        if who:
+            title = f"🚫 {prefix} {who} Goal Cancelled" if prefix else f"🚫 {who} Goal Cancelled"
+        else:
+            title = f"🔄 {prefix} Score Corrected" if prefix else "🔄 Score Corrected"
+        body = score_line
+        if tag:
+            body = f"{score_line}\n{tag}"
+        return (title, body)
 
     if event_type == "game_start":
         return ("▶ Game Start", score_line)
@@ -641,6 +645,7 @@ def build_hockey_message(
         return ("⏱ Final", score_line)
 
     return ("Hockey Update", score_line)
+
 
 
 def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
@@ -760,6 +765,28 @@ def run_once() -> bool:
         last_away = _to_int(st.get("last_away_score"), 0)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
+        # ─────────────────────────
+        # score epoch (취소 후 재득점 재알림용)
+        # - sent_event_keys에 "__score_epoch:N" 한 개를 저장
+        # - 점수 감소(정정/취소)가 감지되면 epoch += 1
+        # ─────────────────────────
+        score_epoch = 0
+        for k in sent_keys:
+            if isinstance(k, str) and k.startswith("__score_epoch:"):
+                try:
+                    score_epoch = int(k.split(":", 1)[1])
+                except Exception:
+                    score_epoch = 0
+        # epoch marker는 1개만 유지
+        sent_keys = [k for k in sent_keys if not (isinstance(k, str) and k.startswith("__score_epoch:"))]
+        sent_keys.append(f"__score_epoch:{score_epoch}")
+
+        def _set_epoch(new_epoch: int) -> None:
+            nonlocal score_epoch, sent_keys
+            score_epoch = max(0, int(new_epoch))
+            sent_keys = [k for k in sent_keys if not (isinstance(k, str) and k.startswith("__score_epoch:"))]
+            sent_keys.append(f"__score_epoch:{score_epoch}")
+
         status_raw = str(g.get("status") or "").strip()
         status_norm = normalize_status(status_raw)
 
@@ -831,9 +858,6 @@ def run_once() -> bool:
         # 3P 종료 + OT/SO/Final 점프 대응
         if sub.notify_periods and last_status_norm == "3P" and status_norm in ("OT", "SO", "FT", "AP", "AOT"):
             # ✅ 정규시간(3P) 종료 시점에 동점이 아니면 3P End는 스킵하고 Final만 가도록
-            # - FT로 끝났고 점수가 동점이 아니면 => OT가 아닌 경기 => 3P End 알림 생략
-            # - OT/SO로 가는 경우(동점) => 3P End 유지
-            # - AOT/AP는 OT/SO를 거친 종료이므로 3P End 유지(혹시 API가 중간 상태를 스킵해도 3P End는 보내는 쪽)
             if not (status_norm == "FT" and home != away):
                 t, b = build_hockey_message("period_end", g, home, away, status_norm="3P")
                 _send_once(f"pe:{sub.game_id}:3P", t, b)
@@ -845,7 +869,6 @@ def run_once() -> bool:
                 t2, b2 = build_hockey_message("so_start", g, home, away)
                 _send_once(f"ss:{sub.game_id}", t2, b2)
 
-
         # OT -> SO start
         if sub.notify_periods and last_status_norm == "OT" and status_norm == "SO":
             t, b = build_hockey_message("so_start", g, home, away)
@@ -856,22 +879,47 @@ def run_once() -> bool:
         # ─────────────────────────
         score_changed = (home, away) != (last_home, last_away)
         score_increased = (home > last_home) or (away > last_away)
+        score_decreased = (home < last_home) or (away < last_away)
 
         became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
         decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
 
-        # ✅ 골 알림은 "증가"일 때만 + dedupe
-        # ✅ period(1P/2P/3P)는 유지, minute(몇 분)만 제거
-        if sub.notify_score and score_increased:
-            goal_key = f"goal:{sub.game_id}:{home}:{away}"
-            if goal_key not in sent_keys:
-                team_name = ""
-                if home > last_home:
-                    team_name = g.get("home_name") or "Home"
-                elif away > last_away:
-                    team_name = g.get("away_name") or "Away"
+        # ✅ 정정/취소(감소) 알림
+        if sub.notify_score and score_decreased:
+            # 취소/정정이 한 번이라도 있으면 epoch를 올려서,
+            # 이후 동일 스코어 재도달(재득점)도 다시 알림 가능하게
+            _set_epoch(score_epoch + 1)
 
-                # ✅ minute 제거 (DB에서 minute 조회하지 않음)
+            team_name = ""
+            if home < last_home:
+                team_name = g.get("home_name") or "Home"
+            elif away < last_away:
+                team_name = g.get("away_name") or "Away"
+
+            corr_key = f"corr:{sub.game_id}:e{score_epoch}:{last_home}-{last_away}->{home}-{away}"
+            if corr_key not in sent_keys:
+                t, b = build_hockey_message(
+                    "score_corrected",
+                    g,
+                    home,
+                    away,
+                    team_name=team_name,
+                    period=status_norm,
+                )
+                _send_once(corr_key, t, b)
+
+        # ✅ 골 알림(증가)
+        if sub.notify_score and score_increased:
+            team_name = ""
+            if home > last_home:
+                team_name = g.get("home_name") or "Home"
+            elif away > last_away:
+                team_name = g.get("away_name") or "Away"
+
+            # 기존: goal:{game_id}:{home}:{away}
+            # 변경: epoch + 전이 포함 (취소 후 재득점 재알림 가능)
+            goal_key = f"goal:{sub.game_id}:e{score_epoch}:{last_home}-{last_away}->{home}-{away}"
+            if goal_key not in sent_keys:
                 t, b = build_hockey_message(
                     "goal",
                     g,
@@ -881,7 +929,6 @@ def run_once() -> bool:
                     period=status_norm,
                 )
                 _send_once(goal_key, t, b)
-
 
         # Final 중복 방지
         if sub.notify_game_end and (became_final or decided_in_ot_or_so):
@@ -904,6 +951,7 @@ def run_once() -> bool:
 
     log.info("tick: sent=%d", sent)
     return has_fast_candidate
+
 
 
 
