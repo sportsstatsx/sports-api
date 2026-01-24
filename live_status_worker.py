@@ -159,30 +159,32 @@ def fetch_live_all(session: requests.Session) -> List[Dict[str, Any]]:
 
 
 
-def target_dates_for_live() -> List[str]:
+def target_dates_for_live(live_items: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """
-    ✅ 날짜 범위 확장 (FT 반영 누락 방지 핵심)
+    FT 누락 방지용 날짜 선택(호출 증가 최소화 버전)
 
-    /fixtures?league=...&date=... 는 보통 "킥오프 날짜(UTC)" 기준으로 묶이는 경우가 있어
-    경기 종료가 다음날로 넘어가도 "어제 date" 쪽에서만 잡히는 케이스가 생길 수 있음.
-
-    정책:
-    - 기본: UTC 어제 + 오늘은 항상 조회
-    - 추가(옵션): UTC 21~23시는 "내일"도 같이 조회 (자정 근처 경기/시간대 꼬임 방어)
+    핵심:
+    - 기본은 UTC "어제 + 오늘"만 스캔 (이 조합이 '90분쯤 응답에서 경기 사라짐'을 막는 핵심)
+    - '내일'은 호출을 크게 늘릴 수 있어 제거
+    - 대신 live=all(또는 watched_live)에서 실제로 라이브로 잡힌 경기들의 fixture.date(UTC)에서
+      YYYY-MM-DD 를 추출해 그 날짜만 추가 스캔 (필요할 때만)
     """
     now = now_utc()
     today = now.date()
 
-    # ✅ 기본: 어제 + 오늘 항상 포함
-    dates = [
+    dates: List[str] = [
         (today - dt.timedelta(days=1)).isoformat(),
         today.isoformat(),
     ]
 
-    # ✅ 옵션: UTC 밤(21~23시)에는 내일도 포함(자정 넘어가는 경기/스케줄 꼬임 방어)
-    # - 너무 과하게 늘리면 API 콜 증가하므로 시간대 제한을 둠
-    if now.hour >= 21:
-        dates.append((today + dt.timedelta(days=1)).isoformat())
+    # live_items에서 kickoff UTC 날짜를 추출해서 추가(필요한 날짜만)
+    if live_items:
+        for it in live_items:
+            fx = it.get("fixture") or {}
+            d = safe_text(fx.get("date")) or ""
+            # "2026-01-25T..." 형태에서 날짜만
+            if len(d) >= 10 and d[4] == "-" and d[7] == "-":
+                dates.append(d[:10])
 
     # 중복 제거(순서 유지)
     seen = set()
@@ -193,6 +195,7 @@ def target_dates_for_live() -> List[str]:
         seen.add(d)
         uniq.append(d)
     return uniq
+
 
 
 
@@ -1354,7 +1357,6 @@ def run_once() -> int:
         ensure_match_postmatch_timeline_state_table()
         run_once._ddl_done = True  # type: ignore[attr-defined]
 
-    dates = target_dates_for_live()
     now = now_utc()
     fetched_at = now
 
@@ -1369,6 +1371,13 @@ def run_once() -> int:
     except Exception as e:
         print(f"[live_detect] err: {e}", file=sys.stderr)
         live_items = []
+
+    # ✅ 날짜 범위 결정은 live=all 이후에 한다 (호출 증가 최소화 + 필요한 날짜만 추가)
+    # - watched_live(필터된 라이브) 기준으로 넣는 게 가장 안전/절약
+    # - 아직 watched_live가 아래에서 만들어지니, 여기선 일단 live_items 전체를 넣고
+    #   실제 스캔 리그는 어차피 watched league로 제한되어 호출 폭증은 없음
+    dates = target_dates_for_live(live_items)
+
 
     watched = set(league_ids)
     watched_live: List[Dict[str, Any]] = []
