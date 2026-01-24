@@ -1570,6 +1570,8 @@ def run_once() -> int:
 
             # ✅ INPLAY: 기존처럼 events/stats 처리
             if sg2 == "INPLAY":
+                total_inplay += 1  # ✅ live=all 기준 inplay 카운트(로그/리턴값용)
+                
                 try:
                     events = fetch_events(s, fixture_id)
 
@@ -1696,6 +1698,12 @@ def run_once() -> int:
                     st = fx.get("status") or {}
                     status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
                     status_group = map_status_group(status_short)
+
+                    # ✅ date scan에서는 INPLAY(라이브중)인 경기는 "아무 것도" 하지 않는다
+                    # (실시간 처리는 live=all 루프가 전담)
+                    if status_group == "INPLAY":
+                        continue
+
                     fixture_groups[fid] = status_group
 
                     upsert_fixture_row(
@@ -1728,55 +1736,15 @@ def run_once() -> int:
                     except Exception as pm_err:
                         print(f"      [postmatch_timeline] fixture_id={fixture_id} err: {pm_err}", file=sys.stderr)
 
-                    # INPLAY 처리
-                    if sg != "INPLAY":
-                        continue
+                    # ✅ date scan 파트는 FT/포스트매치 보정 목적만 수행한다.
+                    #    INPLAY 실시간 처리는 live=all 루프가 전담하므로,
+                    #    여기서는 INPLAY 처리(events/stats)를 하지 않는다.
+                    continue
 
-                    total_inplay += 1
-
-                    # ✅ (1) events 스냅샷 미러링: 워커 주기마다 그대로 DB에 반영 (쿨다운 제거)
-                    try:
-                        events = fetch_events(s, fixture_id)
-
-                        # raw 저장(best-effort)
-                        try:
-                            upsert_match_events_raw(fixture_id, events, now)
-                        except Exception:
-                            pass
-
-                        # fixture 단위 전체 교체(DELETE -> INSERT)
-                        inserted = 0
-                        try:
-                            inserted = replace_match_events_for_fixture(fixture_id, events)
-                        except Exception:
-                            inserted = 0
-
-                        # red 요약도 동일 스냅샷에서 계산
-                        try:
-                            h_red, a_red = calc_red_cards_from_events(events, home_id, away_id)
-                            upsert_match_live_state(fixture_id, h_red, a_red, now)
-                        except Exception:
-                            pass
-
-                        print(f"      [events_snapshot] fixture_id={fixture_id} events={len(events)} inserted={inserted}")
-
-                    except Exception as ev_err:
-                        print(f"      [events_snapshot] fixture_id={fixture_id} err: {ev_err}", file=sys.stderr)
-
-                    # (2) stats (60초 쿨다운 유지)
-                    try:
-                        now_ts3 = time.time()
-                        last_ts = LAST_STATS_SYNC.get(fixture_id)
-                        if (last_ts is None) or ((now_ts3 - last_ts) >= STATS_INTERVAL_SEC):
-                            stats = fetch_team_stats(s, fixture_id)
-                            upsert_match_team_stats(fixture_id, stats)
-                            LAST_STATS_SYNC[fixture_id] = now_ts3
-                            print(f"      [stats] fixture_id={fixture_id} updated")
-                    except Exception as st_err:
-                        print(f"      [stats] fixture_id={fixture_id} err: {st_err}", file=sys.stderr)
 
                 except Exception as e:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
+
 
     # ─────────────────────────────────────
     # (6) 런타임 캐시 prune (메모리 누적 방지)
