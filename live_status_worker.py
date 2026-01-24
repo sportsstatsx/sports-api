@@ -24,7 +24,7 @@ import time
 import json
 import traceback
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import requests
 
@@ -653,7 +653,7 @@ def _get_table_columns(table_name: str) -> List[str]:
     return cols
 
 
-def _read_postmatch_state(fixture_id: int) -> Dict[str, Any] | None:
+def _read_postmatch_state(fixture_id: int) -> Optional[Dict[str, Any]]:
     rows = fetch_all(
         """
         SELECT fixture_id, ft_first_seen_utc, done_60, done_30m, updated_utc
@@ -663,6 +663,7 @@ def _read_postmatch_state(fixture_id: int) -> Dict[str, Any] | None:
         (fixture_id,),
     )
     return rows[0] if rows else None
+
 
 
 def _init_postmatch_state_if_missing(fixture_id: int, now: dt.datetime) -> Dict[str, Any]:
@@ -1499,7 +1500,7 @@ def run_once() -> int:
     watched = set(league_ids)
 
     # ✅ live=all에서 "현재 라이브가 있는 watched 리그"만 추출
-    live_lids: set[int] = set()
+    live_lids: Set[int] = set()
     for it in live_items or []:
         lg = it.get("league") or {}
         lid = safe_int(lg.get("id"))
@@ -1535,6 +1536,10 @@ def run_once() -> int:
             season = safe_int(lg.get("season"))
             if season is None:
                 season = safe_int((item.get("league") or {}).get("season"))
+
+            # ✅ season 없으면 matches 업서트가 ValueError로 터지므로 스킵(로그 도배 방지)
+            if season is None:
+                continue
 
             st = fx.get("status") or {}
             status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
