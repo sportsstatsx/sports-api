@@ -775,12 +775,18 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]], fetch
 def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any]]) -> int:
     """
     match_events를 fixture_id 단위로 '싹 교체'한다. (API 스냅샷 미러링)
-    - 스키마에 존재하는 컬럼만 채움
-    - ✅ events가 비어있어도 'DELETE 후 0건 INSERT' 그대로 반영 (API 흔들림도 그대로 따라감)
+
+    ✅ 변경 정책:
+    - events가 빈 배열([])이면 DB를 건드리지 않는다(삭제/삽입 모두 안 함).
+      → 다음 틱에 데이터가 들어오면 그때 교체(insert)한다.
     반환: insert된 row 수
     """
     cols = set(_get_table_columns("match_events"))
     if not cols:
+        return 0
+
+    # ✅ 빈 배열이면 "기다림"(기존 DB 유지)
+    if not events:
         return 0
 
     # 최소 필수(있을 때만 사용)
@@ -792,14 +798,10 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
 
     inserted = 0
 
-    # ✅ 항상 기존 fixture 이벤트 삭제(스냅샷 교체)
+    # ✅ events가 있을 때만 기존 fixture 이벤트 삭제(스냅샷 교체)
     execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
 
-    # events가 비어있으면 여기서 끝 (DB는 빈 상태로 유지)
-    if not events:
-        return 0
-
-    for ev in (events or []):
+    for ev in events:
         time_obj = ev.get("time") or {}
         team_obj = ev.get("team") or {}
         player_obj = ev.get("player") or {}
@@ -865,6 +867,7 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
         inserted += 1
 
     return inserted
+
 
 
 
