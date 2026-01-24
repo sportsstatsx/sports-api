@@ -1489,6 +1489,12 @@ def run_once() -> int:
 
     watched = set(league_ids)
 
+    # ✅ 카운터는 live=all 루프 전에 확정 초기화
+    # - total_inplay: live=all 기준 INPLAY 개수(리턴/로그)
+    # - total_fixtures: date scan에서 다시 0으로 잡을 예정이라 여기선 선언만 의미(안전)
+    total_inplay = 0
+    total_fixtures = 0
+
     # ✅ live=all에서 "현재 라이브가 있는 watched 리그"만 별도로 추출
     live_lids: set[int] = set()
     for it in live_items or []:
@@ -1571,7 +1577,7 @@ def run_once() -> int:
             # ✅ INPLAY: 기존처럼 events/stats 처리
             if sg2 == "INPLAY":
                 total_inplay += 1  # ✅ live=all 기준 inplay 카운트(로그/리턴값용)
-                
+
                 try:
                     events = fetch_events(s, fixture_id)
 
@@ -1610,8 +1616,6 @@ def run_once() -> int:
         except Exception as e:
             print(f"  ! live_all item 처리 중 에러: {e}", file=sys.stderr)
 
-
-
     # ─────────────────────────────────────
     # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
     # ─────────────────────────────────────
@@ -1627,8 +1631,9 @@ def run_once() -> int:
         if float(v.get("exp") or 0) < now_ts:
             del fc[k]
 
+    # ✅ date scan은 fixtures 카운트만 새로 시작
     total_fixtures = 0
-    total_inplay = 0
+    # ❌ total_inplay는 live=all에서 이미 누적중이므로 여기서 0으로 리셋하면 안됨
 
     fast_leagues = set(parse_fast_leagues(FAST_LEAGUES_ENV))
 
@@ -1646,7 +1651,6 @@ def run_once() -> int:
             if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
                 continue
             LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
-
 
             fixtures: List[Dict[str, Any]] = []
             used_season: Optional[int] = None
@@ -1741,10 +1745,8 @@ def run_once() -> int:
                     #    여기서는 INPLAY 처리(events/stats)를 하지 않는다.
                     continue
 
-
                 except Exception as e:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
-
 
     # ─────────────────────────────────────
     # (6) 런타임 캐시 prune (메모리 누적 방지)
@@ -1769,6 +1771,7 @@ def run_once() -> int:
 
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
     return total_inplay
+
 
 
 
