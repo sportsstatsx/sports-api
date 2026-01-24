@@ -6,7 +6,7 @@
 # - /fixtures 기반 상태/스코어 업데이트 + 원본 raw 저장(match_fixtures_raw)
 # - INPLAY 경기: /events 스냅샷 미러링 저장(match_events/match_events_raw) + red 요약(match_live_state)
 # - INPLAY 경기: /statistics 60초 쿨다운
-# - lineups: 프리매치(-60/-10 슬롯 1회씩) + 킥오프 직후(elapsed<=5) 재시도 정책
+# - lineups: 프리매치(-60/-10 슬롯 1회씩) + INPLAY 초반(elapsed<=15, 20s 쿨다운) 재시도 정책
 #
 # 사용 테이블/PK (확인 완료):
 # - fixtures(fixture_id PK)
