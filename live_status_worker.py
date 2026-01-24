@@ -53,6 +53,11 @@ IDLE_SCAN_INTERVAL_SEC = int(os.environ.get("IDLE_LIVE_FIXTURES_INTERVAL_SEC", "
 # ✅ (D) date(league/date/season) 스캔은 "어제/오늘/내일"만 1시간에 1번(백필/FT 보정용)
 DATE_SCAN_INTERVAL_SEC = int(os.environ.get("LIVE_DATE_SCAN_INTERVAL_SEC", "3600"))
 
+# ✅ (D-2) backfill B안: run_once에서 backfill이 live 틱을 밀지 않게 "처리 예산" 제한
+BACKFILL_BUDGET_SEC = float(os.environ.get("LIVE_BACKFILL_BUDGET_SEC", "2.5"))   # run_once당 backfill에 쓸 최대 시간
+BACKFILL_MAX_COMBOS = int(os.environ.get("LIVE_BACKFILL_MAX_COMBOS", "8"))       # run_once당 (date,lid) 최대 처리 개수
+
+
 # ✅ (E) 워치독: DB에 오래 남은 INPLAY를 60초마다 단건 조회로 FT 보정
 WATCHDOG_INTERVAL_SEC = int(os.environ.get("LIVE_WATCHDOG_INTERVAL_SEC", "60"))
 WATCHDOG_STALE_HOURS = float(os.environ.get("LIVE_WATCHDOG_STALE_HOURS", "2"))
@@ -90,6 +95,10 @@ LAST_FIXTURES_SCAN_TS: Dict[Tuple[int, str], float] = {}
 
 # ✅ 워치독 실행 타이밍
 LAST_WATCHDOG_TS: float = 0.0
+
+# ✅ backfill B안: (date,lid) 조합을 run_once마다 분할 처리하기 위한 커서
+BACKFILL_CURSOR: int = 0
+
 
 
 
@@ -1640,109 +1649,175 @@ def run_once() -> int:
         return int(IDLE_SCAN_INTERVAL_SEC)
 
     def _scan_fixtures_for_dates(date_list: List[str], mode_tag: str, forced_interval: Optional[int] = None) -> None:
+        """
+        - live 모드: 기존처럼 전체(date x league) 순회
+        - backfill 모드(B안): run_once에서 과도하게 길어지지 않도록
+          (date,lid) 조합을 커서로 쪼개서 예산(BUDGET_SEC / MAX_COMBOS)만큼만 처리
+        """
         nonlocal total_fixtures, fixture_groups
+        global BACKFILL_CURSOR
 
+        # ✅ 처리할 (date,lid) 조합 만들기 (순서 고정)
+        combos: List[Tuple[str, int]] = []
         for date_str in date_list:
             for lid in league_ids:
-                scan_interval = int(forced_interval) if forced_interval is not None else _pick_scan_interval(lid)
+                combos.append((date_str, lid))
 
-                # ✅ mode_tag를 키에 포함해서 live-scan / backfill-scan이 서로 방해 안 하게 분리
-                k_scan = (lid, f"{date_str}|{mode_tag}")
-                last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
-                if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
+        if not combos:
+            return
+
+        # ✅ backfill B안: run_once에서 처리량 제한
+        is_backfill_budget = (mode_tag == "backfill") and (forced_interval is not None)
+
+        start_ts = time.time()
+        processed = 0
+
+        # 커서 정규화
+        if BACKFILL_CURSOR < 0 or BACKFILL_CURSOR >= len(combos):
+            BACKFILL_CURSOR = 0
+
+        # 순회 함수(커서부터 시작, 필요하면 랩)
+        def _iter_combo_indices() -> List[int]:
+            if not is_backfill_budget:
+                return list(range(len(combos)))
+
+            # backfill은 커서부터 최대 len(combos)까지 랩 순회 가능하지만,
+            # budget/limit에 걸리면 중단한다.
+            out: List[int] = []
+            for i in range(len(combos)):
+                out.append((BACKFILL_CURSOR + i) % len(combos))
+            return out
+
+        for idx in _iter_combo_indices():
+            # ✅ backfill budget 체크 (시간/개수)
+            if is_backfill_budget:
+                if processed >= max(1, int(BACKFILL_MAX_COMBOS)):
+                    break
+                if (time.time() - start_ts) >= float(BACKFILL_BUDGET_SEC):
+                    break
+
+            date_str, lid = combos[idx]
+            scan_interval = int(forced_interval) if forced_interval is not None else _pick_scan_interval(lid)
+
+            # ✅ mode_tag를 키에 포함해서 live-scan / backfill-scan이 서로 방해 안 하게 분리
+            k_scan = (lid, f"{date_str}|{mode_tag}")
+            last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
+            if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
+                # backfill 커서 진행을 위해 "스킵도 처리한 것으로 간주"하지 않는다.
+                continue
+
+            # 이 조합은 이번 run에서 실제 호출/처리 대상으로 확정
+            LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
+
+            fixtures: List[Dict[str, Any]] = []
+            used_season: Optional[int] = None
+
+            cache_key = (lid, date_str)
+            cached = fc.get(cache_key)
+
+            if cached and float(cached.get("exp") or 0) >= now_ts:
+                if cached.get("no") is True:
+                    # ✅ 실제로는 "경기 없음" 캐시이므로 처리 종료로 본다
+                    processed += 1
+                    if is_backfill_budget:
+                        BACKFILL_CURSOR = (idx + 1) % len(combos)
                     continue
-                LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
 
-                fixtures: List[Dict[str, Any]] = []
-                used_season: Optional[int] = None
-
-                cache_key = (lid, date_str)
-                cached = fc.get(cache_key)
-
-                if cached and float(cached.get("exp") or 0) >= now_ts:
-                    if cached.get("no") is True:
-                        continue
-                    cached_season = cached.get("season")
-                    if isinstance(cached_season, int):
-                        try:
-                            rows = fetch_fixtures(s, lid, date_str, cached_season)
-                            if rows:
-                                fixtures = rows
-                                used_season = cached_season
-                            else:
-                                fc.pop(cache_key, None)
-                        except Exception as e:
-                            fc.pop(cache_key, None)
-                            print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
-
-                if used_season is None:
-                    for season in infer_season_candidates(date_str):
-                        try:
-                            rows = fetch_fixtures(s, lid, date_str, season)
-                            if rows:
-                                fixtures = rows
-                                used_season = season
-                                fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
-                                break
-                        except Exception as e:
-                            print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
-
-                if used_season is None:
-                    fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
-                    continue
-
-                total_fixtures += len(fixtures)
-                print(f"[fixtures:{mode_tag}] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={scan_interval}s")
-
-                for item in fixtures:
+                cached_season = cached.get("season")
+                if isinstance(cached_season, int):
                     try:
-                        fx = item.get("fixture") or {}
-                        fid = safe_int(fx.get("id"))
-                        if fid is None:
-                            continue
-
-                        st = fx.get("status") or {}
-                        status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
-                        status_group = map_status_group(status_short)
-
-                        # ✅ INPLAY(라이브중)은 live=all이 전담 → 여기서는 스킵
-                        if status_group == "INPLAY":
-                            continue
-
-                        fixture_groups[fid] = status_group
-
-                        upsert_fixture_row(
-                            fixture_id=fid,
-                            league_id=lid,
-                            season=used_season,
-                            date_utc=safe_text(fx.get("date")),
-                            status_short=status_short,
-                            status_group=status_group,
-                        )
-
-                        fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
-                            item, league_id=lid, season=used_season
-                        )
-
-                        try:
-                            upsert_match_fixtures_raw(fixture_id, item, fetched_at)
-                        except Exception as raw_err:
-                            print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
-
-                        try:
-                            elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
-                            maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
-                        except Exception as lu_err:
-                            print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
-
-                        # ✅ FINISHED: FT 이후 2회 덮어쓰기 정책 유지
-                        try:
-                            maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
-                        except Exception as pm_err:
-                            print(f"      [postmatch_timeline] fixture_id={fixture_id} err: {pm_err}", file=sys.stderr)
-
+                        rows = fetch_fixtures(s, lid, date_str, cached_season)
+                        if rows:
+                            fixtures = rows
+                            used_season = cached_season
+                        else:
+                            fc.pop(cache_key, None)
                     except Exception as e:
-                        print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
+                        fc.pop(cache_key, None)
+                        print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
+
+            if used_season is None:
+                for season in infer_season_candidates(date_str):
+                    try:
+                        rows = fetch_fixtures(s, lid, date_str, season)
+                        if rows:
+                            fixtures = rows
+                            used_season = season
+                            fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
+                            break
+                    except Exception as e:
+                        print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
+
+            if used_season is None:
+                fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
+                processed += 1
+                if is_backfill_budget:
+                    BACKFILL_CURSOR = (idx + 1) % len(combos)
+                continue
+
+            total_fixtures += len(fixtures)
+            print(f"[fixtures:{mode_tag}] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={scan_interval}s")
+
+            for item in fixtures:
+                try:
+                    fx = item.get("fixture") or {}
+                    fid = safe_int(fx.get("id"))
+                    if fid is None:
+                        continue
+
+                    st = fx.get("status") or {}
+                    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
+                    status_group = map_status_group(status_short)
+
+                    # ✅ INPLAY(라이브중)은 live=all이 전담 → 여기서는 스킵
+                    if status_group == "INPLAY":
+                        continue
+
+                    fixture_groups[fid] = status_group
+
+                    upsert_fixture_row(
+                        fixture_id=fid,
+                        league_id=lid,
+                        season=used_season,
+                        date_utc=safe_text(fx.get("date")),
+                        status_short=status_short,
+                        status_group=status_group,
+                    )
+
+                    fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
+                        item, league_id=lid, season=used_season
+                    )
+
+                    try:
+                        upsert_match_fixtures_raw(fixture_id, item, fetched_at)
+                    except Exception as raw_err:
+                        print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
+
+                    try:
+                        elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
+                        maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
+                    except Exception as lu_err:
+                        print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
+
+                    # ✅ FINISHED: FT 이후 2회 덮어쓰기 정책 유지
+                    try:
+                        maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
+                    except Exception as pm_err:
+                        print(f"      [postmatch_timeline] fixture_id={fixture_id} err: {pm_err}", file=sys.stderr)
+
+                except Exception as e:
+                    print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
+
+            # ✅ 이 (date,lid) 조합 1개 처리 완료
+            processed += 1
+            if is_backfill_budget:
+                BACKFILL_CURSOR = (idx + 1) % len(combos)
+
+        # backfill일 때만 로그로 budget 상태를 남김(원하면 지워도 됨)
+        if is_backfill_budget:
+            spent = time.time() - start_ts
+            print(f"      [backfill_budget] processed_combos={processed}/{len(combos)} cursor={BACKFILL_CURSOR} spent={spent:.2f}s")
+
 
     # ✅ (A) 라이브 성격 스캔: fast/default/idle 적용
     _scan_fixtures_for_dates(live_dates, mode_tag="live", forced_interval=None)
