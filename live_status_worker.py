@@ -1343,33 +1343,30 @@ def run_once() -> int:
         live_items = []
 
     watched = set(league_ids)
-    watched_live: List[Dict[str, Any]] = []
+
+    # ✅ live=all에서 "현재 라이브가 있는 watched 리그"만 별도로 추출
+    live_lids: set[int] = set()
     for it in live_items or []:
         lg = it.get("league") or {}
         lid = safe_int(lg.get("id"))
         if lid is None:
             continue
         if lid in watched:
-            watched_live.append(it)
+            live_lids.add(lid)
 
-    idle_mode = False
+    # ✅ 항상 watched 전체를 스캔한다.
+    # - 라이브가 있는 리그: 빠르게
+    # - 라이브가 없는 리그: 느리게(FT/포스트매치 반영용)
+    live_league_ids = list(league_ids)
 
-    if not watched_live:
-        idle_mode = True
-        live_league_ids = list(league_ids)
-        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → idle slow scan (leagues={len(live_league_ids)})")
+    # idle_mode는 "전체 watched 중 라이브가 0개냐"를 의미로만 남겨둠(로그용)
+    idle_mode = (len(live_lids) == 0)
+
+    if idle_mode:
+        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → all leagues slow scan mode")
     else:
-        live_league_ids = []
-        seen_l = set()
-        for it in watched_live:
-            lg = it.get("league") or {}
-            lid = safe_int(lg.get("id"))
-            if lid is None:
-                continue
-            if lid in seen_l:
-                continue
-            seen_l.add(lid)
-            live_league_ids.append(lid)
+        print(f"[live_detect] watched_live={len(live_lids)} (live_all={len(live_items)}) → mixed scan (live fast / non-live slow)")
+
 
     # ─────────────────────────────────────
     # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
@@ -1396,10 +1393,14 @@ def run_once() -> int:
     for date_str in dates:
         for lid in live_league_ids:
 
-            if idle_mode:
-                scan_interval = IDLE_SCAN_INTERVAL_SEC
-            else:
+            # ✅ 리그별로:
+            # - 지금 라이브가 있는 리그는 빠르게
+            # - 라이브가 없는 리그는 FT/포스트매치 반영을 위해 느리게
+            if lid in live_lids:
                 scan_interval = 5 if lid in fast_leagues else DEFAULT_SCAN_INTERVAL_SEC
+            else:
+                scan_interval = IDLE_SCAN_INTERVAL_SEC
+
 
             k_scan = (lid, date_str)
             last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
