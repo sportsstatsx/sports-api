@@ -792,8 +792,12 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
     if not events:
         return 0
 
-    # ✅ 레이스 차단: DB가 아직 INPLAY면 스킵
+    # ✅ 레이스 차단: "live 역할이 아닐 때만" INPLAY면 스킵
+    # - live role에서는 INPLAY 타임라인을 정상적으로 써야 함
+    # - backfill/watchdog/postmatch 경로에서만 INPLAY 건드리지 않도록 보호
     try:
+        role = (os.environ.get("LIVE_WORKER_ROLE") or "live").strip().lower()
+
         rows = fetch_all(
             """
             SELECT status_group
@@ -805,11 +809,12 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
         )
         if rows:
             sg = (rows[0].get("status_group") or "").strip().upper()
-            if sg == "INPLAY":
+            if (role != "live") and (sg == "INPLAY"):
                 return 0
     except Exception:
-        # 상태 조회 실패 시에는 안전하게 "스킵"하지 않고 기존 동작 유지(최소한 데이터가 쌓이게)
+        # 상태 조회 실패 시에는 안전하게 기존 동작(쓰기) 유지
         pass
+
 
     # 최소 필수(있을 때만 사용)
     def has(c: str) -> bool:
