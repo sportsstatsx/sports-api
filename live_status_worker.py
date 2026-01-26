@@ -779,6 +779,9 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
     ✅ 변경 정책:
     - events가 빈 배열([])이면 DB를 건드리지 않는다(삭제/삽입 모두 안 함).
       → 다음 틱에 데이터가 들어오면 그때 교체(insert)한다.
+    - ✅ 레이스 차단: DB의 matches.status_group 이 아직 'INPLAY'면
+      postmatch/backfill/watchdog 경로에서 match_events를 건드리지 않는다.
+      (라이브중 이벤트는 live=all 경로가 전담)
     반환: insert된 row 수
     """
     cols = set(_get_table_columns("match_events"))
@@ -788,6 +791,25 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
     # ✅ 빈 배열이면 "기다림"(기존 DB 유지)
     if not events:
         return 0
+
+    # ✅ 레이스 차단: DB가 아직 INPLAY면 스킵
+    try:
+        rows = fetch_all(
+            """
+            SELECT status_group
+            FROM matches
+            WHERE fixture_id = %s
+            LIMIT 1
+            """,
+            (fixture_id,),
+        )
+        if rows:
+            sg = (rows[0].get("status_group") or "").strip().upper()
+            if sg == "INPLAY":
+                return 0
+    except Exception:
+        # 상태 조회 실패 시에는 안전하게 "스킵"하지 않고 기존 동작 유지(최소한 데이터가 쌓이게)
+        pass
 
     # 최소 필수(있을 때만 사용)
     def has(c: str) -> bool:
@@ -867,6 +889,7 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
         inserted += 1
 
     return inserted
+
 
 
 
@@ -1466,6 +1489,12 @@ def maybe_sync_lineups(
 # ─────────────────────────────────────
 
 def run_once() -> int:
+    """
+    ✅ LIVE 전용(핫패스):
+    - live=all 감지/즉시 처리
+    - live_dates(오늘, 필요 시 어제) 스캔만 수행
+    - backfill / watchdog 는 별도 워커(run_once_backfill / run_once_watchdog)가 담당
+    """
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
         return 0
@@ -1485,13 +1514,11 @@ def run_once() -> int:
     fetched_at = now
     s = _session()
 
-    # 카운터는 먼저 초기화 (⚠️ 기존 코드: total_inplay 선언 전 사용 버그 있었음)
     total_fixtures = 0
     total_inplay = 0
 
     # ─────────────────────────────────────
-    # (0) live=all 감지( detect_interval 주기 )
-    #  - ✅ 라이브 업데이트는 여기서 즉시 처리
+    # (0) live=all 감지
     # ─────────────────────────────────────
     live_items: List[Dict[str, Any]] = []
     try:
@@ -1520,9 +1547,6 @@ def run_once() -> int:
 
     # ─────────────────────────────────────
     # (0-1) ✅ LIVE 아이템 즉시 처리
-    #  - fixtures/matches/raw 업서트
-    #  - INPLAY: events/stats/lineups 처리
-    #  - FINISHED: postmatch timeline 정책 실행
     # ─────────────────────────────────────
     for item in live_items or []:
         try:
@@ -1540,7 +1564,6 @@ def run_once() -> int:
             if season is None:
                 season = safe_int((item.get("league") or {}).get("season"))
 
-            # ✅ season 없으면 matches 업서트가 ValueError로 터지므로 스킵(로그 도배 방지)
             if season is None:
                 continue
 
@@ -1572,13 +1595,11 @@ def run_once() -> int:
             except Exception:
                 pass
 
-            # ✅ FINISHED: postmatch timeline 정책 유지
             try:
                 maybe_sync_postmatch_timeline(s, fixture_id, sg2, now)
             except Exception:
                 pass
 
-            # ✅ INPLAY: 기존처럼 events/stats 처리
             if sg2 == "INPLAY":
                 total_inplay += 1
 
@@ -1638,18 +1659,9 @@ def run_once() -> int:
     fast_leagues = set(parse_fast_leagues(FAST_LEAGUES_ENV))
     fixture_groups: Dict[int, str] = {}
 
-    # ✅ 라이브 스캔(빠른/느린 스캔 적용): 오늘(+00~03이면 어제 포함)
     live_dates = target_dates_for_live()
-    # ✅ 백필/FT 보정용: 어제/오늘/내일 (1시간에 1번)
-    backfill_dates = target_dates_for_scan()
 
     def _pick_scan_interval(lid: int) -> int:
-        """
-        리그별 스캔 주기 결정:
-        - live 있는 리그: DEFAULT_SCAN_INTERVAL_SEC
-        - live 없는 리그: IDLE_SCAN_INTERVAL_SEC
-        - FAST_LIVE_LEAGUES: detect 주기(보통 5s)로 더 빠르게
-        """
         if lid in fast_leagues:
             return int(DETECT_INTERVAL_SEC)
         if lid in live_lids:
@@ -1657,64 +1669,22 @@ def run_once() -> int:
         return int(IDLE_SCAN_INTERVAL_SEC)
 
     def _scan_fixtures_for_dates(date_list: List[str], mode_tag: str, forced_interval: Optional[int] = None) -> None:
-        """
-        - live 모드: 기존처럼 전체(date x league) 순회
-        - backfill 모드(B안): run_once에서 과도하게 길어지지 않도록
-          (date,lid) 조합을 커서로 쪼개서 예산(BUDGET_SEC / MAX_COMBOS)만큼만 처리
-        """
         nonlocal total_fixtures, fixture_groups
-        global BACKFILL_CURSOR
 
-        # ✅ 처리할 (date,lid) 조합 만들기 (순서 고정)
         combos: List[Tuple[str, int]] = []
         for date_str in date_list:
             for lid in league_ids:
                 combos.append((date_str, lid))
-
         if not combos:
             return
 
-        # ✅ backfill B안: run_once에서 처리량 제한
-        is_backfill_budget = (mode_tag == "backfill") and (forced_interval is not None)
-
-        start_ts = time.time()
-        processed = 0
-
-        # 커서 정규화
-        if BACKFILL_CURSOR < 0 or BACKFILL_CURSOR >= len(combos):
-            BACKFILL_CURSOR = 0
-
-        # 순회 함수(커서부터 시작, 필요하면 랩)
-        def _iter_combo_indices() -> List[int]:
-            if not is_backfill_budget:
-                return list(range(len(combos)))
-
-            # backfill은 커서부터 최대 len(combos)까지 랩 순회 가능하지만,
-            # budget/limit에 걸리면 중단한다.
-            out: List[int] = []
-            for i in range(len(combos)):
-                out.append((BACKFILL_CURSOR + i) % len(combos))
-            return out
-
-        for idx in _iter_combo_indices():
-            # ✅ backfill budget 체크 (시간/개수)
-            if is_backfill_budget:
-                if processed >= max(1, int(BACKFILL_MAX_COMBOS)):
-                    break
-                if (time.time() - start_ts) >= float(BACKFILL_BUDGET_SEC):
-                    break
-
-            date_str, lid = combos[idx]
+        for date_str, lid in combos:
             scan_interval = int(forced_interval) if forced_interval is not None else _pick_scan_interval(lid)
 
-            # ✅ mode_tag를 키에 포함해서 live-scan / backfill-scan이 서로 방해 안 하게 분리
             k_scan = (lid, f"{date_str}|{mode_tag}")
             last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
             if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
-                # backfill 커서 진행을 위해 "스킵도 처리한 것으로 간주"하지 않는다.
                 continue
-
-            # 이 조합은 이번 run에서 실제 호출/처리 대상으로 확정
             LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
 
             fixtures: List[Dict[str, Any]] = []
@@ -1725,10 +1695,6 @@ def run_once() -> int:
 
             if cached and float(cached.get("exp") or 0) >= now_ts:
                 if cached.get("no") is True:
-                    # ✅ 실제로는 "경기 없음" 캐시이므로 처리 종료로 본다
-                    processed += 1
-                    if is_backfill_budget:
-                        BACKFILL_CURSOR = (idx + 1) % len(combos)
                     continue
 
                 cached_season = cached.get("season")
@@ -1758,9 +1724,6 @@ def run_once() -> int:
 
             if used_season is None:
                 fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
-                processed += 1
-                if is_backfill_budget:
-                    BACKFILL_CURSOR = (idx + 1) % len(combos)
                 continue
 
             total_fixtures += len(fixtures)
@@ -1807,7 +1770,6 @@ def run_once() -> int:
                     except Exception as lu_err:
                         print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
 
-                    # ✅ FINISHED: FT 이후 2회 덮어쓰기 정책 유지
                     try:
                         maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
                     except Exception as pm_err:
@@ -1816,22 +1778,8 @@ def run_once() -> int:
                 except Exception as e:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
 
-            # ✅ 이 (date,lid) 조합 1개 처리 완료
-            processed += 1
-            if is_backfill_budget:
-                BACKFILL_CURSOR = (idx + 1) % len(combos)
-
-        # backfill일 때만 로그로 budget 상태를 남김(원하면 지워도 됨)
-        if is_backfill_budget:
-            spent = time.time() - start_ts
-            print(f"      [backfill_budget] processed_combos={processed}/{len(combos)} cursor={BACKFILL_CURSOR} spent={spent:.2f}s")
-
-
-    # ✅ (A) 라이브 성격 스캔: fast/default/idle 적용
+    # ✅ LIVE 스캔만 수행 (backfill은 별도 워커로 분리)
     _scan_fixtures_for_dates(live_dates, mode_tag="live", forced_interval=None)
-
-    # ✅ (B) 백필 스캔: 1시간 고정
-    _scan_fixtures_for_dates(backfill_dates, mode_tag="backfill", forced_interval=DATE_SCAN_INTERVAL_SEC)
 
     # ─────────────────────────────────────
     # (6) 런타임 캐시 prune (메모리 누적 방지)
@@ -1848,16 +1796,197 @@ def run_once() -> int:
     except Exception:
         pass
 
-    # ✅ 워치독: 오래된 INPLAY 단건 보정(60초마다 1회)
-    try:
-        watchdog_fix_stale_inplay(s, now)
-    except Exception as e:
-        print(f"      [watchdog] err: {e}", file=sys.stderr)
-
     print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
     return total_inplay
 
 
+
+def run_once_backfill() -> int:
+    """
+    ✅ BACKFILL 전용(슬로우패스):
+    - 어제/오늘/내일 backfill_dates 스캔만 수행
+    - INPLAY는 스킵(이미 scan 로직에서 status_group==INPLAY continue)
+    """
+    if not API_KEY:
+        print("[backfill_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
+    if not league_ids:
+        print("[backfill_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    # ✅ DDL은 워커 시작 시 1회만(FT postmatch state / red state 공용)
+    if not hasattr(run_once_backfill, "_ddl_done"):
+        ensure_match_live_state_table()
+        ensure_match_postmatch_timeline_state_table()
+        run_once_backfill._ddl_done = True  # type: ignore[attr-defined]
+
+    now = now_utc()
+    fetched_at = now
+    s = _session()
+
+    total_fixtures = 0
+
+    # fixtures cache는 live와 공유하지 않아도 됨(프로세스가 분리되면 자연 분리)
+    if not hasattr(run_once_backfill, "_fixtures_cache"):
+        run_once_backfill._fixtures_cache = {}  # type: ignore[attr-defined]
+    fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once_backfill._fixtures_cache  # type: ignore[attr-defined]
+
+    SEASON_TTL = 60 * 60
+    NOFIX_TTL = 60 * 10
+
+    now_ts = time.time()
+    for k, v in list(fc.items()):
+        if float(v.get("exp") or 0) < now_ts:
+            del fc[k]
+
+    backfill_dates = target_dates_for_scan()
+
+    # backfill은 “주기 고정”이므로 forced_interval로 DATE_SCAN_INTERVAL_SEC를 사용
+    forced_interval = int(DATE_SCAN_INTERVAL_SEC)
+
+    # (date,lid) 조합 만들기
+    combos: List[Tuple[str, int]] = []
+    for date_str in backfill_dates:
+        for lid in league_ids:
+            combos.append((date_str, lid))
+
+    if not combos:
+        return 0
+
+    for date_str, lid in combos:
+        k_scan = (lid, f"{date_str}|backfill")
+        last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
+        if forced_interval > 0 and (now_ts - last_scan) < forced_interval:
+            continue
+        LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
+
+        fixtures: List[Dict[str, Any]] = []
+        used_season: Optional[int] = None
+
+        cache_key = (lid, date_str)
+        cached = fc.get(cache_key)
+
+        if cached and float(cached.get("exp") or 0) >= now_ts:
+            if cached.get("no") is True:
+                continue
+
+            cached_season = cached.get("season")
+            if isinstance(cached_season, int):
+                try:
+                    rows = fetch_fixtures(s, lid, date_str, cached_season)
+                    if rows:
+                        fixtures = rows
+                        used_season = cached_season
+                    else:
+                        fc.pop(cache_key, None)
+                except Exception as e:
+                    fc.pop(cache_key, None)
+                    print(f"  [backfill:fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
+
+        if used_season is None:
+            for season in infer_season_candidates(date_str):
+                try:
+                    rows = fetch_fixtures(s, lid, date_str, season)
+                    if rows:
+                        fixtures = rows
+                        used_season = season
+                        fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
+                        break
+                except Exception as e:
+                    print(f"  [backfill:fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
+
+        if used_season is None:
+            fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
+            continue
+
+        total_fixtures += len(fixtures)
+        print(f"[fixtures:backfill] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={forced_interval}s")
+
+        for item in fixtures:
+            try:
+                fx = item.get("fixture") or {}
+                fid = safe_int(fx.get("id"))
+                if fid is None:
+                    continue
+
+                st = fx.get("status") or {}
+                status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
+                status_group = map_status_group(status_short)
+
+                # ✅ INPLAY는 backfill이 절대 건드리지 않음
+                if status_group == "INPLAY":
+                    continue
+
+                upsert_fixture_row(
+                    fixture_id=fid,
+                    league_id=lid,
+                    season=used_season,
+                    date_utc=safe_text(fx.get("date")),
+                    status_short=status_short,
+                    status_group=status_group,
+                )
+
+                fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
+                    item, league_id=lid, season=used_season
+                )
+
+                try:
+                    upsert_match_fixtures_raw(fixture_id, item, fetched_at)
+                except Exception:
+                    pass
+
+                # 라인업 슬롯/정책은 backfill에서도 “프리매치/초반” 케이스에 도움 됨(그대로 유지)
+                try:
+                    elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
+                    maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
+                except Exception:
+                    pass
+
+                # FT 이후 2회 덮어쓰기 정책 유지
+                try:
+                    maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print(f"  ! backfill fixture 처리 중 에러: {e}", file=sys.stderr)
+
+    print(f"[backfill_worker] done. total_fixtures={total_fixtures}")
+    return total_fixtures
+
+
+def run_once_watchdog() -> int:
+    """
+    ✅ WATCHDOG 전용:
+    - DB에 오래 남은 INPLAY 후보를 뽑아서 단건 /fixtures?id= 로 상태 보정
+    - WATCHDOG_INTERVAL_SEC 주기는 watchdog_fix_stale_inplay 내부에서도 한 번 더 막음
+    """
+    if not API_KEY:
+        print("[watchdog_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
+    if not league_ids:
+        print("[watchdog_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    if not hasattr(run_once_watchdog, "_ddl_done"):
+        ensure_match_live_state_table()
+        ensure_match_postmatch_timeline_state_table()
+        run_once_watchdog._ddl_done = True  # type: ignore[attr-defined]
+
+    now = now_utc()
+    s = _session()
+
+    try:
+        tried = watchdog_fix_stale_inplay(s, now)
+        print(f"[watchdog_worker] done. tried={tried}")
+        return tried
+    except Exception as e:
+        print(f"[watchdog_worker] err: {e}", file=sys.stderr)
+        return 0
 
 
 
@@ -1868,19 +1997,52 @@ def run_once() -> int:
 # 루프
 # ─────────────────────────────────────
 
-def loop() -> None:
-    print(
-        f"[live_status_worker] start (detect_interval={DETECT_INTERVAL_SEC}s, default_scan={DEFAULT_SCAN_INTERVAL_SEC}s, fast_leagues_env='{FAST_LEAGUES_ENV}')"
-    )
-    while True:
-        try:
-            run_once()
-        except Exception:
-            traceback.print_exc()
-        # ✅ 항상 감지 주기로만 돈다 (IDLE 60초 같은 모드 없음)
-        time.sleep(DETECT_INTERVAL_SEC)
+# 역할 분기(파일 1개로 워커 3개 실행할 때 사용)
+LIVE_WORKER_ROLE = (os.environ.get("LIVE_WORKER_ROLE") or "live").strip().lower()
+# live | backfill | watchdog
 
+def loop() -> None:
+    """
+    ✅ 단일 파일에서 역할별로 루프를 분기한다.
+    - live: detect_interval(기존 10초)로 run_once() (핫패스)
+    - backfill: 1시간 주기(기본 DATE_SCAN_INTERVAL_SEC)로 run_once_backfill()
+    - watchdog: 60초 주기(기본 WATCHDOG_INTERVAL_SEC)로 run_once_watchdog()
+    """
+    role = LIVE_WORKER_ROLE
+
+    if role == "backfill":
+        sleep_sec = int(os.environ.get("LIVE_BACKFILL_LOOP_SEC", str(DATE_SCAN_INTERVAL_SEC)))
+        print(f"[live_status_worker] start role=backfill (loop_sec={sleep_sec}s)")
+        while True:
+            try:
+                run_once_backfill()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(max(30, sleep_sec))
+
+    elif role == "watchdog":
+        sleep_sec = int(os.environ.get("LIVE_WATCHDOG_LOOP_SEC", str(WATCHDOG_INTERVAL_SEC)))
+        print(f"[live_status_worker] start role=watchdog (loop_sec={sleep_sec}s)")
+        while True:
+            try:
+                run_once_watchdog()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(max(10, sleep_sec))
+
+    else:
+        # default = live
+        print(
+            f"[live_status_worker] start role=live (detect_interval={DETECT_INTERVAL_SEC}s, default_scan={DEFAULT_SCAN_INTERVAL_SEC}s, fast_leagues_env='{FAST_LEAGUES_ENV}')"
+        )
+        while True:
+            try:
+                run_once()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(DETECT_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
     loop()
+
