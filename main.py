@@ -63,6 +63,7 @@ from teamdetail.routes import teamdetail_bp
 from leaguedetail.routes import leaguedetail_bp
 from notifications.routes import notifications_bp
 from routers.vip_routes import vip_bp
+from routers.version_router import version_bp
 
 from hockey.routers.hockey_games_router import hockey_games_bp
 from hockey.routers.hockey_fixtures_router import hockey_fixtures_bp
@@ -96,6 +97,7 @@ app.register_blueprint(teamdetail_bp)
 app.register_blueprint(leaguedetail_bp)
 app.register_blueprint(notifications_bp)
 app.register_blueprint(vip_bp)
+app.register_blueprint(version_bp)
 
 app.register_blueprint(hockey_games_bp)
 app.register_blueprint(hockey_fixtures_bp)
@@ -2773,6 +2775,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
