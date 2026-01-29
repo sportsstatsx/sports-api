@@ -1,10 +1,9 @@
 # hockey/workers/hockey_backfill_by_date.py
 from __future__ import annotations
 
-import os
 import sys
 import datetime as dt
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from hockey.hockey_db import hockey_execute, hockey_fetch_all
 from hockey.workers.hockey_live_status_worker import (
@@ -13,6 +12,7 @@ from hockey.workers.hockey_live_status_worker import (
     upsert_events,
     ensure_event_key_migration,
     hockey_live_leagues,
+    _meta_refresh_leagues_and_seasons,  # ✅ 추가: FK(league_id) 방지용
 )
 
 # ------------------------------------------------------------
@@ -167,19 +167,14 @@ def _delete_games_and_related(game_ids: List[int]) -> None:
     if not game_ids:
         return
 
-    # events
     hockey_execute(
         "DELETE FROM hockey_game_events WHERE game_id = ANY(%s)",
         (game_ids,),
     )
-
-    # poll state
     hockey_execute(
         "DELETE FROM hockey_live_poll_state WHERE game_id = ANY(%s)",
         (game_ids,),
     )
-
-    # games
     hockey_execute(
         "DELETE FROM hockey_games WHERE id = ANY(%s)",
         (game_ids,),
@@ -217,6 +212,7 @@ def _backfill_from_api(
 
         season = int(league.get("season") or 0)
 
+        # ✅ FK(league_id) 때문에 leagues 메타가 선행되어야 한다.
         gid = upsert_game(item, lid, season)
         if not gid:
             continue
@@ -247,7 +243,6 @@ def main() -> None:
     fetch_events: bool = args["fetch_events"]
 
     leagues_filter = _pick_leagues(all_leagues)
-
     start_utc, end_utc = _local_day_utc_range(date_str, tz_name)
 
     print(
@@ -257,9 +252,19 @@ def main() -> None:
         f"fetch_events={fetch_events}"
     )
 
-    # event_key + unique index 보장 (events 재삽입 시 충돌 방지)
+    # (0) events upsert 안전장치
     ensure_event_key_migration()
     print("[ok] ensure_event_key_migration")
+
+    # ✅ (0.5) league FK 방지: games insert 전에 hockey_leagues를 먼저 채운다
+    # - all-leagues면 전체 리그 메타를 갱신(필터 없음)
+    # - 필터 모드면 해당 리그들만 갱신
+    try:
+        _meta_refresh_leagues_and_seasons([] if not leagues_filter else list(leagues_filter))
+        print("[ok] meta refresh leagues/seasons")
+    except Exception as e:
+        # 메타 리프레시가 실패해도 계속 진행은 하지만, FK가 다시 터질 수 있음.
+        print(f"[warn] meta refresh leagues/seasons failed: {e}")
 
     # 1) 기존 데이터 찾고 삭제
     existing_ids = _find_existing_game_ids_for_day(
