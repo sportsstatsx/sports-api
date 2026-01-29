@@ -79,23 +79,217 @@ def _pick_pair(cols: set[str], pairs: List[Tuple[str, str]]) -> Optional[Tuple[s
             return (a, b)
     return None
 
+def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
+    """
+    matchdetail header에서 fixture_id 추출 (방어적으로 여러 형태 지원)
+    - header['fixture_id']
+    - header['fixture']['id'] or ['fixture_id']
+    - header['match']['fixture_id'] or ['id']
+    """
+    candidates = []
+
+    candidates.append(header.get("fixture_id"))
+
+    fx = header.get("fixture")
+    if isinstance(fx, dict):
+        candidates.append(fx.get("fixture_id"))
+        candidates.append(fx.get("id"))
+
+    mt = header.get("match")
+    if isinstance(mt, dict):
+        candidates.append(mt.get("fixture_id"))
+        candidates.append(mt.get("id"))
+
+    for v in candidates:
+        try:
+            if v is None:
+                continue
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
+    """
+    BRACKET 표시 대상 라운드 판정.
+    - UEFA (2,3,848)의 'Play-offs' 는 예선 성격이라 제외 (우리가 after_anchor=f로 확인함)
+    - 그 외 넉아웃 라운드명은 허용
+    """
+    if not round_name or not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    if league_id in (2, 3, 848) and rn == "Play-offs":
+        return False
+
+    allowed = {
+        "Knockout Round Play-offs",
+        "Round of 32",
+        "Round of 16",
+        "Quarter-finals",
+        "Semi-finals",
+        "Final",
+        "1st Round",
+    }
+    return rn in allowed
+
+
+def _build_bracket_from_tournament_ties(
+    league_id: int,
+    season: int,
+    *,
+    start_round_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    tournament_ties 기반 bracket 생성.
+    - start_round_name이 주어지면 그 라운드부터(포함) 상위 라운드만 내려줌
+      (요구사항: '넉아웃되는 경기부터 표기')
+    """
+
+    # 라운드 순서(고정)
+    order = [
+        "1st Round",
+        "Knockout Round Play-offs",
+        "Round of 32",
+        "Round of 16",
+        "Quarter-finals",
+        "Semi-finals",
+        "Final",
+    ]
+    order_index = {name: i for i, name in enumerate(order)}
+
+    # start_round_name 이후만 포함
+    start_idx = None
+    if start_round_name in order_index:
+        start_idx = order_index[start_round_name]
+
+    # 해당 리그/시즌 ties 전부 가져오기(필터는 파이썬에서)
+    ties_rows: List[Dict[str, Any]] = fetch_all(
+        """
+        SELECT
+            round_name,
+            tie_key,
+            team_a_id,
+            team_b_id,
+            leg1_fixture_id,
+            leg2_fixture_id,
+            leg1_home_id,
+            leg1_away_id,
+            leg1_home_ft,
+            leg1_away_ft,
+            leg1_date_utc,
+            leg2_home_id,
+            leg2_away_id,
+            leg2_home_ft,
+            leg2_away_ft,
+            leg2_date_utc,
+            agg_a,
+            agg_b,
+            winner_team_id
+        FROM tournament_ties
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+
+    # round별로 모으기
+    by_round: Dict[str, List[Dict[str, Any]]] = {}
+    for r in ties_rows:
+        rn = (r.get("round_name") or "").strip()
+        if not _is_knockout_round_for_bracket(league_id, rn):
+            continue
+
+        idx = order_index.get(rn)
+        if idx is None:
+            continue
+        if start_idx is not None and idx < start_idx:
+            continue
+
+        by_round.setdefault(rn, []).append(r)
+
+    # 정렬 및 출력 변환
+    bracket: List[Dict[str, Any]] = []
+    for rn in order:
+        if rn not in by_round:
+            continue
+
+        # tie_key 안정 정렬
+        ties_sorted = sorted(by_round[rn], key=lambda x: str(x.get("tie_key") or ""))
+
+        ties_out: List[Dict[str, Any]] = []
+        for i, tr in enumerate(ties_sorted, start=1):
+            legs: List[Dict[str, Any]] = []
+
+            # leg1
+            if tr.get("leg1_fixture_id") is not None:
+                legs.append(
+                    {
+                        "leg_index": 1,
+                        "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg1_date_utc"),
+                        "home_id": _coalesce_int(tr.get("leg1_home_id"), 0) or None,
+                        "away_id": _coalesce_int(tr.get("leg1_away_id"), 0) or None,
+                        "home_ft": tr.get("leg1_home_ft"),
+                        "away_ft": tr.get("leg1_away_ft"),
+                    }
+                )
+
+            # leg2 (없을 수도 있음: Final 등)
+            if tr.get("leg2_fixture_id") is not None:
+                legs.append(
+                    {
+                        "leg_index": 2,
+                        "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg2_date_utc"),
+                        "home_id": _coalesce_int(tr.get("leg2_home_id"), 0) or None,
+                        "away_id": _coalesce_int(tr.get("leg2_away_id"), 0) or None,
+                        "home_ft": tr.get("leg2_home_ft"),
+                        "away_ft": tr.get("leg2_away_ft"),
+                    }
+                )
+
+            ties_out.append(
+                {
+                    "tie_key": tr.get("tie_key"),
+                    "order_hint": i,
+                    "team_a_id": tr.get("team_a_id"),
+                    "team_b_id": tr.get("team_b_id"),
+                    "agg_a": tr.get("agg_a"),
+                    "agg_b": tr.get("agg_b"),
+                    "winner_team_id": tr.get("winner_team_id"),
+                    "legs": legs,
+                }
+            )
+
+        round_key = rn.upper().replace(" ", "_").replace("-", "_")
+        bracket.append(
+            {
+                "round_key": round_key,
+                "round_label": rn,
+                "ties": ties_out,
+            }
+        )
+
+    return bracket
+
+
 
 def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Match Detail용 Standings 블록 (하이브리드 완전체)
+    Match Detail용 Standings 블록 (TABLE + BRACKET 하이브리드)
 
     ✅ 규칙:
-    1) standings 테이블에 (league_id, season) rows가 있으면 그걸 우선 사용
-    2) standings가 비어 있어도,
-       - 해당 시즌에 "완료된 경기"가 1개라도 있으면(matches 기준)
-       - 즉시 standings를 계산해서 내려준다
-    3) 완료된 경기 자체가 0이면 rows=[] + 안내 문구(message)
-
-    + 기존 matchdetail 특징 유지:
-      - team당 중복 row(스플릿 라운드 등)는 played 최대 row만 남김
-      - group_name 여러 개면 home/away 팀이 속한 group 하나만 사용(단 East/West split은 유지)
-      - is_home / is_away 플래그 포함
-      - context_options(conferences/groups) 포함
+    - 넉아웃(브라켓) 대상 fixture면: mode="BRACKET" + bracket 채워서 반환 (rows는 [])
+    - 그 외에는 기존 TABLE 로직 그대로:
+      1) standings 테이블 우선
+      2) 비어있으면 matches로 계산
+      3) finished=0이면 rows=[] + message
     """
 
     league_id = header.get("league_id")
@@ -137,12 +331,67 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "season": None,
                 "name": league_name,
             },
+            "mode": "TABLE",
             "rows": [],
+            "bracket": None,
             "context_options": {"conferences": [], "groups": []},
             "message": "Standings are not available yet.\nPlease check back later.",
+            "source": "standings_table",
         }
 
-    # 1) standings 테이블 우선
+    # ─────────────────────────────────────────────────────────────
+    # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
+    #    - 요구사항: '넉아웃되는 경기부터 표기'
+    # ─────────────────────────────────────────────────────────────
+    fixture_id = _extract_fixture_id_from_header(header)
+    league_round = header.get("league_round")
+    league_round_str = league_round.strip() if isinstance(league_round, str) else None
+
+    if fixture_id is not None and _is_knockout_round_for_bracket(league_id_int, league_round_str):
+        tie_row = _fetch_one(
+            """
+            SELECT round_name
+            FROM tournament_ties
+            WHERE league_id = %s
+              AND season = %s
+              AND (%s = leg1_fixture_id OR %s = leg2_fixture_id)
+            LIMIT 1
+            """,
+            (league_id_int, season_resolved, fixture_id, fixture_id),
+        )
+
+        tie_round_name = (tie_row or {}).get("round_name")
+        tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
+
+        # header의 league_round와 DB의 round_name이 다를 수도 있으니,
+        # DB에 있는 값이 넉아웃 라운드면 그걸 기준으로 start_round를 잡는다.
+        start_round = tie_round_name if _is_knockout_round_for_bracket(league_id_int, tie_round_name) else league_round_str
+
+        bracket = _build_bracket_from_tournament_ties(
+            league_id_int,
+            season_resolved,
+            start_round_name=start_round,
+        )
+
+        if bracket:
+            return {
+                "league": {
+                    "league_id": league_id_int,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "mode": "BRACKET",
+                "rows": [],
+                "bracket": bracket,
+                "context_options": {"conferences": [], "groups": []},
+                "message": None,
+                "source": "tournament_ties",
+            }
+        # bracket이 비면(데이터 미수집) TABLE로 fallback
+
+    # ─────────────────────────────────────────────────────────────
+    # 1) standings 테이블 우선 (기존 로직 그대로)
+    # ─────────────────────────────────────────────────────────────
     try:
         rows_raw: List[Dict[str, Any]] = fetch_all(
             """
@@ -175,7 +424,9 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     source = "standings_table" if rows_raw else "computed_from_matches"
 
-    # 2) standings가 비어 있으면 → matches에서 즉시 계산
+    # ─────────────────────────────────────────────────────────────
+    # 2) standings가 비어 있으면 → matches에서 즉시 계산 (기존 로직 그대로)
+    # ─────────────────────────────────────────────────────────────
     if not rows_raw:
         mcols = _cols_of("matches")
 
@@ -203,9 +454,12 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "season": season_resolved,
                     "name": league_name,
                 },
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
         ht, at = team_pair
@@ -240,9 +494,12 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "season": season_resolved,
                     "name": league_name,
                 },
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
         # matches 기반 standings 계산 (포인트/득실/다득점 기본 정렬)
@@ -347,9 +604,12 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "season": season_resolved,
                     "name": league_name,
                 },
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
     # ── 공통 후처리: 팀당 중복 row 정리 (played 최대 row만) ─────────────────
@@ -440,9 +700,10 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "season": season_resolved,
             "name": league_name,
         },
+        "mode": "TABLE",
         "rows": table,
+        "bracket": None,
         "context_options": context_options,
-        # 디버깅/검증 편의(앱에서 안 써도 무방)
         "source": source,
     }
 
@@ -451,6 +712,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
+
 
 
 def _build_context_options_from_rows(
