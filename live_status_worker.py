@@ -1168,11 +1168,16 @@ def bracket_fill_missing_rounds(session: requests.Session, league_id: int, seaso
     return done
 
 
-def run_once_standings() -> int:
+def run_once_standings(do_periodic: bool = True) -> int:
     """
     ✅ Standings 워커:
-    - 30분 주기 refresh + FT 트리거 즉시 1회
+    - FT 트리거 즉시 1회(폴링): do_periodic=False 로 호출
+    - 30분 주기 refresh: do_periodic=True 로 호출
     - 트리거 소비 방식: B(standings_consumed_utc)
+
+    중요:
+    - do_periodic=False 일 때는 "트리거로 묶인 (league_id, season)"만 갱신한다.
+      (전체 리그 standings 호출 금지)
     """
     if not API_KEY:
         print("[standings_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1187,12 +1192,12 @@ def run_once_standings() -> int:
         ensure_ft_triggers_table()
         run_once_standings._ddl_done = True  # type: ignore[attr-defined]
 
-    nowu = now_utc()
     s = _session()
 
     # 1) 트리거 우선 처리(미소비)
     triggers = _select_unconsumed_triggers("standings", limit=60)
     processed_pairs: Set[Tuple[int, int]] = set()
+
     for t in triggers:
         lid = safe_int(t.get("league_id"))
         season = safe_int(t.get("season"))
@@ -1200,8 +1205,9 @@ def run_once_standings() -> int:
             continue
         processed_pairs.add((lid, season))
 
-    # 트리거로 묶인 (lid,season)만 우선 갱신
     total_rows = 0
+
+    # 트리거로 묶인 (lid,season)만 우선 갱신
     for (lid, season) in sorted(processed_pairs):
         try:
             rows = fetch_standings(s, lid, season)
@@ -1218,6 +1224,14 @@ def run_once_standings() -> int:
             _mark_triggers_consumed("standings", fids)
         except Exception:
             pass
+
+    # ✅ 폴링 모드(do_periodic=False)면 여기서 종료
+    if not do_periodic:
+        try:
+            cleanup_old_rows()
+        except Exception:
+            pass
+        return total_rows
 
     # 2) 정기 refresh(30분): 시즌을 DB로 추정해서 1회 갱신
     # - 이미 트리거로 처리한 (lid,season)은 중복 호출 피함
@@ -1244,14 +1258,20 @@ def run_once_standings() -> int:
     return total_rows
 
 
-def run_once_bracket() -> int:
+
+def run_once_bracket(do_periodic: bool = True) -> int:
     """
     ✅ Round/Bracket 워커:
-    - 60분 주기 + FT 트리거 즉시 1회
+    - FT 트리거 즉시 1회(폴링): do_periodic=False 로 호출
+    - 60분 주기 실행: do_periodic=True 로 호출
     - 역할:
       1) /fixtures?id= 로 league.round 및 raw 채우기(빈 것만, limit)
       2) DB matches 기반으로 tournament_ties 생성/갱신
     - 트리거 소비 방식: B(bracket_consumed_utc)
+
+    중요:
+    - do_periodic=False 일 때는 트리거로 묶인 (league_id, season)만 처리한다.
+      (전체 리그 정기 작업 금지)
     """
     if not API_KEY:
         print("[bracket_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1272,6 +1292,7 @@ def run_once_bracket() -> int:
     # 1) 트리거 우선 처리
     triggers = _select_unconsumed_triggers("bracket", limit=60)
     processed_pairs: Set[Tuple[int, int]] = set()
+
     for t in triggers:
         lid = safe_int(t.get("league_id"))
         season = safe_int(t.get("season"))
@@ -1280,6 +1301,7 @@ def run_once_bracket() -> int:
         processed_pairs.add((lid, season))
 
     total = 0
+
     for (lid, season) in sorted(processed_pairs):
         try:
             filled = bracket_fill_missing_rounds(s, lid, season, limit=60)
@@ -1296,6 +1318,14 @@ def run_once_bracket() -> int:
             _mark_triggers_consumed("bracket", fids)
         except Exception:
             pass
+
+    # ✅ 폴링 모드(do_periodic=False)면 여기서 종료
+    if not do_periodic:
+        try:
+            cleanup_old_rows()
+        except Exception:
+            pass
+        return total
 
     # 2) 정기(60분): 시즌 추정 후 실행(트리거로 처리한 것 제외)
     for lid in league_ids:
@@ -1319,6 +1349,7 @@ def run_once_bracket() -> int:
         pass
 
     return total
+
 
 
 
@@ -2756,11 +2787,11 @@ LIVE_WORKER_ROLE = (os.environ.get("LIVE_WORKER_ROLE") or "live").strip().lower(
 def loop() -> None:
     """
     ✅ 단일 파일에서 역할별로 루프를 분기한다.
-    - live: detect_interval(기존 10초)로 run_once() (핫패스)
-    - backfill: 1시간 주기(기본 DATE_SCAN_INTERVAL_SEC)로 run_once_backfill()
-    - watchdog: 60초 주기(기본 WATCHDOG_INTERVAL_SEC)로 run_once_watchdog()
-    - standings: 30분 주기 + FT 트리거 즉시(폴링)로 run_once_standings()
-    - bracket: 60분 주기 + FT 트리거 즉시(폴링)로 run_once_bracket()
+
+    핵심 수정:
+    - standings/bracket은 TRIGGER_POLL_SEC마다 "트리거만" 처리(do_periodic=False)
+    - STANDINGS_LOOP_SEC/BRACKET_LOOP_SEC마다 "정기 작업" 1회(do_periodic=True)
+    - 이렇게 해야 호출수 폭발 없이 'FT 즉시 1회 + 주기적 갱신'이 정확히 성립함
     """
     role = LIVE_WORKER_ROLE
 
@@ -2785,21 +2816,19 @@ def loop() -> None:
             time.sleep(max(10, sleep_sec))
 
     elif role == "standings":
-        # ✅ 30분 주기 + FT 트리거 즉시성(짧은 폴링)
         print(f"[live_status_worker] start role=standings (periodic={STANDINGS_LOOP_SEC}s, poll={TRIGGER_POLL_SEC}s)")
         last_periodic = 0.0
         while True:
             try:
                 now_ts = time.time()
 
-                # 트리거 폴링: 자주 돌려도 run_once_standings 내부가 '미소비 트리거만' 처리하므로 안전
-                run_once_standings()
+                # 1) 트리거 폴링: 트리거만 처리 (즉시성)
+                run_once_standings(do_periodic=False)
 
-                # periodic 간격 강제(너무 자주 전체 갱신하지 않게)
+                # 2) 주기적 전체 갱신: 30분에 1번만
                 if (now_ts - last_periodic) >= float(STANDINGS_LOOP_SEC):
                     last_periodic = now_ts
-                    # periodic도 run_once_standings 내부에서 처리(트리거 처리 후 남은 리그 갱신)
-                    run_once_standings()
+                    run_once_standings(do_periodic=True)
 
             except Exception:
                 traceback.print_exc()
@@ -2807,18 +2836,19 @@ def loop() -> None:
             time.sleep(max(5, int(TRIGGER_POLL_SEC)))
 
     elif role == "bracket":
-        # ✅ 60분 주기 + FT 트리거 즉시성(짧은 폴링)
         print(f"[live_status_worker] start role=bracket (periodic={BRACKET_LOOP_SEC}s, poll={TRIGGER_POLL_SEC}s)")
         last_periodic = 0.0
         while True:
             try:
                 now_ts = time.time()
 
-                run_once_bracket()
+                # 1) 트리거 폴링: 트리거만 처리 (즉시성)
+                run_once_bracket(do_periodic=False)
 
+                # 2) 주기적 전체 갱신: 60분에 1번만
                 if (now_ts - last_periodic) >= float(BRACKET_LOOP_SEC):
                     last_periodic = now_ts
-                    run_once_bracket()
+                    run_once_bracket(do_periodic=True)
 
             except Exception:
                 traceback.print_exc()
@@ -2836,6 +2866,7 @@ def loop() -> None:
             except Exception:
                 traceback.print_exc()
             time.sleep(DETECT_INTERVAL_SEC)
+
 
 
 
