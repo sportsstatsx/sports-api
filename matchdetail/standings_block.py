@@ -162,6 +162,7 @@ def _build_bracket_from_tournament_ties(
     tournament_ties 기반 bracket 생성.
     - start_round_name이 주어지면 그 라운드부터(포함) 상위 라운드만 내려줌
       (요구사항: '넉아웃되는 경기부터 표기')
+    - ✅ NEW: legs에 home_name/home_logo/away_name/away_logo 포함
     """
 
     # 라운드 순서(고정)
@@ -217,6 +218,63 @@ def _build_bracket_from_tournament_ties(
         (league_id, season),
     )
 
+    # ✅ NEW: 브라켓에 등장하는 모든 팀 id를 한 번에 모아서 teams에서 이름/로고 매핑
+    team_ids: set[int] = set()
+    for tr in ties_rows:
+        for k in (
+            "team_a_id",
+            "team_b_id",
+            "leg1_home_id",
+            "leg1_away_id",
+            "leg2_home_id",
+            "leg2_away_id",
+            "winner_team_id",
+        ):
+            v = tr.get(k)
+            try:
+                if v is None:
+                    continue
+                iv = int(v)
+                if iv > 0:
+                    team_ids.add(iv)
+            except (TypeError, ValueError):
+                continue
+
+    team_map: Dict[int, Dict[str, Any]] = {}
+    if team_ids:
+        # ⚠️ Postgres에서 IN %s 에 튜플 넘기는 방식 (fetch_all이 psycopg2 스타일이라고 가정)
+        team_rows = fetch_all(
+            """
+            SELECT id, name, logo
+            FROM teams
+            WHERE id = ANY(%s)
+            """,
+            (list(team_ids),),
+        )
+        for r in team_rows:
+            try:
+                tid = int(r.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0:
+                team_map[tid] = {
+                    "name": r.get("name"),
+                    "logo": r.get("logo"),
+                }
+
+    def _team_name_logo(tid: Any) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            tid_i = int(tid) if tid is not None else 0
+        except (TypeError, ValueError):
+            tid_i = 0
+        if tid_i <= 0:
+            return (None, None)
+        info = team_map.get(tid_i) or {}
+        name = info.get("name")
+        logo = info.get("logo")
+        return (name if isinstance(name, str) and name.strip() else None,
+                logo if isinstance(logo, str) and logo.strip() else None)
+
     # round별로 모으기
     by_round: Dict[str, List[Dict[str, Any]]] = {}
     for r in ties_rows:
@@ -247,29 +305,53 @@ def _build_bracket_from_tournament_ties(
 
             # leg1
             if tr.get("leg1_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg1_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg1_away_id"), 0) or None
+
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+
                 legs.append(
                     {
                         "leg_index": 1,
                         "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
                         "date_utc": tr.get("leg1_date_utc"),
-                        "home_id": _coalesce_int(tr.get("leg1_home_id"), 0) or None,
-                        "away_id": _coalesce_int(tr.get("leg1_away_id"), 0) or None,
+                        "home_id": h_id,
+                        "away_id": a_id,
                         "home_ft": tr.get("leg1_home_ft"),
                         "away_ft": tr.get("leg1_away_ft"),
+
+                        # ✅ NEW
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
                     }
                 )
 
             # leg2 (없을 수도 있음: Final 등)
             if tr.get("leg2_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
+
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+
                 legs.append(
                     {
                         "leg_index": 2,
                         "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
                         "date_utc": tr.get("leg2_date_utc"),
-                        "home_id": _coalesce_int(tr.get("leg2_home_id"), 0) or None,
-                        "away_id": _coalesce_int(tr.get("leg2_away_id"), 0) or None,
+                        "home_id": h_id,
+                        "away_id": a_id,
                         "home_ft": tr.get("leg2_home_ft"),
                         "away_ft": tr.get("leg2_away_ft"),
+
+                        # ✅ NEW
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
                     }
                 )
 
@@ -296,6 +378,7 @@ def _build_bracket_from_tournament_ties(
         )
 
     return bracket
+
 
 
 
