@@ -62,6 +62,246 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
 
     return None
 
+# ────────────────────────────────────────────────────────────
+#  BRACKET (tournament_ties 기반) - matchdetail과 동일
+# ────────────────────────────────────────────────────────────
+
+def _is_knockout_round_for_bracket(round_name: Optional[str]) -> bool:
+    if not round_name or not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    allowed = {
+        "Play-offs",
+        "Play-off",
+        "Playoff",
+        "Knockout Round Play-offs",
+        "Round of 64",
+        "Round of 32",
+        "Round of 16",
+        "Quarter-finals",
+        "Semi-finals",
+        "Final",
+        "1st Round",
+        "2nd Round",
+        "3rd Round",
+    }
+    return rn in allowed
+
+
+def _build_bracket_from_tournament_ties(
+    league_id: int,
+    season: int,
+    *,
+    start_round_name: Optional[str] = None,
+    end_round_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    order = [
+        "1st Round",
+        "2nd Round",
+        "3rd Round",
+        "Play-offs",
+        "Play-off",
+        "Playoff",
+        "Knockout Round Play-offs",
+        "Round of 64",
+        "Round of 32",
+        "Round of 16",
+        "Quarter-finals",
+        "Semi-finals",
+        "Final",
+    ]
+    order_index = {name: i for i, name in enumerate(order)}
+
+    start_idx = order_index.get(start_round_name) if start_round_name in order_index else None
+    end_idx = order_index.get(end_round_name) if end_round_name in order_index else None
+
+    ties_rows: List[Dict[str, Any]] = fetch_all(
+        """
+        SELECT
+            round_name,
+            tie_key,
+            team_a_id,
+            team_b_id,
+            leg1_fixture_id,
+            leg2_fixture_id,
+            leg1_home_id,
+            leg1_away_id,
+            leg1_home_ft,
+            leg1_away_ft,
+            leg1_date_utc,
+            leg2_home_id,
+            leg2_away_id,
+            leg2_home_ft,
+            leg2_away_ft,
+            leg2_date_utc,
+            agg_a,
+            agg_b,
+            winner_team_id
+        FROM tournament_ties
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+
+    # 브라켓에 등장하는 팀 모아서 teams에서 이름/로고 매핑
+    team_ids: set[int] = set()
+    for tr in ties_rows:
+        for k in (
+            "team_a_id",
+            "team_b_id",
+            "leg1_home_id",
+            "leg1_away_id",
+            "leg2_home_id",
+            "leg2_away_id",
+            "winner_team_id",
+        ):
+            v = tr.get(k)
+            try:
+                if v is None:
+                    continue
+                iv = int(v)
+                if iv > 0:
+                    team_ids.add(iv)
+            except (TypeError, ValueError):
+                continue
+
+    team_map: Dict[int, Dict[str, Any]] = {}
+    if team_ids:
+        team_rows = fetch_all(
+            """
+            SELECT id, name, logo
+            FROM teams
+            WHERE id = ANY(%s)
+            """,
+            (list(team_ids),),
+        )
+        for r in team_rows:
+            try:
+                tid = int(r.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0:
+                team_map[tid] = {"name": r.get("name"), "logo": r.get("logo")}
+
+    def _team_name_logo(tid: Any) -> tuple[Optional[str], Optional[str]]:
+        try:
+            tid_i = int(tid) if tid is not None else 0
+        except (TypeError, ValueError):
+            tid_i = 0
+        if tid_i <= 0:
+            return (None, None)
+        info = team_map.get(tid_i) or {}
+        name = info.get("name")
+        logo = info.get("logo")
+        return (
+            name if isinstance(name, str) and name.strip() else None,
+            logo if isinstance(logo, str) and logo.strip() else None,
+        )
+
+    by_round: Dict[str, List[Dict[str, Any]]] = {}
+    for r in ties_rows:
+        rn = (r.get("round_name") or "").strip()
+        if not _is_knockout_round_for_bracket(rn):
+            continue
+
+        idx = order_index.get(rn)
+        if idx is None:
+            continue
+
+        if start_idx is not None and idx < start_idx:
+            continue
+        if end_idx is not None and idx > end_idx:
+            continue
+
+        by_round.setdefault(rn, []).append(r)
+
+    bracket: List[Dict[str, Any]] = []
+    for rn in order:
+        if rn not in by_round:
+            continue
+
+        ties_sorted = sorted(by_round[rn], key=lambda x: str(x.get("tie_key") or ""))
+
+        ties_out: List[Dict[str, Any]] = []
+        for i, tr in enumerate(ties_sorted, start=1):
+            legs: List[Dict[str, Any]] = []
+
+            # leg1
+            if tr.get("leg1_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg1_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg1_away_id"), 0) or None
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+                legs.append(
+                    {
+                        "leg_index": 1,
+                        "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg1_date_utc"),
+                        "home_id": h_id,
+                        "away_id": a_id,
+                        "home_ft": tr.get("leg1_home_ft"),
+                        "away_ft": tr.get("leg1_away_ft"),
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
+                    }
+                )
+
+            # leg2
+            if tr.get("leg2_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+                legs.append(
+                    {
+                        "leg_index": 2,
+                        "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg2_date_utc"),
+                        "home_id": h_id,
+                        "away_id": a_id,
+                        "home_ft": tr.get("leg2_home_ft"),
+                        "away_ft": tr.get("leg2_away_ft"),
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
+                    }
+                )
+
+            a_id = tr.get("team_a_id")
+            b_id = tr.get("team_b_id")
+            a_name, a_logo = _team_name_logo(a_id)
+            b_name, b_logo = _team_name_logo(b_id)
+
+            ties_out.append(
+                {
+                    "tie_key": tr.get("tie_key"),
+                    "order_hint": i,
+                    "team_a_id": a_id,
+                    "team_b_id": b_id,
+                    "team_a_name": a_name,
+                    "team_a_logo": a_logo,
+                    "team_b_name": b_name,
+                    "team_b_logo": b_logo,
+                    "agg_a": tr.get("agg_a"),
+                    "agg_b": tr.get("agg_b"),
+                    "winner_team_id": tr.get("winner_team_id"),
+                    "legs": legs,
+                }
+            )
+
+        round_key = rn.upper().replace(" ", "_").replace("-", "_")
+        bracket.append({"round_key": round_key, "round_label": rn, "ties": ties_out})
+
+    return bracket
+
 
 # ────────────────────────────────────────────────────────────
 #  컨퍼런스 / 그룹 / 스플릿 정보 추출 (context_options)
@@ -124,7 +364,13 @@ def _build_context_options_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, Li
     }
 
 
-def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, Any]:
+def build_standings_block(
+    league_id: int,
+    season: Optional[int],
+    *,
+    current_round_name: Optional[str] = None,
+) -> Dict[str, Any]:
+
     """
     League Detail 화면의 'Standings' 탭 데이터.
 
@@ -169,6 +415,31 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
     except Exception as e:
         print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
 
+    # ─────────────────────────────────────────────────────────────
+    # 0) BRACKET 우선: bundle_service가 넘긴 current_round_name이 있으면
+    #    matchdetail과 동일하게 "현재 라운드까지(end_round_name)" 브라켓 생성
+    # ─────────────────────────────────────────────────────────────
+    cr = current_round_name.strip() if isinstance(current_round_name, str) else None
+    if cr and _is_knockout_round_for_bracket(cr):
+        bracket = _build_bracket_from_tournament_ties(
+            league_id,
+            season_resolved,
+            start_round_name=None,
+            end_round_name=cr,  # ✅ 핵심: 현재 라운드까지 포함
+        )
+        if bracket:
+            return {
+                "league_id": league_id,
+                "season": season_resolved,
+                "league_name": league_name,
+                "rows": [],
+                "bracket": bracket,
+                "mode": "BRACKET",
+                "context_options": {"conferences": [], "groups": []},
+            }
+        # bracket 비면 기존 TABLE 로직으로 fallback
+
+    
     def _cols_of(table_name: str) -> set[str]:
         try:
             cols = fetch_all(
