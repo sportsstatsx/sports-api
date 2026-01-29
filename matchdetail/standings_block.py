@@ -114,8 +114,10 @@ def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
 def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
     """
     BRACKET 표시 대상 라운드 판정.
-    - UEFA (2,3,848)의 'Play-offs' 는 예선 성격이라 제외 (우리가 after_anchor=f로 확인함)
-    - 그 외 넉아웃 라운드명은 허용
+
+    정책(너가 원하는 버전):
+    - "넉아웃 성격이면 예선/플레이오프 포함해서 브라켓으로 전부 보여준다"
+    - 리그별 예외로 거르지 않는다(코드 단순화)
     """
     if not round_name or not isinstance(round_name, str):
         return False
@@ -124,19 +126,30 @@ def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) ->
     if not rn:
         return False
 
-    if league_id in (2, 3, 848) and rn == "Play-offs":
-        return False
-
     allowed = {
+        # UEFA / 대륙컵
+        "Play-offs",
+        "Play-off",
+        "Playoff",
         "Knockout Round Play-offs",
+
+        # 일반 라운드
+        "Round of 64",
         "Round of 32",
         "Round of 16",
         "Quarter-finals",
         "Semi-finals",
         "Final",
+
+        # 예선/초기 라운드(너 워커 셋에 맞춰 확장)
         "1st Round",
+        "2nd Round",
+        "3rd Round",
     }
+
     return rn in allowed
+
+
 
 
 def _build_bracket_from_tournament_ties(
@@ -154,7 +167,13 @@ def _build_bracket_from_tournament_ties(
     # 라운드 순서(고정)
     order = [
         "1st Round",
+        "2nd Round",
+        "3rd Round",
+        "Play-offs",
+        "Play-off",
+        "Playoff",
         "Knockout Round Play-offs",
+        "Round of 64",
         "Round of 32",
         "Round of 16",
         "Quarter-finals",
@@ -277,6 +296,7 @@ def _build_bracket_from_tournament_ties(
         )
 
     return bracket
+
 
 
 
