@@ -157,12 +157,16 @@ def _build_bracket_from_tournament_ties(
     season: int,
     *,
     start_round_name: Optional[str] = None,
+    end_round_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     tournament_ties 기반 bracket 생성.
-    - start_round_name이 주어지면 그 라운드부터(포함) 상위 라운드만 내려줌
-      (요구사항: '넉아웃되는 경기부터 표기')
-    - ✅ NEW: legs에 home_name/home_logo/away_name/away_logo 포함
+
+    - start_round_name: 이 라운드부터(포함) 보여줌 (예: Knockout Round Play-offs부터)
+    - end_round_name: 이 라운드까지(포함) 보여줌 (예: Final이면 Final까지 = 이전 라운드 포함)
+
+    ✅ Final matchdetail에서 이전 라운드가 안 보이는 문제는
+       end_round_name을 "Final"로 주면 해결됨.
     """
 
     # 라운드 순서(고정)
@@ -183,10 +187,8 @@ def _build_bracket_from_tournament_ties(
     ]
     order_index = {name: i for i, name in enumerate(order)}
 
-    # start_round_name 이후만 포함
-    start_idx = None
-    if start_round_name in order_index:
-        start_idx = order_index[start_round_name]
+    start_idx = order_index.get(start_round_name) if start_round_name in order_index else None
+    end_idx = order_index.get(end_round_name) if end_round_name in order_index else None
 
     # 해당 리그/시즌 ties 전부 가져오기(필터는 파이썬에서)
     ties_rows: List[Dict[str, Any]] = fetch_all(
@@ -218,7 +220,7 @@ def _build_bracket_from_tournament_ties(
         (league_id, season),
     )
 
-    # ✅ NEW: 브라켓에 등장하는 모든 팀 id를 한 번에 모아서 teams에서 이름/로고 매핑
+    # 브라켓에 등장하는 모든 팀 id를 한 번에 모아서 teams에서 이름/로고 매핑
     team_ids: set[int] = set()
     for tr in ties_rows:
         for k in (
@@ -242,7 +244,6 @@ def _build_bracket_from_tournament_ties(
 
     team_map: Dict[int, Dict[str, Any]] = {}
     if team_ids:
-        # ⚠️ Postgres에서 IN %s 에 튜플 넘기는 방식 (fetch_all이 psycopg2 스타일이라고 가정)
         team_rows = fetch_all(
             """
             SELECT id, name, logo
@@ -272,8 +273,10 @@ def _build_bracket_from_tournament_ties(
         info = team_map.get(tid_i) or {}
         name = info.get("name")
         logo = info.get("logo")
-        return (name if isinstance(name, str) and name.strip() else None,
-                logo if isinstance(logo, str) and logo.strip() else None)
+        return (
+            name if isinstance(name, str) and name.strip() else None,
+            logo if isinstance(logo, str) and logo.strip() else None,
+        )
 
     # round별로 모으기
     by_round: Dict[str, List[Dict[str, Any]]] = {}
@@ -285,7 +288,11 @@ def _build_bracket_from_tournament_ties(
         idx = order_index.get(rn)
         if idx is None:
             continue
+
+        # ✅ 범위 필터: start ~ end
         if start_idx is not None and idx < start_idx:
+            continue
+        if end_idx is not None and idx > end_idx:
             continue
 
         by_round.setdefault(rn, []).append(r)
@@ -296,7 +303,6 @@ def _build_bracket_from_tournament_ties(
         if rn not in by_round:
             continue
 
-        # tie_key 안정 정렬
         ties_sorted = sorted(by_round[rn], key=lambda x: str(x.get("tie_key") or ""))
 
         ties_out: List[Dict[str, Any]] = []
@@ -320,8 +326,6 @@ def _build_bracket_from_tournament_ties(
                         "away_id": a_id,
                         "home_ft": tr.get("leg1_home_ft"),
                         "away_ft": tr.get("leg1_away_ft"),
-
-                        # ✅ NEW
                         "home_name": h_name,
                         "home_logo": h_logo,
                         "away_name": a_name,
@@ -329,7 +333,7 @@ def _build_bracket_from_tournament_ties(
                     }
                 )
 
-            # leg2 (없을 수도 있음: Final 등)
+            # leg2
             if tr.get("leg2_fixture_id") is not None:
                 h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
                 a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
@@ -346,8 +350,6 @@ def _build_bracket_from_tournament_ties(
                         "away_id": a_id,
                         "home_ft": tr.get("leg2_home_ft"),
                         "away_ft": tr.get("leg2_away_ft"),
-
-                        # ✅ NEW
                         "home_name": h_name,
                         "home_logo": h_logo,
                         "away_name": a_name,
@@ -364,23 +366,18 @@ def _build_bracket_from_tournament_ties(
                 {
                     "tie_key": tr.get("tie_key"),
                     "order_hint": i,
-
                     "team_a_id": a_id,
                     "team_b_id": b_id,
-
-                    # ✅ NEW: tie 레벨에도 팀명/로고 내려줌(leg가 비어도 UI 방어)
                     "team_a_name": a_name,
                     "team_a_logo": a_logo,
                     "team_b_name": b_name,
                     "team_b_logo": b_logo,
-
                     "agg_a": tr.get("agg_a"),
                     "agg_b": tr.get("agg_b"),
                     "winner_team_id": tr.get("winner_team_id"),
                     "legs": legs,
                 }
             )
-
 
         round_key = rn.upper().replace(" ", "_").replace("-", "_")
         bracket.append(
@@ -392,6 +389,7 @@ def _build_bracket_from_tournament_ties(
         )
 
     return bracket
+
 
 
 
@@ -458,7 +456,8 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # ─────────────────────────────────────────────────────────────
     # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
-    #    - 요구사항: '넉아웃되는 경기부터 표기'
+    #    - ✅ FIX: Final matchdetail에서 이전 라운드가 안 보이던 문제 해결
+    #      => "현재 라운드까지(포함)" 브라켓을 내려줌 (end_round_name 사용)
     # ─────────────────────────────────────────────────────────────
     fixture_id = _extract_fixture_id_from_header(header)
     league_round = header.get("league_round")
@@ -480,14 +479,18 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         tie_round_name = (tie_row or {}).get("round_name")
         tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
 
-        # header의 league_round와 DB의 round_name이 다를 수도 있으니,
-        # DB에 있는 값이 넉아웃 라운드면 그걸 기준으로 start_round를 잡는다.
-        start_round = tie_round_name if _is_knockout_round_for_bracket(league_id_int, tie_round_name) else league_round_str
+        # DB round_name이 유효하면 그걸 current round로 사용
+        current_round = (
+            tie_round_name
+            if _is_knockout_round_for_bracket(league_id_int, tie_round_name)
+            else league_round_str
+        )
 
         bracket = _build_bracket_from_tournament_ties(
             league_id_int,
             season_resolved,
-            start_round_name=start_round,
+            start_round_name=None,
+            end_round_name=current_round,   # ✅ 핵심: 현재 라운드까지 포함해서 내려줌
         )
 
         if bracket:
@@ -824,11 +827,11 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "source": source,
     }
 
-    # rows가 비면 안내문구(혹시라도 안전망)
     if not table:
         out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
+
 
 
 
