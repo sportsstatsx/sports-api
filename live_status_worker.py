@@ -939,6 +939,9 @@ def _mark_triggers_consumed(which: str, fixture_ids: List[int]) -> None:
 def _bracket_round_names() -> Set[str]:
     # 너 DB에서 실제로 보이는 round 값(Quarter-finals/Semi-finals/Final)을 기본 포함
     # 다른 대륙컵/리그도 방어적으로 몇 개 더 포함(없으면 그냥 빈 결과)
+    #
+    # ✅ 중요: UCL 24/25부터 'Knockout Round Play-offs'가 브라켓 시작점이 될 수 있음
+    # (tournament_ties를 matches에서 생성하는 이 워커에서도 포함해야 함)
     return {
         "Final",
         "Semi-finals",
@@ -946,6 +949,11 @@ def _bracket_round_names() -> Set[str]:
         "Round of 16",
         "Round of 32",
         "Round of 64",
+
+        # ✅ UCL/UEL 컨벤션
+        "Knockout Round Play-offs",
+
+        # (기존 유지)
         "Play-offs",
         "Playoff",
         "Play-off",
@@ -953,6 +961,7 @@ def _bracket_round_names() -> Set[str]:
         "2nd Round",
         "3rd Round",
     }
+
 
 
 def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> int:
