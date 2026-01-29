@@ -355,18 +355,32 @@ def _build_bracket_from_tournament_ties(
                     }
                 )
 
+            a_id = tr.get("team_a_id")
+            b_id = tr.get("team_b_id")
+            a_name, a_logo = _team_name_logo(a_id)
+            b_name, b_logo = _team_name_logo(b_id)
+
             ties_out.append(
                 {
                     "tie_key": tr.get("tie_key"),
                     "order_hint": i,
-                    "team_a_id": tr.get("team_a_id"),
-                    "team_b_id": tr.get("team_b_id"),
+
+                    "team_a_id": a_id,
+                    "team_b_id": b_id,
+
+                    # ✅ NEW: tie 레벨에도 팀명/로고 내려줌(leg가 비어도 UI 방어)
+                    "team_a_name": a_name,
+                    "team_a_logo": a_logo,
+                    "team_b_name": b_name,
+                    "team_b_logo": b_logo,
+
                     "agg_a": tr.get("agg_a"),
                     "agg_b": tr.get("agg_b"),
                     "winner_team_id": tr.get("winner_team_id"),
                     "legs": legs,
                 }
             )
+
 
         round_key = rn.upper().replace(" ", "_").replace("-", "_")
         bracket.append(
