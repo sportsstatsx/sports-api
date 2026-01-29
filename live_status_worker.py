@@ -1184,9 +1184,9 @@ def run_once_standings(do_periodic: bool = True) -> int:
     - 30분 주기 refresh: do_periodic=True 로 호출
     - 트리거 소비 방식: B(standings_consumed_utc)
 
-    중요:
-    - do_periodic=False 일 때는 "트리거로 묶인 (league_id, season)"만 갱신한다.
-      (전체 리그 standings 호출 금지)
+    ✅ FIX(중요):
+    - /standings 호출이 실패하거나 빈 응답이면 트리거를 소비하지 않는다.
+      (그래야 다음 poll에서 재시도 가능)
     """
     if not API_KEY:
         print("[standings_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1205,34 +1205,55 @@ def run_once_standings(do_periodic: bool = True) -> int:
 
     # 1) 트리거 우선 처리(미소비)
     triggers = _select_unconsumed_triggers("standings", limit=60)
+
+    # fixture_id -> (lid, season)
+    trig_map: Dict[int, Tuple[int, int]] = {}
     processed_pairs: Set[Tuple[int, int]] = set()
 
-    for t in triggers:
+    for t in triggers or []:
+        fid = safe_int(t.get("fixture_id"))
         lid = safe_int(t.get("league_id"))
         season = safe_int(t.get("season"))
-        if lid is None or season is None:
+        if fid is None or lid is None or season is None:
             continue
-        processed_pairs.add((lid, season))
+        trig_map[int(fid)] = (int(lid), int(season))
+        processed_pairs.add((int(lid), int(season)))
 
     total_rows = 0
 
-    # 트리거로 묶인 (lid,season)만 우선 갱신
+    # ✅ 성공한 pair만 모아서 그 pair에 속한 trigger만 consumed 처리
+    succeeded_pairs: Set[Tuple[int, int]] = set()
+
     for (lid, season) in sorted(processed_pairs):
         try:
             rows = fetch_standings(s, lid, season)
+
+            # ✅ 빈 응답이면 성공으로 치지 않고 트리거 유지(재시도)
+            if not rows:
+                print(f"[standings_worker] trigger_refresh league={lid} season={season} rows=0 -> keep triggers (retry)")
+                continue
+
             n = upsert_standings_rows(lid, season, rows)
             total_rows += n
+            succeeded_pairs.add((lid, season))
             print(f"[standings_worker] trigger_refresh league={lid} season={season} rows={len(rows)} upserted={n}")
-        except Exception as e:
-            print(f"[standings_worker] trigger_refresh league={lid} season={season} err: {e}", file=sys.stderr)
 
-    # 트리거 소비(개별 fixture 단위)
-    if triggers:
-        fids = [int(x.get("fixture_id")) for x in triggers if safe_int(x.get("fixture_id")) is not None]
-        try:
-            _mark_triggers_consumed("standings", fids)
-        except Exception:
-            pass
+        except Exception as e:
+            # ✅ 에러면 트리거 유지(재시도)
+            print(f"[standings_worker] trigger_refresh league={lid} season={season} err: {e} -> keep triggers", file=sys.stderr)
+
+    # ✅ 성공한 pair에 속한 fixture_id만 consumed 처리
+    if triggers and succeeded_pairs:
+        ok_fids: List[int] = []
+        for fid, pair in trig_map.items():
+            if pair in succeeded_pairs:
+                ok_fids.append(int(fid))
+
+        if ok_fids:
+            try:
+                _mark_triggers_consumed("standings", ok_fids)
+            except Exception:
+                pass
 
     # ✅ 폴링 모드(do_periodic=False)면 여기서 종료
     if not do_periodic:
@@ -1243,15 +1264,17 @@ def run_once_standings(do_periodic: bool = True) -> int:
         return total_rows
 
     # 2) 정기 refresh(30분): 시즌을 DB로 추정해서 1회 갱신
-    # - 이미 트리거로 처리한 (lid,season)은 중복 호출 피함
+    # - 이미 트리거로 "성공 처리"한 (lid,season)은 중복 호출 피함
     for lid in league_ids:
         season = _resolve_season_for_league_from_db(lid)
         if season is None:
             continue
-        if (lid, season) in processed_pairs:
+        if (lid, season) in succeeded_pairs:
             continue
         try:
             rows = fetch_standings(s, lid, season)
+            if not rows:
+                continue
             n = upsert_standings_rows(lid, season, rows)
             total_rows += n
             print(f"[standings_worker] periodic_refresh league={lid} season={season} rows={len(rows)} upserted={n}")
@@ -1268,6 +1291,7 @@ def run_once_standings(do_periodic: bool = True) -> int:
 
 
 
+
 def run_once_bracket(do_periodic: bool = True) -> int:
     """
     ✅ Round/Bracket 워커:
@@ -1278,9 +1302,10 @@ def run_once_bracket(do_periodic: bool = True) -> int:
       2) DB matches 기반으로 tournament_ties 생성/갱신
     - 트리거 소비 방식: B(bracket_consumed_utc)
 
-    중요:
-    - do_periodic=False 일 때는 트리거로 묶인 (league_id, season)만 처리한다.
-      (전체 리그 정기 작업 금지)
+    ✅ FIX(중요):
+    - trigger 처리에서 "실제로 의미 있는 작업(라운드 채움 or ties upsert)이 1개라도 성공"한
+      (league_id, season) 페어에 속한 fixture_id만 consumed 처리한다.
+      (실패/무변경이면 트리거 유지 → 다음 poll에서 재시도 가능)
     """
     if not API_KEY:
         print("[bracket_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -1298,35 +1323,58 @@ def run_once_bracket(do_periodic: bool = True) -> int:
 
     s = _session()
 
-    # 1) 트리거 우선 처리
+    # 1) 트리거 우선 처리(미소비)
     triggers = _select_unconsumed_triggers("bracket", limit=60)
+
+    # fixture_id -> (lid, season)
+    trig_map: Dict[int, Tuple[int, int]] = {}
     processed_pairs: Set[Tuple[int, int]] = set()
 
-    for t in triggers:
+    for t in triggers or []:
+        fid = safe_int(t.get("fixture_id"))
         lid = safe_int(t.get("league_id"))
         season = safe_int(t.get("season"))
-        if lid is None or season is None:
+        if fid is None or lid is None or season is None:
             continue
-        processed_pairs.add((lid, season))
+        trig_map[int(fid)] = (int(lid), int(season))
+        processed_pairs.add((int(lid), int(season)))
 
     total = 0
+
+    # ✅ 성공한 pair만 모아서 그 pair에 속한 trigger만 consumed 처리
+    succeeded_pairs: Set[Tuple[int, int]] = set()
 
     for (lid, season) in sorted(processed_pairs):
         try:
             filled = bracket_fill_missing_rounds(s, lid, season, limit=60)
             up = build_and_upsert_bracket_for_league_season(lid, season)
-            total += (filled + up)
-            print(f"[bracket_worker] trigger_run league={lid} season={season} filled_round={filled} upserted_ties={up}")
-        except Exception as e:
-            print(f"[bracket_worker] trigger_run league={lid} season={season} err: {e}", file=sys.stderr)
 
-    # 트리거 소비
-    if triggers:
-        fids = [int(x.get("fixture_id")) for x in triggers if safe_int(x.get("fixture_id")) is not None]
-        try:
-            _mark_triggers_consumed("bracket", fids)
-        except Exception:
-            pass
+            total += (filled + up)
+
+            # ✅ 의미있는 작업이 1개라도 있으면 성공으로 간주(= 소비 가능)
+            if (filled + up) > 0:
+                succeeded_pairs.add((lid, season))
+                print(f"[bracket_worker] trigger_run league={lid} season={season} filled_round={filled} upserted_ties={up}")
+            else:
+                # 아무 것도 안 했으면 트리거 유지(다음 poll에서 재시도/나중에 DB가 채워질 수 있음)
+                print(f"[bracket_worker] trigger_run league={lid} season={season} no-op (filled=0, up=0) -> keep triggers (retry)")
+
+        except Exception as e:
+            # ✅ 에러면 트리거 유지(재시도)
+            print(f"[bracket_worker] trigger_run league={lid} season={season} err: {e} -> keep triggers", file=sys.stderr)
+
+    # ✅ 성공한 pair에 속한 fixture_id만 consumed 처리
+    if triggers and succeeded_pairs:
+        ok_fids: List[int] = []
+        for fid, pair in trig_map.items():
+            if pair in succeeded_pairs:
+                ok_fids.append(int(fid))
+
+        if ok_fids:
+            try:
+                _mark_triggers_consumed("bracket", ok_fids)
+            except Exception:
+                pass
 
     # ✅ 폴링 모드(do_periodic=False)면 여기서 종료
     if not do_periodic:
@@ -1336,12 +1384,12 @@ def run_once_bracket(do_periodic: bool = True) -> int:
             pass
         return total
 
-    # 2) 정기(60분): 시즌 추정 후 실행(트리거로 처리한 것 제외)
+    # 2) 정기(60분): 시즌 추정 후 실행(트리거로 "성공 처리"한 것 제외)
     for lid in league_ids:
         season = _resolve_season_for_league_from_db(lid)
         if season is None:
             continue
-        if (lid, season) in processed_pairs:
+        if (lid, season) in succeeded_pairs:
             continue
         try:
             filled = bracket_fill_missing_rounds(s, lid, season, limit=40)
@@ -1358,6 +1406,7 @@ def run_once_bracket(do_periodic: bool = True) -> int:
         pass
 
     return total
+
 
 
 
