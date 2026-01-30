@@ -368,8 +368,10 @@ def build_standings_block(
     league_id: int,
     season: Optional[int],
     *,
-    current_round_name: Optional[str] = None,
+    fixture_id: Optional[int] = None,
+    league_round: Optional[str] = None,
 ) -> Dict[str, Any]:
+
 
     """
     League Detail 화면의 'Standings' 탭 데이터.
@@ -416,17 +418,42 @@ def build_standings_block(
         print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
 
     # ─────────────────────────────────────────────────────────────
-    # 0) BRACKET 우선: bundle_service가 넘긴 current_round_name이 있으면
-    #    matchdetail과 동일하게 "현재 라운드까지(end_round_name)" 브라켓 생성
+    # 0) matchdetail과 동일:
+    #    "대표 fixture + 그 fixture의 league_round"가 knockout이면 BRACKET
+    #    그리고 tournament_ties에서 실제 round_name을 찾아 current_round를 확정 후
+    #    그 라운드까지(end_round_name) 브라켓을 내려준다.
     # ─────────────────────────────────────────────────────────────
-    cr = current_round_name.strip() if isinstance(current_round_name, str) else None
-    if cr and _is_knockout_round_for_bracket(cr):
+    league_round_str = league_round.strip() if isinstance(league_round, str) else None
+
+    if isinstance(fixture_id, int) and fixture_id > 0 and _is_knockout_round_for_bracket(league_round_str):
+        tie_row = _fetch_one(
+            """
+            SELECT round_name
+            FROM tournament_ties
+            WHERE league_id = %s
+              AND season = %s
+              AND (%s = leg1_fixture_id OR %s = leg2_fixture_id)
+            LIMIT 1
+            """,
+            (league_id, season_resolved, fixture_id, fixture_id),
+        )
+
+        tie_round_name = (tie_row or {}).get("round_name")
+        tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
+
+        current_round = (
+            tie_round_name
+            if _is_knockout_round_for_bracket(tie_round_name)
+            else league_round_str
+        )
+
         bracket = _build_bracket_from_tournament_ties(
             league_id,
             season_resolved,
             start_round_name=None,
-            end_round_name=cr,  # ✅ 핵심: 현재 라운드까지 포함
+            end_round_name=current_round,
         )
+
         if bracket:
             return {
                 "league_id": league_id,
@@ -438,6 +465,7 @@ def build_standings_block(
                 "context_options": {"conferences": [], "groups": []},
             }
         # bracket 비면 기존 TABLE 로직으로 fallback
+
 
     
     def _cols_of(table_name: str) -> set[str]:
