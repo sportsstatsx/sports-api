@@ -9,15 +9,10 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     """
     League Detail 화면의 'Seasons' 탭 + 기본 시즌 선택에 사용할 시즌 목록.
 
-    반환 예시:
-    {
-        "league_id": 188,
-        "seasons": [2025, 2024],
-        "season_champions": [
-            {"season": 2025, "team_id": 943, "team_name": "Some Club", "points": 12},
-            {"season": 2024, "team_id": 24608, "team_name": "Another Club", "points": 53}
-        ]
-    }
+    정책:
+    - 기본은 standings(rank=1) 우승팀
+    - 단, 플레이오프/브라켓 리그의 경우 tournament_ties의 Final winner_team_id가 있으면 그 팀을 우선 우승팀으로 사용
+    - 최신 시즌(latest_season)은 우승팀 목록에서 제외(기존 정책 유지)
     """
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
@@ -38,11 +33,52 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] ERROR league_id={league_id}: {e}")
         seasons = []
 
-    # 2) 시즌별 우승 팀 (standings 기준)
-    #    - league_id = X
-    #    - rank = 1
-    #    - 같은 시즌에 여러 group_name 이 있을 수 있으니
-    #      → DISTINCT ON (season) 으로 시즌당 한 팀만 선택
+    # 2-A) 플레이오프/브라켓 Final 우승팀 (tournament_ties 기준, 있으면 우선)
+    # - season별로 Final 라운드의 winner_team_id를 선택
+    # - 여러 건이 있을 수 있으니 DISTINCT ON (season) + 최신 날짜 우선
+    final_winner_map: Dict[int, Dict[str, Any]] = {}
+    try:
+        final_rows = fetch_all(
+            """
+            SELECT DISTINCT ON (tt.season)
+                tt.season,
+                tt.winner_team_id AS team_id,
+                COALESCE(t.name, '') AS team_name,
+                t.logo AS team_logo
+            FROM tournament_ties AS tt
+            LEFT JOIN teams AS t
+              ON t.id = tt.winner_team_id
+            WHERE tt.league_id = %s
+              AND tt.winner_team_id IS NOT NULL
+              AND LOWER(COALESCE(tt.round_name, '')) = 'final'
+            ORDER BY
+              tt.season DESC,
+              COALESCE(tt.leg2_date_utc, tt.leg1_date_utc) DESC NULLS LAST
+            ;
+            """,
+            (league_id,),
+        )
+
+        for r in final_rows:
+            sv = r.get("season")
+            if sv is None:
+                continue
+            s_int = int(sv)
+            final_winner_map[s_int] = {
+                "season": s_int,
+                "team_id": r.get("team_id"),
+                "team_name": r.get("team_name") or "",
+                "team_logo": r.get("team_logo"),
+                "points": None,  # 플레이오프 우승은 standings points 의미가 다를 수 있어 None
+                "_source": "tournament_final",
+            }
+    except Exception as e:
+        # tournament_ties 테이블/컬럼이 없거나(리그에 브라켓이 없거나) 에러면 그냥 fallback
+        print(f"[build_seasons_block] FINAL WINNER ERROR league_id={league_id}: {e}")
+        final_winner_map = {}
+
+    # 2-B) 시즌별 우승 팀 (standings 기준) - fallback
+    standings_champ_map: Dict[int, Dict[str, Any]] = {}
     try:
         champ_rows = fetch_all(
             """
@@ -62,25 +98,38 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             (league_id,),
         )
 
-        season_champions = []
         for r in champ_rows:
-            season_val = r.get("season")
-            if season_val is None:
+            sv = r.get("season")
+            if sv is None:
                 continue
-            season_champions.append(
-                {
-                    "season": int(season_val),
-                    "team_id": r.get("team_id"),
-                    "team_name": r.get("team_name") or "",
-                    "team_logo": r.get("team_logo"),
-                    "points": r.get("points"),
-                }
-            )
+            s_int = int(sv)
+            standings_champ_map[s_int] = {
+                "season": s_int,
+                "team_id": r.get("team_id"),
+                "team_name": r.get("team_name") or "",
+                "team_logo": r.get("team_logo"),
+                "points": r.get("points"),
+                "_source": "standings_rank1",
+            }
     except Exception as e:
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
-        season_champions = []
+        standings_champ_map = {}
 
-    # 3) 현재 진행 중인 시즌(가장 최신 시즌)은 챔피언 목록에서 제외
+    # 2-C) 병합: Final 우승팀이 있으면 우선, 없으면 standings 1위
+    merged: Dict[int, Dict[str, Any]] = {}
+    for s, v in standings_champ_map.items():
+        merged[s] = v
+    for s, v in final_winner_map.items():
+        merged[s] = v  # Final 우선 덮어쓰기
+
+    # 정렬된 리스트로 변환
+    season_champions = [merged[s] for s in sorted(merged.keys(), reverse=True)]
+
+    # 내부용 필드 제거
+    for c in season_champions:
+        c.pop("_source", None)
+
+    # 3) 현재 진행 중인 시즌(가장 최신 시즌)은 챔피언 목록에서 제외 (기존 정책 유지)
     try:
         latest_season = resolve_season_for_league(league_id, None)
     except Exception as e:
@@ -100,6 +149,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         "seasons": seasons,
         "season_champions": season_champions,
     }
+
 
 
 def resolve_season_for_league(league_id: int, season: Optional[int]) -> Optional[int]:
