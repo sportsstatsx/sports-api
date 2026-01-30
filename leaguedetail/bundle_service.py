@@ -118,12 +118,52 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     seasons_block = build_seasons_block(league_id=league_id)
     results_block = build_results_block(league_id=league_id, season=resolved_season)
     fixtures_block = build_fixtures_block(league_id=league_id, season=resolved_season)
-    current_round_name = _pick_current_round_name_for_bracket(league_id=league_id, season=resolved_season)
+        # ✅ matchdetail과 동일한 방식:
+    # 1) league_detail에서도 대표 fixture를 하나 고른다(예정 1순위, 없으면 최근 완료)
+    # 2) 그 fixture의 league_round로 knockout 여부를 판단하고,
+    # 3) knockout이면 그 round까지 브라켓을 자른다.
+    rep = fetch_one(
+        """
+        WITH cand AS (
+          SELECT
+            m.fixture_id,
+            m.date_utc,
+            m.league_round,
+            CASE
+              WHEN lower(coalesce(m.status_group,'')) = 'finished'
+                OR coalesce(m.status,'') IN ('FT','AET','PEN')
+                OR coalesce(m.status_short,'') IN ('FT','AET','PEN')
+              THEN 1 ELSE 0
+            END AS is_finished
+          FROM matches m
+          WHERE m.league_id = %s
+            AND m.season = %s
+            AND m.fixture_id IS NOT NULL
+        )
+        SELECT fixture_id, date_utc, league_round
+        FROM cand
+        ORDER BY
+          -- ✅ 1순위: 아직 안 끝난 경기 중 "가장 가까운 예정 경기"
+          (CASE WHEN is_finished = 0 THEN 0 ELSE 1 END) ASC,
+          (CASE WHEN is_finished = 0 THEN date_utc END) ASC NULLS LAST,
+          -- ✅ 2순위: 전부 끝났으면 "가장 최근 완료 경기"
+          (CASE WHEN is_finished = 1 THEN date_utc END) DESC NULLS LAST
+        LIMIT 1
+        """,
+        (league_id, resolved_season),
+    )
+
+    rep_fixture_id = (rep or {}).get("fixture_id")
+    rep_league_round = (rep or {}).get("league_round")
+    rep_league_round_str = rep_league_round.strip() if isinstance(rep_league_round, str) else None
+
     standings_block = build_standings_block(
         league_id=league_id,
         season=resolved_season,
-        current_round_name=current_round_name,
+        fixture_id=rep_fixture_id if isinstance(rep_fixture_id, int) else None,
+        league_round=rep_league_round_str,
     )
+
 
 
     league_name: Optional[str] = None
