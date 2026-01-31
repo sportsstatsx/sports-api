@@ -188,60 +188,117 @@ def _norm_round_name(raw: Any) -> str:
 def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     """
     DB round_name(표기 제각각)을 canonical key로 정규화.
-    매번 order 리스트에 문자열을 계속 추가하는 방식(패치 반복)을 피하기 위한 원샷 처리.
+    - 흔한 변형(Last 16, 1/8 Finals, Round of Eight, Promotion/Relegation Playoffs 등)까지 흡수
     """
     s = _norm_round_name(raw_round_name)
     if not s:
         return None
 
-    # Final / Finals
-    if re.fullmatch(r"finals?", s):
+    # ── Final / Semi / Quarter ─────────────────────────────
+    if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
         return "final"
 
-    # Semi
     if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
         return "semi"
 
-    # Quarter
     if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
         return "quarter"
+
+    # ── Last N / 1/8 Finals / 1/16 Finals / Round of words ──
+    # Last 16 / Last16 / Last-16
+    m = re.fullmatch(r"last (\d+)", s)
+    if m:
+        n = int(m.group(1))
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
+        return f"r{n}"
+
+    # 1/8 finals, 1/16 finals, 1/32 finals ...
+    m = re.fullmatch(r"1\s*/\s*(\d+)\s*finals?", s)
+    if m:
+        denom = int(m.group(1))
+        n = denom * 2
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
+        return f"r{n}"
 
     # Round of N
     m = re.fullmatch(r"round of (\d+)", s)
     if m:
-        n = m.group(1)
+        n = int(m.group(1))
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
         return f"r{n}"
 
-    # Play-in
-    if "play in" in s or "playin" in s:
+    # Round of sixteen / thirty two / sixty four / one hundred twenty eight / two hundred fifty six
+    word_map = {
+        "sixteen": 16,
+        "thirty two": 32,
+        "thirtytwo": 32,
+        "sixty four": 64,
+        "sixtyfour": 64,
+        "one hundred twenty eight": 128,
+        "one hundred and twenty eight": 128,
+        "one hundred twentyeight": 128,
+        "two hundred fifty six": 256,
+        "two hundred and fifty six": 256,
+        "two hundred fiftysix": 256,
+    }
+    m = re.fullmatch(r"round of (.+)", s)
+    if m:
+        w = m.group(1).strip()
+        n = word_map.get(w)
+        if n:
+            if n == 8:
+                return "quarter"
+            if n == 4:
+                return "semi"
+            if n == 2:
+                return "final"
+            return f"r{n}"
+
+    # ── Play-in / Wildcard ─────────────────────────────────
+    if "play in" in s or "playin" in s or "wild card" in s or "wildcard" in s:
         return "play_in"
 
-    # Playoff / Play-offs / Playoffs
+    # ── Playoffs variants (promotion/relegation/championship) ──
+    # promotion playoffs / relegation playoffs / championship playoffs 등
     if "play off" in s or "playoff" in s or "play offs" in s or "playoffs" in s:
-        # Knockout Round Play-offs / Knockout Round Playoffs
         if "knockout round" in s:
             return "knockout_playoffs"
         return "playoffs"
 
-    # Elimination
+    # ── Elimination ────────────────────────────────────────
     if "elimination" in s:
-        # Elimination Final(s)
         if "final" in s:
             return "elimination_final"
         return "elimination"
 
-    # Preliminary / Qualifying
+    # ── Preliminary / Qualifying ───────────────────────────
     if "preliminary" in s:
         return "preliminary"
-    if "qualifying" in s:
+    if "qualifying" in s or "qualifier" in s:
         return "qualifying"
 
-    # 1st/2nd/3rd/4th Round (숫자 기반)
+    # ── 1st/2nd/3rd/4th Round (숫자 기반) ───────────────────
     m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
     if m:
         return f"round_{m.group(1)}"
 
     return None
+
 
 
 def _canonical_round_label(canon: str) -> str:
@@ -270,13 +327,24 @@ def _canonical_round_label(canon: str) -> str:
         return "Preliminary Round"
     if canon == "qualifying":
         return "Qualifying Round"
-    if canon.startswith("round_") and canon.split("_", 1)[1].isdigit():
-        n = canon.split("_", 1)[1]
-        return f"{n}th Round"
+
+    # round_1/2/3/4... 는 1st/2nd/3rd/4th...로 표기
+    if canon.startswith("round_"):
+        n_str = canon.split("_", 1)[1]
+        if n_str.isdigit():
+            n = int(n_str)
+            if n % 100 in (11, 12, 13):
+                suf = "th"
+            else:
+                suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+            return f"{n}{suf} Round"
+
     return canon
 
 
+
 # canonical round 정렬 우선순위(고정)
+# - 더 큰 예선 라운드가 나와도 표시 가능하도록 r256 추가(있으면 쓰고, 없으면 그냥 무시됨)
 _CANON_ORDER: List[str] = [
     "preliminary",
     "qualifying",
@@ -289,6 +357,7 @@ _CANON_ORDER: List[str] = [
     "elimination_final",
     "playoffs",
     "knockout_playoffs",
+    "r256",
     "r128",
     "r64",
     "r32",
@@ -298,6 +367,7 @@ _CANON_ORDER: List[str] = [
     "final",
 ]
 _CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
+
 
 
 
