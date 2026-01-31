@@ -13,7 +13,8 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     - 기본은 standings(rank=1) 우승팀
     - 단, 플레이오프/브라켓 리그의 경우 tournament_ties의 "최종 라운드 winner"를 우선 우승팀으로 사용
       (round_name 표기 변형이 많으므로, canonical 정규화로 Final을 안정적으로 인식)
-    - 최신 시즌(latest_season)은 우승팀 목록에서 제외(기존 정책 유지)
+    - ✅ 최신 시즌(latest_season)은 "진행중인 경우에만" 우승팀 목록에서 제외
+      (다음 시즌이 아직 시작 전이면 latest_season=직전 종료시즌이 될 수 있으므로, 종료시즌은 제외하면 안 됨)
     """
     import re  # ✅ 누락 방지: 이 함수 안에서 re 사용하므로 내부 import로 안전 고정
 
@@ -109,6 +110,33 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         "final",
     ]
     CANON_ORDER_INDEX = {k: i for i, k in enumerate(CANON_ORDER)}
+
+    def _is_season_in_progress(season_value: int) -> bool:
+        """
+        최신 시즌 제외 정책을 '진행중인 경우에만' 적용하기 위한 판정.
+        - 해당 시즌에 미종료 경기가 1개라도 있으면 진행중(True)
+        - 전부 Finished(FT/AET/PEN 포함)면 진행중(False)
+        """
+        try:
+            rows = fetch_all(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM matches
+                WHERE league_id = %s
+                  AND season = %s
+                  AND NOT (
+                    lower(coalesce(status_group,'')) = 'finished'
+                    OR coalesce(status,'') IN ('FT','AET','PEN')
+                    OR coalesce(status_short,'') IN ('FT','AET','PEN')
+                  )
+                """,
+                (league_id, season_value),
+            )
+            cnt = int((rows[0].get("cnt") if rows else 0) or 0)
+            return cnt > 0
+        except Exception as e:
+            print(f"[build_seasons_block] _is_season_in_progress ERROR league_id={league_id} season={season_value}: {e}")
+            return False
 
     # 1) 사용 가능한 시즌 목록 (matches 기준)
     try:
@@ -261,7 +289,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     for c in season_champions:
         c.pop("_source", None)
 
-    # 3) 최신 시즌 제외(기존 정책)
+    # 3) ✅ 최신 시즌 제외: "진행중일 때만" 제외
     try:
         latest_season = resolve_season_for_league(league_id, None)
     except Exception as e:
@@ -269,13 +297,23 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}")
 
     if latest_season is not None and len(season_champions) > 1:
-        season_champions = [c for c in season_champions if c.get("season") != latest_season]
+        try:
+            ls_int = int(latest_season)
+        except Exception:
+            ls_int = -1
+
+        if ls_int > 0 and _is_season_in_progress(ls_int):
+            season_champions = [
+                c for c in season_champions
+                if c.get("season") != latest_season
+            ]
 
     return {
         "league_id": league_id,
         "seasons": seasons,
         "season_champions": season_champions,
     }
+
 
 
 
