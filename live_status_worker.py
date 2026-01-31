@@ -937,30 +937,38 @@ def _mark_triggers_consumed(which: str, fixture_ids: List[int]) -> None:
 
 
 def _bracket_round_names() -> Set[str]:
-    # 너 DB에서 실제로 보이는 round 값(Quarter-finals/Semi-finals/Final)을 기본 포함
-    # 다른 대륙컵/리그도 방어적으로 몇 개 더 포함(없으면 그냥 빈 결과)
-    #
-    # ✅ 중요: UCL 24/25부터 'Knockout Round Play-offs'가 브라켓 시작점이 될 수 있음
-    # (tournament_ties를 matches에서 생성하는 이 워커에서도 포함해야 함)
+    """
+    ✅ '정확 일치' 기반 필터용 라운드명 세트(백업/호환용)
+
+    - 기존에 잘 되던 라운드명은 그대로 유지
+    - 우리가 DB에서 확인한 "예선/플레이오프/플레이-인/엘리미네이션" 계열을 추가
+    - 실제 판정은 build_and_upsert_bracket_for_league_season에서
+      _is_knockout_round_name() 규칙 기반으로 수행한다.
+      (이 세트는 혹시 모를 보수적 fallback/참고용)
+    """
     return {
-        "Final",
-        "Semi-finals",
-        "Quarter-finals",
-        "Round of 16",
-        "Round of 32",
-        "Round of 64",
+        # 핵심 녹아웃
+        "Final", "Finals",
+        "Semi-finals", "Semi Final", "Semi Finals", "Semifinals",
+        "Quarter-finals", "Quarter Final", "Quarter Finals", "Quarterfinals",
+        "Round of 16", "Round of 32", "Round of 64", "Round of 128",
 
-        # ✅ UCL/UEL 컨벤션
-        "Knockout Round Play-offs",
+        # UEFA/대륙컵 컨벤션
+        "Knockout Round Play-offs", "Knockout Round Playoffs",
+        "Play-offs", "Playoffs", "Play-off", "Playoff",
 
-        # (기존 유지)
-        "Play-offs",
-        "Playoff",
-        "Play-off",
-        "1st Round",
-        "2nd Round",
-        "3rd Round",
+        # 예선/초기 라운드(녹아웃일 수 있음)
+        "Preliminary Round",
+        "1st Preliminary Round", "2nd Preliminary Round", "3rd Preliminary Round",
+        "Qualifying Round",
+        "1st Qualifying Round", "2nd Qualifying Round", "3rd Qualifying Round", "4th Qualifying Round",
+        "1st Round", "2nd Round", "3rd Round", "4th Round",
+
+        # 리그/컵에서 자주 나오는 녹아웃 표기
+        "Elimination Finals", "Elimination Final",
+        "Play-In", "Play-In Final", "Play In", "Play In Final",
     }
+
 
 
 
@@ -969,9 +977,78 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
     DB의 matches(이미 저장된 경기)에서 round 기반으로 tie를 만들고 tournament_ties에 upsert.
     - 두 팀 조합(순서 무관) + round_name 기준으로 tie_key 생성
     - 2leg면 date_utc로 leg1/leg2 정렬
+
+    ✅ 변경(핵심):
+    - 기존: round_name 정확 일치(set)만 포함 → 누락 발생 가능
+    - 개선: "넉아웃 라운드인지"를 규칙(포함/제외 패턴)으로 판정
+      * 예선이라도 Knockout이면 포함(Preliminary/Qualifying/Round/Playoff/Final 등)
+      * League Stage / Regular Season / Apertura / Clausura / Group 등 '승점/스테이지'는 제외
+    - 기존 기능(2leg/agg/winner 계산, PK, upsert)은 그대로 유지
     """
-    rounds = _bracket_round_names()
-    # DB에 실제로 존재하는 round만 가져오도록 ILIKE로 완화하지 않고 정확 매칭(너 데이터가 깔끔함)
+    import re
+
+    def _norm(s: Any) -> str:
+        if s is None:
+            return ""
+        try:
+            x = str(s).strip()
+            x = re.sub(r"\s+", " ", x)
+            return x
+        except Exception:
+            return ""
+
+    def _is_knockout_round_name(round_name: str) -> bool:
+        rn = _norm(round_name)
+        if not rn:
+            return False
+
+        lo = rn.lower()
+
+        # 1) ✅ 승점/스테이지/리그 형태는 브라켓에서 제외(우리가 합의한 핵심)
+        #    - "League Stage - 1" 같은 패턴
+        #    - "Regular Season - 2"
+        #    - "Apertura - 1", "Clausura - 1"
+        #    - "Group A/B" 같은 조별리그
+        if (
+            "league stage" in lo
+            or "regular season" in lo
+            or "apertura" in lo
+            or "clausura" in lo
+            or lo.startswith("group ")
+            or "group stage" in lo
+            or lo.startswith("stage ")
+        ):
+            return False
+
+        # 2) ✅ 포함 키워드(넉아웃을 강하게 시사)
+        #    - 예선이라도 KO면 포함: preliminary/qualifying
+        include_tokens = (
+            "final",
+            "semi",
+            "quarter",
+            "round of",
+            "knockout",
+            "playoff",
+            "play-off",
+            "play in",
+            "play-in",
+            "elimination",
+            "preliminary",
+            "qualifying",
+            "qualifier",
+        )
+        if any(t in lo for t in include_tokens):
+            return True
+
+        # 3) ✅ 숫자 라운드(1st/2nd/3rd/4th Round)는 대부분 KO 성격 → 포함
+        #    단, 위에서 승점/스테이지는 이미 제외했으니 안전
+        if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
+            return True
+        if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+            return True
+
+        return False
+
     rows = fetch_all(
         """
         SELECT fixture_id, league_round, date_utc,
@@ -987,19 +1064,19 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
         (int(league_id), int(season)),
     ) or []
 
-    # round 필터
     filtered: List[Dict[str, Any]] = []
     for r in rows:
-        rn = (safe_text(r.get("league_round")) or "").strip()
+        rn = _norm(r.get("league_round"))
         if not rn:
             continue
-        if rn in rounds:
+
+        # ✅ 규칙 기반 넉아웃 판정
+        if _is_knockout_round_name(rn):
             filtered.append(r)
 
     if not filtered:
         return 0
 
-    # group by (round_name, pair_key)
     def _pair_key(h: int, a: int) -> Tuple[int, int]:
         return (h, a) if h <= a else (a, h)
 
@@ -1020,7 +1097,7 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
         aid = safe_int(r.get("away_id")) or 0
         if hid == 0 or aid == 0:
             continue
-        rn = (safe_text(r.get("league_round")) or "").strip()
+        rn = _norm(r.get("league_round"))
         pk = _pair_key(hid, aid)
         buckets.setdefault((rn, pk), []).append(r)
 
@@ -1033,7 +1110,6 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
         leg1 = games[0]
         leg2 = games[1] if len(games) >= 2 else None
 
-        # agg 계산: team_a_id=ta, team_b_id=tb 기준(홈/원정 상관없이 합)
         def _score_for(team_id: int, g: Dict[str, Any]) -> int:
             hid = safe_int(g.get("home_id")) or 0
             aid = safe_int(g.get("away_id")) or 0
@@ -1052,19 +1128,17 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
 
         winner = None
         if leg2 is None:
-            # 단판: leg1 결과로 승자
             if agg_a > agg_b:
                 winner = ta
             elif agg_b > agg_a:
                 winner = tb
         else:
-            # 2leg: aggregate로 승자(동률은 winner 미결정으로 둠)
             if agg_a > agg_b:
                 winner = ta
             elif agg_b > agg_a:
                 winner = tb
 
-        tie_key = f"{ta}-{tb}"  # round_name과 함께 PK 구성됨
+        tie_key = f"{ta}-{tb}"
 
         execute(
             """
@@ -1123,6 +1197,7 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
         upserted += 1
 
     return upserted
+
 
 
 def bracket_fill_missing_rounds(session: requests.Session, league_id: int, season: int, limit: int = 50) -> int:
