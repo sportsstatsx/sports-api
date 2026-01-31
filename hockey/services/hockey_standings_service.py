@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
+from hockey.regular_season_config import get_regular_season_start_utc
 
 
 def _safe_int(v: Any) -> Optional[int]:
@@ -61,6 +62,141 @@ def _group_rank(group_name: str) -> tuple[int, str]:
 
     return (9, g0)
 
+def _is_finished_status(status: Any) -> bool:
+    s = (status or "")
+    s = str(s).strip().upper()
+    return s in ("FT", "AOT", "AP", "AET", "PEN", "FIN", "END", "ENDED")
+
+
+def _build_regular_stats_map_from_games(
+    league_id: int,
+    season: int,
+    regular_start_utc: datetime,
+) -> Dict[int, Dict[str, Optional[int]]]:
+    """
+    정규시즌 시작(UTC) 이후의 '종료 경기'만으로 팀별 누적 스탯을 재계산한다.
+
+    ✅ 표기 정책(중요):
+    - wins/losses는 "정규(레귤러 타임) 승/패" 로 반환 (OTW/OTL은 별도)
+      => wins = total_wins - ot_wins
+      => losses = total_losses - ot_losses
+    - points는 NHL/AHL 기준으로:
+      points = (total_wins * 2) + (ot_losses * 1)
+      (여기서 total_wins = reg_wins + ot_wins)
+    """
+    games = hockey_fetch_all(
+        """
+        SELECT
+            home_team_id,
+            away_team_id,
+            status,
+            score_json
+        FROM hockey_games
+        WHERE league_id = %s
+          AND season = %s
+          AND game_date >= %s
+        """,
+        (league_id, season, regular_start_utc),
+    )
+
+    # team_id -> accumulator
+    acc: Dict[int, Dict[str, int]] = {}
+
+    def ensure(tid: int) -> Dict[str, int]:
+        if tid not in acc:
+            acc[tid] = {
+                "played": 0,
+                "total_wins": 0,     # ✅ 정규+OT 포함 승
+                "total_losses": 0,   # ✅ 정규+OT 포함 패
+                "ot_wins": 0,
+                "ot_losses": 0,
+                "gf": 0,
+                "ga": 0,
+            }
+        return acc[tid]
+
+    for g in games:
+        status = g.get("status")
+        if not _is_finished_status(status):
+            continue
+
+        sj = g.get("score_json") or {}
+        try:
+            hs = sj.get("home")
+            as_ = sj.get("away")
+            if hs is None or as_ is None:
+                continue
+            hs_i = int(hs)
+            as_i = int(as_)
+        except Exception:
+            continue
+
+        home_id = _safe_int(g.get("home_team_id"))
+        away_id = _safe_int(g.get("away_team_id"))
+        if home_id is None or away_id is None:
+            continue
+
+        st = str(status).strip().upper()
+        is_ot_bucket = st in ("AOT", "AP", "PEN", "AET")  # ✅ OT/SO로 처리
+
+        # HOME 누적
+        h = ensure(home_id)
+        h["played"] += 1
+        h["gf"] += hs_i
+        h["ga"] += as_i
+
+        # AWAY 누적
+        a = ensure(away_id)
+        a["played"] += 1
+        a["gf"] += as_i
+        a["ga"] += hs_i
+
+        if hs_i > as_i:
+            h["total_wins"] += 1
+            a["total_losses"] += 1
+            if is_ot_bucket:
+                h["ot_wins"] += 1
+                a["ot_losses"] += 1
+        elif hs_i < as_i:
+            a["total_wins"] += 1
+            h["total_losses"] += 1
+            if is_ot_bucket:
+                a["ot_wins"] += 1
+                h["ot_losses"] += 1
+        else:
+            # 종료경기 동점은 거의 없지만 방어
+            pass
+
+    out: Dict[int, Dict[str, Optional[int]]] = {}
+    for tid, a in acc.items():
+        played = a["played"]
+        total_wins = a["total_wins"]
+        total_losses = a["total_losses"]
+        ot_wins = a["ot_wins"]
+        ot_losses = a["ot_losses"]
+
+        # ✅ 표기용 정규 승/패
+        reg_wins = total_wins - ot_wins
+        reg_losses = total_losses - ot_losses
+
+        # ✅ 포인트는 "전체 승" 기준
+        points = (total_wins * 2) + (ot_losses * 1)
+
+        out[tid] = {
+            "played": played,
+            "wins": reg_wins,          # ✅ W는 정규승
+            "losses": reg_losses,      # ✅ L은 정규패
+            "ot_wins": ot_wins,
+            "ot_losses": ot_losses,
+            "points": points,
+            "gf": a["gf"],
+            "ga": a["ga"],
+        }
+
+    return out
+
+
+
 
 def hockey_get_standings(
     league_id: int,
@@ -73,6 +209,11 @@ def hockey_get_standings(
     - hockey_standings 정규화 컬럼을 신뢰 (raw_json 파싱 ❌)
     - 반환 구조: stages=[{stage, groups:[{group_name, rows:[...]}]}]
     - 필터 지원: stage, group_name
+
+    ✅ 추가 정책(기능 추가, 기존 동작 유지):
+    - 특정 리그/시즌(NHL/AHL 등)에서 프리시즌이 섞여 스탯이 깨지는 경우,
+      '정규시즌 시작일' 이후의 hockey_games(종료 경기)로 팀 스탯을 재계산해서
+      Regular Season stage에 한해 stats를 override 한다.
     """
 
     # league 메타
@@ -134,6 +275,16 @@ def hockey_get_standings(
         tuple(params),
     )
 
+    # ✅ 정규시즌 시작일이 등록된 리그/시즌이면, games 기반 재계산 맵 준비
+    regular_start_utc = get_regular_season_start_utc(league_id, season)
+    regular_stats_map: Dict[int, Dict[str, Optional[int]]] = {}
+    if regular_start_utc is not None:
+        regular_stats_map = _build_regular_stats_map_from_games(
+            league_id=league_id,
+            season=season,
+            regular_start_utc=regular_start_utc,
+        )
+
     # stages_map[stage][group_name] = [rows...]
     stages_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
@@ -141,6 +292,9 @@ def hockey_get_standings(
         st = (r.get("stage") or "Overall").strip()
         gn = (r.get("group_name") or "Overall").strip()
 
+        team_id = _safe_int(r.get("team_id"))
+
+        # DB standings 값(기존)
         gp = _safe_int(r.get("games_played"))
         w = _safe_int(r.get("win_total"))
         l = _safe_int(r.get("lose_total"))
@@ -150,6 +304,22 @@ def hockey_get_standings(
         ga = _safe_int(r.get("goals_against"))
         pts = _safe_int(r.get("points"))
 
+        # ✅ Regular Season stage인 경우에만 override (기존 기능/정렬/필터는 유지)
+        if regular_stats_map and team_id is not None:
+            st_l = st.lower()
+            is_regular_stage = ("regular" in st_l) or (st_l in ("overall",))
+            if is_regular_stage:
+                rs = regular_stats_map.get(team_id)
+                if rs:
+                    gp = rs.get("played")
+                    w = rs.get("wins")
+                    l = rs.get("losses")
+                    ot_w = rs.get("ot_wins")
+                    ot_l = rs.get("ot_losses")
+                    gf = rs.get("gf")
+                    ga = rs.get("ga")
+                    pts = rs.get("points")
+
         diff = None
         if gf is not None and ga is not None:
             diff = gf - ga
@@ -157,7 +327,7 @@ def hockey_get_standings(
         row_obj = {
             "rank": _safe_int(r.get("position")),
             "team": {
-                "id": _safe_int(r.get("team_id")),
+                "id": team_id,
                 "name": r.get("team_name"),
                 "logo": r.get("team_logo"),
             },
@@ -227,3 +397,4 @@ def hockey_get_standings(
             .replace("+00:00", "Z"),
         },
     }
+
