@@ -75,13 +75,15 @@ def _build_regular_stats_map_from_games(
 ) -> Dict[int, Dict[str, Optional[int]]]:
     """
     정규시즌 시작(UTC) 이후의 '종료 경기'만으로 팀별 누적 스탯을 재계산한다.
-    - 대상: NHL/AHL 같은 프리시즌 포함 문제가 있는 리그
-    - 계산: played, wins, losses, ot_wins, ot_losses, points, gf, ga
-      * points 규칙: 2*승 + 1*OT/SO 패 (NHL/AHL 표준)
-      * OT/SO 판정: status가 AOT/AP/PEN/AET 인 경우를 OT bucket으로 취급
-        (현재 데이터에서 주로 AOT/AP가 핵심)
+
+    ✅ 표기 정책(중요):
+    - wins/losses는 "정규(레귤러 타임) 승/패" 로 반환 (OTW/OTL은 별도)
+      => wins = total_wins - ot_wins
+      => losses = total_losses - ot_losses
+    - points는 NHL/AHL 기준으로:
+      points = (total_wins * 2) + (ot_losses * 1)
+      (여기서 total_wins = reg_wins + ot_wins)
     """
-    # score_json 구조: {"home": <int|null>, "away": <int|null>}
     games = hockey_fetch_all(
         """
         SELECT
@@ -104,11 +106,10 @@ def _build_regular_stats_map_from_games(
         if tid not in acc:
             acc[tid] = {
                 "played": 0,
-                "wins": 0,
-                "losses": 0,
+                "total_wins": 0,     # ✅ 정규+OT 포함 승
+                "total_losses": 0,   # ✅ 정규+OT 포함 패
                 "ot_wins": 0,
                 "ot_losses": 0,
-                "points": 0,
                 "gf": 0,
                 "ga": 0,
             }
@@ -135,9 +136,8 @@ def _build_regular_stats_map_from_games(
         if home_id is None or away_id is None:
             continue
 
-        # OT/SO bucket 판정 (정규 규칙을 100% 알 수 없으니 status 기반으로만 안정 처리)
         st = str(status).strip().upper()
-        is_ot_bucket = st in ("AOT", "AP", "PEN", "AET")
+        is_ot_bucket = st in ("AOT", "AP", "PEN", "AET")  # ✅ OT/SO로 처리
 
         # HOME 누적
         h = ensure(home_id)
@@ -152,35 +152,41 @@ def _build_regular_stats_map_from_games(
         a["ga"] += hs_i
 
         if hs_i > as_i:
-            h["wins"] += 1
+            h["total_wins"] += 1
+            a["total_losses"] += 1
             if is_ot_bucket:
                 h["ot_wins"] += 1
-            a["losses"] += 1
-            if is_ot_bucket:
                 a["ot_losses"] += 1
         elif hs_i < as_i:
-            a["wins"] += 1
+            a["total_wins"] += 1
+            h["total_losses"] += 1
             if is_ot_bucket:
                 a["ot_wins"] += 1
-            h["losses"] += 1
-            if is_ot_bucket:
                 h["ot_losses"] += 1
         else:
-            # 하키 종료경기에서 동점은 거의 없지만, 혹시 있을 경우: 포인트/승패 계산 제외
+            # 종료경기 동점은 거의 없지만 방어
             pass
 
-    # points 계산 (NHL/AHL: 승 2점, OT/SO 패 1점)
     out: Dict[int, Dict[str, Optional[int]]] = {}
     for tid, a in acc.items():
-        wins = a["wins"]
+        played = a["played"]
+        total_wins = a["total_wins"]
+        total_losses = a["total_losses"]
+        ot_wins = a["ot_wins"]
         ot_losses = a["ot_losses"]
-        points = wins * 2 + ot_losses * 1
+
+        # ✅ 표기용 정규 승/패
+        reg_wins = total_wins - ot_wins
+        reg_losses = total_losses - ot_losses
+
+        # ✅ 포인트는 "전체 승" 기준
+        points = (total_wins * 2) + (ot_losses * 1)
 
         out[tid] = {
-            "played": a["played"],
-            "wins": wins,
-            "losses": a["losses"],
-            "ot_wins": a["ot_wins"],
+            "played": played,
+            "wins": reg_wins,          # ✅ W는 정규승
+            "losses": reg_losses,      # ✅ L은 정규패
+            "ot_wins": ot_wins,
             "ot_losses": ot_losses,
             "points": points,
             "gf": a["gf"],
@@ -188,6 +194,7 @@ def _build_regular_stats_map_from_games(
         }
 
     return out
+
 
 
 
