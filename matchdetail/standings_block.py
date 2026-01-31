@@ -169,6 +169,135 @@ def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) ->
     return False
 
 
+# ─────────────────────────────────────────
+# Bracket round name normalization (ONE-SHOT)
+# ─────────────────────────────────────────
+
+def _norm_round_name(raw: Any) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.lower()
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("-", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
+    """
+    DB round_name(표기 제각각)을 canonical key로 정규화.
+    매번 order 리스트에 문자열을 계속 추가하는 방식(패치 반복)을 피하기 위한 원샷 처리.
+    """
+    s = _norm_round_name(raw_round_name)
+    if not s:
+        return None
+
+    # Final / Finals
+    if re.fullmatch(r"finals?", s):
+        return "final"
+
+    # Semi
+    if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
+        return "semi"
+
+    # Quarter
+    if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
+        return "quarter"
+
+    # Round of N
+    m = re.fullmatch(r"round of (\d+)", s)
+    if m:
+        n = m.group(1)
+        return f"r{n}"
+
+    # Play-in
+    if "play in" in s or "playin" in s:
+        return "play_in"
+
+    # Playoff / Play-offs / Playoffs
+    if "play off" in s or "playoff" in s or "play offs" in s or "playoffs" in s:
+        # Knockout Round Play-offs / Knockout Round Playoffs
+        if "knockout round" in s:
+            return "knockout_playoffs"
+        return "playoffs"
+
+    # Elimination
+    if "elimination" in s:
+        # Elimination Final(s)
+        if "final" in s:
+            return "elimination_final"
+        return "elimination"
+
+    # Preliminary / Qualifying
+    if "preliminary" in s:
+        return "preliminary"
+    if "qualifying" in s:
+        return "qualifying"
+
+    # 1st/2nd/3rd/4th Round (숫자 기반)
+    m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
+    if m:
+        return f"round_{m.group(1)}"
+
+    return None
+
+
+def _canonical_round_label(canon: str) -> str:
+    """
+    canonical key -> UI label(표기 통일)
+    """
+    if canon == "final":
+        return "Final"
+    if canon == "semi":
+        return "Semi-finals"
+    if canon == "quarter":
+        return "Quarter-finals"
+    if canon.startswith("r") and canon[1:].isdigit():
+        return f"Round of {canon[1:]}"
+    if canon == "knockout_playoffs":
+        return "Knockout Round Play-offs"
+    if canon == "playoffs":
+        return "Play-offs"
+    if canon == "play_in":
+        return "Play-In"
+    if canon == "elimination_final":
+        return "Elimination Final"
+    if canon == "elimination":
+        return "Elimination"
+    if canon == "preliminary":
+        return "Preliminary Round"
+    if canon == "qualifying":
+        return "Qualifying Round"
+    if canon.startswith("round_") and canon.split("_", 1)[1].isdigit():
+        n = canon.split("_", 1)[1]
+        return f"{n}th Round"
+    return canon
+
+
+# canonical round 정렬 우선순위(고정)
+_CANON_ORDER: List[str] = [
+    "preliminary",
+    "qualifying",
+    "round_1",
+    "round_2",
+    "round_3",
+    "round_4",
+    "play_in",
+    "elimination",
+    "elimination_final",
+    "playoffs",
+    "knockout_playoffs",
+    "r128",
+    "r64",
+    "r32",
+    "r16",
+    "quarter",
+    "semi",
+    "final",
+]
+_CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
 
 
 
@@ -182,33 +311,21 @@ def _build_bracket_from_tournament_ties(
     """
     tournament_ties 기반 bracket 생성.
 
-    - start_round_name: 이 라운드부터(포함) 보여줌 (예: Knockout Round Play-offs부터)
-    - end_round_name: 이 라운드까지(포함) 보여줌 (예: Final이면 Final까지 = 이전 라운드 포함)
+    - start_round_name: 이 라운드부터(포함) 보여줌
+    - end_round_name: 이 라운드까지(포함) 보여줌
 
-    ✅ Final matchdetail에서 이전 라운드가 안 보이는 문제는
-       end_round_name을 "Final"로 주면 해결됨.
+    ✅ 변경 포인트(원샷 안정화):
+    - DB round_name 표기가 제각각이어도 canonical key로 정규화해서 정렬/표시
+    - 매번 order 리스트에 문자열을 계속 추가하는 패치 반복을 제거
+    - 기존 legs/팀매핑/knockout 필터 정책은 그대로 유지
     """
 
-    # 라운드 순서(고정)
-    order = [
-        "1st Round",
-        "2nd Round",
-        "3rd Round",
-        "Play-offs",
-        "Play-off",
-        "Playoff",
-        "Knockout Round Play-offs",
-        "Round of 64",
-        "Round of 32",
-        "Round of 16",
-        "Quarter-finals",
-        "Semi-finals",
-        "Final",
-    ]
-    order_index = {name: i for i, name in enumerate(order)}
+    # start/end도 canonical로 변환해서 범위 필터를 안정화
+    start_canon = _canonical_round_key(start_round_name) if start_round_name else None
+    end_canon = _canonical_round_key(end_round_name) if end_round_name else None
 
-    start_idx = order_index.get(start_round_name) if start_round_name in order_index else None
-    end_idx = order_index.get(end_round_name) if end_round_name in order_index else None
+    start_idx = _CANON_ORDER_INDEX.get(start_canon) if start_canon else None
+    end_idx = _CANON_ORDER_INDEX.get(end_canon) if end_canon else None
 
     # 해당 리그/시즌 ties 전부 가져오기(필터는 파이썬에서)
     ties_rows: List[Dict[str, Any]] = fetch_all(
@@ -298,14 +415,21 @@ def _build_bracket_from_tournament_ties(
             logo if isinstance(logo, str) and logo.strip() else None,
         )
 
-    # round별로 모으기
-    by_round: Dict[str, List[Dict[str, Any]]] = {}
+    # canonical round별로 모으기
+    by_canon: Dict[str, List[Dict[str, Any]]] = {}
     for r in ties_rows:
-        rn = (r.get("round_name") or "").strip()
-        if not _is_knockout_round_for_bracket(league_id, rn):
+        raw_rn = (r.get("round_name") or "").strip()
+
+        # 기존 정책 유지: "넉아웃으로 판단되는 라운드만 브라켓 포함"
+        if not _is_knockout_round_for_bracket(league_id, raw_rn):
             continue
 
-        idx = order_index.get(rn)
+        canon = _canonical_round_key(raw_rn)
+        if not canon:
+            # 기존과 동일 정책: 우리가 분류 못하는 round_name은 제외
+            continue
+
+        idx = _CANON_ORDER_INDEX.get(canon)
         if idx is None:
             continue
 
@@ -315,15 +439,16 @@ def _build_bracket_from_tournament_ties(
         if end_idx is not None and idx > end_idx:
             continue
 
-        by_round.setdefault(rn, []).append(r)
+        by_canon.setdefault(canon, []).append(r)
 
     # 정렬 및 출력 변환
     bracket: List[Dict[str, Any]] = []
-    for rn in order:
-        if rn not in by_round:
+
+    for canon in _CANON_ORDER:
+        if canon not in by_canon:
             continue
 
-        ties_sorted = sorted(by_round[rn], key=lambda x: str(x.get("tie_key") or ""))
+        ties_sorted = sorted(by_canon[canon], key=lambda x: str(x.get("tie_key") or ""))
 
         ties_out: List[Dict[str, Any]] = []
         for i, tr in enumerate(ties_sorted, start=1):
@@ -399,16 +524,19 @@ def _build_bracket_from_tournament_ties(
                 }
             )
 
-        round_key = rn.upper().replace(" ", "_").replace("-", "_")
+        round_label = _canonical_round_label(canon)
+        round_key = round_label.upper().replace(" ", "_").replace("-", "_")
+
         bracket.append(
             {
                 "round_key": round_key,
-                "round_label": rn,
+                "round_label": round_label,
                 "ties": ties_out,
             }
         )
 
     return bracket
+
 
 
 
