@@ -577,12 +577,16 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
     - PK: (league_id, season, stage, group_name, team_id)
     - NOT NULL: league_id, season, stage, group_name, team_id, position, raw_json
     - trg_hockey_standings_fill_derived 가 raw_json 기반으로 파생 컬럼을 채움
+
+    🔧 PATCH:
+    - NHL(league_id=57)의 경우
+      group_name == "NHL" (리그 전체 집계)는 저장하지 않음
+      → Division / Conference 스탠딩만 유지
     """
     if not leagues:
         return
 
     cols = _table_columns("hockey_standings")
-
     season_by_league = _resolve_standings_season_by_league(leagues)
 
     for lid in leagues:
@@ -594,7 +598,10 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
         try:
             payload = _get("/standings", {"league": int(lid), "season": int(season)})
         except Exception as e:
-            log.warning("standings fetch failed: league=%s season=%s err=%s", lid, season, e)
+            log.warning(
+                "standings fetch failed: league=%s season=%s err=%s",
+                lid, season, e
+            )
             continue
 
         blocks = _normalize_standings_blocks(payload)
@@ -609,11 +616,8 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             )
             continue
 
-        # stage 기본값(없어도 NOT NULL 만족 위해 fallback)
-        # case A에서는 league_block에서 stage를 얻을 수도 있지만, blocks만으로도 충분히 동작하게 기본값만 둔다.
         default_stage = "Regular Season"
 
-        # blocks는 항상 [ [row,row..], [row,row..] ] 형태로 통일됨
         groups: List[List[Dict[str, Any]]] = []
         for b in blocks:
             if isinstance(b, list):
@@ -621,7 +625,6 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
 
         if not groups:
             continue
-
 
         upserted = 0
         skipped = 0
@@ -633,44 +636,48 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                 team = row.get("team") if isinstance(row.get("team"), dict) else {}
                 team_id = _safe_int(team.get("id"))
 
-                # ✅ (1) team_id가 None/0/음수면 스킵 (FK 위반 근본 차단)
+                # (1) team_id 유효성
                 if team_id is None or team_id <= 0:
                     skipped += 1
-                    tname = _safe_text(team.get("name"))
-                    log.warning(
-                        "standings skip(invalid team_id): league=%s season=%s team_id=%s team_name=%s",
-                        lid, season, team_id, tname
-                    )
                     continue
 
-                # ✅ (2) hockey_teams에 없는 team_id면 스킵 (meta refresh 레이스 방지)
-                #     (원하면 나중에 여기서 팀 자동 보강 로직도 넣을 수 있음)
+                # (2) hockey_teams 존재 여부
                 exists = hockey_fetch_one(
                     "SELECT 1 FROM hockey_teams WHERE id=%s LIMIT 1",
                     (int(team_id),),
                 )
                 if not exists:
                     skipped += 1
-                    tname = _safe_text(team.get("name"))
-                    log.warning(
-                        "standings skip(team not in hockey_teams): league=%s season=%s team_id=%s team_name=%s",
-                        lid, season, team_id, tname
-                    )
                     continue
 
-                position = _safe_int(row.get("rank")) or _safe_int(row.get("position")) or 0
-
+                position = (
+                    _safe_int(row.get("rank"))
+                    or _safe_int(row.get("position"))
+                    or 0
+                )
 
                 stage = _safe_text(row.get("stage")) or default_stage
+
                 g = row.get("group")
-                group_name = None
                 if isinstance(g, dict):
                     group_name = _safe_text(g.get("name"))
                 else:
                     group_name = _safe_text(g)
 
-                group_name = group_name or _safe_text(row.get("group_name")) or group_name_fallback
+                group_name = (
+                    group_name
+                    or _safe_text(row.get("group_name"))
+                    or group_name_fallback
+                )
 
+                # ─────────────────────────────────────────
+                # 🔥 PATCH 핵심: NHL 전체 집계 그룹 제거
+                # ─────────────────────────────────────────
+                if int(lid) == 57:
+                    if group_name and group_name.strip().lower() == "nhl":
+                        skipped += 1
+                        continue
+                # ─────────────────────────────────────────
 
                 insert_cols: List[str] = []
                 insert_vals: List[Any] = []
@@ -693,9 +700,10 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                     continue
 
                 cols_sql = ", ".join(insert_cols)
-                ph_parts = []
-                for c in insert_cols:
-                    ph_parts.append("%s::jsonb" if c == "raw_json" else "%s")
+                ph_parts = [
+                    "%s::jsonb" if c == "raw_json" else "%s"
+                    for c in insert_cols
+                ]
                 ph_sql = ", ".join(ph_parts)
 
                 upd_parts = []
@@ -722,6 +730,7 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             "standings refreshed: league=%s season=%s groups=%s upserted=%s skipped=%s",
             lid, season, len(groups), upserted, skipped
         )
+
 
 
 
