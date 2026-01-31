@@ -15,11 +15,13 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
       (round_name 표기 변형이 많으므로, canonical 정규화로 Final을 안정적으로 인식)
     - 최신 시즌(latest_season)은 우승팀 목록에서 제외(기존 정책 유지)
     """
+    import re  # ✅ 누락 방지: 이 함수 안에서 re 사용하므로 내부 import로 안전 고정
+
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
 
     # ─────────────────────────────────────────────
-    # local helpers (matchdetail의 핵심만 축약)
+    # local helpers
     # ─────────────────────────────────────────────
     def _norm_round_name(raw: Any) -> str:
         s = (raw or "").strip()
@@ -73,7 +75,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         if "playoff" in s or "play off" in s or "playoffs" in s or "play offs" in s:
             return "playoffs"
 
-        # elimination / preliminary / qualifying (있으면 최종라운드 fallback에 도움)
+        # elimination / preliminary / qualifying
         if "elimination" in s:
             if "final" in s:
                 return "elimination_final"
@@ -124,11 +126,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] ERROR league_id={league_id}: {e}")
         seasons = []
 
-    # 2-A) 플레이오프/브라켓 우승팀 (tournament_ties 기준, 있으면 우선)
-    # - round_name 표기 변형이 많아서 SQL에서 'final'로 고정 필터링하지 않음
-    # - 시즌별로:
-    #   1) canon == 'final' winner가 있으면 그걸 우선
-    #   2) 없으면 canon order에서 가장 뒤(최종 라운드) winner를 fallback
+    # 2-A) tournament_ties 기반 우승팀 후보(있으면 우선)
     final_winner_map: Dict[int, Dict[str, Any]] = {}
     try:
         tie_rows = fetch_all(
@@ -175,7 +173,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         for s_int, items in candidates_by_season.items():
             pick: Optional[Dict[str, Any]] = None
 
-            # 1) Final 우선
             finals = [x for x in items if x.get("canon") == "final"]
             if finals:
                 finals.sort(
@@ -187,7 +184,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 )
                 pick = finals[0]
             else:
-                # 2) fallback: canon order 상 가장 뒤 라운드
                 known = [x for x in items if isinstance(x.get("canon_idx"), int)]
                 if known:
                     known.sort(
@@ -200,7 +196,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     )
                     pick = known[0]
                 else:
-                    # 3) canon 판정 불가면: 최신 row(ORDER BY로 이미 정렬되었음)
                     pick = items[0] if items else None
 
             if pick:
@@ -209,16 +204,15 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "team_id": pick.get("team_id"),
                     "team_name": pick.get("team_name") or "",
                     "team_logo": pick.get("team_logo"),
-                    "points": None,  # 플레이오프 우승은 standings points 의미가 다를 수 있어 None
+                    "points": None,
                     "_source": "tournament_winner",
                 }
 
     except Exception as e:
-        # tournament_ties 테이블/컬럼이 없거나(리그에 브라켓이 없거나) 에러면 그냥 fallback
         print(f"[build_seasons_block] TOURNAMENT WINNER ERROR league_id={league_id}: {e}")
         final_winner_map = {}
 
-    # 2-B) 시즌별 우승 팀 (standings 기준) - fallback
+    # 2-B) standings(rank=1) fallback
     standings_champ_map: Dict[int, Dict[str, Any]] = {}
     try:
         champ_rows = fetch_all(
@@ -256,40 +250,33 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         standings_champ_map = {}
 
-    # 2-C) 병합: tournament 우승팀이 있으면 우선, 없으면 standings 1위
+    # 2-C) 병합: tournament 우선
     merged: Dict[int, Dict[str, Any]] = {}
     for s, v in standings_champ_map.items():
         merged[s] = v
     for s, v in final_winner_map.items():
         merged[s] = v
 
-    # 정렬된 리스트로 변환
     season_champions = [merged[s] for s in sorted(merged.keys(), reverse=True)]
-
-    # 내부용 필드 제거
     for c in season_champions:
         c.pop("_source", None)
 
-    # 3) 현재 진행 중인 시즌(가장 최신 시즌)은 챔피언 목록에서 제외 (기존 정책 유지)
+    # 3) 최신 시즌 제외(기존 정책)
     try:
         latest_season = resolve_season_for_league(league_id, None)
     except Exception as e:
         latest_season = None
-        print(
-            f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}"
-        )
+        print(f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}")
 
     if latest_season is not None and len(season_champions) > 1:
-        season_champions = [
-            c for c in season_champions
-            if c.get("season") != latest_season
-        ]
+        season_champions = [c for c in season_champions if c.get("season") != latest_season]
 
     return {
         "league_id": league_id,
         "seasons": seasons,
         "season_champions": season_champions,
     }
+
 
 
 
