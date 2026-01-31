@@ -1793,6 +1793,10 @@ def maybe_sync_postmatch_timeline(
     - FT 최초 감지 시각 기준
       * +60초 1회
       * +30분 1회
+
+    ✅ 추가(복구용):
+    - stats / lineups 가 DB에 비어있으면(또는 부족하면) postmatch 시점에 1회 보강
+      * 호출 폭발 방지: +60s, +30m 실행 구간에서만 / 그리고 DB에 이미 있으면 스킵
     """
     if status_group != "FINISHED":
         return
@@ -1814,6 +1818,61 @@ def maybe_sync_postmatch_timeline(
     done_60 = int(st.get("done_60") or 0) == 1
     done_30m = int(st.get("done_30m") or 0) == 1
 
+    def _needs_stats(fid: int) -> bool:
+        try:
+            r = fetch_all(
+                "SELECT 1 FROM match_team_stats WHERE fixture_id=%s LIMIT 1",
+                (int(fid),),
+            )
+            return not bool(r)
+        except Exception:
+            # 조회 실패 시엔 과호출 방지 위해 "필요 없음" 취급
+            return False
+
+    def _needs_lineups(fid: int) -> bool:
+        try:
+            r = fetch_all(
+                "SELECT COUNT(*) AS n FROM match_lineups WHERE fixture_id=%s",
+                (int(fid),),
+            )
+            n = int((r[0].get("n") if r else 0) or 0)
+            # 홈/원정 2팀 row가 있어야 정상
+            return n < 2
+        except Exception:
+            return False
+
+    def _try_fill_stats_and_lineups(tag: str) -> Tuple[bool, bool]:
+        filled_stats = False
+        filled_lineups = False
+
+        # stats 보강
+        if _needs_stats(fixture_id):
+            try:
+                stats = fetch_team_stats(session, fixture_id)
+                if stats:
+                    upsert_match_team_stats(fixture_id, stats)
+                    filled_stats = True
+            except Exception:
+                pass
+
+        # lineups 보강
+        if _needs_lineups(fixture_id):
+            try:
+                lu = fetch_lineups(session, fixture_id)
+                # upsert_match_lineups는 ready 기준이지만,
+                # postmatch 복구 목적이므로 "DB에 들어갔는지"가 중요 → 함수 반환값은 참고만
+                _ = upsert_match_lineups(fixture_id, lu, nowu)
+                # 실제로 2팀이 채워졌는지 재확인
+                if not _needs_lineups(fixture_id):
+                    filled_lineups = True
+            except Exception:
+                pass
+
+        if filled_stats or filled_lineups:
+            print(f"      [postmatch_fill] fixture_id={fixture_id} tag={tag} stats={filled_stats} lineups={filled_lineups}")
+
+        return filled_stats, filled_lineups
+
     # 1) +60초 1회
     if (not done_60) and (nowu >= (base + dt.timedelta(seconds=60))):
         events = fetch_events(session, fixture_id)
@@ -1827,6 +1886,9 @@ def maybe_sync_postmatch_timeline(
             ins = replace_match_events_for_fixture(fixture_id, events)
         except Exception:
             ins = 0
+
+        # ✅ stats/lineups 보강(비어있으면)
+        _try_fill_stats_and_lineups(tag="60s")
 
         _mark_postmatch_done(fixture_id, "60", nowu)
         print(f"      [postmatch_timeline] fixture_id={fixture_id} +60s events={len(events)} inserted={ins}")
@@ -1845,8 +1907,12 @@ def maybe_sync_postmatch_timeline(
         except Exception:
             ins = 0
 
+        # ✅ stats/lineups 보강(비어있으면)
+        _try_fill_stats_and_lineups(tag="30m")
+
         _mark_postmatch_done(fixture_id, "30m", nowu)
         print(f"      [postmatch_timeline] fixture_id={fixture_id} +30m events={len(events)} inserted={ins}")
+
 
 
 
