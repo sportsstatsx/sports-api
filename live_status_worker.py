@@ -1004,50 +1004,63 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
 
         lo = rn.lower()
 
-        # 1) ✅ 승점/스테이지/리그 형태는 브라켓에서 제외(우리가 합의한 핵심)
-        #    - "League Stage - 1" 같은 패턴
-        #    - "Regular Season - 2"
-        #    - "Apertura - 1", "Clausura - 1"
-        #    - "Group A/B" 같은 조별리그
+        # ─────────────────────────────────────────────
+        # 0) ✅ KO 키워드가 있으면 "우선 통과"
+        #    - Apertura/Clausura 접두가 있어도 KO면 포함돼야 함
+        #    - 멕시코 262/263: "Apertura - Quarter-finals" 같은 케이스를 살린다
+        # ─────────────────────────────────────────────
+        ko_tokens = (
+            "final",          # final/finals
+            "semi",           # semi/semi-finals/semifinals
+            "quarter",        # quarter/quarter-finals
+            "round of",       # round of 16/32/...
+            "knockout",       # knockout
+            "playoff",        # playoffs
+            "play-off",       # play-offs
+            "play in",        # play in
+            "play-in",        # play-in
+            "elimination",    # elimination final(s)
+            "preliminary",    # preliminary round
+            "qualifying",     # qualifying round
+            "qualifier",      # qualifier(s)
+            "reclasificacion",  # mexico 특유: reclasificacion
+            "reclasificación",  # 악센트 버전
+        )
+        if any(t in lo for t in ko_tokens):
+            return True
+
+        # ─────────────────────────────────────────────
+        # 1) ✅ "Apertura/Clausura - 숫자"는 정규 라운드로 간주 → 제외
+        #    예) "Apertura - 9", "Clausura - 1"
+        # ─────────────────────────────────────────────
+        # (띄어쓰기/대소문자/하이픈 변형 방어는 _norm + lower로 처리됨)
+        if re.match(r"^(apertura|clausura)\s*-\s*\d+$", lo):
+            return False
+
+        # ─────────────────────────────────────────────
+        # 2) ✅ 승점/스테이지/리그 형태는 브라켓에서 제외(기존 정책 유지)
+        #    - group stage / league stage / regular season / stage N / group A ...
+        # ─────────────────────────────────────────────
         if (
             "league stage" in lo
             or "regular season" in lo
-            or "apertura" in lo
-            or "clausura" in lo
             or lo.startswith("group ")
             or "group stage" in lo
             or lo.startswith("stage ")
         ):
             return False
 
-        # 2) ✅ 포함 키워드(넉아웃을 강하게 시사)
-        #    - 예선이라도 KO면 포함: preliminary/qualifying
-        include_tokens = (
-            "final",
-            "semi",
-            "quarter",
-            "round of",
-            "knockout",
-            "playoff",
-            "play-off",
-            "play in",
-            "play-in",
-            "elimination",
-            "preliminary",
-            "qualifying",
-            "qualifier",
-        )
-        if any(t in lo for t in include_tokens):
-            return True
-
+        # ─────────────────────────────────────────────
         # 3) ✅ 숫자 라운드(1st/2nd/3rd/4th Round)는 대부분 KO 성격 → 포함
-        #    단, 위에서 승점/스테이지는 이미 제외했으니 안전
+        #    - 위에서 stage/regular/group은 이미 제외했으니 안전
+        # ─────────────────────────────────────────────
         if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
             return True
         if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
             return True
 
         return False
+
 
     rows = fetch_all(
         """
