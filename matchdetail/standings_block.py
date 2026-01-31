@@ -113,11 +113,12 @@ def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
 
 def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
     """
-    BRACKET 표시 대상 라운드 판정.
+    BRACKET 표시 대상 라운드 판정(규칙 기반).
 
-    정책(너가 원하는 버전):
-    - "넉아웃 성격이면 예선/플레이오프 포함해서 브라켓으로 전부 보여준다"
-    - 리그별 예외로 거르지 않는다(코드 단순화)
+    ✅ 우리가 합의한 정책:
+    - "예선이라도 넉아웃이면 브라켓에 포함"
+    - 단, '승점/스테이지/리그 예선'은 브라켓에서 제외
+      (League Stage - n / Regular Season - n / Apertura - n / Clausura - n / Group A 등)
     """
     if not round_name or not isinstance(round_name, str):
         return False
@@ -126,28 +127,47 @@ def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) ->
     if not rn:
         return False
 
-    allowed = {
-        # UEFA / 대륙컵
-        "Play-offs",
-        "Play-off",
-        "Playoff",
-        "Knockout Round Play-offs",
+    lo = rn.lower()
 
-        # 일반 라운드
-        "Round of 64",
-        "Round of 32",
-        "Round of 16",
-        "Quarter-finals",
-        "Semi-finals",
-        "Final",
+    # 1) ✅ 승점/스테이지/리그 방식 예선 제외
+    if (
+        "league stage" in lo
+        or "regular season" in lo
+        or "apertura" in lo
+        or "clausura" in lo
+        or lo.startswith("group ")
+        or "group stage" in lo
+        or lo.startswith("stage ")
+    ):
+        return False
 
-        # 예선/초기 라운드(너 워커 셋에 맞춰 확장)
-        "1st Round",
-        "2nd Round",
-        "3rd Round",
-    }
+    # 2) ✅ 넉아웃 시사 키워드 포함이면 포함
+    include_tokens = (
+        "final",
+        "semi",
+        "quarter",
+        "round of",
+        "knockout",
+        "playoff",
+        "play-off",
+        "play in",
+        "play-in",
+        "elimination",
+        "preliminary",
+        "qualifying",
+        "qualifier",
+    )
+    if any(t in lo for t in include_tokens):
+        return True
 
-    return rn in allowed
+    # 3) ✅ 1st/2nd/3rd/4th Round 패턴 포함
+    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
+        return True
+    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+        return True
+
+    return False
+
 
 
 
