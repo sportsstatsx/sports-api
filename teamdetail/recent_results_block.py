@@ -11,8 +11,11 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
     Team Detail 화면의 'Recent results' 섹션에 내려줄 데이터.
 
     - matches 테이블에서 해당 시즌, 해당 팀이 뛴 '완료된 경기'만 가져온다.
-    - ✅ league_id 로 고정해서 "현재 선택한 리그" 기준으로만 보여준다.
+    - ✅ 어떤 matchdetail(리그/대륙컵)에서 진입하든, 팀의 전체 경기(리그+대륙컵)를 모두 보여준다.
     - ✅ FINISHED 판정은 status_group / status / status_short 모두로 방어한다.
+
+    NOTE:
+    - league_id 파라미터는 번들 호환을 위해 유지하지만, 최근결과 필터에는 사용하지 않는다.
     """
 
     rows_db = fetch_all(
@@ -36,8 +39,7 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         FROM matches AS m
         JOIN teams   AS th ON th.id = m.home_id
         JOIN teams   AS ta ON ta.id = m.away_id
-        WHERE m.league_id = %s
-          AND m.season    = %s
+        WHERE m.season    = %s
           AND (m.home_id = %s OR m.away_id = %s)
           AND (
             lower(coalesce(m.status_group,'')) = 'finished'
@@ -50,7 +52,6 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
         (
             team_id,   # CASE home_id
             team_id,   # CASE away_id
-            league_id,
             season,
             team_id,
             team_id,
@@ -80,7 +81,7 @@ def build_recent_results_block(team_id: int, league_id: int, season: int) -> Dic
 
     return {
         "team_id": team_id,
-        "league_id": league_id,
+        "league_id": league_id,  # 번들 호환용(필터에는 미사용)
         "season": season,
         "rows": rows,
     }

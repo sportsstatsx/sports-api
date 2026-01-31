@@ -140,9 +140,8 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
     - 최근 폼: matches 에서 최근 10경기 (리그+대륙컵 합산)
 
     ✅ 하이브리드 보정(완전체):
-    - team_season_stats(full_json) 기반 domestic_matches(played)가 0(또는 None)이면
-      matches 테이블에서 "해당 리그 + 해당 시즌 + 해당 팀" 완료경기 수로 fallback 보정.
-      (시즌 초반/집계 갱신 지연 대응)
+    - team_season_stats(full_json) 기반 played가 덜 갱신된 경우가 있어서
+      matches 테이블 완료경기 COUNT가 더 크면 max로 보정한다.
     """
     team_row = _fetch_team(team_id)
     league_row = _fetch_league(league_id)
@@ -155,10 +154,73 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
     domestic_league_name = None
     continental_league_name = None
     continental_matches = 0
+    continental_league_id = None  # ✅ 추가: 대륙컵 리그 id 보관
 
     # team_season_stats 에서 리그 / 대륙컵 분리
+    team_country = (team_row or {}).get("country")
+
+    # stats_rows에 포함된 league_id들의 country를 한번에 조회 (대개 1~2개)
+    league_country_by_id: Dict[int, Any] = {}
+    try:
+        league_ids = [int(r.get("league_id") or 0) for r in stats_rows]
+        league_ids = [x for x in league_ids if x > 0]
+        if league_ids:
+            placeholders = ",".join(["%s"] * len(league_ids))
+            lrows = fetch_all(
+                f"""
+                SELECT id, country
+                FROM leagues
+                WHERE id IN ({placeholders})
+                """,
+                tuple(league_ids),
+            )
+            for lr in lrows:
+                lid = int(lr.get("id") or 0)
+                if lid > 0:
+                    league_country_by_id[lid] = lr.get("country")
+    except Exception:
+        league_country_by_id = {}
+
+    # (1) domestic 후보: team_country와 league_country가 같은 league
+    domestic_candidate = None
+    continental_candidate = None
+
     for row in stats_rows:
-        js = row["full_json"]
+        lid = int(row.get("league_id") or 0)
+        lcountry = league_country_by_id.get(lid)
+
+        if team_country and lcountry and str(team_country).strip() and str(lcountry).strip():
+            if str(team_country).strip() == str(lcountry).strip():
+                domestic_candidate = row
+            else:
+                # 대륙컵/타국리그 후보 (여러개면 첫번째만)
+                if continental_candidate is None:
+                    continental_candidate = row
+        else:
+            # country 판정 불가하면 일단 후보로만 쌓아두고, 마지막에 fallback에서 처리
+            if continental_candidate is None and lid != int(league_id):
+                continental_candidate = row
+
+    # (2) fallback: country로 domestic 못 잡으면 "요청 league_id"를 domestic으로
+    if domestic_candidate is None:
+        for row in stats_rows:
+            if int(row.get("league_id") or 0) == int(league_id):
+                domestic_candidate = row
+                break
+
+    # (3) 그래도 continental이 없으면, domestic이 아닌 아무거나 하나
+    if continental_candidate is None:
+        for row in stats_rows:
+            if domestic_candidate is None:
+                # domestic 자체가 없으면 첫 row를 domestic로 보고 continental은 None
+                break
+            if int(row.get("league_id") or 0) != int(domestic_candidate.get("league_id") or 0):
+                continental_candidate = row
+                break
+
+    # (4) domestic_candidate 적용 (played/w/d/l/gf/ga는 domestic 기준)
+    if domestic_candidate is not None:
+        js = domestic_candidate["full_json"]
         fixtures = js.get("fixtures", {})
         played_total = _safe_get(fixtures, "played", "total", default=0)
         wins_total = _safe_get(fixtures, "wins", "total", default=0)
@@ -167,25 +229,63 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
         gf_total = _safe_get(js, "goals", "for", "total", "total", default=0)
         ga_total = _safe_get(js, "goals", "against", "total", "total", default=0)
 
-        if row["league_id"] == league_id:
-            # 요청 들어온 리그 (예: Primera A)
-            domestic_league_name = row["league_name"]
-            played = int(played_total or 0)
-            wins = int(wins_total or 0)
-            draws = int(draws_total or 0)
-            losses = int(loses_total or 0)
-            goals_for = int(gf_total or 0)
-            goals_against = int(ga_total or 0)
-        else:
-            # 그 외 리그 하나를 "대륙컵" 쪽으로 사용 (챔스 / 유로파 등)
-            if continental_league_name is None:
-                continental_league_name = row["league_name"]
-                continental_matches = int(played_total or 0)
+        domestic_league_name = domestic_candidate.get("league_name")
+        played = int(played_total or 0)
+        wins = int(wins_total or 0)
+        draws = int(draws_total or 0)
+        losses = int(loses_total or 0)
+        goals_for = int(gf_total or 0)
+        goals_against = int(ga_total or 0)
 
-    # ✅ fallback: team_season_stats가 아직 0이면 matches에서 "완료 경기 수"로 보정
-    if played <= 0:
-        try:
-            row = fetch_all(
+    # (5) continental_candidate 적용 (matches만)
+    if continental_candidate is not None:
+        js = continental_candidate["full_json"]
+        fixtures = js.get("fixtures", {})
+        cont_played_total = _safe_get(fixtures, "played", "total", default=0)
+
+        continental_league_id = int(continental_candidate.get("league_id") or 0) or None
+        continental_league_name = continental_candidate.get("league_name")
+        continental_matches = int(cont_played_total or 0)
+
+
+    # ✅ 리그명 방어(혹시 stats_rows가 비었을 때)
+    if domestic_league_name is None:
+        domestic_league_name = (league_row or {}).get("name")
+
+    # ─────────────────────────────────────────
+    # ✅ ALWAYS reconcile by matches COUNT (중요!)
+    # - team_season_stats가 6으로 덜 갱신되어도,
+    #   matches COUNT가 8이면 played를 8로 올린다.
+    # ─────────────────────────────────────────
+    try:
+        # (1) 현재 league_id (요청 리그) 완료경기 수
+        rows = fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM matches
+            WHERE league_id = %s
+              AND season    = %s
+              AND (home_id = %s OR away_id = %s)
+              AND (
+                lower(coalesce(status_group,'')) = 'finished'
+                OR coalesce(status,'') IN ('FT','AET','PEN')
+                OR coalesce(status_short,'') IN ('FT','AET','PEN')
+              )
+              AND home_ft IS NOT NULL
+              AND away_ft IS NOT NULL
+            """,
+            (league_id, season, team_id, team_id),
+        )
+        dom_cnt = 0
+        if rows:
+            dom_cnt = int(rows[0].get("cnt") or 0)
+
+        if dom_cnt > played:
+            played = dom_cnt  # ✅ 핵심: max 보정
+
+        # (2) 대륙컵도 동일하게 보정 (있을 때만)
+        if continental_league_id is not None:
+            rows2 = fetch_all(
                 """
                 SELECT COUNT(*) AS cnt
                 FROM matches
@@ -200,24 +300,18 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
                   AND home_ft IS NOT NULL
                   AND away_ft IS NOT NULL
                 """,
-                (league_id, season, team_id, team_id),
+                (continental_league_id, season, team_id, team_id),
             )
-            cnt = 0
-            if row:
-                cnt = int(row[0].get("cnt") or 0)
+            cont_cnt = 0
+            if rows2:
+                cont_cnt = int(rows2[0].get("cnt") or 0)
 
-            # played만 보정(승/무/패/득실은 team_season_stats가 갱신되면 자동으로 채워질 것)
-            # 최소한 헤더 "Matches"가 0으로 보이는 문제 해결
-            if cnt > 0:
-                played = cnt
+            if cont_cnt > continental_matches:
+                continental_matches = cont_cnt
 
-                # domestic_league_name이 아직 None이면 league_row 기반으로라도 채움
-                if domestic_league_name is None:
-                    domestic_league_name = (league_row or {}).get("name")
-
-        except Exception:
-            # fallback 실패해도 조용히 무시 (기존 0 유지)
-            pass
+    except Exception:
+        # COUNT 실패해도 기존 값 유지
+        pass
 
     goal_diff = goals_for - goals_against
 
@@ -230,7 +324,7 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
         "team_logo": (team_row or {}).get("logo"),
         "league_name": (league_row or {}).get("name"),
         "season_label": str(season),
-        "position": None,  # 나중에 standings_block 쪽이랑 연결해서 채울 수 있음
+        "position": None,
 
         "played": played,
         "wins": wins,
@@ -240,13 +334,12 @@ def build_header_block(team_id: int, league_id: int, season: int) -> Dict[str, A
         "goals_against": goals_against,
         "goal_diff": goal_diff,
 
-        # 👉 팀 전체 최근 10경기 (리그 + 대륙컵 합산)
         "recent_form": recent_form,
 
-        # 매치 수 요약 (헤더 "Matches" 섹션용)
         "domestic_league_name": domestic_league_name,
         "domestic_matches": played,
         "continental_league_name": continental_league_name,
         "continental_matches": continental_matches,
     }
+
 

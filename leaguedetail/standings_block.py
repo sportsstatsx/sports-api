@@ -1,7 +1,7 @@
 # leaguedetail/standings_block.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
 from db import fetch_all
@@ -62,69 +62,555 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
 
     return None
 
+# ────────────────────────────────────────────────────────────
+#  BRACKET (tournament_ties 기반) - matchdetail과 동일
+# ────────────────────────────────────────────────────────────
+
+def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
+    """
+    BRACKET 표시 대상 라운드 판정(규칙 기반).
+
+    ✅ 정책:
+    - "예선이라도 넉아웃이면 브라켓에 포함"
+    - 단, '승점/스테이지/리그 예선'은 브라켓에서 제외
+      (League Stage - n / Regular Season - n / Apertura - n / Clausura - n / Group A 등)
+    """
+    if not round_name or not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    lo = rn.lower()
+
+    # 1) ✅ 승점/스테이지/리그 방식 예선 제외
+    if (
+        "league stage" in lo
+        or "regular season" in lo
+        or "apertura" in lo
+        or "clausura" in lo
+        or lo.startswith("group ")
+        or "group stage" in lo
+        or lo.startswith("stage ")
+    ):
+        return False
+
+    # 2) ✅ 넉아웃 시사 키워드 포함이면 포함
+    include_tokens = (
+        "final",
+        "semi",
+        "quarter",
+        "round of",
+        "knockout",
+        "playoff",
+        "play-off",
+        "play in",
+        "play-in",
+        "elimination",
+        "preliminary",
+        "qualifying",
+        "qualifier",
+    )
+    if any(t in lo for t in include_tokens):
+        return True
+
+    # 3) ✅ 1st/2nd/3rd/4th Round 패턴 포함
+    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
+        return True
+    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────
+# Bracket round name normalization (ONE-SHOT)
+# ─────────────────────────────────────────
+
+def _norm_round_name(raw: Any) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = s.lower()
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("-", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
+    """
+    DB round_name(표기 제각각)을 canonical key로 정규화.
+    """
+    s = _norm_round_name(raw_round_name)
+    if not s:
+        return None
+
+    if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
+        return "final"
+    if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
+        return "semi"
+    if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
+        return "quarter"
+
+    m = re.fullmatch(r"last (\d+)", s)
+    if m:
+        n = int(m.group(1))
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
+        return f"r{n}"
+
+    m = re.fullmatch(r"1\s*/\s*(\d+)\s*finals?", s)
+    if m:
+        denom = int(m.group(1))
+        n = denom * 2
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
+        return f"r{n}"
+
+    m = re.fullmatch(r"round of (\d+)", s)
+    if m:
+        n = int(m.group(1))
+        if n == 8:
+            return "quarter"
+        if n == 4:
+            return "semi"
+        if n == 2:
+            return "final"
+        return f"r{n}"
+
+    word_map = {
+        "sixteen": 16,
+        "thirty two": 32,
+        "thirtytwo": 32,
+        "sixty four": 64,
+        "sixtyfour": 64,
+        "one hundred twenty eight": 128,
+        "one hundred and twenty eight": 128,
+        "one hundred twentyeight": 128,
+        "two hundred fifty six": 256,
+        "two hundred and fifty six": 256,
+        "two hundred fiftysix": 256,
+    }
+    m = re.fullmatch(r"round of (.+)", s)
+    if m:
+        w = m.group(1).strip()
+        n = word_map.get(w)
+        if n:
+            if n == 8:
+                return "quarter"
+            if n == 4:
+                return "semi"
+            if n == 2:
+                return "final"
+            return f"r{n}"
+
+    if "play in" in s or "playin" in s or "wild card" in s or "wildcard" in s:
+        return "play_in"
+
+    if "play off" in s or "playoff" in s or "play offs" in s or "playoffs" in s:
+        if "knockout round" in s:
+            return "knockout_playoffs"
+        return "playoffs"
+
+    if "elimination" in s:
+        if "final" in s:
+            return "elimination_final"
+        return "elimination"
+
+    if "preliminary" in s:
+        return "preliminary"
+    if "qualifying" in s or "qualifier" in s:
+        return "qualifying"
+
+    m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
+    if m:
+        return f"round_{m.group(1)}"
+
+    return None
+
+
+def _canonical_round_label(canon: str) -> str:
+    if canon == "final":
+        return "Final"
+    if canon == "semi":
+        return "Semi-finals"
+    if canon == "quarter":
+        return "Quarter-finals"
+    if canon.startswith("r") and canon[1:].isdigit():
+        return f"Round of {canon[1:]}"
+    if canon == "knockout_playoffs":
+        return "Knockout Round Play-offs"
+    if canon == "playoffs":
+        return "Play-offs"
+    if canon == "play_in":
+        return "Play-In"
+    if canon == "elimination_final":
+        return "Elimination Final"
+    if canon == "elimination":
+        return "Elimination"
+    if canon == "preliminary":
+        return "Preliminary Round"
+    if canon == "qualifying":
+        return "Qualifying Round"
+
+    if canon.startswith("round_"):
+        n_str = canon.split("_", 1)[1]
+        if n_str.isdigit():
+            n = int(n_str)
+            if n % 100 in (11, 12, 13):
+                suf = "th"
+            else:
+                suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+            return f"{n}{suf} Round"
+
+    return canon
+
+
+_CANON_ORDER: List[str] = [
+    "preliminary",
+    "qualifying",
+    "round_1",
+    "round_2",
+    "round_3",
+    "round_4",
+    "play_in",
+    "elimination",
+    "elimination_final",
+    "playoffs",
+    "knockout_playoffs",
+    "r256",
+    "r128",
+    "r64",
+    "r32",
+    "r16",
+    "quarter",
+    "semi",
+    "final",
+]
+_CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
+
+
+def _build_bracket_from_tournament_ties(
+    league_id: int,
+    season: int,
+    *,
+    start_round_name: Optional[str] = None,
+    end_round_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+
+    start_canon = _canonical_round_key(start_round_name) if start_round_name else None
+    end_canon = _canonical_round_key(end_round_name) if end_round_name else None
+
+    start_idx = _CANON_ORDER_INDEX.get(start_canon) if start_canon else None
+    end_idx = _CANON_ORDER_INDEX.get(end_canon) if end_canon else None
+
+    ties_rows: List[Dict[str, Any]] = fetch_all(
+        """
+        SELECT
+            round_name,
+            tie_key,
+            team_a_id,
+            team_b_id,
+            leg1_fixture_id,
+            leg2_fixture_id,
+            leg1_home_id,
+            leg1_away_id,
+            leg1_home_ft,
+            leg1_away_ft,
+            leg1_date_utc,
+            leg2_home_id,
+            leg2_away_id,
+            leg2_home_ft,
+            leg2_away_ft,
+            leg2_date_utc,
+            agg_a,
+            agg_b,
+            winner_team_id
+        FROM tournament_ties
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+
+    team_ids: set[int] = set()
+    for tr in ties_rows:
+        for k in (
+            "team_a_id",
+            "team_b_id",
+            "leg1_home_id",
+            "leg1_away_id",
+            "leg2_home_id",
+            "leg2_away_id",
+            "winner_team_id",
+        ):
+            v = tr.get(k)
+            try:
+                if v is None:
+                    continue
+                iv = int(v)
+                if iv > 0:
+                    team_ids.add(iv)
+            except (TypeError, ValueError):
+                continue
+
+    team_map: Dict[int, Dict[str, Any]] = {}
+    if team_ids:
+        team_rows = fetch_all(
+            """
+            SELECT id, name, logo
+            FROM teams
+            WHERE id = ANY(%s)
+            """,
+            (list(team_ids),),
+        )
+        for r in team_rows:
+            try:
+                tid = int(r.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0:
+                team_map[tid] = {"name": r.get("name"), "logo": r.get("logo")}
+
+    def _team_name_logo(tid: Any) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            tid_i = int(tid) if tid is not None else 0
+        except (TypeError, ValueError):
+            tid_i = 0
+        if tid_i <= 0:
+            return (None, None)
+        info = team_map.get(tid_i) or {}
+        name = info.get("name")
+        logo = info.get("logo")
+        return (
+            name if isinstance(name, str) and name.strip() else None,
+            logo if isinstance(logo, str) and logo.strip() else None,
+        )
+
+    by_canon: Dict[str, List[Dict[str, Any]]] = {}
+    for r in ties_rows:
+        raw_rn = (r.get("round_name") or "").strip()
+
+        if not _is_knockout_round_for_bracket(league_id, raw_rn):
+            continue
+
+        canon = _canonical_round_key(raw_rn)
+        if not canon:
+            continue
+
+        idx = _CANON_ORDER_INDEX.get(canon)
+        if idx is None:
+            continue
+
+        if start_idx is not None and idx < start_idx:
+            continue
+        if end_idx is not None and idx > end_idx:
+            continue
+
+        by_canon.setdefault(canon, []).append(r)
+
+    bracket: List[Dict[str, Any]] = []
+    for canon in _CANON_ORDER:
+        if canon not in by_canon:
+            continue
+
+        ties_sorted = sorted(by_canon[canon], key=lambda x: str(x.get("tie_key") or ""))
+
+        ties_out: List[Dict[str, Any]] = []
+        for i, tr in enumerate(ties_sorted, start=1):
+            legs: List[Dict[str, Any]] = []
+
+            if tr.get("leg1_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg1_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg1_away_id"), 0) or None
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+                legs.append(
+                    {
+                        "leg_index": 1,
+                        "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg1_date_utc"),
+                        "home_id": h_id,
+                        "away_id": a_id,
+                        "home_ft": tr.get("leg1_home_ft"),
+                        "away_ft": tr.get("leg1_away_ft"),
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
+                    }
+                )
+
+            if tr.get("leg2_fixture_id") is not None:
+                h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
+                a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
+                h_name, h_logo = _team_name_logo(h_id)
+                a_name, a_logo = _team_name_logo(a_id)
+                legs.append(
+                    {
+                        "leg_index": 2,
+                        "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
+                        "date_utc": tr.get("leg2_date_utc"),
+                        "home_id": h_id,
+                        "away_id": a_id,
+                        "home_ft": tr.get("leg2_home_ft"),
+                        "away_ft": tr.get("leg2_away_ft"),
+                        "home_name": h_name,
+                        "home_logo": h_logo,
+                        "away_name": a_name,
+                        "away_logo": a_logo,
+                    }
+                )
+
+            a_id = tr.get("team_a_id")
+            b_id = tr.get("team_b_id")
+            a_name, a_logo = _team_name_logo(a_id)
+            b_name, b_logo = _team_name_logo(b_id)
+
+            ties_out.append(
+                {
+                    "tie_key": tr.get("tie_key"),
+                    "order_hint": i,
+                    "team_a_id": a_id,
+                    "team_b_id": b_id,
+                    "team_a_name": a_name,
+                    "team_a_logo": a_logo,
+                    "team_b_name": b_name,
+                    "team_b_logo": b_logo,
+                    "agg_a": tr.get("agg_a"),
+                    "agg_b": tr.get("agg_b"),
+                    "winner_team_id": tr.get("winner_team_id"),
+                    "legs": legs,
+                }
+            )
+
+        round_label = _canonical_round_label(canon)
+        round_key = round_label.upper().replace(" ", "_").replace("-", "_")
+
+        bracket.append({"round_key": round_key, "round_label": round_label, "ties": ties_out})
+
+    return bracket
+
+
 
 # ────────────────────────────────────────────────────────────
 #  컨퍼런스 / 그룹 / 스플릿 정보 추출 (context_options)
 # ────────────────────────────────────────────────────────────
 
-_RX_GROUP = re.compile(r"group\s+[A-Z]", re.IGNORECASE)
-_RX_CONF = re.compile(r"conference", re.IGNORECASE)
-_RX_EAST = re.compile(r"east", re.IGNORECASE)
-_RX_WEST = re.compile(r"west", re.IGNORECASE)
-_RX_CHAMP = re.compile(r"championship", re.IGNORECASE)
-_RX_RELEG = re.compile(r"relegation", re.IGNORECASE)
-_RX_PLAYOFF = re.compile(r"play[- ]?off", re.IGNORECASE)
-
-
-def _build_context_options_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+def _build_context_options_from_rows(
+    rows: List[Dict[str, Any]]
+) -> Dict[str, List[str]]:
     """
-    standings row 들을 보고:
-      - MLS East/West 같은 컨퍼런스
-      - K리그 Championship / Relegation / Playoff 스플릿
-      - Group A / Group B 등 그룹
-    을 추출해서 context_options 로 내려준다.
+    matchdetail과 동일한 컨퍼런스/그룹 인식 로직.
 
-    클라이언트에서는:
-      conferences → StandingsContext.conferences
-      groups      → StandingsContext.groups
-    로 맵핑해서 칩 필터로 사용.
+    - conferences: ["East", "West"] 등
+    - groups: ["Group A", "Group B", "Championship Round", "Relegation Round"] 등
     """
+    if not rows:
+        return {"conferences": [], "groups": []}
+
+    group_raw: List[str] = []
+    desc_raw: List[str] = []
+    for r in rows:
+        g = r.get("group_name")
+        d = r.get("description")
+        if isinstance(g, str):
+            g = g.strip()
+            if g:
+                group_raw.append(re.sub(r"\s+", " ", g))
+        if isinstance(d, str):
+            desc_raw.append(d.lower())
+
+    group_raw = list(dict.fromkeys(group_raw))  # distinct, 순서 유지
+
+    rx_has_split_round = re.compile(
+        r"(champ(ion)?ship\s+.*(round|rnd))|(releg(ation)?\s+.*(round|rnd))",
+        re.IGNORECASE,
+    )
+    rx_group = re.compile(r"group\s*([A-Z])", re.IGNORECASE)
+
+    def derive_from_description() -> List[str]:
+        if not desc_raw:
+            return []
+        has_champ_round = any(
+            rx_has_split_round.search(d) and "champ" in d for d in desc_raw
+        )
+        has_releg_round = any(
+            rx_has_split_round.search(d) and "releg" in d for d in desc_raw
+        )
+        out: List[str] = []
+        if has_champ_round:
+            out.append("Championship Round")
+        if has_releg_round:
+            out.append("Relegation Round")
+        return out
+
+    has_east = any("east" in g.lower() for g in group_raw)
+    has_west = any("west" in g.lower() for g in group_raw)
+    has_grp = any(rx_group.search(g) for g in group_raw)
+    has_rnd = any(rx_has_split_round.search(g) for g in group_raw)
 
     conferences: List[str] = []
+    if has_east:
+        conferences.append("East")
+    if has_west:
+        conferences.append("West")
+
     groups: List[str] = []
-
-    for r in rows:
-        g = (r.get("group_name") or "").strip()
-        desc = (r.get("description") or "").strip()
-        text = f"{g} {desc}".strip()
-        if not text:
+    for g in group_raw:
+        gl = g.lower()
+        if "east" in gl or "west" in gl:
             continue
+        m = rx_group.search(g)
+        if m:
+            groups.append(f"Group {m.group(1).upper()}")
+        elif rx_has_split_round.search(g) and "champ" in gl:
+            groups.append("Championship Round")
+        elif rx_has_split_round.search(g) and "releg" in gl:
+            groups.append("Relegation Round")
 
-        # 1) 컨퍼런스/East/West (MLS 류)
-        if _RX_CONF.search(text) or _RX_EAST.search(text) or _RX_WEST.search(text):
-            label = g or desc
-            if label and label not in conferences:
-                conferences.append(label)
-            continue
+    has_meaningful = has_east or has_west or has_grp or has_rnd or bool(groups)
+    if not has_meaningful:
+        groups = derive_from_description()
 
-        # 2) 챔피언십/강등/플레이오프/그룹 → groups 로
-        if (
-            _RX_CHAMP.search(text)
-            or _RX_RELEG.search(text)
-            or _RX_PLAYOFF.search(text)
-            or _RX_GROUP.search(text)
-        ):
-            label = g or desc
-            if label and label not in groups:
-                groups.append(label)
+    def _dedup_case_insensitive(items: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for x in items:
+            key = x.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(x)
+        return out
 
-    return {
-        "conferences": conferences,
-        "groups": groups,
-    }
+    conferences = _dedup_case_insensitive(conferences)
+    groups = _dedup_case_insensitive(groups)
+
+    return {"conferences": conferences, "groups": groups}
 
 
-def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, Any]:
+
+def build_standings_block(
+    league_id: int,
+    season: Optional[int],
+    *,
+    fixture_id: Optional[int] = None,
+    league_round: Optional[str] = None,
+) -> Dict[str, Any]:
+
+
     """
     League Detail 화면의 'Standings' 탭 데이터.
 
@@ -169,6 +655,58 @@ def build_standings_block(league_id: int, season: Optional[int]) -> Dict[str, An
     except Exception as e:
         print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
 
+    # ─────────────────────────────────────────────────────────────
+    # 0) matchdetail과 동일:
+    #    "대표 fixture + 그 fixture의 league_round"가 knockout이면 BRACKET
+    #    그리고 tournament_ties에서 실제 round_name을 찾아 current_round를 확정 후
+    #    그 라운드까지(end_round_name) 브라켓을 내려준다.
+    # ─────────────────────────────────────────────────────────────
+    league_round_str = league_round.strip() if isinstance(league_round, str) else None
+
+    if isinstance(fixture_id, int) and fixture_id > 0 and _is_knockout_round_for_bracket(league_id, league_round_str):
+        tie_row = _fetch_one(
+            """
+            SELECT round_name
+            FROM tournament_ties
+            WHERE league_id = %s
+              AND season = %s
+              AND (%s = leg1_fixture_id OR %s = leg2_fixture_id)
+            LIMIT 1
+            """,
+            (league_id, season_resolved, fixture_id, fixture_id),
+        )
+
+        tie_round_name = (tie_row or {}).get("round_name")
+        tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
+
+        current_round = (
+            tie_round_name
+            if _is_knockout_round_for_bracket(league_id, tie_round_name)
+            else league_round_str
+        )
+
+
+        bracket = _build_bracket_from_tournament_ties(
+            league_id,
+            season_resolved,
+            start_round_name=None,
+            end_round_name=current_round,
+        )
+
+        if bracket:
+            return {
+                "league_id": league_id,
+                "season": season_resolved,
+                "league_name": league_name,
+                "rows": [],
+                "bracket": bracket,
+                "mode": "BRACKET",
+                "context_options": {"conferences": [], "groups": []},
+            }
+        # bracket 비면 기존 TABLE 로직으로 fallback
+
+
+    
     def _cols_of(table_name: str) -> set[str]:
         try:
             cols = fetch_all(
