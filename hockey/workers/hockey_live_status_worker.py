@@ -107,6 +107,11 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
     """
     /leagues 를 받아서 hockey_leagues + hockey_league_seasons 를 갱신.
     - 스키마 차이 대비: 존재하는 컬럼만 채움
+
+    ✅ 안정화 패치:
+    - hockey_leagues upsert에서, UPDATE할 컬럼이 하나도 없으면
+      "ON CONFLICT DO UPDATE SET" 뒤가 비어서 SQL 에러가 날 수 있음.
+      → 이 경우 ON CONFLICT DO NOTHING 으로 처리한다.
     """
     payload = _get("/leagues", {})
     resp = payload.get("response") if isinstance(payload, dict) else None
@@ -115,6 +120,8 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
 
     leagues_cols = _table_columns("hockey_leagues")
     seasons_cols = _table_columns("hockey_league_seasons")
+
+    leagues_set = set(leagues) if leagues else set()
 
     for item in resp:
         if not isinstance(item, dict):
@@ -129,7 +136,7 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
             continue
 
         # ✅ 현재 워커에서 관리하는 리그만
-        if leagues and league_id not in set(leagues):
+        if leagues_set and league_id not in leagues_set:
             continue
 
         league_name = _safe_text(lg.get("name"))
@@ -172,24 +179,33 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
             if "updated_at" in leagues_cols:
                 upd_parts.append("updated_at=now()")
 
-            upd_sql = ", ".join(upd_parts) if upd_parts else ""
-            hockey_execute(
-                f"""
-                INSERT INTO hockey_leagues ({cols_sql})
-                VALUES ({ph_sql})
-                ON CONFLICT (id) DO UPDATE SET
-                {upd_sql}
-                """,
-                tuple(insert_vals),
-            )
-
-
+            if upd_parts:
+                hockey_execute(
+                    f"""
+                    INSERT INTO hockey_leagues ({cols_sql})
+                    VALUES ({ph_sql})
+                    ON CONFLICT (id) DO UPDATE SET
+                      {", ".join(upd_parts)}
+                    """,
+                    tuple(insert_vals),
+                )
+            else:
+                # ✅ 업데이트할 게 없으면 DO NOTHING
+                hockey_execute(
+                    f"""
+                    INSERT INTO hockey_leagues ({cols_sql})
+                    VALUES ({ph_sql})
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    tuple(insert_vals),
+                )
 
         # ── hockey_league_seasons upsert
         # seasons 응답 형태가 바뀔 수 있으니 최대한 안전 처리
         for s in seasons:
             if not isinstance(s, dict):
                 continue
+
             season = _safe_int(s.get("season"))
             if season is None:
                 continue
@@ -214,17 +230,6 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
             _sadd("raw_json", _jsonb_dump(s))
 
             if scols:
-                cols_sql = ", ".join(scols)
-                ph_sql = ", ".join(["%s"] * len(scols))
-
-                upd_parts = []
-                for c in scols:
-                    if c in ("league_id", "season"):
-                        continue
-                    upd_parts.append(f"{c}=EXCLUDED.{c}")
-                if "updated_at" in seasons_cols:
-                    upd_parts.append("updated_at=now()")
-
                 # ✅ UNIQUE 없어도 동작하도록: UPDATE -> 없으면 INSERT
                 _upsert_no_unique(
                     "hockey_league_seasons",
@@ -233,6 +238,7 @@ def _meta_refresh_leagues_and_seasons(leagues: List[int]) -> None:
                     svals,
                     ["league_id", "season"],
                 )
+
 
 
 
@@ -737,9 +743,12 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
 
 
 
-def _run_meta_and_standings_refresh(leagues: List[int]) -> None:
+def _run_meta_and_standings_refresh(leagues: List[int], *, include_standings: bool = False) -> None:
     """
-    한 번에 묶어서 실행 (ADD ONLY)
+    묶음 실행기 (ADD ONLY)
+
+    기본 동작: meta만 실행 (main의 meta refresh fallback 용도로 딱 맞춤)
+    필요 시: include_standings=True 로 standings까지 같이 실행 가능
     """
     try:
         _meta_refresh_leagues_and_seasons(leagues)
@@ -756,10 +765,12 @@ def _run_meta_and_standings_refresh(leagues: List[int]) -> None:
     except Exception as e:
         log.warning("meta refresh teams failed: %s", e)
 
-    try:
-        _refresh_standings_for_leagues(leagues)
-    except Exception as e:
-        log.warning("standings refresh failed: %s", e)
+    if include_standings:
+        try:
+            _refresh_standings_for_leagues(leagues)
+        except Exception as e:
+            log.warning("standings refresh failed: %s", e)
+
 
 
 def ensure_event_key_migration() -> None:
@@ -906,7 +917,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
     env:
       HOCKEY_LIVE_PRESTART_MIN        (default 60)
       HOCKEY_LIVE_INPLAY_MAX_MIN      (default 240)
-      HOCKEY_LIVE_NS_GRACE_MIN        (default 20)
       HOCKEY_LIVE_FUTURE_GRACE_MIN    (default 2)
       HOCKEY_LIVE_BATCH_LIMIT         (default 120)
     """
@@ -916,7 +926,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     inplay_max_min = _int_env("HOCKEY_LIVE_INPLAY_MAX_MIN", 240)
-    ns_grace_min = _int_env("HOCKEY_LIVE_NS_GRACE_MIN", 20)
     future_grace_min = _int_env("HOCKEY_LIVE_FUTURE_GRACE_MIN", 2)
     batch_limit = _int_env("HOCKEY_LIVE_BATCH_LIMIT", 120)
 
@@ -925,7 +934,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
     inplay_end = now + dt.timedelta(minutes=future_grace_min)
-
 
     rows = hockey_fetch_all(
         """
@@ -951,7 +959,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
                 'ABD','AW','CANC','POST','WO'
               )
 
-
               AND (
                 -- ✅ 보통 진행중 상태 (NS/TBD 제외)
                 COALESCE(g.status, '') NOT IN ('NS','TBD')
@@ -960,7 +967,6 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
 
                 -- ✅ NS/TBD가 오래 남는 리그가 있어 grace 제한 없이 in-play 윈도우 동안 유지
                 (COALESCE(g.status, '') IN ('NS','TBD'))
-
 
                 OR
 
@@ -981,9 +987,9 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             inplay_start, inplay_end,
             batch_limit,
         ),
-
     )
     return [dict(r) for r in rows]
+
 
 
 
@@ -999,32 +1005,17 @@ def _is_finished_status(s: str, game_date: Optional[dt.datetime]) -> bool:
     }:
         return True
 
+    # 시간 기반 종료: 과거 경기인데 미시작/중단류 상태로 남아있는 경우
     if isinstance(game_date, dt.datetime):
         try:
             age = _utc_now() - game_date
-            if age > dt.timedelta(hours=6):
-                if x in {"NS", "TBD", "SUSP", "INT", "DELAYED"}:
-                    return True
+            if age > dt.timedelta(hours=6) and x in {"NS", "TBD", "SUSP", "INT", "DELAYED"}:
+                return True
         except Exception:
             pass
 
     return False
 
-
-
-    # 2) 시간 기반 종료: 과거 경기인데 미시작/중단류 상태로 남아있는 경우
-    #    (여기서 6시간은 너가 쿼리에서 쓰던 기준과 동일하게 맞춤)
-    if isinstance(game_date, dt.datetime):
-        try:
-            age = _utc_now() - game_date
-            if age > dt.timedelta(hours=6):
-                if x in {"NS", "TBD", "SUSP", "INT", "DELAYED"}:
-                    return True
-        except Exception:
-            # game_date 비교 실패 시에는 보수적으로 False
-            pass
-
-    return False
 
 
 
@@ -1093,6 +1084,23 @@ def _extract_team_ids(item: Dict[str, Any]) -> Tuple[Optional[int], Optional[int
     away_id = _safe_int(away.get("id")) if isinstance(away, dict) else None
     return home_id, away_id
 
+def _is_finished_status_short(s: Optional[str]) -> bool:
+    x = (s or "").upper().strip()
+    return x in {
+        "FT", "AET", "PEN", "FIN", "END", "ENDED",
+        "AP", "AOT",
+        "ABD", "AW", "CANC", "POST", "WO",
+    }
+
+
+def _has_score(score_json: Any) -> bool:
+    if not isinstance(score_json, dict):
+        return False
+    h = score_json.get("home")
+    a = score_json.get("away")
+    return isinstance(h, int) and isinstance(a, int)
+
+
 
 def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: int) -> Optional[int]:
     gid = _safe_int(item.get("id"))
@@ -1124,6 +1132,40 @@ def upsert_game(item: Dict[str, Any], league_id_fallback: int, season_fallback: 
 
     tz = _safe_text(item.get("timezone"))
     scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+
+    # ─────────────────────────────────────────
+    # ✅ 재발 방지 보호:
+    # DB가 이미 종료(AOT/AP/FT 등) + 스코어가 확정인데,
+    # API(/games)가 P3 + scores null 같은 "깨진 요약"을 주면
+    # DB 값을 덮어쓰지 않는다.
+    # ─────────────────────────────────────────
+    try:
+        cur = hockey_fetch_one(
+            "SELECT status, score_json FROM hockey_games WHERE id=%s",
+            (gid,),
+        )
+        if cur:
+            cur_status = (cur.get("status") or "").strip()
+            cur_score = cur.get("score_json")
+
+            incoming_finished = _is_finished_status_short(status)
+            cur_finished = _is_finished_status_short(cur_status)
+
+            incoming_score_null = (
+                not isinstance(scores, dict)
+                or scores.get("home") is None
+                or scores.get("away") is None
+            )
+
+            if cur_finished and _has_score(cur_score) and (not incoming_finished) and incoming_score_null:
+                # ✅ 덮어쓰기 방지: status/score는 DB 유지
+                status = cur_status
+                # score_json은 DB 유지되도록 scores를 DB값으로 대체
+                if isinstance(cur_score, dict):
+                    scores = {"home": cur_score.get("home"), "away": cur_score.get("away")}
+    except Exception:
+        pass
+    
 
     hockey_execute(
         """
@@ -1212,6 +1254,11 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
     - 이번 스냅샷에 존재하는 event_key 목록을 만든다.
     - 스냅샷 이벤트를 upsert 한다.
     - DB에 남아있는 goal/penalty 중, 이번 스냅샷에 없는 event_key는 HARD DELETE 한다.
+
+    ✅ 안전 가드:
+    - 스냅샷이 빈 리스트(일시 오류/레이트리밋/네트워크)로 들어오는 경우,
+      HARD DELETE를 수행하면 기존 goal/penalty가 전부 삭제될 수 있으므로
+      snapshot_event_keys가 비어있을 때는 DELETE를 수행하지 않는다.
     """
     snapshot_event_keys: List[str] = []
 
@@ -1303,21 +1350,83 @@ def upsert_events(game_id: int, ev_list: List[Dict[str, Any]]) -> None:
 
     # ─────────────────────────────────────────
     # 스냅샷 HARD DELETE 동기화 (근본 해결)
-    # - 이번 스냅샷에 없는 goal/penalty 이벤트는 DB에서 제거
-    # - 이렇게 해야 minute 정정/삭제된 "찌꺼기 이벤트"가 남지 않음
+    # ✅ 단, snapshot_event_keys가 비어있을 때는 삭제 금지(전부 삭제 위험)
     # ─────────────────────────────────────────
-    hockey_execute(
-        """
-        DELETE FROM hockey_game_events
-        WHERE game_id = %s
-          AND type IN ('goal','penalty')
-          AND (event_key IS NOT NULL AND event_key <> '')
-          AND NOT (event_key = ANY(%s))
-        """,
-        (game_id, snapshot_event_keys),
-    )
+    if snapshot_event_keys:
+        hockey_execute(
+            """
+            DELETE FROM hockey_game_events
+            WHERE game_id = %s
+              AND type IN ('goal','penalty')
+              AND (event_key IS NOT NULL AND event_key <> '')
+              AND NOT (event_key = ANY(%s))
+            """,
+            (game_id, snapshot_event_keys),
+        )
 
 
+
+def _calc_score_from_events(ev_list: List[Dict[str, Any]], home_id: int, away_id: int) -> Tuple[Optional[int], Optional[int], bool]:
+    """
+    events 스냅샷에서 goal만 집계.
+    returns: (home_goals, away_goals, has_ot_goal)
+    """
+    if not ev_list or not home_id or not away_id:
+        return (None, None, False)
+
+    h = 0
+    a = 0
+    has_ot = False
+
+    for ev in ev_list:
+        if not isinstance(ev, dict):
+            continue
+        if (ev.get("type") or "").strip().lower() != "goal":
+            continue
+
+        period = (ev.get("period") or "").strip().upper()
+        if period == "OT":
+            has_ot = True
+
+        team = ev.get("team") if isinstance(ev.get("team"), dict) else {}
+        tid = _safe_int(team.get("id")) if isinstance(team, dict) else None
+        if tid == home_id:
+            h += 1
+        elif tid == away_id:
+            a += 1
+
+    return (h, a, has_ot)
+
+
+def _apply_stuck_summary_fix(game_id: int, home_goals: int, away_goals: int, *, make_aot: bool) -> None:
+    """
+    score_json이 비어있는 게임에 한해, events 집계로 score_json 채우기.
+    OT 골이 있으면 status=AOT로 보정.
+    """
+    if make_aot:
+        hockey_execute(
+            """
+            UPDATE hockey_games
+            SET status='AOT',
+                status_long='After Overtime',
+                score_json=jsonb_build_object('home',%s,'away',%s),
+                updated_at=now()
+            WHERE id=%s
+              AND (score_json->>'home' IS NULL OR score_json->>'away' IS NULL)
+            """,
+            (home_goals, away_goals, game_id),
+        )
+    else:
+        hockey_execute(
+            """
+            UPDATE hockey_games
+            SET score_json=jsonb_build_object('home',%s,'away',%s),
+                updated_at=now()
+            WHERE id=%s
+              AND (score_json->>'home' IS NULL OR score_json->>'away' IS NULL)
+            """,
+            (home_goals, away_goals, game_id),
+        )
 
 
 def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
@@ -1716,6 +1825,27 @@ def tick_once_windowed(
                             if ev_list:
                                 upsert_events(gid, ev_list)
                                 events_upserted += len(ev_list)
+
+                                # ✅ /games scores가 null로 깨진 케이스 보정:
+                                # events로 goal 집계해서 score_json 채우고,
+                                # OT 골이 있으면 AOT로 마감 처리(394668 같은 케이스 자동복구)
+                                try:
+                                    # 최신 home/away 팀 id는 DB에서 가져오는 게 안전
+                                    cur2 = hockey_fetch_one(
+                                        "SELECT home_team_id, away_team_id, score_json, status FROM hockey_games WHERE id=%s",
+                                        (gid,),
+                                    )
+                                    if cur2:
+                                        hid = int(cur2.get("home_team_id") or 0)
+                                        aid = int(cur2.get("away_team_id") or 0)
+                                        h, a, has_ot = _calc_score_from_events(ev_list, hid, aid)
+
+                                        if isinstance(h, int) and isinstance(a, int) and (has_ot or (h + a) > 0):
+                                            # OT 골이 있으면 AOT로 보정 (그 외는 점수만 채움)
+                                            _apply_stuck_summary_fix(gid, h, a, make_aot=bool(has_ot))
+                                except Exception as e:
+                                    log.warning("stuck summary fix failed: game=%s err=%s", gid, e)
+
                     except Exception as e:
                         log.warning("events fetch failed: game=%s err=%s", gid, e)
 
@@ -1753,7 +1883,6 @@ def main() -> None:
     slow_interval = _float_env("HOCKEY_LIVE_SLOW_INTERVAL_SEC", 20.0)  # slow(기본)
     idle_interval = _float_env("HOCKEY_LIVE_IDLE_INTERVAL_SEC", 180.0) # 후보 없을 때
 
-
     pre_min = _int_env("HOCKEY_LIVE_PRESTART_MIN", 60)
     post_min = _int_env("HOCKEY_LIVE_POSTEND_MIN", 30)
 
@@ -1769,11 +1898,6 @@ def main() -> None:
         slow_interval,
         idle_interval,
     )
-
-
-
-    super_fast_leagues = _int_set_env("HOCKEY_LIVE_SUPER_FAST_LEAGUES")
-    super_fast_interval = _float_env("HOCKEY_LIVE_SUPER_FAST_INTERVAL_SEC", 5.0)
 
     log.info(
         "🏒 hockey live worker(interval tiers): super_fast_leagues=%s super_fast=%.1fs fast_leagues=%s fast=%.1fs slow=%.1fs idle=%.1fs",
@@ -1799,9 +1923,17 @@ def main() -> None:
             try:
                 if _last_meta_ts == 0.0 or (now_ts - _last_meta_ts) >= float(meta_refresh_sec):
                     log.info("meta refresh start (interval=%ss)", meta_refresh_sec)
-                    _meta_refresh_leagues_and_seasons(leagues)
-                    _meta_refresh_countries()
-                    _meta_refresh_teams_for_leagues(leagues)
+                    # ✅ 미사용 함수였던 묶음 실행기를 실제로 사용
+                    # (standings까지 같이 갱신하고 싶으면 이 함수 하나로도 가능하지만,
+                    #  여기서는 기존 구조대로 standings 주기와 분리 유지)
+                    try:
+                        _meta_refresh_leagues_and_seasons(leagues)
+                        _meta_refresh_countries()
+                        _meta_refresh_teams_for_leagues(leagues)
+                    except Exception:
+                        # fallback: 묶음 함수(내부 try/except)
+                        _run_meta_and_standings_refresh(leagues)
+
                     _last_meta_ts = now_ts
                     log.info("meta refresh done")
             except Exception as e:
@@ -1901,6 +2033,7 @@ def main() -> None:
         except Exception as e:
             log.exception("tick failed: %s", e)
             time.sleep(idle_interval)
+
 
 
 
