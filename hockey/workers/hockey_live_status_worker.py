@@ -676,6 +676,9 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                     or group_name_fallback
                 )
 
+                # ✅ ADD: overall/Overall 2벌 방지 (PK에 group_name이 들어가므로 정규화 필수)
+                group_name = _canon_group_name(group_name)
+
                 # ─────────────────────────────────────────
                 # 🔥 PATCH 핵심: NHL 전체 집계 그룹 제거
                 # ─────────────────────────────────────────
@@ -684,6 +687,7 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                         skipped += 1
                         continue
                 # ─────────────────────────────────────────
+
 
                 insert_cols: List[str] = []
                 insert_vals: List[Any] = []
@@ -838,6 +842,19 @@ def _safe_text(v: Any) -> Optional[str]:
     s = str(v).strip()
     return s or None
 
+def _canon_group_name(v: Optional[str]) -> str:
+    """
+    standings group_name 정규화:
+    - None/빈값 -> "Overall"
+    - "overall"/"Overall"/" OVERALL " -> "Overall"
+    - 그 외는 원문 유지 (Conference/Division 등)
+    """
+    s = (v or "").strip()
+    if not s:
+        return "Overall"
+    if s.lower() == "overall":
+        return "Overall"
+    return s
 
 def _jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
