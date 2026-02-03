@@ -98,6 +98,97 @@ def get_target_dates() -> List[str]:
         cur += dt.timedelta(days=1)
     return out
 
+def get_target_season() -> Optional[int]:
+    """
+    시즌 모드:
+      - ENV TARGET_SEASON=2024
+      - 또는 CLI: --season 2024
+    """
+    env_season = (os.environ.get("TARGET_SEASON") or "").strip()
+    if env_season:
+        try:
+            return int(env_season)
+        except ValueError:
+            print(f"[WARN] TARGET_SEASON invalid: {env_season!r}", file=sys.stderr)
+            return None
+
+    # CLI: --season 2024
+    if "--season" in sys.argv:
+        try:
+            idx = sys.argv.index("--season")
+            if idx + 1 < len(sys.argv):
+                return int(sys.argv[idx + 1].strip())
+        except Exception:
+            print("[WARN] --season value invalid", file=sys.stderr)
+            return None
+
+    return None
+
+
+def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any]]:
+    """
+    시즌 전체 백필용 fixtures 수집.
+
+    - FINISHED 범주(FT/AET/PEN)를 최대한 커버한다.
+    - API가 status 콤마를 허용하면 1콜로 끝내고,
+      거부하면 FT/AET/PEN을 분해 호출해서 합친다.
+    """
+    tz = (os.environ.get("API_TZ") or "Asia/Seoul").strip()
+
+    finished_statuses = (os.environ.get("FINISHED_STATUSES") or "FT,AET,PEN").strip()
+    statuses = [s.strip().upper() for s in finished_statuses.split(",") if s.strip()]
+    if not statuses:
+        statuses = ["FT", "AET", "PEN"]
+
+    base_params: Dict[str, Any] = {
+        "league": int(league_id),
+        "season": int(season),
+        "timezone": tz,
+    }
+
+    merged: Dict[int, Dict[str, Any]] = {}
+
+    # 1) 콤마로 1번에 시도
+    try:
+        params = dict(base_params)
+        params["status"] = ",".join(statuses)
+        data = _safe_get("/fixtures", params=params)
+        rows = data.get("response", []) or []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            basic = _extract_fixture_basic(r)
+            if not basic:
+                continue
+            merged[basic["fixture_id"]] = r
+
+        if merged:
+            return list(merged.values())
+    except Exception:
+        pass
+
+    # 2) fallback: status를 분해해서 여러 번 호출 후 merge
+    for st in statuses:
+        try:
+            params = dict(base_params)
+            params["status"] = st
+            data = _safe_get("/fixtures", params=params)
+            rows = data.get("response", []) or []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                basic = _extract_fixture_basic(r)
+                if not basic:
+                    continue
+                merged[basic["fixture_id"]] = r
+        except Exception as e:
+            print(
+                f"[WARN] fixtures season fetch failed league={league_id} season={season} status={st}: {e}",
+                file=sys.stderr,
+            )
+            continue
+
+    return list(merged.values())
 
 
 
@@ -756,7 +847,8 @@ def backfill_postmatch_for_fixture(
 # ─────────────────────────────────────
 
 def main() -> None:
-    target_dates = get_target_dates()
+    target_season = get_target_season()
+    target_dates = get_target_dates()  # 시즌 모드가 아니면 기존대로 날짜 모드 사용
     live_leagues = parse_live_leagues(os.environ.get("LIVE_LEAGUES", ""))
 
     if not live_leagues:
@@ -765,17 +857,111 @@ def main() -> None:
 
     force = (os.environ.get("FORCE_BACKFILL") or "").strip().lower() in ("1", "true", "yes", "y")
     today_str = now_utc().strftime("%Y-%m-%d")
-    print(f"[postmatch_backfill] dates={target_dates}, today={today_str}, leagues={live_leagues}, force={force}")
+
+    if target_season is not None:
+        print(f"[postmatch_backfill] season_mode season={target_season}, today={today_str}, leagues={live_leagues}, force={force}")
+    else:
+        print(f"[postmatch_backfill] dates={target_dates}, today={today_str}, leagues={live_leagues}, force={force}")
+
 
     total_new = 0
     total_skipped = 0
 
     fetched_standings_keys = set()  # (league_id, season) 중복 호출 방지
 
+    # ─────────────────────────────────────
+    #  ✅ 시즌 모드: league + season 전체(FT) 백필
+    # ─────────────────────────────────────
+    if target_season is not None:
+        for lid in live_leagues:
+            try:
+                # standings (league+season)
+                skey = (int(lid), int(target_season))
+                need_st = force or (not has_standings(int(lid), int(target_season)))
+                if need_st and skey not in fetched_standings_keys:
+                    try:
+                        st_rows = fetch_standings_from_api(int(lid), int(target_season))
+                        if st_rows:
+                            upsert_standings_rows(int(lid), int(target_season), st_rows)
+                            fetched_standings_keys.add(skey)
+                            print(f"    * standings league={lid} season={target_season}: rows={len(st_rows)}")
+                        else:
+                            print(f"    ! standings league={lid} season={target_season}: empty response", file=sys.stderr)
+                    except Exception as se:
+                        print(f"    ! standings league={lid} season={target_season} 에러: {se}", file=sys.stderr)
+
+                fixtures = fetch_fixtures_for_season(int(lid), int(target_season))
+                print(f"  - season={target_season} league {lid}: fixtures={len(fixtures)}")
+
+                for fx in fixtures:
+                    basic = _extract_fixture_basic(fx)
+                    if basic is None:
+                        continue
+
+                    fixture_id = basic["fixture_id"]
+                    sg = (basic.get("status_group") or "").strip()
+
+                    # ✅ 시즌 모드에서는 season을 target_season으로 고정
+                    season = int(target_season)
+
+                    # ✅ 모든 상태에서 fixtures/matches/raw 업서트 (기존 정책 유지)
+                    fx_full = fetch_fixture_by_id(fixture_id) or fx
+
+                    try:
+                        upsert_match_fixtures_raw(fixture_id, fx_full)
+                    except Exception as raw_e:
+                        print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+
+                    upsert_fixture_row(fx_full, int(lid), season)
+                    upsert_match_row(fx_full, int(lid), season)
+
+                    # ✅ 무거운 백필은 FINISHED만
+                    if sg != "FINISHED":
+                        continue
+
+                    need_events = force or (not has_match_events(fixture_id))
+                    need_lineups = force or (not has_lineups(fixture_id))
+                    need_team_stats = force or (not has_team_stats(fixture_id))
+                    need_player_stats = force or (not has_player_stats(fixture_id))
+
+                    if not (need_events or need_lineups or need_team_stats or need_player_stats):
+                        total_skipped += 1
+                        continue
+
+                    todo = []
+                    if need_events:
+                        todo.append("events")
+                    if need_lineups:
+                        todo.append("lineups")
+                    if need_team_stats:
+                        todo.append("team_stats")
+                    if need_player_stats:
+                        todo.append("player_stats")
+
+                    print(f"    * fixture {fixture_id}: backfill={'+'.join(todo)}")
+                    backfill_postmatch_for_fixture(
+                        fixture_id,
+                        do_events=need_events,
+                        do_lineups=need_lineups,
+                        do_team_stats=need_team_stats,
+                        do_player_stats=need_player_stats,
+                    )
+                    total_new += 1
+
+            except Exception as e:
+                print(f"  ! season={target_season} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+        print(f"[postmatch_backfill] 완료. 신규={total_new}, 스킵={total_skipped}")
+        return
+
+    # ─────────────────────────────────────
+    #  ✅ 날짜 모드(기존 로직 그대로)
+    # ─────────────────────────────────────
     for target_date in target_dates:
         for lid in live_leagues:
             try:
                 season_guess = pick_season_for_date(lid, target_date)
+
 
                 # ✅ standings는 league+season 단위. season_guess가 틀릴 수 있어 fallback 시도
                 if season_guess is not None:
