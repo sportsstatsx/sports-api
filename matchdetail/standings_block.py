@@ -619,10 +619,17 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     ✅ 규칙:
     - 넉아웃(브라켓) 대상 fixture면: mode="BRACKET" + bracket 채워서 반환 (rows는 [])
-    - 그 외에는 기존 TABLE 로직 그대로:
+    - 그 외 TABLE:
       1) standings 테이블 우선
       2) 비어있으면 matches로 계산
       3) finished=0이면 rows=[] + message
+
+    ✅ A 방식(서버가 필터용 context_options 제공) 강화:
+    - MLS(East/West)는 기존처럼 "전체 rows 유지 + 필터" (컷팅 없음)
+    - Split Round(Championship/Relegation)도 "전체 rows 유지 + 필터"
+    - Group A/B(예: Argentina)도 "전체 rows 유지 + 필터"
+    - 따라서 "홈/원정 팀이 속한 group만 남기는 컷팅"은 제거
+    - 중복 제거는 team_id 단독이 아니라 (team_id + group_name) 기준으로만 안전하게 수행
     """
 
     league_id = header.get("league_id")
@@ -674,8 +681,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # ─────────────────────────────────────────────────────────────
     # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
-    #    - ✅ FIX: Final matchdetail에서 이전 라운드가 안 보이던 문제 해결
-    #      => "현재 라운드까지(포함)" 브라켓을 내려줌 (end_round_name 사용)
     # ─────────────────────────────────────────────────────────────
     fixture_id = _extract_fixture_id_from_header(header)
     league_round = header.get("league_round")
@@ -697,7 +702,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         tie_round_name = (tie_row or {}).get("round_name")
         tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
 
-        # DB round_name이 유효하면 그걸 current round로 사용
         current_round = (
             tie_round_name
             if _is_knockout_round_for_bracket(league_id_int, tie_round_name)
@@ -708,7 +712,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             league_id_int,
             season_resolved,
             start_round_name=None,
-            end_round_name=current_round,   # ✅ 핵심: 현재 라운드까지 포함해서 내려줌
+            end_round_name=current_round,
         )
 
         if bracket:
@@ -725,10 +729,10 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "message": None,
                 "source": "tournament_ties",
             }
-        # bracket이 비면(데이터 미수집) TABLE로 fallback
+        # bracket이 비면 TABLE로 fallback
 
     # ─────────────────────────────────────────────────────────────
-    # 1) standings 테이블 우선 (기존 로직 그대로)
+    # 1) standings 테이블 우선
     # ─────────────────────────────────────────────────────────────
     try:
         rows_raw: List[Dict[str, Any]] = fetch_all(
@@ -763,7 +767,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     source = "standings_table" if rows_raw else "computed_from_matches"
 
     # ─────────────────────────────────────────────────────────────
-    # 2) standings가 비어 있으면 → matches에서 즉시 계산 (기존 로직 그대로)
+    # 2) standings 비어 있으면 → matches에서 계산 (기존 로직 유지)
     # ─────────────────────────────────────────────────────────────
     if not rows_raw:
         mcols = _cols_of("matches")
@@ -803,7 +807,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ht, at = team_pair
         hg, ag = goal_pair
 
-        # 완료된 경기 수 확인 (0이면 시즌 시작 전/데이터 없음)
         try:
             cnt_row = _fetch_one(
                 f"""
@@ -840,7 +843,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "source": source,
             }
 
-        # matches 기반 standings 계산 (포인트/득실/다득점 기본 정렬)
         try:
             rows_raw = fetch_all(
                 f"""
@@ -950,60 +952,74 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "source": source,
             }
 
-    # ── 공통 후처리: 팀당 중복 row 정리 (played 최대 row만) ─────────────────
-    rows_by_team: Dict[int, Dict[str, Any]] = {}
+    # ─────────────────────────────────────────────────────────────
+    # 공통 후처리 (핵심 변경):
+    # - (team_id) 단독 디듀프 제거
+    # - (team_id + group_name) 기준으로만 "진짜 중복" 정리
+    # - group 컷팅(main_group) 완전 제거 → 전체 rows 유지 + 앱에서 필터 선택
+    # ─────────────────────────────────────────────────────────────
+    def _norm_group(v: Any) -> str:
+        if not isinstance(v, str):
+            return ""
+        return re.sub(r"\s+", " ", v).strip()
+
+    def _better_row(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        같은 (team_id, group_name) 키에 대해 어떤 row를 남길지 결정.
+        - played 큰 것 우선
+        - points, goals_diff, goals_for 큰 것 우선
+        - rank는 작은 것 우선 (있으면)
+        """
+        a_played = _coalesce_int(a.get("played"), 0)
+        b_played = _coalesce_int(b.get("played"), 0)
+        if b_played != a_played:
+            return b if b_played > a_played else a
+
+        a_pts = _coalesce_int(a.get("points"), 0)
+        b_pts = _coalesce_int(b.get("points"), 0)
+        if b_pts != a_pts:
+            return b if b_pts > a_pts else a
+
+        a_gd = _coalesce_int(a.get("goals_diff"), 0)
+        b_gd = _coalesce_int(b.get("goals_diff"), 0)
+        if b_gd != a_gd:
+            return b if b_gd > a_gd else a
+
+        a_gf = _coalesce_int(a.get("goals_for"), 0)
+        b_gf = _coalesce_int(b.get("goals_for"), 0)
+        if b_gf != a_gf:
+            return b if b_gf > a_gf else a
+
+        a_rank = _coalesce_int(a.get("rank"), 0) or 999999
+        b_rank = _coalesce_int(b.get("rank"), 0) or 999999
+        if b_rank != a_rank:
+            return b if b_rank < a_rank else a
+
+        return a
+
+    rows_by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for r in rows_raw:
         tid = _coalesce_int(r.get("team_id"), 0)
         if tid == 0:
             continue
-        prev = rows_by_team.get(tid)
+        gkey = _norm_group(r.get("group_name"))
+        key = (tid, gkey)
+        prev = rows_by_key.get(key)
         if prev is None:
-            rows_by_team[tid] = r
+            rows_by_key[key] = r
         else:
-            prev_played = _coalesce_int(prev.get("played"), 0)
-            cur_played = _coalesce_int(r.get("played"), 0)
-            if cur_played > prev_played:
-                rows_by_team[tid] = r
+            rows_by_key[key] = _better_row(prev, r)
 
-    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
+    dedup_rows: List[Dict[str, Any]] = list(rows_by_key.values())
 
-    # ── group_name 여러 개면 home/away가 속한 group 하나만 사용 (East/West split 제외) ──
-    group_names = {
-        (r.get("group_name") or "").strip()
-        for r in dedup_rows
-        if r.get("group_name") is not None
-    }
+    # 정렬: group_name -> rank -> team_name (그룹별로 붙어서 내려가게)
+    def _sort_key(r: Dict[str, Any]):
+        g = _norm_group(r.get("group_name"))
+        rk = _coalesce_int(r.get("rank"), 0) or 999999
+        tn = str(r.get("team_name") or "")
+        return (g.lower(), rk, tn.lower())
 
-    def _is_east_west_split(names) -> bool:
-        lower = {g.lower() for g in names if g}
-        has_east = any("east" in g for g in lower)
-        has_west = any("west" in g for g in lower)
-        return has_east and has_west
-
-    if len(group_names) > 1 and not _is_east_west_split(group_names):
-        main_group = None
-
-        if home_team_id is not None:
-            for r in dedup_rows:
-                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(home_team_id, 0):
-                    main_group = (r.get("group_name") or "").strip()
-                    break
-
-        if main_group is None and away_team_id is not None:
-            for r in dedup_rows:
-                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(away_team_id, 0):
-                    main_group = (r.get("group_name") or "").strip()
-                    break
-
-        if main_group:
-            dedup_rows = [
-                r
-                for r in dedup_rows
-                if (r.get("group_name") or "").strip() == main_group
-            ]
-
-    # ── rank 기준 정렬 후 JSON 매핑 ───────────────────────────────────────
-    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0) or 999999)
+    dedup_rows.sort(key=_sort_key)
 
     table: List[Dict[str, Any]] = []
     for r in dedup_rows:
@@ -1049,6 +1065,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
+
 
 
 
