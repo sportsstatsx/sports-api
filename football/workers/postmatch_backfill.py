@@ -294,16 +294,32 @@ def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any
     """
     시즌 전체 백필용 fixtures 수집.
 
-    - FINISHED 범주(FT/AET/PEN)를 최대한 커버한다.
-    - API가 status 콤마를 허용하면 1콜로 끝내고,
-      거부하면 FT/AET/PEN을 분해 호출해서 합친다.
+    정책:
+    - 시즌 모드에서도 UPCOMING(NS/TBD)까지 fixtures/matches/raw는 채워서
+      "다음 해 일정(예: 2026년 경기)"이 DB에 존재하게 한다.
+    - 무거운 백필(events/lineups/stats/players)은 기존대로 FINISHED에서만 수행(main 루프의 sg 체크로 유지)
+
+    구현:
+    - FINISHED_STATUSES(기본 FT,AET,PEN) + UPCOMING_STATUSES(기본 NS,TBD)를 합쳐서 요청/merge
+    - API가 status 콤마를 허용하면 1콜 시도, 실패 시 status 분해 호출 후 merge
     """
     tz = (os.environ.get("API_TZ") or "Asia/Seoul").strip()
 
     finished_statuses = (os.environ.get("FINISHED_STATUSES") or "FT,AET,PEN").strip()
-    statuses = [s.strip().upper() for s in finished_statuses.split(",") if s.strip()]
+    upcoming_statuses = (os.environ.get("UPCOMING_STATUSES") or "NS,TBD").strip()
+
+    statuses: List[str] = []
+    for raw in (finished_statuses + "," + upcoming_statuses).split(","):
+        s = raw.strip().upper()
+        if s:
+            statuses.append(s)
+
+    # 중복 제거(순서 유지)
+    seen = set()
+    statuses = [s for s in statuses if not (s in seen or seen.add(s))]
+
     if not statuses:
-        statuses = ["FT", "AET", "PEN"]
+        statuses = ["FT", "AET", "PEN", "NS", "TBD"]
 
     base_params: Dict[str, Any] = {
         "league": int(league_id),
@@ -313,13 +329,8 @@ def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any
 
     merged: Dict[int, Dict[str, Any]] = {}
 
-    # 1) 콤마로 1번에 시도
-    try:
-        params = dict(base_params)
-        params["status"] = ",".join(statuses)
-        data = _safe_get("/fixtures", params=params)
-        rows = data.get("response", []) or []
-        for r in rows:
+    def _merge_rows(rows: Any) -> None:
+        for r in rows or []:
             if not isinstance(r, dict):
                 continue
             basic = _extract_fixture_basic(r)
@@ -327,6 +338,12 @@ def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any
                 continue
             merged[basic["fixture_id"]] = r
 
+    # 1) 콤마로 1번에 시도
+    try:
+        params = dict(base_params)
+        params["status"] = ",".join(statuses)
+        data = _safe_get("/fixtures", params=params)
+        _merge_rows(data.get("response", []))
         if merged:
             return list(merged.values())
     except Exception:
@@ -338,14 +355,7 @@ def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any
             params = dict(base_params)
             params["status"] = st
             data = _safe_get("/fixtures", params=params)
-            rows = data.get("response", []) or []
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                basic = _extract_fixture_basic(r)
-                if not basic:
-                    continue
-                merged[basic["fixture_id"]] = r
+            _merge_rows(data.get("response", []))
         except Exception as e:
             print(
                 f"[WARN] fixtures season fetch failed league={league_id} season={season} status={st}: {e}",
@@ -354,6 +364,7 @@ def fetch_fixtures_for_season(league_id: int, season: int) -> List[Dict[str, Any
             continue
 
     return list(merged.values())
+
 
 
 
