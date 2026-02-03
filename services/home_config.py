@@ -293,3 +293,120 @@ def build_home_master_config() -> Dict[str, Any]:
             "americas_cups": AMERICAS_CONTINENTAL_CUPS,
         },
     }
+
+def get_home_config() -> Dict[str, Any]:
+    """
+    /api/home/config 라우터에서 호출하는 진입점.
+    (이름만 맞춰주는 얇은 래퍼)
+    """
+    return build_home_master_config()
+
+def sort_leagues_for_home(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    get_home_leagues() 결과 rows를 '홈 매치리스트 섹션 순서(home_section_order)'로 정렬한다.
+
+    rows item 예시:
+      {"league_id": 39, "name": "...", "country": "...", "logo": "...", "season": 2025}
+    """
+    if not rows:
+        return []
+
+    cfg = build_home_master_config()
+    order: List[int] = cfg.get("home_section_order") or []
+
+    idx: Dict[int, int] = {}
+    for i, lid in enumerate(order):
+        try:
+            idx[int(lid)] = i
+        except (TypeError, ValueError):
+            continue
+
+    def _key(r: Dict[str, Any]) -> Tuple[int, str, int]:
+        lid = r.get("league_id")
+        try:
+            lid_int = int(lid)
+        except (TypeError, ValueError):
+            lid_int = -1
+
+        # home_section_order에 없으면 맨 뒤로
+        order_idx = idx.get(lid_int, 10_000)
+
+        name = (r.get("name") or "").strip().lower()
+        return (order_idx, name, lid_int)
+
+    return sorted(rows, key=_key)
+
+def build_league_directory_from_config(
+    *,
+    date_str: Optional[str],
+    timezone_str: str,
+) -> List[Dict[str, Any]]:
+    """
+    홈 '리그 선택 바텀시트' 디렉터리:
+    - 순서는 home_config의 filter_order를 그대로 사용 (대륙/티어/5대리그/ABC 규칙 반영)
+    - 반환은 UI에서 쓰기 쉬운 '섹션' 리스트 형태
+
+    반환 예시:
+    [
+      {
+        "section": "Europe",
+        "items": [
+          {"league_id": 39, "name": "...", "country": "...", "continent": "...", "tier": 1, "is_cup": False},
+          ...
+        ]
+      },
+      ...
+    ]
+
+    ⚠️ date_str/timezone_str은 현재 단계에서는 '정렬'에 영향을 주지 않음.
+       (오늘 경기 있는 리그만 보여주고 싶으면 이 함수에서 matches로 필터링하는 버전도 가능)
+    """
+    cfg = build_home_master_config()
+
+    leagues_meta: Dict[int, Dict[str, Any]] = {}
+    for x in (cfg.get("supported_leagues") or []):
+        try:
+            leagues_meta[int(x.get("league_id"))] = x
+        except Exception:
+            continue
+
+    ordered_ids: List[int] = []
+    for lid in (cfg.get("filter_order") or []):
+        try:
+            ordered_ids.append(int(lid))
+        except (TypeError, ValueError):
+            continue
+
+    # continent 별로 묶기
+    sections: Dict[str, List[Dict[str, Any]]] = {c: [] for c in CONTINENT_ORDER}
+    sections.setdefault("Other", [])
+
+    for lid in ordered_ids:
+        meta = leagues_meta.get(lid) or {}
+        continent = (meta.get("continent") or "").strip() or "Other"
+        if continent not in sections:
+            continent = "Other"
+        sections[continent].append(
+            {
+                "league_id": lid,
+                "name": meta.get("name"),
+                "country": meta.get("country"),
+                "continent": meta.get("continent"),
+                "tier": meta.get("tier"),
+                "is_cup": meta.get("is_cup"),
+            }
+        )
+
+    # 결과는 CONTINENT_ORDER 순서 고정
+    out: List[Dict[str, Any]] = []
+    for c in CONTINENT_ORDER:
+        items = sections.get(c) or []
+        if items:
+            out.append({"section": c, "items": items})
+
+    # Other가 있으면 마지막에
+    other_items = sections.get("Other") or []
+    if other_items:
+        out.append({"section": "Other", "items": other_items})
+
+    return out
