@@ -32,6 +32,9 @@ BASE_URL = "https://v3.football.api-sports.io"
 # - backfill/watchdog/postmatch 경로에서 INPLAY 이벤트를 건드리지 않게 보호 로직이 동작한다.
 os.environ.setdefault("LIVE_WORKER_ROLE", "backfill")
 
+# ✅ leagues(seasons) 캐시: league_id -> seasons list
+_LEAGUE_SEASONS_CACHE: Dict[int, List[Dict[str, Any]]] = {}
+
 
 
 # ─────────────────────────────────────
@@ -41,12 +44,15 @@ os.environ.setdefault("LIVE_WORKER_ROLE", "backfill")
 def _get_api_key() -> str:
     key = (
         os.environ.get("APIFOOTBALL_KEY")
+        or os.environ.get("API_FOOTBALL_KEY")
         or os.environ.get("API_KEY")
         or ""
     )
+
     if not key:
         raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_FOOTBALL_KEY / API_KEY)")
     return key
+
 
 
 def _get_headers() -> Dict[str, str]:
@@ -213,12 +219,17 @@ def _safe_get(path: str, *, params: Dict[str, Any], timeout: int = 25, max_retry
 
             # ✅ 200 OK라도 errors가 차있을 수 있음(예: season required)
             errs = data.get("errors")
+            has_err = False
             if isinstance(errs, dict) and errs:
-                print(f"[WARN] API errors on {path} params={params}: {errs}", file=sys.stderr)
+                has_err = True
             elif isinstance(errs, list) and len(errs) > 0:
-                print(f"[WARN] API errors on {path} params={params}: {errs}", file=sys.stderr)
+                has_err = True
+
+            if has_err:
+                raise RuntimeError(f"API errors on {path} params={params}: {errs}")
 
             return data
+
         except Exception as e:
             last_err = e
             time.sleep(0.7 * (i + 1))
@@ -688,6 +699,68 @@ def upsert_match_events_raw(fixture_id: int, events: List[Dict[str, Any]], fetch
         tuple(insert_vals),
     )
 
+def _table_exists(table_name: str) -> bool:
+    # information_schema 조회 결과가 비어있으면 테이블이 없다고 간주
+    cols = _get_table_columns(table_name)
+    return bool(cols)
+
+def upsert_generic_raw_snapshot(table_name: str, fixture_id: int, payload: Any, fetched_at: dt.datetime) -> None:
+    """
+    *스키마 변경 없이* raw 스냅샷 저장:
+    - table_name이 없으면 조용히 return
+    - data 컬럼 후보: data_json / raw_json / data
+    - 시간 컬럼 후보: fetched_at|fetched_utc, updated_at|updated_utc
+    """
+    if not _table_exists(table_name):
+        return
+
+    cols = set(_get_table_columns(table_name))
+
+    col_data = "data_json" if "data_json" in cols else ("raw_json" if "raw_json" in cols else ("data" if "data" in cols else None))
+    col_fetched = "fetched_at" if "fetched_at" in cols else ("fetched_utc" if "fetched_utc" in cols else None)
+    col_updated = "updated_at" if "updated_at" in cols else ("updated_utc" if "updated_utc" in cols else None)
+
+    if not col_data:
+        return
+
+    raw = json.dumps(payload if payload is not None else [], ensure_ascii=False, separators=(",", ":"))
+
+    nowu = fetched_at.astimezone(dt.timezone.utc)
+    ts_val = nowu.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    insert_cols = ["fixture_id", col_data]
+    insert_vals: List[Any] = [int(fixture_id), raw]
+
+    if col_fetched:
+        insert_cols.append(col_fetched)
+        insert_vals.append(ts_val)
+    if col_updated:
+        insert_cols.append(col_updated)
+        insert_vals.append(ts_val)
+
+    col_sql = ", ".join(insert_cols)
+    ph_sql = ", ".join(["%s"] * len(insert_cols))
+
+    if col_updated:
+        upd_set = f"{col_data} = EXCLUDED.{col_data}, {col_updated} = EXCLUDED.{col_updated}"
+        where_clause = f"{table_name}.{col_data} IS DISTINCT FROM EXCLUDED.{col_data}"
+    else:
+        upd_set = f"{col_data} = EXCLUDED.{col_data}"
+        where_clause = f"{table_name}.{col_data} IS DISTINCT FROM EXCLUDED.{col_data}"
+
+    execute(
+        f"""
+        INSERT INTO {table_name} ({col_sql})
+        VALUES ({ph_sql})
+        ON CONFLICT (fixture_id) DO UPDATE SET
+            {upd_set}
+        WHERE
+            {where_clause}
+        """,
+        tuple(insert_vals),
+    )
+
+
 def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any]]) -> int:
     """
     match_events를 fixture_id 단위로 '싹 교체'한다. (API 스냅샷 미러링)
@@ -951,9 +1024,12 @@ def upsert_match_player_stats(fixture_id: int, players_stats: List[Dict[str, Any
                 VALUES (%s, %s, %s)
                 ON CONFLICT (fixture_id, player_id) DO UPDATE SET
                     data_json = EXCLUDED.data_json
+                WHERE
+                    match_player_stats.data_json IS DISTINCT FROM EXCLUDED.data_json
                 """,
                 (fixture_id, int(player_id), json.dumps(p, ensure_ascii=False)),
             )
+
 
 def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]]) -> None:
     # standings는 league+season 단위 최종본 목적 → 통째로 교체(스테일 팀/그룹 제거)
@@ -1040,6 +1116,26 @@ def _has_any_row(table: str, fixture_id: int) -> bool:
 def has_match_events(fixture_id: int) -> bool:
     return _has_any_row("match_events", fixture_id)
 
+def has_match_events_raw(fixture_id: int) -> bool:
+    return _has_any_row("match_events_raw", fixture_id)
+
+def _has_any_row_if_table_exists(table: str, fixture_id: int) -> bool:
+    # 테이블이 없으면 "이미 있다고 치고" 백필 필요 조건에서 제외
+    if not _table_exists(table):
+        return True
+    return _has_any_row(table, fixture_id)
+
+def has_lineups_raw(fixture_id: int) -> bool:
+    return _has_any_row_if_table_exists("match_lineups_raw", fixture_id)
+
+def has_team_stats_raw(fixture_id: int) -> bool:
+    return _has_any_row_if_table_exists("match_team_stats_raw", fixture_id)
+
+def has_player_stats_raw(fixture_id: int) -> bool:
+    return _has_any_row_if_table_exists("match_player_stats_raw", fixture_id)
+
+
+
 
 def has_lineups(fixture_id: int) -> bool:
     return _has_any_row("match_lineups", fixture_id)
@@ -1075,58 +1171,88 @@ def backfill_postmatch_for_fixture(
     fixture_id: int,
     *,
     do_events: bool,
+    do_events_raw: bool,
     do_lineups: bool,
+    do_lineups_raw: bool,
     do_team_stats: bool,
+    do_team_stats_raw: bool,
     do_player_stats: bool,
+    do_player_stats_raw: bool,
 ) -> None:
-    if do_events:
+    fetched_at = now_utc()
+
+    # events / events_raw
+    if do_events or do_events_raw:
         try:
             events = fetch_events_from_api(fixture_id)
         except Exception as e:
             print(f"    ! fixture {fixture_id}: events 호출 에러: {e}", file=sys.stderr)
             events = []
 
-        # ✅ raw는 events가 비어도 저장(복구/디버그 가치)
-        try:
-            upsert_match_events_raw(fixture_id, events, now_utc())
-        except Exception:
-            pass
-
-        # ✅ live 최신 정책: events==[]면 DB match_events는 건드리지 않음
-        try:
-            inserted = replace_match_events_for_fixture(fixture_id, events)
-            if inserted:
+        if do_events_raw:
+            try:
+                upsert_match_events_raw(fixture_id, events, fetched_at)
+            except Exception:
                 pass
-        except Exception:
-            pass
 
+        if do_events:
+            try:
+                replace_match_events_for_fixture(fixture_id, events)
+            except Exception:
+                pass
 
-    if do_lineups:
+    # lineups / lineups_raw
+    if do_lineups or do_lineups_raw:
         try:
             lineups = fetch_lineups_from_api(fixture_id)
         except Exception as e:
             print(f"    ! fixture {fixture_id}: lineups 호출 에러: {e}", file=sys.stderr)
             lineups = []
-        if lineups:
+
+        if do_lineups_raw:
+            try:
+                upsert_generic_raw_snapshot("match_lineups_raw", fixture_id, lineups, fetched_at)
+            except Exception:
+                pass
+
+        if do_lineups and lineups:
             upsert_match_lineups(fixture_id, lineups)
 
-    if do_team_stats:
+    # team stats / team_stats_raw
+    if do_team_stats or do_team_stats_raw:
         try:
             stats = fetch_team_stats_from_api(fixture_id)
         except Exception as e:
             print(f"    ! fixture {fixture_id}: statistics 호출 에러: {e}", file=sys.stderr)
             stats = []
-        if stats:
+
+        if do_team_stats_raw:
+            try:
+                upsert_generic_raw_snapshot("match_team_stats_raw", fixture_id, stats, fetched_at)
+            except Exception:
+                pass
+
+        if do_team_stats and stats:
             upsert_match_team_stats(fixture_id, stats)
 
-    if do_player_stats:
+    # player stats / player_stats_raw
+    if do_player_stats or do_player_stats_raw:
         try:
             players_stats = fetch_player_stats_from_api(fixture_id)
         except Exception as e:
             print(f"    ! fixture {fixture_id}: players 호출 에러: {e}", file=sys.stderr)
             players_stats = []
-        if players_stats:
+
+        if do_player_stats_raw:
+            try:
+                upsert_generic_raw_snapshot("match_player_stats_raw", fixture_id, players_stats, fetched_at)
+            except Exception:
+                pass
+
+        if do_player_stats and players_stats:
             upsert_match_player_stats(fixture_id, players_stats)
+
+
 
 
 
@@ -1222,33 +1348,61 @@ def main() -> None:
                         pass
 
                     need_events = force or (not has_match_events(fixture_id))
-
+                    need_events_raw = force or (not has_match_events_raw(fixture_id))
                     need_lineups = force or (not has_lineups(fixture_id))
                     need_team_stats = force or (not has_team_stats(fixture_id))
                     need_player_stats = force or (not has_player_stats(fixture_id))
+                    need_lineups_raw = force or (not has_lineups_raw(fixture_id))
+                    need_team_stats_raw = force or (not has_team_stats_raw(fixture_id))
+                    need_player_stats_raw = force or (not has_player_stats_raw(fixture_id))
 
-                    if not (need_events or need_lineups or need_team_stats or need_player_stats):
+                    if not (
+                        need_events or need_events_raw
+                        or need_lineups or need_lineups_raw
+                        or need_team_stats or need_team_stats_raw
+                        or need_player_stats or need_player_stats_raw
+                    ):
                         total_skipped += 1
                         continue
+
+
 
                     todo = []
                     if need_events:
                         todo.append("events")
+                    elif need_events_raw:
+                        todo.append("events_raw")
+
                     if need_lineups:
                         todo.append("lineups")
+                    elif need_lineups_raw:
+                        todo.append("lineups_raw")
+
                     if need_team_stats:
                         todo.append("team_stats")
+                    elif need_team_stats_raw:
+                        todo.append("team_stats_raw")
+
                     if need_player_stats:
                         todo.append("player_stats")
+                    elif need_player_stats_raw:
+                        todo.append("player_stats_raw")
+
 
                     print(f"    * fixture {fixture_id}: backfill={'+'.join(todo)}")
                     backfill_postmatch_for_fixture(
                         fixture_id,
                         do_events=need_events,
+                        do_events_raw=need_events_raw,
                         do_lineups=need_lineups,
+                        do_lineups_raw=need_lineups_raw,
                         do_team_stats=need_team_stats,
+                        do_team_stats_raw=need_team_stats_raw,
                         do_player_stats=need_player_stats,
+                        do_player_stats_raw=need_player_stats_raw,
                     )
+
+
                     total_new += 1
 
             except Exception as e:
@@ -1373,34 +1527,62 @@ def main() -> None:
                         pass
 
                     need_events = force or (not has_match_events(fixture_id))
-
+                    need_events_raw = force or (not has_match_events_raw(fixture_id))
                     need_lineups = force or (not has_lineups(fixture_id))
                     need_team_stats = force or (not has_team_stats(fixture_id))
                     need_player_stats = force or (not has_player_stats(fixture_id))
+                    need_lineups_raw = force or (not has_lineups_raw(fixture_id))
+                    need_team_stats_raw = force or (not has_team_stats_raw(fixture_id))
+                    need_player_stats_raw = force or (not has_player_stats_raw(fixture_id))
 
-                    if not (need_events or need_lineups or need_team_stats or need_player_stats):
+                    if not (
+                        need_events or need_events_raw
+                        or need_lineups or need_lineups_raw
+                        or need_team_stats or need_team_stats_raw
+                        or need_player_stats or need_player_stats_raw
+                    ):
                         total_skipped += 1
                         continue
+
+
 
 
                     todo = []
                     if need_events:
                         todo.append("events")
+                    elif need_events_raw:
+                        todo.append("events_raw")
+
                     if need_lineups:
                         todo.append("lineups")
+                    elif need_lineups_raw:
+                        todo.append("lineups_raw")
+
                     if need_team_stats:
                         todo.append("team_stats")
+                    elif need_team_stats_raw:
+                        todo.append("team_stats_raw")
+
                     if need_player_stats:
                         todo.append("player_stats")
+                    elif need_player_stats_raw:
+                        todo.append("player_stats_raw")
+
 
                     print(f"    * fixture {fixture_id}: backfill={'+'.join(todo)}")
                     backfill_postmatch_for_fixture(
                         fixture_id,
                         do_events=need_events,
+                        do_events_raw=need_events_raw,
                         do_lineups=need_lineups,
+                        do_lineups_raw=need_lineups_raw,
                         do_team_stats=need_team_stats,
+                        do_team_stats_raw=need_team_stats_raw,
                         do_player_stats=need_player_stats,
+                        do_player_stats_raw=need_player_stats_raw,
                     )
+
+
                     total_new += 1
 
             except Exception as e:
