@@ -491,18 +491,118 @@ def get_home_leagues(
 def get_home_league_directory(
     date_str: Optional[str],
     timezone_str: str,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    ✅ 서버 단일 기준(home_config.py)을 따르는 리그 디렉터리(필터용)
+    ✅ 리그 선택 바텀시트(스크린샷 구조 지원)
 
-    - 대륙 순서: Europe > Asia > Americas
-    - 대륙컵은 각 대륙 내부에 포함
-    - 유럽: 5대리그 고정 + 나머지 1부 A~Z + 2부 A~Z
-    - 아시아/아메리카: 1부 A~Z + 2부 A~Z
+    반환(rows):
+      {
+        "today": [
+          {"continent": "Europe", "count": 8, "items": [ ... ]},
+          {"continent": "Asia", "count": 2, "items": [ ... ]},
+          ...
+        ],
+        "no_games": [
+          {"continent": "Europe", "count": 16, "items": [ ... ]},
+          {"continent": "Asia", "count": 8, "items": [ ... ]},
+          {"continent": "Americas", "count": 6, "items": [ ... ]},
+          ...
+        ]
+      }
+
+    - today: 오늘(사용자 로컬 date) 경기 있는 리그들
+    - no_games: 오늘 경기 없는 리그들
+    - 정렬/대륙/티어 규칙은 home_config.filter_order 기반(=build_league_directory_from_config 결과) 그대로 사용
     """
-    from services.home_config import build_league_directory_from_config
+    from services.home_config import (
+        SUPPORTED_LEAGUE_IDS,
+        CONTINENT_ORDER,
+        build_league_directory_from_config,
+    )
 
-    return build_league_directory_from_config(date_str=date_str, timezone_str=timezone_str)
+    # 1) config 기준 "전체" 디렉터리 (대륙/정렬 규칙 반영된 섹션 리스트)
+    #    full_sections: [{"section": "Europe", "items": [...]}, ...]
+    full_sections = build_league_directory_from_config(
+        date_str=date_str,
+        timezone_str=timezone_str,
+    )
+
+    # 2) 오늘(로컬 date) 기준 UTC 범위
+    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+
+    supported: List[int] = []
+    for x in (SUPPORTED_LEAGUE_IDS or []):
+        try:
+            supported.append(int(x))
+        except (TypeError, ValueError):
+            continue
+
+    if not supported:
+        return {"today": [], "no_games": []}
+
+    # 3) 오늘 경기 있는 league_id 집합 계산 (matches 기준)
+    placeholders = ", ".join(["%s"] * len(supported))
+    params: List[Any] = [utc_start, utc_end]
+    params.extend(supported)
+
+    rows = fetch_all(
+        f"""
+        SELECT DISTINCT m.league_id
+        FROM matches m
+        WHERE m.date_utc::timestamptz BETWEEN %s AND %s
+          AND m.league_id IN ({placeholders})
+        """,
+        tuple(params),
+    )
+
+    today_ids: set[int] = set()
+    for r in rows:
+        try:
+            today_ids.add(int(r.get("league_id")))
+        except Exception:
+            continue
+
+    # 4) full_sections 를 today / no_games 로 분리 + count 부착
+    today_out: List[Dict[str, Any]] = []
+    nog_out: List[Dict[str, Any]] = []
+
+    for sec in (full_sections or []):
+        continent = (sec.get("section") or "").strip()
+        items = sec.get("items") or []
+
+        if not continent or not isinstance(items, list):
+            continue
+
+        today_items: List[Dict[str, Any]] = []
+        nog_items: List[Dict[str, Any]] = []
+
+        for it in items:
+            lid = it.get("league_id")
+            try:
+                lid_int = int(lid)
+            except Exception:
+                continue
+
+            if lid_int in today_ids:
+                today_items.append(it)
+            else:
+                nog_items.append(it)
+
+        if today_items:
+            today_out.append({"continent": continent, "count": len(today_items), "items": today_items})
+        if nog_items:
+            nog_out.append({"continent": continent, "count": len(nog_items), "items": nog_items})
+
+    # 5) 대륙 순서 고정 (Europe > Asia > Americas)
+    order_idx: Dict[str, int] = {}
+    for i, c in enumerate(CONTINENT_ORDER or []):
+        order_idx[str(c)] = i
+
+    today_out.sort(key=lambda x: order_idx.get(str(x.get("continent")), 999))
+    nog_out.sort(key=lambda x: order_idx.get(str(x.get("continent")), 999))
+
+    return {"today": today_out, "no_games": nog_out}
+
 
 
 
