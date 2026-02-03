@@ -35,6 +35,160 @@ os.environ.setdefault("LIVE_WORKER_ROLE", "backfill")
 # ✅ leagues(seasons) 캐시: league_id -> seasons list
 _LEAGUE_SEASONS_CACHE: Dict[int, List[Dict[str, Any]]] = {}
 
+# ─────────────────────────────────────
+#  ✅ Teams / Leagues meta backfill (ADD ONLY)
+# ─────────────────────────────────────
+
+def _chunked(xs: List[int], size: int) -> List[List[int]]:
+    out: List[List[int]] = []
+    cur: List[int] = []
+    for x in xs:
+        cur.append(int(x))
+        if len(cur) >= size:
+            out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _missing_team_ids(team_ids: List[int]) -> List[int]:
+    if not team_ids:
+        return []
+    rows = fetch_all(
+        "SELECT id FROM teams WHERE id = ANY(%s)",
+        (team_ids,),
+    )
+    existing = {int(r["id"]) for r in (rows or []) if r and r.get("id") is not None}
+    return [tid for tid in team_ids if int(tid) not in existing]
+
+
+def _missing_league_ids_or_logo(league_ids: List[int]) -> List[int]:
+    """
+    leagues row가 없거나, logo가 비어있는 league_id만 리턴
+    """
+    if not league_ids:
+        return []
+    rows = fetch_all(
+        "SELECT id, logo FROM leagues WHERE id = ANY(%s)",
+        (league_ids,),
+    )
+    have = {}
+    for r in (rows or []):
+        if not r or r.get("id") is None:
+            continue
+        have[int(r["id"])] = (r.get("logo") or "").strip()
+
+    out: List[int] = []
+    for lid in league_ids:
+        logo = have.get(int(lid))
+        if logo is None or logo == "":
+            out.append(int(lid))
+    return out
+
+
+def _upsert_team_from_api(team_obj: Dict[str, Any]) -> None:
+    """
+    API /teams response element: {"team": {...}, "venue": {...}} 형태
+    teams 테이블 스키마: id, name, country, logo
+    """
+    t = team_obj.get("team") or {}
+    tid = t.get("id")
+    if tid is None:
+        return
+    name = t.get("name")
+    country = t.get("country")
+    logo = t.get("logo")
+
+    execute(
+        """
+        INSERT INTO teams (id, name, country, logo)
+        VALUES (%s,%s,%s,%s)
+        ON CONFLICT (id) DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name,''), teams.name),
+            country = COALESCE(NULLIF(EXCLUDED.country,''), teams.country),
+            logo = COALESCE(NULLIF(EXCLUDED.logo,''), teams.logo)
+        """,
+        (int(tid), name, country, logo),
+    )
+
+
+def _upsert_league_from_api(league_resp0: Dict[str, Any]) -> None:
+    """
+    API /leagues?id=xxx response[0] 형태:
+      { "league": {...}, "country": {...}, "seasons": [...] }
+    leagues 테이블 스키마: id, name, country, logo
+    """
+    lg = league_resp0.get("league") or {}
+    lid = lg.get("id")
+    if lid is None:
+        return
+
+    name = lg.get("name")
+    logo = lg.get("logo")
+
+    c = league_resp0.get("country") or {}
+    country_name = c.get("name") or None
+
+    execute(
+        """
+        INSERT INTO leagues (id, name, country, logo)
+        VALUES (%s,%s,%s,%s)
+        ON CONFLICT (id) DO UPDATE SET
+            name = COALESCE(NULLIF(EXCLUDED.name,''), leagues.name),
+            country = COALESCE(NULLIF(EXCLUDED.country,''), leagues.country),
+            logo = COALESCE(NULLIF(EXCLUDED.logo,''), leagues.logo)
+        """,
+        (int(lid), name, country_name, logo),
+    )
+
+
+def backfill_teams_meta(team_ids: List[int]) -> None:
+    """
+    team_ids 중 teams 테이블에 없는 것만 /teams?id= 로 채운다.
+    """
+    team_ids = sorted({int(x) for x in (team_ids or []) if x is not None})
+    missing = _missing_team_ids(team_ids)
+    if not missing:
+        return
+
+    print(f"[meta] missing teams: {len(missing)}")
+
+    # API-Sports는 id 파라미터에 여러 개를 콤마로 받는 경우가 많음.
+    # 안전하게 20개씩 쪼개 호출.
+    for batch in _chunked(missing, 20):
+        try:
+            data = _safe_get("/teams", params={"id": ",".join(map(str, batch))})
+            resp = data.get("response") or []
+            for r in resp:
+                if isinstance(r, dict):
+                    _upsert_team_from_api(r)
+        except Exception as e:
+            print(f"[meta] teams batch failed ids={batch}: {e}", file=sys.stderr)
+
+
+def backfill_leagues_meta(league_ids: List[int]) -> None:
+    """
+    league_ids 중 leagues 테이블 row가 없거나 logo가 빈 것만 /leagues?id= 로 채운다.
+    """
+    league_ids = sorted({int(x) for x in (league_ids or []) if x is not None})
+    missing = _missing_league_ids_or_logo(league_ids)
+    if not missing:
+        return
+
+    print(f"[meta] missing leagues/logo: {len(missing)}")
+
+    # leagues는 보통 id 단건 호출이 확실해서 1개씩
+    for lid in missing:
+        try:
+            data = _safe_get("/leagues", params={"id": int(lid)})
+            resp = data.get("response") or []
+            if resp and isinstance(resp, list) and isinstance(resp[0], dict):
+                _upsert_league_from_api(resp[0])
+        except Exception as e:
+            print(f"[meta] leagues fetch failed id={lid}: {e}", file=sys.stderr)
+
+
 
 
 # ─────────────────────────────────────
@@ -1290,6 +1444,11 @@ def main() -> None:
 
     fetched_standings_keys = set()  # (league_id, season) 중복 호출 방지
 
+    # ✅ 이번 실행에서 만난 팀/리그 id 수집 → 마지막에 meta backfill
+    seen_team_ids: set[int] = set()
+    seen_league_ids: set[int] = set()
+
+
     # ─────────────────────────────────────
     #  ✅ 시즌 모드: league + season 전체(FT) 백필
     # ─────────────────────────────────────
@@ -1321,6 +1480,15 @@ def main() -> None:
 
                     fixture_id = basic["fixture_id"]
                     sg = (basic.get("status_group") or "").strip()
+
+                    # ✅ meta 수집
+                    if basic.get("league_id") is not None:
+                        seen_league_ids.add(int(basic["league_id"]))
+                    if basic.get("home_id") is not None:
+                        seen_team_ids.add(int(basic["home_id"]))
+                    if basic.get("away_id") is not None:
+                        seen_team_ids.add(int(basic["away_id"]))
+
 
                     # ✅ 시즌 모드에서는 season을 target_season으로 고정
                     season = int(target_season)
@@ -1409,6 +1577,15 @@ def main() -> None:
                 print(f"  ! season={target_season} league {lid} 처리 중 에러: {e}", file=sys.stderr)
 
         print(f"[postmatch_backfill] 완료. 신규={total_new}, 스킵={total_skipped}")
+        # ✅ meta backfill (teams/leagues)
+        try:
+            if seen_league_ids:
+                backfill_leagues_meta(sorted(seen_league_ids))
+            if seen_team_ids:
+                backfill_teams_meta(sorted(seen_team_ids))
+        except Exception as me:
+            print(f"[meta] backfill failed: {me}", file=sys.stderr)
+
         return
 
     # ─────────────────────────────────────
@@ -1500,6 +1677,15 @@ def main() -> None:
                     fixture_id = basic["fixture_id"]
                     sg = (basic.get("status_group") or "").strip()
 
+                    # ✅ meta 수집
+                    if basic.get("league_id") is not None:
+                        seen_league_ids.add(int(basic["league_id"]))
+                    if basic.get("home_id") is not None:
+                        seen_team_ids.add(int(basic["home_id"]))
+                    if basic.get("away_id") is not None:
+                        seen_team_ids.add(int(basic["away_id"]))
+
+
                     season = basic.get("season") or season_guess
                     if season is None:
                         continue
@@ -1587,6 +1773,16 @@ def main() -> None:
 
             except Exception as e:
                 print(f"  ! date={target_date} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+    # ✅ meta backfill (teams/leagues)
+    try:
+        if seen_league_ids:
+            backfill_leagues_meta(sorted(seen_league_ids))
+        if seen_team_ids:
+            backfill_teams_meta(sorted(seen_team_ids))
+    except Exception as me:
+        print(f"[meta] backfill failed: {me}", file=sys.stderr)
+
 
     print(f"[postmatch_backfill] 완료. 신규={total_new}, 스킵={total_skipped}")
 
