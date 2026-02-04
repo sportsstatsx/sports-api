@@ -116,6 +116,181 @@ def _fetch_legs_by_tie_id(league_id: int, season: int) -> Dict[int, List[Dict[st
     return out
 
 
+# ─────────────────────────────────────────
+# 정식 정렬 규칙(고정)
+# 1) stage 우선순위: Regular -> Playoffs/Post -> Pre -> 기타(알파벳)
+# 2) group 우선순위(동일 stage): Division(기본) -> Conference -> Overall -> 기타
+#    (NHL 기본 정렬 포함: Atlantic/Metropolitan/Central/Pacific, Eastern/Western)
+# ─────────────────────────────────────────
+def _stage_rank(stage: str) -> tuple[int, str]:
+    s0 = (stage or "").strip().lower()
+
+    if "regular" in s0:
+        return (1, s0)
+    if "playoff" in s0 or "post" in s0 or "final" in s0:
+        return (2, s0)
+    if "pre" in s0 or "exhibition" in s0:
+        return (3, s0)
+    return (9, s0)
+
+
+def _group_rank(group_name: str) -> tuple[int, str]:
+    g0 = (group_name or "").strip().lower()
+
+    # 기본: 디비전 먼저
+    if "division" in g0:
+        # NHL 디비전 정식 순서 고정
+        order = {
+            "atlantic division": 1,
+            "metropolitan division": 2,
+            "central division": 3,
+            "pacific division": 4,
+        }
+        return (1, str(order.get(g0, 99)).zfill(2) + "_" + g0)
+
+    if "conference" in g0:
+        order = {
+            "eastern conference": 1,
+            "western conference": 2,
+        }
+        return (2, str(order.get(g0, 99)).zfill(2) + "_" + g0)
+
+    # 전체/통합 느낌(리그마다 다르니 최소 규칙만)
+    if g0 in ("overall", "all", "total") or "overall" in g0:
+        return (3, g0)
+
+    return (9, g0)
+
+
+def _is_finished_status(status: Any) -> bool:
+    s = (status or "")
+    s = str(s).strip().upper()
+    return s in ("FT", "AOT", "AP", "AET", "PEN", "FIN", "END", "ENDED")
+
+
+def _build_regular_stats_map_from_games(
+    league_id: int,
+    season: int,
+    regular_start_utc: datetime,
+) -> Dict[int, Dict[str, Optional[int]]]:
+    """
+    정규시즌 시작(UTC) 이후의 '종료 경기'만으로 팀별 누적 스탯을 재계산한다.
+
+    ✅ 표기 정책(중요):
+    - wins/losses는 "정규(레귤러 타임) 승/패" 로 반환 (OTW/OTL은 별도)
+      => wins = total_wins - ot_wins
+      => losses = total_losses - ot_losses
+    - points는 NHL/AHL 기준으로:
+      points = (total_wins * 2) + (ot_losses * 1)
+      (여기서 total_wins = reg_wins + ot_wins)
+    """
+    games = hockey_fetch_all(
+        """
+        SELECT
+            home_team_id,
+            away_team_id,
+            status,
+            score_json
+        FROM hockey_games
+        WHERE league_id = %s
+          AND season = %s
+          AND game_date >= %s
+        """,
+        (league_id, season, regular_start_utc),
+    )
+
+    # team_id -> accumulator
+    acc: Dict[int, Dict[str, int]] = {}
+
+    def ensure(tid: int) -> Dict[str, int]:
+        if tid not in acc:
+            acc[tid] = {
+                "played": 0,
+                "total_wins": 0,     # ✅ 정규+OT 포함 승
+                "total_losses": 0,   # ✅ 정규+OT 포함 패
+                "ot_wins": 0,
+                "ot_losses": 0,
+                "gf": 0,
+                "ga": 0,
+            }
+        return acc[tid]
+
+    for g in games:
+        status = g.get("status")
+        if not _is_finished_status(status):
+            continue
+
+        sj = g.get("score_json") or {}
+        try:
+            hs = sj.get("home")
+            as_ = sj.get("away")
+            if hs is None or as_ is None:
+                continue
+            hs_i = int(hs) if not isinstance(hs, dict) else int(hs.get("total") or hs.get("goals") or hs.get("score"))
+            as_i = int(as_) if not isinstance(as_, dict) else int(as_.get("total") or as_.get("goals") or as_.get("score"))
+        except Exception:
+            continue
+
+        home_id = _safe_int(g.get("home_team_id"))
+        away_id = _safe_int(g.get("away_team_id"))
+        if home_id is None or away_id is None:
+            continue
+
+        st = str(status).strip().upper()
+        is_ot_bucket = st in ("AOT", "AP", "PEN", "AET")  # ✅ OT/SO로 처리
+
+        # HOME 누적
+        h = ensure(home_id)
+        h["played"] += 1
+        h["gf"] += hs_i
+        h["ga"] += as_i
+
+        # AWAY 누적
+        a = ensure(away_id)
+        a["played"] += 1
+        a["gf"] += as_i
+        a["ga"] += hs_i
+
+        if hs_i > as_i:
+            h["total_wins"] += 1
+            a["total_losses"] += 1
+            if is_ot_bucket:
+                h["ot_wins"] += 1
+                a["ot_losses"] += 1
+        elif hs_i < as_i:
+            a["total_wins"] += 1
+            h["total_losses"] += 1
+            if is_ot_bucket:
+                a["ot_wins"] += 1
+                h["ot_losses"] += 1
+
+    out: Dict[int, Dict[str, Optional[int]]] = {}
+    for tid, a in acc.items():
+        played = a["played"]
+        total_wins = a["total_wins"]
+        total_losses = a["total_losses"]
+        ot_wins = a["ot_wins"]
+        ot_losses = a["ot_losses"]
+
+        # ✅ 표기용 정규 승/패
+        reg_wins = total_wins - ot_wins
+        reg_losses = total_losses - ot_losses
+
+        # ✅ 포인트는 "전체 승" 기준
+        points = (total_wins * 2) + (ot_losses * 1)
+
+        out[tid] = {
+            "played": played,
+            "wins": reg_wins,          # ✅ W는 정규승
+            "losses": reg_losses,      # ✅ L은 정규패
+            "ot_wins": ot_wins,
+            "ot_losses": ot_losses,
+            "points": points,
+            "gf": a["gf"],
+            "ga": a["ga"],
+        }
+
+    return out
 
 
 
