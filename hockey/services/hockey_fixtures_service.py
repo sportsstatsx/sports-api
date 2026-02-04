@@ -17,7 +17,38 @@ def hockey_get_fixtures_by_utc_range(
 
     - hockey_games + hockey_teams + hockey_leagues 조인
     - score는 raw_json(scores.home/away)에서 우선 추출 (없으면 null)
+    - ✅ round/week(라운드) 정보: raw_json->>'week' 에서 추출해서 내려준다.
     """
+
+    def _normalize_round_chip(week_val: Optional[str]) -> Optional[str]:
+        """
+        API-Sports hockey games 응답의 week 값을 라운드 칩 표기로 정규화.
+        예)
+          - "Quarter-finals" / "DEL2 - Quarter-finals" -> "QF"
+          - "Semi-finals" -> "SF"
+          - "Final" -> "Final"
+          - "35" -> "R35"
+        """
+        if week_val is None:
+            return None
+        w = str(week_val).strip()
+        if not w:
+            return None
+
+        # 숫자 week => 라운드 숫자
+        if w.isdigit():
+            return f"R{w}"
+
+        wl = w.lower()
+        if "quarter" in wl:
+            return "QF"
+        if "semi" in wl:
+            return "SF"
+        if "final" in wl:
+            return "Final"
+
+        # 기타 텍스트는 원문 유지(필요 시 추후 룰 추가)
+        return w
 
     params: List[Any] = [utc_start, utc_end]
     where_clauses: List[str] = ["(g.game_date::timestamptz >= %s AND g.game_date::timestamptz < %s)"]
@@ -34,6 +65,7 @@ def hockey_get_fixtures_by_utc_range(
 
     # ✅ 핵심: teams/leagues 테이블이 있으니 정식 JOIN 구조로 간다.
     # 점수는 raw_json 기반으로 최대한 안전하게 추출 (raw_json이 text여도 ::jsonb 캐스팅)
+    # ✅ 라운드(week): raw_json->>'week' 로 추출
     sql = f"""
         SELECT
             g.id AS game_id,
@@ -57,6 +89,8 @@ def hockey_get_fixtures_by_utc_range(
             ta.name AS away_name,
             ta.logo AS away_logo,
 
+            (g.raw_json::jsonb ->> 'week') AS week,
+
             COALESCE(
                 NULLIF((g.score_json ->> 'home'), '')::int,
                 CASE
@@ -72,7 +106,6 @@ def hockey_get_fixtures_by_utc_range(
                     ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'away'), '')::int
                 END
             ) AS away_score
-
 
         FROM hockey_games g
         JOIN hockey_teams th ON th.id = g.home_team_id
@@ -102,7 +135,7 @@ def hockey_get_fixtures_by_utc_range(
         else:
             dt_iso = None
 
-                # ✅ 종료 정규화:
+        # ✅ 종료 정규화:
         # API-Sports가 "AOT(After Over Time)" / "AP(After Penalties)"로 멈춰있어도
         # 우리 앱 UX에서는 "종료"로 취급해야 함.
         raw_status = (r.get("status") or "").strip().upper()
@@ -114,7 +147,6 @@ def hockey_get_fixtures_by_utc_range(
 
         if raw_status in ("AOT", "AP"):
             norm_status = "FT"
-            # status_long은 굳이 바꿀 필요 없지만, 앱에서 "진행중"처럼 보이는 원인이면 Finished로 통일
             if not norm_status_long or norm_status_long in ("After Over Time", "After Penalties"):
                 norm_status_long = "Finished"
 
@@ -133,6 +165,12 @@ def hockey_get_fixtures_by_utc_range(
         if norm_status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
             status_long_out = f"{norm_status_long} {clock_text}"
 
+        # ✅ week / round 표기 (ADD ONLY)
+        week_raw = r.get("week")
+        week_raw_str = str(week_raw).strip() if week_raw is not None else ""
+        round_raw = week_raw_str if week_raw_str else None
+        round_chip = _normalize_round_chip(round_raw)
+
         fixtures.append(
             {
                 "game_id": r["game_id"],
@@ -143,6 +181,12 @@ def hockey_get_fixtures_by_utc_range(
                 "status_long": status_long_out,
                 "clock": clock_text or None,
                 "timer": live_timer or None,
+
+                # ✅ 라운드/주차 원문 + 칩 표기 (ADD ONLY)
+                "week": round_raw,
+                "round_raw": round_raw,
+                "round_chip": round_chip,
+
                 "league": {
                     "id": r["league_id2"],
                     "name": r["league_name"],
@@ -164,5 +208,5 @@ def hockey_get_fixtures_by_utc_range(
             }
         )
 
-
     return fixtures
+
