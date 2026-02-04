@@ -18,6 +18,69 @@ def _safe_int(v: Any) -> Optional[int]:
 
 
 # ─────────────────────────────────────────
+# ✅ Playoffs Bracket: tie -> legs join (DB only)
+# - 정규리그 혼입 차단: (g.raw_json->>'week') = t.round
+# ─────────────────────────────────────────
+def _fetch_legs_by_tie_id(league_id: int, season: int) -> Dict[int, List[Dict[str, Any]]]:
+    rows = hockey_fetch_all(
+        """
+        SELECT
+            t.id AS tie_id,
+            g.id AS game_id,
+            g.game_date,
+            g.home_team_id,
+            g.away_team_id,
+            g.home_score,
+            g.away_score,
+            g.status,
+            ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY g.game_date, g.id) AS leg_index
+        FROM hockey_tournament_ties t
+        JOIN hockey_games g
+          ON g.league_id = t.league_id
+         AND g.season   = t.season
+         AND g.game_date BETWEEN t.first_game AND t.last_game
+         AND (
+              (g.home_team_id = t.team1_id AND g.away_team_id = t.team2_id)
+           OR (g.home_team_id = t.team2_id AND g.away_team_id = t.team1_id)
+         )
+         AND (g.raw_json->>'week') = t.round
+        WHERE t.league_id = %s
+          AND t.season   = %s
+        ORDER BY t.id, leg_index
+        """,
+        (league_id, season),
+    )
+
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for r in rows:
+        tie_id = _safe_int(r.get("tie_id"))
+        if tie_id is None:
+            continue
+
+        gd = r.get("game_date")
+        if gd is not None and hasattr(gd, "isoformat"):
+            date_iso = gd.isoformat().replace("+00:00", "Z")
+        else:
+            date_iso = gd
+
+        out.setdefault(tie_id, []).append(
+            {
+                "leg_index": _safe_int(r.get("leg_index")) or 0,
+                "game_id": _safe_int(r.get("game_id")),
+                "date": date_iso,
+                "home_team_id": _safe_int(r.get("home_team_id")),
+                "away_team_id": _safe_int(r.get("away_team_id")),
+                "home_score": _safe_int(r.get("home_score")),
+                "away_score": _safe_int(r.get("away_score")),
+                "status": r.get("status"),
+            }
+        )
+
+    return out
+
+
+
+# ─────────────────────────────────────────
 # 정식 정렬 규칙(고정)
 # 1) stage 우선순위: Regular -> Playoffs/Post -> Pre -> 기타(알파벳)
 # 2) group 우선순위(동일 stage): Division(기본) -> Conference -> Overall -> 기타
@@ -243,6 +306,7 @@ def hockey_get_standings(
         tie_rows = hockey_fetch_all(
             """
             SELECT
+                t.id AS tie_id,
                 t.round,
                 t.team1_id,
                 t.team2_id,
@@ -276,10 +340,16 @@ def hockey_get_standings(
             (league_id, season),
         )
 
+
         if tie_rows:
+            # ✅ tie_id -> legs[]
+            legs_map = _fetch_legs_by_tie_id(league_id=league_id, season=season)
+
             rounds_map: Dict[str, List[Dict[str, Any]]] = {}
             for tr in tie_rows:
                 rname = (tr.get("round") or "").strip() or "Unknown"
+                tie_id = _safe_int(tr.get("tie_id"))
+
                 rounds_map.setdefault(rname, []).append(
                     {
                         "round": rname,
@@ -300,9 +370,12 @@ def hockey_get_standings(
                             "winner_team_id": _safe_int(tr.get("winner_team_id")),
                             "first_game": (tr.get("first_game").isoformat().replace("+00:00", "Z") if tr.get("first_game") else None),
                             "last_game": (tr.get("last_game").isoformat().replace("+00:00", "Z") if tr.get("last_game") else None),
+                            # ✅ legs (정규리그 혼입 차단: week==round 조건으로만 매칭된 경기들)
+                            "legs": (legs_map.get(tie_id, []) if tie_id is not None else []),
                         },
                     }
                 )
+
 
             # round 순서 고정
             round_order = ["Quarter-finals", "Semi-finals", "Final", "3rd place"]
