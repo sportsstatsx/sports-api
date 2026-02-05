@@ -91,6 +91,11 @@ def hockey_get_fixtures_by_utc_range(
 
             (g.raw_json::jsonb ->> 'week') AS week,
 
+            -- ✅ [ADD] BT 조립용: period score 존재 여부만 확인 (1P/2P까지만)
+            (g.raw_json::jsonb -> 'periods' ->> 'first')  AS period_first,
+            (g.raw_json::jsonb -> 'periods' ->> 'second') AS period_second,
+            (g.raw_json::jsonb -> 'periods' ->> 'third')  AS period_third,
+
             COALESCE(
                 NULLIF((g.score_json ->> 'home'), '')::int,
                 CASE
@@ -98,6 +103,7 @@ def hockey_get_fixtures_by_utc_range(
                     ELSE NULLIF((g.raw_json::jsonb -> 'scores' ->> 'home'), '')::int
                 END
             ) AS home_score,
+
 
             COALESCE(
                 NULLIF((g.score_json ->> 'away'), '')::int,
@@ -162,8 +168,30 @@ def hockey_get_fixtures_by_utc_range(
                     clock_text = live_timer
 
         status_long_out = norm_status_long
+
+        # ✅ LIVE(진행중)면 status_long에 timer 붙이기
         if norm_status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
             status_long_out = f"{norm_status_long} {clock_text}"
+
+        # ✅ [ADD] BT(Break Time)일 때: "BT 1P End" / "BT 2P End" (요구사항: 1~2P까지만)
+        # - period_first/second는 DB raw_json.periods의 값이 null이면 비어있게 옴
+        # - third가 0:0으로 와도 우리는 "3P End"는 절대 만들지 않음
+        if norm_status == "BT":
+            p1 = (r.get("period_first") or "").strip()
+            p2 = (r.get("period_second") or "").strip()
+
+            end_label = ""
+            if p2:
+                end_label = "2P End"
+            elif p1:
+                end_label = "1P End"
+
+            # end_label 못 만들면 "Break Time" 유지(Intermission 금지 요구 반영은 앱에서)
+            if end_label:
+                status_long_out = f"BT {end_label}"
+            else:
+                status_long_out = "Break Time"
+
 
         # ✅ week / round 표기 (ADD ONLY)
         week_raw = r.get("week")
