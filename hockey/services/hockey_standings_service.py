@@ -292,6 +292,22 @@ def _build_regular_stats_map_from_games(
 
     return out
 
+def _get_standings_fetch_state(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    return hockey_fetch_one(
+        """
+        SELECT
+          league_id, season,
+          last_status,
+          last_fetch_ts,
+          last_success_ts,
+          last_row_count,
+          last_error
+        FROM hockey_standings_fetch_state
+        WHERE league_id=%s AND season=%s
+        LIMIT 1
+        """,
+        (league_id, season),
+    )
 
 
 def hockey_get_standings(
@@ -448,6 +464,59 @@ def hockey_get_standings(
     # ─────────────────────────────────────────
     # 기존 standings 로직 (그대로)
     # ─────────────────────────────────────────
+
+    # ─────────────────────────────────────────
+    # ✅ NEW: standings source availability gate (DB fetch_state 기준)
+    # - API가 빈 응답이면 워커가 last_status='empty'로 기록함
+    # - 이 경우 DB에 남아있는 과거 standings를 그대로 노출하면 "틀린 순위"가 될 수 있으니
+    #   stages를 비워서 앱이 스탠딩 UI를 숨길 수 있게 한다.
+    # ─────────────────────────────────────────
+    st_state = _get_standings_fetch_state(league_id=league_id, season=season)
+
+    if st_state:
+        last_status = (st_state.get("last_status") or "").strip().lower()
+        if last_status in ("empty", "error"):
+            msg = "Standings are temporarily unavailable."
+            if last_status == "error":
+                msg = "Standings are temporarily unavailable."
+
+            return {
+                "ok": True,
+                "available": False,
+                "message": msg,
+                "league": {
+                    "id": league["id"],
+                    "name": league["name"],
+                    "logo": league["logo"],
+                    "country": league.get("country"),
+                },
+                "season": season,
+                "stages": [],
+                "meta": {
+                    "source": "db",
+                    "fetch_state": {
+                        "last_status": st_state.get("last_status"),
+                        "last_fetch_ts": (
+                            st_state.get("last_fetch_ts").isoformat().replace("+00:00", "Z")
+                            if st_state.get("last_fetch_ts") else None
+                        ),
+                        "last_success_ts": (
+                            st_state.get("last_success_ts").isoformat().replace("+00:00", "Z")
+                            if st_state.get("last_success_ts") else None
+                        ),
+                        "last_row_count": st_state.get("last_row_count"),
+                        "last_error": st_state.get("last_error"),
+                    },
+                    "filters": {"stage": stage, "group_name": group_name},
+                    "generated_at": datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+            }
+
+    # st_state가 없으면(초기) 기존 로직 그대로 진행
+
     where = ["s.league_id = %s", "s.season = %s"]
     params: List[Any] = [league_id, season]
 
