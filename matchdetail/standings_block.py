@@ -1014,10 +1014,15 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # 정렬: group_name -> rank -> team_name (그룹별로 붙어서 내려가게)
     def _sort_key(r: Dict[str, Any]):
-        g = _norm_group(r.get("group_name"))
+        eff_g = _effective_group_name(
+            raw_group_name=r.get("group_name"),
+            description=r.get("description"),
+        )
+        g = _norm_group(eff_g)
         rk = _coalesce_int(r.get("rank"), 0) or 999999
         tn = str(r.get("team_name") or "")
         return (g.lower(), rk, tn.lower())
+
 
     dedup_rows.sort(key=_sort_key)
 
@@ -1039,8 +1044,12 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "goal_diff": _coalesce_int(r.get("goals_diff"), 0),
                 "points": _coalesce_int(r.get("points"), 0),
                 "description": r.get("description"),
-                "group_name": r.get("group_name"),
+                "group_name": _effective_group_name(
+                    raw_group_name=r.get("group_name"),
+                    description=r.get("description"),
+                ),
                 "form": r.get("form"),
+
                 "is_home": (home_team_id is not None and team_id == home_team_id),
                 "is_away": (away_team_id is not None and team_id == away_team_id),
             }
@@ -1067,6 +1076,39 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return out
 
 
+def _effective_group_name(
+    *,
+    raw_group_name: Any,
+    description: Any,
+) -> Optional[str]:
+    """
+    rows의 group_name이 리그명/기본값으로만 채워지고,
+    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
+
+    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
+    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
+    """
+    g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
+    d = description.strip().lower() if isinstance(description, str) else ""
+
+    # group_name 자체가 의미있으면 그대로 둠
+    gl = g.lower()
+    if gl:
+        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
+            return g
+        if gl.startswith("group "):
+            return g
+        if "east" in gl or "west" in gl:
+            return g
+
+    # description 기반 split round 보정
+    if "champ" in d and "round" in d:
+        return "Championship Round"
+    if "releg" in d and "round" in d:
+        return "Relegation Round"
+
+    # 그 외는 기존 group_name 유지(빈 값이면 None)
+    return g if g else None
 
 
 
