@@ -148,12 +148,15 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if not s:
         return None
 
-    if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
+    # 기존은 fullmatch라서 "Conference League Play-offs - Final" 같은 케이스가 안 잡힘
+    # → 문장 내 포함도 인식하도록 확장(다른 영향 최소화)
+    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
         return "final"
-    if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
+    if re.search(r"(^|\s)semi\s*finals?(\s|$)", s) or re.search(r"(^|\s)semifinals?(\s|$)", s):
         return "semi"
-    if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
+    if re.search(r"(^|\s)quarter\s*finals?(\s|$)", s) or re.search(r"(^|\s)quarterfinals?(\s|$)", s):
         return "quarter"
+
 
     m = re.fullmatch(r"last (\d+)", s)
     if m:
@@ -233,9 +236,12 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if "qualifying" in s or "qualifier" in s:
         return "qualifying"
 
-    m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
+    # 기존은 fullmatch라서 "Conference League Play-offs - 1st Round" 같은 케이스가 안 잡힘
+    # → 포함 매칭으로 확장
+    m = re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", s)
     if m:
-        return f"round_{m.group(1)}"
+        return f"round_{m.group(2)}"
+
 
     return None
 
