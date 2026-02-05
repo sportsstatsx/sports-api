@@ -186,11 +186,13 @@ def hockey_get_fixtures_by_utc_range(
             elif p1:
                 end_label = "1P End"
 
-            # end_label 못 만들면 "Break Time" 유지(Intermission 금지 요구 반영은 앱에서)
+            # ✅ end_label 있으면: "2P End Break" / "1P End Break"
+            # ✅ end_label 없으면: "Break" (Intermission 금지)
             if end_label:
-                status_long_out = f"BT {end_label}"
+                status_long_out = f"{end_label} Break"
             else:
-                status_long_out = "Break Time"
+                status_long_out = "Break"
+
 
 
         # ✅ week / round 표기 (ADD ONLY)
