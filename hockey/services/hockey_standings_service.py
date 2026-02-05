@@ -661,6 +661,7 @@ def hockey_get_standings(
 
     return {
         "ok": True,
+        "available": True,  # ✅ ADD
         "league": {
             "id": league["id"],
             "name": league["name"],
@@ -681,4 +682,5 @@ def hockey_get_standings(
             .replace("+00:00", "Z"),
         },
     }
+
 
