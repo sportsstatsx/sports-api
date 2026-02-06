@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, List, Tuple
 import re
+import datetime as dt
+
 
 from db import fetch_all
 
@@ -110,6 +112,107 @@ def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
 
     return None
 
+def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
+    """
+    DB/헤더에서 오는 date_utc 문자열을 UTC datetime으로 파싱 (방어적)
+    지원 예:
+      - "2026-02-06 13:29:37"
+      - "2026-02-06T13:29:37+00:00"
+      - "2026-02-06 13:29:37+00:00"
+    """
+    if not isinstance(s, str):
+        return None
+    txt = s.strip()
+    if not txt:
+        return None
+
+    # ISO offset 형태 우선
+    try:
+        # 공백 -> T 보정
+        iso = txt.replace(" ", "T")
+        d = dt.datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc)
+    except Exception:
+        pass
+
+    # "yyyy-mm-dd HH:MM:SS" (초 19자리) fallback
+    try:
+        head = txt.replace("T", " ").split("+", 1)[0].strip()[:19]
+        d = dt.datetime.strptime(head, "%Y-%m-%d %H:%M:%S")
+        return d.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _should_hide_standings_early_season(
+    *,
+    league_id: int,
+    season: int,
+    fixture_id: Optional[int],
+    rows_raw: List[Dict[str, Any]],
+    window_days: int = 14,
+    played_threshold: int = 15,
+) -> bool:
+    """
+    옵션 A:
+    - 시즌 시작 초반(window_days 이내)인데
+    - standings rows의 played가 비정상적으로 크면(played_threshold 이상)
+    => API-Sports가 지난 시즌 최종 테이블을 current season으로 잘못 내려준 케이스로 보고 숨김.
+    """
+    if not rows_raw:
+        return False
+
+    # max played 체크
+    max_played = 0
+    for r in rows_raw:
+        p = _coalesce_int(r.get("played"), 0)
+        if p > max_played:
+            max_played = p
+
+    if max_played < played_threshold:
+        return False
+
+    # 시즌 시작일(우리 DB fixtures 기준)
+    min_row = _fetch_one(
+        """
+        SELECT MIN(date_utc) AS min_date_utc
+        FROM fixtures
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+    season_start_dt = _parse_utc_dt((min_row or {}).get("min_date_utc"))
+    if season_start_dt is None:
+        return False
+
+    # 현재 경기(혹은 참조 시점) 날짜
+    ref_dt: Optional[dt.datetime] = None
+    if fixture_id is not None:
+        fx_row = _fetch_one(
+            """
+            SELECT date_utc
+            FROM fixtures
+            WHERE fixture_id = %s
+            LIMIT 1
+            """,
+            (fixture_id,),
+        )
+        ref_dt = _parse_utc_dt((fx_row or {}).get("date_utc"))
+
+    if ref_dt is None:
+        ref_dt = dt.datetime.now(dt.timezone.utc)
+
+    # 시즌 시작 후 window_days 이내면 "초반"
+    delta_days = (ref_dt - season_start_dt).total_seconds() / 86400.0
+    if delta_days <= window_days:
+        return True
+
+    return False
+
+
 
 def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
     """
@@ -194,15 +297,26 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if not s:
         return None
 
-    # ── Final / Semi / Quarter ─────────────────────────────
-    if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
-        return "final"
+    # ── Elimination (Final 포함) ───────────────────────────
+    # "Elimination Final"이 먼저 final로 잡혀버리는 문제 방지
+    if "elimination" in s:
+        if re.search(r"(^|\s)elimination\s+final(s)?(\s|$)", s):
+            return "elimination_final"
+        return "elimination"
 
-    if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
+    # ── Semi / Quarter / Final ─────────────────────────────
+    # ✅ Semi/Quarter를 Final보다 먼저 판정해야 "semi finals"가 final로 오염되지 않는다.
+    if re.search(r"(^|\s)semi\s*finals?(\s|$)", s) or re.search(r"(^|\s)semifinals?(\s|$)", s):
         return "semi"
 
-    if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
+    if re.search(r"(^|\s)quarter\s*finals?(\s|$)", s) or re.search(r"(^|\s)quarterfinals?(\s|$)", s):
         return "quarter"
+
+    # Final은 가장 마지막에 판정 (semi/quarter/elimination final과 충돌 방지)
+    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
+        return "final"
+
+
 
     # ── Last N / 1/8 Finals / 1/16 Finals / Round of words ──
     # Last 16 / Last16 / Last-16
@@ -293,9 +407,12 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
         return "qualifying"
 
     # ── 1st/2nd/3rd/4th Round (숫자 기반) ───────────────────
-    m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
+    # 기존은 fullmatch라서 "Conference League Play-offs - 1st Round" 같은 케이스가 안 잡힘
+    # → 포함 매칭으로 확장
+    m = re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", s)
     if m:
-        return f"round_{m.group(1)}"
+        return f"round_{m.group(2)}"
+
 
     return None
 
@@ -619,10 +736,17 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     ✅ 규칙:
     - 넉아웃(브라켓) 대상 fixture면: mode="BRACKET" + bracket 채워서 반환 (rows는 [])
-    - 그 외에는 기존 TABLE 로직 그대로:
+    - 그 외 TABLE:
       1) standings 테이블 우선
       2) 비어있으면 matches로 계산
       3) finished=0이면 rows=[] + message
+
+    ✅ A 방식(서버가 필터용 context_options 제공) 강화:
+    - MLS(East/West)는 기존처럼 "전체 rows 유지 + 필터" (컷팅 없음)
+    - Split Round(Championship/Relegation)도 "전체 rows 유지 + 필터"
+    - Group A/B(예: Argentina)도 "전체 rows 유지 + 필터"
+    - 따라서 "홈/원정 팀이 속한 group만 남기는 컷팅"은 제거
+    - 중복 제거는 team_id 단독이 아니라 (team_id + group_name) 기준으로만 안전하게 수행
     """
 
     league_id = header.get("league_id")
@@ -674,12 +798,26 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     # ─────────────────────────────────────────────────────────────
     # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
-    #    - ✅ FIX: Final matchdetail에서 이전 라운드가 안 보이던 문제 해결
-    #      => "현재 라운드까지(포함)" 브라켓을 내려줌 (end_round_name 사용)
     # ─────────────────────────────────────────────────────────────
     fixture_id = _extract_fixture_id_from_header(header)
-    league_round = header.get("league_round")
+
+    # ✅ league_round 추출 보강: header 구조가 달라도 안정적으로 라운드 문자열 확보
+    league_round = None
+    if isinstance(header.get("league_round"), str):
+        league_round = header.get("league_round")
+
+    if league_round is None and isinstance(header.get("round"), str):
+        league_round = header.get("round")
+
+    league_info2 = header.get("league")
+    if league_round is None and isinstance(league_info2, dict):
+        if isinstance(league_info2.get("round"), str):
+            league_round = league_info2.get("round")
+        elif isinstance(league_info2.get("league_round"), str):
+            league_round = league_info2.get("league_round")
+
     league_round_str = league_round.strip() if isinstance(league_round, str) else None
+
 
     if fixture_id is not None and _is_knockout_round_for_bracket(league_id_int, league_round_str):
         tie_row = _fetch_one(
@@ -697,7 +835,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         tie_round_name = (tie_row or {}).get("round_name")
         tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
 
-        # DB round_name이 유효하면 그걸 current round로 사용
         current_round = (
             tie_round_name
             if _is_knockout_round_for_bracket(league_id_int, tie_round_name)
@@ -708,27 +845,24 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             league_id_int,
             season_resolved,
             start_round_name=None,
-            end_round_name=current_round,   # ✅ 핵심: 현재 라운드까지 포함해서 내려줌
+            end_round_name=current_round,
         )
 
         if bracket:
-            return {
-                "league": {
-                    "league_id": league_id_int,
-                    "season": season_resolved,
-                    "name": league_name,
-                },
-                "mode": "BRACKET",
-                "rows": [],
-                "bracket": bracket,
-                "context_options": {"conferences": [], "groups": []},
-                "message": None,
-                "source": "tournament_ties",
-            }
-        # bracket이 비면(데이터 미수집) TABLE로 fallback
+            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
+            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
+            bracket_mode = "BRACKET"
+            bracket_data = bracket
+            bracket_source = "tournament_ties"
+        else:
+            bracket_mode = None
+            bracket_data = None
+            bracket_source = None
+        # bracket이 비면 기존 TABLE로 fallback (기존 로직 그대로)
+
 
     # ─────────────────────────────────────────────────────────────
-    # 1) standings 테이블 우선 (기존 로직 그대로)
+    # 1) standings 테이블 우선
     # ─────────────────────────────────────────────────────────────
     try:
         rows_raw: List[Dict[str, Any]] = fetch_all(
@@ -763,7 +897,35 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     source = "standings_table" if rows_raw else "computed_from_matches"
 
     # ─────────────────────────────────────────────────────────────
-    # 2) standings가 비어 있으면 → matches에서 즉시 계산 (기존 로직 그대로)
+    # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
+    # ─────────────────────────────────────────────────────────────
+    if rows_raw:
+        fixture_id_for_guard = fixture_id if "fixture_id" in locals() else _extract_fixture_id_from_header(header)
+        if _should_hide_standings_early_season(
+            league_id=league_id_int,
+            season=season_resolved,
+            fixture_id=fixture_id_for_guard,
+            rows_raw=rows_raw,
+            window_days=14,
+            played_threshold=15,
+        ):
+            return {
+                "league": {
+                    "league_id": league_id_int,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "mode": "TABLE",
+                "rows": [],
+                "bracket": None,
+                "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": "standings_table",
+            }
+
+
+    # ─────────────────────────────────────────────────────────────
+    # 2) standings 비어 있으면 → matches에서 계산 (기존 로직 유지)
     # ─────────────────────────────────────────────────────────────
     if not rows_raw:
         mcols = _cols_of("matches")
@@ -803,7 +965,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ht, at = team_pair
         hg, ag = goal_pair
 
-        # 완료된 경기 수 확인 (0이면 시즌 시작 전/데이터 없음)
         try:
             cnt_row = _fetch_one(
                 f"""
@@ -840,7 +1001,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "source": source,
             }
 
-        # matches 기반 standings 계산 (포인트/득실/다득점 기본 정렬)
         try:
             rows_raw = fetch_all(
                 f"""
@@ -950,60 +1110,79 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "source": source,
             }
 
-    # ── 공통 후처리: 팀당 중복 row 정리 (played 최대 row만) ─────────────────
-    rows_by_team: Dict[int, Dict[str, Any]] = {}
+    # ─────────────────────────────────────────────────────────────
+    # 공통 후처리 (핵심 변경):
+    # - (team_id) 단독 디듀프 제거
+    # - (team_id + group_name) 기준으로만 "진짜 중복" 정리
+    # - group 컷팅(main_group) 완전 제거 → 전체 rows 유지 + 앱에서 필터 선택
+    # ─────────────────────────────────────────────────────────────
+    def _norm_group(v: Any) -> str:
+        if not isinstance(v, str):
+            return ""
+        return re.sub(r"\s+", " ", v).strip()
+
+    def _better_row(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        같은 (team_id, group_name) 키에 대해 어떤 row를 남길지 결정.
+        - played 큰 것 우선
+        - points, goals_diff, goals_for 큰 것 우선
+        - rank는 작은 것 우선 (있으면)
+        """
+        a_played = _coalesce_int(a.get("played"), 0)
+        b_played = _coalesce_int(b.get("played"), 0)
+        if b_played != a_played:
+            return b if b_played > a_played else a
+
+        a_pts = _coalesce_int(a.get("points"), 0)
+        b_pts = _coalesce_int(b.get("points"), 0)
+        if b_pts != a_pts:
+            return b if b_pts > a_pts else a
+
+        a_gd = _coalesce_int(a.get("goals_diff"), 0)
+        b_gd = _coalesce_int(b.get("goals_diff"), 0)
+        if b_gd != a_gd:
+            return b if b_gd > a_gd else a
+
+        a_gf = _coalesce_int(a.get("goals_for"), 0)
+        b_gf = _coalesce_int(b.get("goals_for"), 0)
+        if b_gf != a_gf:
+            return b if b_gf > a_gf else a
+
+        a_rank = _coalesce_int(a.get("rank"), 0) or 999999
+        b_rank = _coalesce_int(b.get("rank"), 0) or 999999
+        if b_rank != a_rank:
+            return b if b_rank < a_rank else a
+
+        return a
+
+    rows_by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for r in rows_raw:
         tid = _coalesce_int(r.get("team_id"), 0)
         if tid == 0:
             continue
-        prev = rows_by_team.get(tid)
+        gkey = _norm_group(r.get("group_name"))
+        key = (tid, gkey)
+        prev = rows_by_key.get(key)
         if prev is None:
-            rows_by_team[tid] = r
+            rows_by_key[key] = r
         else:
-            prev_played = _coalesce_int(prev.get("played"), 0)
-            cur_played = _coalesce_int(r.get("played"), 0)
-            if cur_played > prev_played:
-                rows_by_team[tid] = r
+            rows_by_key[key] = _better_row(prev, r)
 
-    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
+    dedup_rows: List[Dict[str, Any]] = list(rows_by_key.values())
 
-    # ── group_name 여러 개면 home/away가 속한 group 하나만 사용 (East/West split 제외) ──
-    group_names = {
-        (r.get("group_name") or "").strip()
-        for r in dedup_rows
-        if r.get("group_name") is not None
-    }
+    # 정렬: group_name -> rank -> team_name (그룹별로 붙어서 내려가게)
+    def _sort_key(r: Dict[str, Any]):
+        eff_g = _effective_group_name(
+            raw_group_name=r.get("group_name"),
+            description=r.get("description"),
+        )
+        g = _norm_group(eff_g)
+        rk = _coalesce_int(r.get("rank"), 0) or 999999
+        tn = str(r.get("team_name") or "")
+        return (g.lower(), rk, tn.lower())
 
-    def _is_east_west_split(names) -> bool:
-        lower = {g.lower() for g in names if g}
-        has_east = any("east" in g for g in lower)
-        has_west = any("west" in g for g in lower)
-        return has_east and has_west
 
-    if len(group_names) > 1 and not _is_east_west_split(group_names):
-        main_group = None
-
-        if home_team_id is not None:
-            for r in dedup_rows:
-                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(home_team_id, 0):
-                    main_group = (r.get("group_name") or "").strip()
-                    break
-
-        if main_group is None and away_team_id is not None:
-            for r in dedup_rows:
-                if _coalesce_int(r.get("team_id"), 0) == _coalesce_int(away_team_id, 0):
-                    main_group = (r.get("group_name") or "").strip()
-                    break
-
-        if main_group:
-            dedup_rows = [
-                r
-                for r in dedup_rows
-                if (r.get("group_name") or "").strip() == main_group
-            ]
-
-    # ── rank 기준 정렬 후 JSON 매핑 ───────────────────────────────────────
-    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0) or 999999)
+    dedup_rows.sort(key=_sort_key)
 
     table: List[Dict[str, Any]] = []
     for r in dedup_rows:
@@ -1023,8 +1202,12 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "goal_diff": _coalesce_int(r.get("goals_diff"), 0),
                 "points": _coalesce_int(r.get("points"), 0),
                 "description": r.get("description"),
-                "group_name": r.get("group_name"),
+                "group_name": _effective_group_name(
+                    raw_group_name=r.get("group_name"),
+                    description=r.get("description"),
+                ),
                 "form": r.get("form"),
+
                 "is_home": (home_team_id is not None and team_id == home_team_id),
                 "is_away": (away_team_id is not None and team_id == away_team_id),
             }
@@ -1038,6 +1221,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "season": season_resolved,
             "name": league_name,
         },
+        # ✅ 기본은 TABLE, bracket이 있으면 BRACKET으로만 바꿔 끼움
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
@@ -1045,11 +1229,64 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "source": source,
     }
 
+    # ✅ BRACKET이 있었으면: bracket을 추가로 포함 + chips에 Play-offs 추가
+    if "bracket_data" in locals() and bracket_data:
+        out["mode"] = "BRACKET"
+        out["bracket"] = bracket_data
+        out["source"] = bracket_source or out.get("source")
+
+        # UX-2: 기존 그룹칩 + Play-offs 혼합
+        try:
+            co = out.get("context_options") or {}
+            groups = list(co.get("groups") or [])
+            # case-insensitive 중복 방지
+            if not any((g or "").strip().lower() == "play-offs" for g in groups):
+                groups.append("Play-offs")
+            co["groups"] = groups
+            out["context_options"] = co
+        except Exception:
+            pass
+
+
     if not table:
         out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
 
+
+def _effective_group_name(
+    *,
+    raw_group_name: Any,
+    description: Any,
+) -> Optional[str]:
+    """
+    rows의 group_name이 리그명/기본값으로만 채워지고,
+    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
+
+    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
+    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
+    """
+    g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
+    d = description.strip().lower() if isinstance(description, str) else ""
+
+    # group_name 자체가 의미있으면 그대로 둠
+    gl = g.lower()
+    if gl:
+        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
+            return g
+        if gl.startswith("group "):
+            return g
+        if "east" in gl or "west" in gl:
+            return g
+
+    # description 기반 split round 보정
+    if "champ" in d and "round" in d:
+        return "Championship Round"
+    if "releg" in d and "round" in d:
+        return "Relegation Round"
+
+    # 그 외는 기존 group_name 유지(빈 값이면 None)
+    return g if g else None
 
 
 

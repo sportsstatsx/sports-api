@@ -116,10 +116,6 @@ def build_insights_filter_meta(
         "last_n": last_n,
     }
 
-    return {
-        "competition": comp_norm,
-        "last_n": last_n,
-    }
 
 def _resolve_default_team_season_for_league(
     *,
@@ -410,23 +406,39 @@ def get_home_leagues(
     league_ids: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    주어진 날짜(date_str)를 'timezone_str 기준 로컬 날짜'로 보고,
-    그 하루(00:00~23:59)가 커버하는 UTC 구간에 실제 경기가 편성된
-    리그 목록을 돌려준다.
+    ✅ 서버 단일 기준(home_config.py)을 따르는 Today 리그 목록
 
-    - DB matches.date_utc 는 UTC 기준이고,
-    - 여기서 계산한 utc_start ~ utc_end 사이에 있는 경기만 Today 로 본다.
-    - league_ids 가 주어지면 해당 리그들만 필터링.
+    정책:
+      - 오늘(사용자 로컬 date) 경기 있는 리그만
+      - 반드시 SUPPORTED_LEAGUE_IDS 안에서만
+      - (선택) league_ids 파라미터가 오면 그 subset만
+      - 반환 정렬은 DB가 아니라 home_config의 "홈 매치리스트 섹션 순서" 기준
     """
+    from services.home_config import SUPPORTED_LEAGUE_IDS, sort_leagues_for_home
+
     utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
 
-    params: List[Any] = [utc_start, utc_end]
-    where_clause = "m.date_utc::timestamptz BETWEEN %s AND %s"
+    supported = set(int(x) for x in (SUPPORTED_LEAGUE_IDS or []))
 
+    # 요청 league_ids가 오면: supported ∩ 요청값
+    requested: Optional[set[int]] = None
     if league_ids:
-        placeholders = ", ".join(["%s"] * len(league_ids))
-        where_clause += f" AND m.league_id IN ({placeholders})"
-        params.extend(league_ids)
+        requested = set()
+        for x in league_ids:
+            try:
+                requested.add(int(x))
+            except (TypeError, ValueError):
+                continue
+
+    target_ids = supported if requested is None else (supported & requested)
+
+    # 타겟이 비면 바로 빈 배열
+    if not target_ids:
+        return []
+
+    params: List[Any] = [utc_start, utc_end]
+    placeholders = ", ".join(["%s"] * len(target_ids))
+    params.extend(sorted(target_ids))
 
     rows = fetch_all(
         f"""
@@ -435,20 +447,17 @@ def get_home_leagues(
             l.name    AS league_name,
             l.country AS country,
             l.logo    AS league_logo,
-            m.season
+            MAX(m.season) AS season
         FROM matches m
         JOIN leagues l
           ON m.league_id = l.id
-        WHERE {where_clause}
+        WHERE m.date_utc::timestamptz BETWEEN %s AND %s
+          AND m.league_id IN ({placeholders})
         GROUP BY
             m.league_id,
             l.name,
             l.country,
-            l.logo,
-            m.season
-        ORDER BY
-            l.country,
-            l.name
+            l.logo
         """,
         tuple(params),
     )
@@ -461,10 +470,17 @@ def get_home_leagues(
                 "name": r["league_name"],
                 "country": r["country"],
                 "logo": r["league_logo"],
-                "season": r["season"],
+                "season": r.get("season"),
             }
         )
-    return result
+
+    # ✅ 정렬을 home_config 기준으로 고정
+    try:
+        return sort_leagues_for_home(result)
+    except Exception:
+        # 정렬 실패해도 최소한 name 기준 안정 정렬
+        return sorted(result, key=lambda x: (str(x.get("country") or ""), str(x.get("name") or "")))
+
 
 
 # ─────────────────────────────────────
@@ -475,12 +491,119 @@ def get_home_leagues(
 def get_home_league_directory(
     date_str: Optional[str],
     timezone_str: str,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    홈 리그 디렉터리(필터용)는 전부 league_directory_service 쪽에서 계산한다.
-    여기서는 날짜/타임존만 넘겨주는 얇은 래퍼 역할만 한다.
+    ✅ 리그 선택 바텀시트(스크린샷 구조 지원)
+
+    반환(rows):
+      {
+        "today": [
+          {"continent": "Europe", "count": 8, "items": [ ... ]},
+          {"continent": "Asia", "count": 2, "items": [ ... ]},
+          ...
+        ],
+        "no_games": [
+          {"continent": "Europe", "count": 16, "items": [ ... ]},
+          {"continent": "Asia", "count": 8, "items": [ ... ]},
+          {"continent": "Americas", "count": 6, "items": [ ... ]},
+          ...
+        ]
+      }
+
+    - today: 오늘(사용자 로컬 date) 경기 있는 리그들
+    - no_games: 오늘 경기 없는 리그들
+    - 정렬/대륙/티어 규칙은 home_config.filter_order 기반(=build_league_directory_from_config 결과) 그대로 사용
     """
-    return build_league_directory(date_str=date_str, timezone_str=timezone_str)
+    from services.home_config import (
+        SUPPORTED_LEAGUE_IDS,
+        CONTINENT_ORDER,
+        build_league_directory_from_config,
+    )
+
+    # 1) config 기준 "전체" 디렉터리 (대륙/정렬 규칙 반영된 섹션 리스트)
+    #    full_sections: [{"section": "Europe", "items": [...]}, ...]
+    full_sections = build_league_directory_from_config(
+        date_str=date_str,
+        timezone_str=timezone_str,
+    )
+
+    # 2) 오늘(로컬 date) 기준 UTC 범위
+    utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
+
+    supported: List[int] = []
+    for x in (SUPPORTED_LEAGUE_IDS or []):
+        try:
+            supported.append(int(x))
+        except (TypeError, ValueError):
+            continue
+
+    if not supported:
+        return {"today": [], "no_games": []}
+
+    # 3) 오늘 경기 있는 league_id 집합 계산 (matches 기준)
+    placeholders = ", ".join(["%s"] * len(supported))
+    params: List[Any] = [utc_start, utc_end]
+    params.extend(supported)
+
+    rows = fetch_all(
+        f"""
+        SELECT DISTINCT m.league_id
+        FROM matches m
+        WHERE m.date_utc::timestamptz BETWEEN %s AND %s
+          AND m.league_id IN ({placeholders})
+        """,
+        tuple(params),
+    )
+
+    today_ids: set[int] = set()
+    for r in rows:
+        try:
+            today_ids.add(int(r.get("league_id")))
+        except Exception:
+            continue
+
+    # 4) full_sections 를 today / no_games 로 분리 + count 부착
+    today_out: List[Dict[str, Any]] = []
+    nog_out: List[Dict[str, Any]] = []
+
+    for sec in (full_sections or []):
+        continent = (sec.get("section") or "").strip()
+        items = sec.get("items") or []
+
+        if not continent or not isinstance(items, list):
+            continue
+
+        today_items: List[Dict[str, Any]] = []
+        nog_items: List[Dict[str, Any]] = []
+
+        for it in items:
+            lid = it.get("league_id")
+            try:
+                lid_int = int(lid)
+            except Exception:
+                continue
+
+            if lid_int in today_ids:
+                today_items.append(it)
+            else:
+                nog_items.append(it)
+
+        if today_items:
+            today_out.append({"continent": continent, "count": len(today_items), "items": today_items})
+        if nog_items:
+            nog_out.append({"continent": continent, "count": len(nog_items), "items": nog_items})
+
+    # 5) 대륙 순서 고정 (Europe > Asia > Americas)
+    order_idx: Dict[str, int] = {}
+    for i, c in enumerate(CONTINENT_ORDER or []):
+        order_idx[str(c)] = i
+
+    today_out.sort(key=lambda x: order_idx.get(str(x.get("continent")), 999))
+    nog_out.sort(key=lambda x: order_idx.get(str(x.get("continent")), 999))
+
+    return {"today": today_out, "no_games": nog_out}
+
+
 
 
 

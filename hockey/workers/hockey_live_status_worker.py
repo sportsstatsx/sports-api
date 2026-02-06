@@ -571,6 +571,58 @@ def _normalize_standings_blocks(payload: Dict[str, Any]) -> List[List[Dict[str, 
 
     return []
 
+def _upsert_standings_fetch_state(
+    league_id: int,
+    season: int,
+    *,
+    status: str,                 # 'ok' | 'empty' | 'error'
+    row_count: Optional[int] = None,
+    error: Optional[str] = None,
+    success: bool = False,
+) -> None:
+    """
+    standings fetch 결과를 hockey_standings_fetch_state에 기록한다.
+    - status: ok/empty/error
+    - success=True면 last_success_ts도 갱신
+    """
+    try:
+        hockey_execute(
+            """
+            INSERT INTO hockey_standings_fetch_state (
+              league_id, season,
+              last_status, last_fetch_ts,
+              last_success_ts,
+              last_row_count,
+              last_error,
+              updated_at
+            )
+            VALUES (%s, %s, %s, now(),
+                    CASE WHEN %s THEN now() ELSE NULL END,
+                    %s,
+                    %s,
+                    now())
+            ON CONFLICT (league_id, season) DO UPDATE SET
+              last_status     = EXCLUDED.last_status,
+              last_fetch_ts   = now(),
+              last_success_ts = CASE
+                                  WHEN EXCLUDED.last_success_ts IS NOT NULL THEN EXCLUDED.last_success_ts
+                                  ELSE hockey_standings_fetch_state.last_success_ts
+                                END,
+              last_row_count  = EXCLUDED.last_row_count,
+              last_error      = EXCLUDED.last_error,
+              updated_at      = now()
+            """,
+            (
+                int(league_id),
+                int(season),
+                str(status),
+                bool(success),
+                row_count,
+                error,
+            ),
+        )
+    except Exception as e:
+        log.warning("standings_fetch_state upsert failed: league=%s season=%s status=%s err=%s", league_id, season, status, e)
 
 
 
@@ -608,19 +660,56 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
                 "standings fetch failed: league=%s season=%s err=%s",
                 lid, season, e
             )
+            # ✅ 상태 기록: error
+            _upsert_standings_fetch_state(
+                league_id=int(lid),
+                season=int(season),
+                status="error",
+                row_count=None,
+                error=str(e),
+                success=False,
+            )
             continue
+
 
         blocks = _normalize_standings_blocks(payload)
         if not blocks:
             resp = payload.get("response") if isinstance(payload, dict) else None
+
+            # ✅ 진짜 "비어있음" (results=0 / response=[])
+            is_empty = isinstance(resp, list) and len(resp) == 0
+
             t0 = None
             if isinstance(resp, list) and resp:
                 t0 = type(resp[0]).__name__
-            log.warning(
-                "standings shape unexpected(normalize empty): league=%s season=%s resp0_type=%s",
-                lid, season, t0
-            )
+
+            if is_empty:
+                log.info("standings empty: league=%s season=%s (API returned empty response)", lid, season)
+                _upsert_standings_fetch_state(
+                    league_id=int(lid),
+                    season=int(season),
+                    status="empty",
+                    row_count=0,
+                    error=None,
+                    success=False,
+                )
+            else:
+                # normalize 실패(형태 이상)도 일단 empty 취급하면 앱이 안전해짐
+                log.warning(
+                    "standings shape unexpected(normalize empty): league=%s season=%s resp0_type=%s",
+                    lid, season, t0
+                )
+                _upsert_standings_fetch_state(
+                    league_id=int(lid),
+                    season=int(season),
+                    status="empty",
+                    row_count=0,
+                    error="normalize_empty",
+                    success=False,
+                )
+
             continue
+
 
         default_stage = "Regular Season"
 
@@ -740,6 +829,17 @@ def _refresh_standings_for_leagues(leagues: List[int]) -> None:
             "standings refreshed: league=%s season=%s groups=%s upserted=%s skipped=%s",
             lid, season, len(groups), upserted, skipped
         )
+
+        # ✅ 상태 기록: ok (upserted가 0이어도 blocks가 있었으면 ok로 간주)
+        _upsert_standings_fetch_state(
+            league_id=int(lid),
+            season=int(season),
+            status="ok" if upserted > 0 else "empty",
+            row_count=int(upserted),
+            error=None if upserted > 0 else "no_rows_upserted",
+            success=(upserted > 0),
+        )
+
 
 
 

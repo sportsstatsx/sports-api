@@ -148,12 +148,26 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if not s:
         return None
 
-    if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
-        return "final"
-    if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
+    # ── Elimination (Final 포함) ───────────────────────────
+    # "Elimination Final"이 먼저 final로 잡혀버리는 문제 방지
+    if "elimination" in s:
+        if re.search(r"(^|\s)elimination\s+final(s)?(\s|$)", s):
+            return "elimination_final"
+        return "elimination"
+
+    # ── Semi / Quarter / Final ─────────────────────────────
+    # ✅ Semi/Quarter를 Final보다 먼저 판정해야 "semi finals"가 final로 오염되지 않는다.
+    if re.search(r"(^|\s)semi\s*finals?(\s|$)", s) or re.search(r"(^|\s)semifinals?(\s|$)", s):
         return "semi"
-    if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
+
+    if re.search(r"(^|\s)quarter\s*finals?(\s|$)", s) or re.search(r"(^|\s)quarterfinals?(\s|$)", s):
         return "quarter"
+
+    # Final은 가장 마지막에 판정 (semi/quarter/elimination final과 충돌 방지)
+    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
+        return "final"
+
+
 
     m = re.fullmatch(r"last (\d+)", s)
     if m:
@@ -233,9 +247,12 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if "qualifying" in s or "qualifier" in s:
         return "qualifying"
 
-    m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
+    # 기존은 fullmatch라서 "Conference League Play-offs - 1st Round" 같은 케이스가 안 잡힘
+    # → 포함 매칭으로 확장
+    m = re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", s)
     if m:
-        return f"round_{m.group(1)}"
+        return f"round_{m.group(2)}"
+
 
     return None
 
@@ -503,6 +520,42 @@ def _build_bracket_from_tournament_ties(
     return bracket
 
 
+def _effective_group_name(
+    *,
+    raw_group_name: Any,
+    description: Any,
+) -> Optional[str]:
+    """
+    rows의 group_name이 리그명/기본값으로만 채워지고,
+    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
+
+    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
+    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
+    """
+    g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
+    d = description.strip().lower() if isinstance(description, str) else ""
+
+    # group_name 자체가 의미있으면 그대로 둠
+    gl = g.lower()
+    if gl:
+        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
+            return g
+        if gl.startswith("group "):
+            return g
+        if "east" in gl or "west" in gl:
+            return g
+
+    # description 기반 split round 보정
+    if "champ" in d and "round" in d:
+        return "Championship Round"
+    if "releg" in d and "round" in d:
+        return "Relegation Round"
+
+    # 그 외는 기존 group_name 유지(빈 값이면 None)
+    return g if g else None
+
+
+
 
 # ────────────────────────────────────────────────────────────
 #  컨퍼런스 / 그룹 / 스플릿 정보 추출 (context_options)
@@ -694,16 +747,15 @@ def build_standings_block(
         )
 
         if bracket:
-            return {
-                "league_id": league_id,
-                "season": season_resolved,
-                "league_name": league_name,
-                "rows": [],
-                "bracket": bracket,
-                "mode": "BRACKET",
-                "context_options": {"conferences": [], "groups": []},
-            }
-        # bracket 비면 기존 TABLE 로직으로 fallback
+            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
+            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
+            bracket_mode = "BRACKET"
+            bracket_data = bracket
+        else:
+            bracket_mode = None
+            bracket_data = None
+        # bracket 비면 기존 TABLE 로직으로 fallback (기존 로직 그대로)
+
 
 
     
@@ -934,24 +986,84 @@ def build_standings_block(
                 "context_options": {"conferences": [], "groups": []},
             }
 
-    # ── 1) 팀당 중복 row 정리 (played 가장 큰 row만 사용) ─────────────────
-    rows_by_team: Dict[int, Dict[str, Any]] = {}
+    # ─────────────────────────────────────────────────────────────
+    # 공통 후처리 (matchdetail과 동일):
+    # - (team_id) 단독 디듀프 제거
+    # - (team_id + group_name) 기준으로만 "진짜 중복" 정리
+    # - 정렬: group_name -> rank -> team_name
+    # - group_name은 _effective_group_name()으로 보정(오스트리아 split 등)
+    # ─────────────────────────────────────────────────────────────
+    def _norm_group(v: Any) -> str:
+        if not isinstance(v, str):
+            return ""
+        return re.sub(r"\s+", " ", v).strip()
+
+    def _better_row(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        같은 (team_id, group_name) 키에 대해 어떤 row를 남길지 결정.
+        - played 큰 것 우선
+        - points, goals_diff, goals_for 큰 것 우선
+        - rank는 작은 것 우선 (있으면)
+        """
+        a_played = _coalesce_int(a.get("played"), 0)
+        b_played = _coalesce_int(b.get("played"), 0)
+        if b_played != a_played:
+            return b if b_played > a_played else a
+
+        a_pts = _coalesce_int(a.get("points"), 0)
+        b_pts = _coalesce_int(b.get("points"), 0)
+        if b_pts != a_pts:
+            return b if b_pts > a_pts else a
+
+        a_gd = _coalesce_int(a.get("goals_diff"), 0)
+        b_gd = _coalesce_int(b.get("goals_diff"), 0)
+        if b_gd != a_gd:
+            return b if b_gd > a_gd else a
+
+        a_gf = _coalesce_int(a.get("goals_for"), 0)
+        b_gf = _coalesce_int(b.get("goals_for"), 0)
+        if b_gf != a_gf:
+            return b if b_gf > a_gf else a
+
+        a_rank = _coalesce_int(a.get("rank"), 0) or 999999
+        b_rank = _coalesce_int(b.get("rank"), 0) or 999999
+        if b_rank != a_rank:
+            return b if b_rank < a_rank else a
+
+        return a
+
+    rows_by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for r in rows_raw:
-        team_id = _coalesce_int(r.get("team_id"), 0)
-        if team_id == 0:
+        tid = _coalesce_int(r.get("team_id"), 0)
+        if tid == 0:
             continue
+        gkey = _norm_group(
+            _effective_group_name(
+                raw_group_name=r.get("group_name"),
+                description=r.get("description"),
+            )
+        )
+        key = (tid, gkey)
 
-        prev = rows_by_team.get(team_id)
+        prev = rows_by_key.get(key)
         if prev is None:
-            rows_by_team[team_id] = r
+            rows_by_key[key] = r
         else:
-            prev_played = _coalesce_int(prev.get("played"), 0)
-            cur_played = _coalesce_int(r.get("played"), 0)
-            if cur_played > prev_played:
-                rows_by_team[team_id] = r
+            rows_by_key[key] = _better_row(prev, r)
 
-    dedup_rows: List[Dict[str, Any]] = list(rows_by_team.values())
-    dedup_rows.sort(key=lambda r: _coalesce_int(r.get("rank"), 0) or 999999)
+    dedup_rows: List[Dict[str, Any]] = list(rows_by_key.values())
+
+    def _sort_key(r: Dict[str, Any]):
+        eff_g = _effective_group_name(
+            raw_group_name=r.get("group_name"),
+            description=r.get("description"),
+        )
+        g = _norm_group(eff_g)
+        rk = _coalesce_int(r.get("rank"), 0) or 999999
+        tn = str(r.get("team_name") or "")
+        return (g.lower(), rk, tn.lower())
+
+    dedup_rows.sort(key=_sort_key)
 
     out_rows: List[Dict[str, Any]] = []
     for r in dedup_rows:
@@ -970,18 +1082,56 @@ def build_standings_block(
                 "goal_diff": _coalesce_int(r.get("goals_diff"), 0),
                 "points": _coalesce_int(r.get("points"), 0),
                 "description": r.get("description"),
-                "group_name": r.get("group_name"),
+                "group_name": _effective_group_name(
+                    raw_group_name=r.get("group_name"),
+                    description=r.get("description"),
+                ),
                 "form": r.get("form"),
             }
         )
 
-    context_options = _build_context_options_from_rows(dedup_rows)
+    # context_options는 "보정된 group_name" 기준으로 만들어야
+    # description에만 split 정보가 있는 리그(예: Austria)도 chips가 안정적이다.
+    context_rows: List[Dict[str, Any]] = []
+    for r in dedup_rows:
+        rr = dict(r)
+        rr["group_name"] = _effective_group_name(
+            raw_group_name=r.get("group_name"),
+            description=r.get("description"),
+        )
+        context_rows.append(rr)
 
-    return {
+    context_options = _build_context_options_from_rows(context_rows)
+
+
+    out = {
         "league_id": league_id,
         "season": season_resolved,
         "league_name": league_name,
         "rows": out_rows,
         "context_options": context_options,
+        # ✅ 기본 제공 (앱 파서가 mode/bracket 항상 읽을 수 있게)
+        "mode": "TABLE",
+        "bracket": None,
     }
+
+    # ✅ BRACKET이 있었으면: bracket 포함 + chips에 Play-offs 추가
+    if "bracket_data" in locals() and bracket_data:
+        out["mode"] = "BRACKET"
+        out["bracket"] = bracket_data
+
+        # UX-2: 기존 그룹칩 + Play-offs 혼합
+        try:
+            co = out.get("context_options") or {}
+            groups = list(co.get("groups") or [])
+            if not any((g or "").strip().lower() == "play-offs" for g in groups):
+                groups.append("Play-offs")
+            co["groups"] = groups
+            out["context_options"] = co
+        except Exception:
+            pass
+
+    return out
+
+
 

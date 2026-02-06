@@ -18,6 +18,105 @@ def _safe_int(v: Any) -> Optional[int]:
 
 
 # ─────────────────────────────────────────
+# ✅ Playoffs Bracket: tie -> legs join (DB only)
+# - 정규리그 혼입 차단: (g.raw_json->>'week') = t.round
+# ─────────────────────────────────────────
+def _fetch_legs_by_tie_id(league_id: int, season: int) -> Dict[int, List[Dict[str, Any]]]:
+    rows = hockey_fetch_all(
+        """
+        SELECT
+            t.id AS tie_id,
+            g.id AS game_id,
+            g.game_date,
+            g.home_team_id,
+            g.away_team_id,
+            g.status,
+            g.score_json,
+            ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY g.game_date, g.id) AS leg_index
+        FROM hockey_tournament_ties t
+        JOIN hockey_games g
+          ON g.league_id = t.league_id
+         AND g.season   = t.season
+         AND g.game_date BETWEEN t.first_game AND t.last_game
+         AND (
+              (g.home_team_id = t.team1_id AND g.away_team_id = t.team2_id)
+           OR (g.home_team_id = t.team2_id AND g.away_team_id = t.team1_id)
+         )
+         AND (g.raw_json->>'week') = t.round
+        WHERE t.league_id = %s
+          AND t.season   = %s
+        ORDER BY t.id, leg_index
+        """,
+        (league_id, season),
+    )
+
+    def _extract_score_total(score_json: Any, side: str) -> Optional[int]:
+        """
+        score_json 구조가 리그/시즌마다 다를 수 있어서 최대한 안전하게 파싱.
+        기대 가능한 형태들:
+        - {"home": 3, "away": 2}
+        - {"home": {"total": 3}, "away": {"total": 2}}
+        - {"home": {"goals": 3}, ...}
+        - {"home": {"score": 3}, ...}
+        """
+        if not score_json or not isinstance(score_json, dict):
+            return None
+
+        v = score_json.get(side)
+        try:
+            if v is None:
+                return None
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.strip().isdigit():
+                return int(v.strip())
+            if isinstance(v, dict):
+                for k in ("total", "goals", "score", "points"):
+                    x = v.get(k)
+                    if x is None:
+                        continue
+                    if isinstance(x, int):
+                        return x
+                    if isinstance(x, str) and x.strip().isdigit():
+                        return int(x.strip())
+        except Exception:
+            return None
+
+        return None
+
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for r in rows:
+        tie_id = _safe_int(r.get("tie_id"))
+        if tie_id is None:
+            continue
+
+        gd = r.get("game_date")
+        if gd is not None and hasattr(gd, "isoformat"):
+            date_iso = gd.isoformat().replace("+00:00", "Z")
+        else:
+            date_iso = gd
+
+        sj = r.get("score_json") or {}
+        home_score = _extract_score_total(sj, "home")
+        away_score = _extract_score_total(sj, "away")
+
+        out.setdefault(tie_id, []).append(
+            {
+                "leg_index": _safe_int(r.get("leg_index")) or 0,
+                "game_id": _safe_int(r.get("game_id")),
+                "date": date_iso,
+                "home_team_id": _safe_int(r.get("home_team_id")),
+                "away_team_id": _safe_int(r.get("away_team_id")),
+                "home_score": home_score,
+                "away_score": away_score,
+                "status": r.get("status"),
+            }
+        )
+
+    return out
+
+
+# ─────────────────────────────────────────
 # 정식 정렬 규칙(고정)
 # 1) stage 우선순위: Regular -> Playoffs/Post -> Pre -> 기타(알파벳)
 # 2) group 우선순위(동일 stage): Division(기본) -> Conference -> Overall -> 기타
@@ -61,6 +160,7 @@ def _group_rank(group_name: str) -> tuple[int, str]:
         return (3, g0)
 
     return (9, g0)
+
 
 def _is_finished_status(status: Any) -> bool:
     s = (status or "")
@@ -126,8 +226,8 @@ def _build_regular_stats_map_from_games(
             as_ = sj.get("away")
             if hs is None or as_ is None:
                 continue
-            hs_i = int(hs)
-            as_i = int(as_)
+            hs_i = int(hs) if not isinstance(hs, dict) else int(hs.get("total") or hs.get("goals") or hs.get("score"))
+            as_i = int(as_) if not isinstance(as_, dict) else int(as_.get("total") or as_.get("goals") or as_.get("score"))
         except Exception:
             continue
 
@@ -163,9 +263,6 @@ def _build_regular_stats_map_from_games(
             if is_ot_bucket:
                 a["ot_wins"] += 1
                 h["ot_losses"] += 1
-        else:
-            # 종료경기 동점은 거의 없지만 방어
-            pass
 
     out: Dict[int, Dict[str, Optional[int]]] = {}
     for tid, a in acc.items():
@@ -195,7 +292,22 @@ def _build_regular_stats_map_from_games(
 
     return out
 
-
+def _get_standings_fetch_state(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    return hockey_fetch_one(
+        """
+        SELECT
+          league_id, season,
+          last_status,
+          last_fetch_ts,
+          last_success_ts,
+          last_row_count,
+          last_error
+        FROM hockey_standings_fetch_state
+        WHERE league_id=%s AND season=%s
+        LIMIT 1
+        """,
+        (league_id, season),
+    )
 
 
 def hockey_get_standings(
@@ -233,6 +345,177 @@ def hockey_get_standings(
     )
     if not league:
         raise ValueError("LEAGUE_NOT_FOUND")
+
+    # ─────────────────────────────────────────
+    # ✅ Playoffs/Knockout → Bracket (DB ties 기반)
+    # - stage/group 필터가 걸린 경우에는 기존 standings 동작 유지
+    # - ties가 있으면 standings 대신 bracket 응답
+    # ─────────────────────────────────────────
+    if not stage and not group_name:
+        tie_rows = hockey_fetch_all(
+            """
+            SELECT
+                t.id AS tie_id,
+                t.round,
+                t.team1_id,
+                t.team2_id,
+                t.team1_wins,
+                t.team2_wins,
+                t.best_of,
+                t.winner_team_id,
+                t.first_game,
+                t.last_game,
+                a.name AS team1_name,
+                a.logo AS team1_logo,
+                b.name AS team2_name,
+                b.logo AS team2_logo
+            FROM hockey_tournament_ties t
+            JOIN hockey_teams a ON a.id = t.team1_id
+            JOIN hockey_teams b ON b.id = t.team2_id
+            WHERE t.league_id = %s
+              AND t.season = %s
+            ORDER BY
+              CASE t.round
+                WHEN 'Quarter-finals' THEN 1
+                WHEN 'Semi-finals' THEN 2
+                WHEN 'Final' THEN 3
+                WHEN '3rd place' THEN 4
+                ELSE 99
+              END,
+              t.first_game NULLS LAST,
+              t.team1_id,
+              t.team2_id
+            """,
+            (league_id, season),
+        )
+
+
+        if tie_rows:
+            # ✅ tie_id -> legs[]
+            legs_map = _fetch_legs_by_tie_id(league_id=league_id, season=season)
+
+            rounds_map: Dict[str, List[Dict[str, Any]]] = {}
+            for tr in tie_rows:
+                rname = (tr.get("round") or "").strip() or "Unknown"
+                tie_id = _safe_int(tr.get("tie_id"))
+
+                rounds_map.setdefault(rname, []).append(
+                    {
+                        "round": rname,
+                        "team1": {
+                            "id": _safe_int(tr.get("team1_id")),
+                            "name": tr.get("team1_name"),
+                            "logo": tr.get("team1_logo"),
+                        },
+                        "team2": {
+                            "id": _safe_int(tr.get("team2_id")),
+                            "name": tr.get("team2_name"),
+                            "logo": tr.get("team2_logo"),
+                        },
+                        "series": {
+                            "team1_wins": _safe_int(tr.get("team1_wins")) or 0,
+                            "team2_wins": _safe_int(tr.get("team2_wins")) or 0,
+                            "best_of": _safe_int(tr.get("best_of")),
+                            "winner_team_id": _safe_int(tr.get("winner_team_id")),
+                            "first_game": (tr.get("first_game").isoformat().replace("+00:00", "Z") if tr.get("first_game") else None),
+                            "last_game": (tr.get("last_game").isoformat().replace("+00:00", "Z") if tr.get("last_game") else None),
+                            # ✅ legs (정규리그 혼입 차단: week==round 조건으로만 매칭된 경기들)
+                            "legs": (legs_map.get(tie_id, []) if tie_id is not None else []),
+                        },
+                    }
+                )
+
+
+            # round 순서 고정
+            round_order = ["Quarter-finals", "Semi-finals", "Final", "3rd place"]
+            rounds_out: List[Dict[str, Any]] = []
+
+            for rn in round_order:
+                if rn in rounds_map:
+                    rounds_out.append({"name": rn, "ties": rounds_map[rn]})
+
+            # 알 수 없는 라운드가 있으면 뒤에 붙임
+            for rn in sorted([k for k in rounds_map.keys() if k not in set(round_order)]):
+                rounds_out.append({"name": rn, "ties": rounds_map[rn]})
+
+            return {
+                "ok": True,
+                "type": "bracket",
+                "league": {
+                    "id": league["id"],
+                    "name": league["name"],
+                    "logo": league["logo"],
+                    "country": league.get("country"),
+                },
+                "season": season,
+                "rounds": rounds_out,
+                # ✅ 앱이 기존 stages를 강제 접근하는 경우를 대비해 빈 배열로 포함
+                "stages": [],
+                "meta": {
+                    "source": "db_ties",
+                    "filters": {"stage": None, "group_name": None},
+                    "generated_at": datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+            }
+
+    # ─────────────────────────────────────────
+    # 기존 standings 로직 (그대로)
+    # ─────────────────────────────────────────
+
+    # ─────────────────────────────────────────
+    # ✅ NEW: standings source availability gate (DB fetch_state 기준)
+    # - API가 빈 응답이면 워커가 last_status='empty'로 기록함
+    # - 이 경우 DB에 남아있는 과거 standings를 그대로 노출하면 "틀린 순위"가 될 수 있으니
+    #   stages를 비워서 앱이 스탠딩 UI를 숨길 수 있게 한다.
+    # ─────────────────────────────────────────
+    st_state = _get_standings_fetch_state(league_id=league_id, season=season)
+
+    if st_state:
+        last_status = (st_state.get("last_status") or "").strip().lower()
+        if last_status in ("empty", "error"):
+            msg = "Standings are temporarily unavailable."
+            if last_status == "error":
+                msg = "Standings are temporarily unavailable."
+
+            return {
+                "ok": True,
+                "available": False,
+                "message": msg,
+                "league": {
+                    "id": league["id"],
+                    "name": league["name"],
+                    "logo": league["logo"],
+                    "country": league.get("country"),
+                },
+                "season": season,
+                "stages": [],
+                "meta": {
+                    "source": "db",
+                    "fetch_state": {
+                        "last_status": st_state.get("last_status"),
+                        "last_fetch_ts": (
+                            st_state.get("last_fetch_ts").isoformat().replace("+00:00", "Z")
+                            if st_state.get("last_fetch_ts") else None
+                        ),
+                        "last_success_ts": (
+                            st_state.get("last_success_ts").isoformat().replace("+00:00", "Z")
+                            if st_state.get("last_success_ts") else None
+                        ),
+                        "last_row_count": st_state.get("last_row_count"),
+                        "last_error": st_state.get("last_error"),
+                    },
+                    "filters": {"stage": stage, "group_name": group_name},
+                    "generated_at": datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                },
+            }
+
+    # st_state가 없으면(초기) 기존 로직 그대로 진행
 
     where = ["s.league_id = %s", "s.season = %s"]
     params: List[Any] = [league_id, season]
@@ -274,6 +557,7 @@ def hockey_get_standings(
         """,
         tuple(params),
     )
+
 
     # ✅ 정규시즌 시작일이 등록된 리그/시즌이면, games 기반 재계산 맵 준비
     regular_start_utc = get_regular_season_start_utc(league_id, season)
@@ -377,6 +661,7 @@ def hockey_get_standings(
 
     return {
         "ok": True,
+        "available": True,  # ✅ ADD
         "league": {
             "id": league["id"],
             "name": league["name"],
@@ -397,4 +682,5 @@ def hockey_get_standings(
             .replace("+00:00", "Z"),
         },
     }
+
 

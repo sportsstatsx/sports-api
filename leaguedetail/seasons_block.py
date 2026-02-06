@@ -22,6 +22,44 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     season_champions: List[Dict[str, Any]] = []
 
     # ─────────────────────────────────────────────
+    # Champion decision types (league_id based)
+    # ─────────────────────────────────────────────
+    # ① 정규시즌 1위 = 챔피언
+    REGULAR_SEASON_CHAMPION = {
+        189, 219, 145, 71, 72, 169, 346, 40, 39, 61, 62, 79, 78, 290, 135, 136,
+        98, 99, 89, 88, 106, 107, 94, 95, 305, 307, 180, 293, 140, 141, 208,
+        207, 204, 203,
+    }
+
+    # ② 플레이오프 우승 = 챔피언
+    PLAYOFFS_CHAMPION = {188, 253}
+
+    # ③ 정규시즌 챔프 + 플레이오프 챔프 (2개 존재)
+    REGULAR_AND_PLAYOFFS = {218, 144, 345, 119, 292}
+
+    # ④ 플레이오프/스플릿이 있어도 “챔피언은 정규시즌 1위”
+    # (너가 준 분류 기준)
+    PLAYOFFS_BUT_REGULAR_IS_CHAMPION = {179}
+
+    # ⑤ 토너먼트 (정규시즌 개념 없음) = 최종 우승
+    KNOCKOUT_TOURNAMENT = {17, 16, 2, 848, 3}
+
+    def _champion_mode(lid: int) -> str:
+        if lid in KNOCKOUT_TOURNAMENT:
+            return "knockout"
+        if lid in REGULAR_AND_PLAYOFFS:
+            return "regular+playoffs"
+        if lid in PLAYOFFS_CHAMPION:
+            return "playoffs"
+        if lid in PLAYOFFS_BUT_REGULAR_IS_CHAMPION:
+            return "regular"
+        if lid in REGULAR_SEASON_CHAMPION:
+            return "regular"
+        # 안전 폴백: 기본은 정규시즌(standings) 우선
+        return "regular"
+
+
+    # ─────────────────────────────────────────────
     # local helpers
     # ─────────────────────────────────────────────
     def _norm_round_name(raw: Any) -> str:
@@ -40,9 +78,16 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         if not s:
             return None
 
-        # Final 계열
+        # ✅ Qualifying/Preliminary Final 은 "진짜 우승 결승"이 아니므로 분리
+        if "qualifying" in s and "final" in s:
+            return "qualifying_final"
+        if "preliminary" in s and "final" in s:
+            return "preliminary_final"
+
+        # Final 계열 (✅ 진짜 Final만)
         if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
             return "final"
+
 
         # Semi / Quarter
         if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
@@ -91,6 +136,8 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     CANON_ORDER: List[str] = [
         "preliminary",
         "qualifying",
+        "preliminary_final",
+        "qualifying_final",
         "round_1",
         "round_2",
         "round_3",
@@ -113,11 +160,19 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
 
     def _is_season_in_progress(season_value: int) -> bool:
         """
-        최신 시즌 제외 정책을 '진행중인 경우에만' 적용하기 위한 판정.
-        - 해당 시즌에 미종료 경기가 1개라도 있으면 진행중(True)
-        - 전부 Finished(FT/AET/PEN 포함)면 진행중(False)
+        진행중 판정(강화판)
+
+        1) matches 에서 미종료가 있으면 진행중(True)
+        2) matches 에 미종료가 없어도, fixtures 에 미종료(예정/진행)가 있으면 진행중(True)
+           (⚠️ 챔스/유로파처럼 matches 에는 끝난 경기만 있고,
+               fixtures 에만 예정경기가 들어있는 케이스 방어)
+        3) 둘 다 없으면 진행중(False)
+
+        주의:
+        - fixtures 테이블에 status_group 컬럼이 없을 수 있으니 fixtures에서는 status/status_short만 사용
         """
         try:
+            # 1) matches 기준
             rows = fetch_all(
                 """
                 SELECT COUNT(*) AS cnt
@@ -133,10 +188,36 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 (league_id, season_value),
             )
             cnt = int((rows[0].get("cnt") if rows else 0) or 0)
-            return cnt > 0
+            if cnt > 0:
+                return True
+
+            # 2) fixtures 기준 (status_group 사용 금지)
+            rows2 = fetch_all(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM fixtures
+                WHERE league_id = %s
+                  AND season = %s
+                  AND NOT (
+                    coalesce(status,'') IN ('FT','AET','PEN')
+                    OR coalesce(status_short,'') IN ('FT','AET','PEN')
+                  )
+                """,
+                (league_id, season_value),
+            )
+            cnt2 = int((rows2[0].get("cnt") if rows2 else 0) or 0)
+            return cnt2 > 0
+
         except Exception as e:
-            print(f"[build_seasons_block] _is_season_in_progress ERROR league_id={league_id} season={season_value}: {e}")
+            print(
+                f"[build_seasons_block] _is_season_in_progress ERROR "
+                f"league_id={league_id} season={season_value}: {e}"
+            )
             return False
+
+
+
+
 
     # 1) 사용 가능한 시즌 목록 (matches 기준)
     try:
@@ -212,19 +293,24 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 )
                 pick = finals[0]
             else:
-                known = [x for x in items if isinstance(x.get("canon_idx"), int)]
-                if known:
-                    known.sort(
-                        key=lambda x: (
-                            x["canon_idx"],
-                            x.get("tie_date_utc") is not None,
-                            x.get("tie_date_utc"),
-                        ),
-                        reverse=True,
-                    )
-                    pick = known[0]
+                # ✅ 챔스/유로파 같은 순수 토너먼트는 "Final" 없으면 우승 확정으로 보지 않는다
+                if league_id in KNOCKOUT_TOURNAMENT:
+                    pick = None
                 else:
-                    pick = items[0] if items else None
+                    # (기타 리그는 기존 폴백 유지)
+                    known = [x for x in items if isinstance(x.get("canon_idx"), int)]
+                    if known:
+                        known.sort(
+                            key=lambda x: (
+                                x["canon_idx"],
+                                x.get("tie_date_utc") is not None,
+                                x.get("tie_date_utc"),
+                            ),
+                            reverse=True,
+                        )
+                        pick = known[0]
+                    else:
+                        pick = items[0] if items else None
 
             if pick:
                 final_winner_map[s_int] = {
@@ -236,83 +322,289 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "_source": "tournament_winner",
                 }
 
+
     except Exception as e:
         print(f"[build_seasons_block] TOURNAMENT WINNER ERROR league_id={league_id}: {e}")
         final_winner_map = {}
 
     # 2-B) standings(rank=1) fallback
+    # ✅ split 리그(Champ Rnd / Releg Rnd 등)에서 rank=1 후보가 여러 개 생기므로
+    #    "Championship(Champ Rnd)"를 Regular Season Champion으로 우선 선택하고
+    #    "Relegation(Releg Rnd)"는 뒤로 밀어버린다.
     standings_champ_map: Dict[int, Dict[str, Any]] = {}
     try:
-        champ_rows = fetch_all(
-            """
-            SELECT DISTINCT ON (s.season)
-                s.season,
-                s.team_id,
-                COALESCE(t.name, '') AS team_name,
-                t.logo AS team_logo,
-                s.points
-            FROM standings AS s
-            LEFT JOIN teams AS t
-              ON t.id = s.team_id
-            WHERE s.league_id = %s
-              AND s.rank = 1
-            ORDER BY s.season DESC, s.rank ASC;
-            """,
-            (league_id,),
-        )
+        # 1) 가능한 경우 group_name/description까지 같이 받아서 우선순위 결정
+        try:
+            champ_rows = fetch_all(
+                """
+                SELECT
+                    s.season,
+                    s.team_id,
+                    COALESCE(t.name, '') AS team_name,
+                    t.logo AS team_logo,
+                    s.points,
+                    COALESCE(s.group_name, '') AS group_name,
+                    COALESCE(s.description, '') AS description
+                FROM standings AS s
+                LEFT JOIN teams AS t
+                  ON t.id = s.team_id
+                WHERE s.league_id = %s
+                  AND s.rank = 1
+                ORDER BY s.season DESC;
+                """,
+                (league_id,),
+            )
 
-        for r in champ_rows:
-            sv = r.get("season")
-            if sv is None:
-                continue
-            s_int = int(sv)
-            standings_champ_map[s_int] = {
-                "season": s_int,
-                "team_id": r.get("team_id"),
-                "team_name": r.get("team_name") or "",
-                "team_logo": r.get("team_logo"),
-                "points": r.get("points"),
-                "_source": "standings_rank1",
-            }
+            def _stage_priority(g: str, d: str) -> int:
+                x = f"{g} {d}".strip().lower()
+                # ✅ Champ Rnd 우선
+                if "champ" in x or "championship" in x:
+                    return 1
+                # ✅ Regular/Table/Overall 다음
+                if "regular" in x or "table" in x or "overall" in x:
+                    return 2
+                # ✅ Releg Rnd는 최하위
+                if "releg" in x:
+                    return 99
+                return 50
+
+            # season 별로 rank=1 후보들 중 "가장 적절한" 1개만 pick
+            candidates_by_season: Dict[int, List[Dict[str, Any]]] = {}
+            for r in champ_rows:
+                sv = r.get("season")
+                if sv is None:
+                    continue
+                s_int = int(sv)
+                candidates_by_season.setdefault(s_int, []).append(r)
+
+            for s_int, items in candidates_by_season.items():
+                # priority 낮을수록 우선, 동률이면 points 높은 쪽 우선
+                best = sorted(
+                    items,
+                    key=lambda r: (
+                        _stage_priority(r.get("group_name") or "", r.get("description") or ""),
+                        -(int(r.get("points") or 0)),
+                    )
+                )[0]
+
+                standings_champ_map[s_int] = {
+                    "season": s_int,
+                    "team_id": best.get("team_id"),
+                    "team_name": best.get("team_name") or "",
+                    "team_logo": best.get("team_logo"),
+                    "points": best.get("points"),
+                    "_source": "standings_rank1",
+                }
+
+        except Exception:
+            # 2) group_name 컬럼이 없거나 실패하면 기존 방식으로 폴백
+            champ_rows = fetch_all(
+                """
+                SELECT DISTINCT ON (s.season)
+                    s.season,
+                    s.team_id,
+                    COALESCE(t.name, '') AS team_name,
+                    t.logo AS team_logo,
+                    s.points
+                FROM standings AS s
+                LEFT JOIN teams AS t
+                  ON t.id = s.team_id
+                WHERE s.league_id = %s
+                  AND s.rank = 1
+                ORDER BY s.season DESC, s.rank ASC;
+                """,
+                (league_id,),
+            )
+
+            for r in champ_rows:
+                sv = r.get("season")
+                if sv is None:
+                    continue
+                s_int = int(sv)
+                standings_champ_map[s_int] = {
+                    "season": s_int,
+                    "team_id": r.get("team_id"),
+                    "team_name": r.get("team_name") or "",
+                    "team_logo": r.get("team_logo"),
+                    "points": r.get("points"),
+                    "_source": "standings_rank1",
+                }
+
     except Exception as e:
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         standings_champ_map = {}
 
-    # 2-C) 병합: tournament 우선
-    merged: Dict[int, Dict[str, Any]] = {}
-    for s, v in standings_champ_map.items():
-        merged[s] = v
-    for s, v in final_winner_map.items():
-        merged[s] = v
 
-    season_champions = [merged[s] for s in sorted(merged.keys(), reverse=True)]
-    for c in season_champions:
-        c.pop("_source", None)
+    # 2-C) ✅ 리그 타입별 챔피언 결정
+    mode = _champion_mode(league_id)
 
-    # 3) ✅ 최신 시즌 제외: "진행중일 때만" 제외
-    try:
-        latest_season = resolve_season_for_league(league_id, None)
-    except Exception as e:
-        latest_season = None
-        print(f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}")
+    merged_rows: List[Dict[str, Any]] = []
 
-    if latest_season is not None and len(season_champions) > 1:
+    if mode == "regular":
+        # 정규시즌 1위만
+        for s in sorted(standings_champ_map.keys(), reverse=True):
+            v = standings_champ_map[s].copy()
+            v["champion_type"] = "regular_season"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    elif mode == "playoffs":
+        # 플레이오프 우승만
+        for s in sorted(final_winner_map.keys(), reverse=True):
+            v = final_winner_map[s].copy()
+            v["champion_type"] = "playoffs"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    elif mode == "regular+playoffs":
+        # 한 시즌에 2개: 정규(standings) + PO(tournament)
+        all_seasons = sorted(
+            set(list(standings_champ_map.keys()) + list(final_winner_map.keys())),
+            reverse=True,
+        )
+        for s in all_seasons:
+            if s in standings_champ_map:
+                v = standings_champ_map[s].copy()
+                v["champion_type"] = "regular_season"
+                v.pop("_source", None)
+                merged_rows.append(v)
+            if s in final_winner_map:
+                v = final_winner_map[s].copy()
+                v["champion_type"] = "playoffs"
+                v.pop("_source", None)
+                merged_rows.append(v)
+
+    elif mode == "knockout":
+        # 토너먼트는 최종 우승만 (tournament winner)
+        for s in sorted(final_winner_map.keys(), reverse=True):
+            v = final_winner_map[s].copy()
+            v["champion_type"] = "tournament"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    else:
+        # 혹시 모를 폴백: 기존과 달리 "정규 우선, 없으면 PO"
+        all_seasons = sorted(
+            set(list(standings_champ_map.keys()) + list(final_winner_map.keys())),
+            reverse=True,
+        )
+        for s in all_seasons:
+            if s in standings_champ_map:
+                v = standings_champ_map[s].copy()
+                v["champion_type"] = "regular_season"
+                v.pop("_source", None)
+                merged_rows.append(v)
+            elif s in final_winner_map:
+                v = final_winner_map[s].copy()
+                v["champion_type"] = "playoffs"
+                v.pop("_source", None)
+                merged_rows.append(v)
+
+    # ---------------------------------------------------------
+    # ✅ NEW POLICY:
+    # - 최신 시즌도 포함해서 "박스(Season row)"는 항상 표시
+    # - 단, 해당 시즌이 진행중이면(team/로고) 챔피언 정보는 비워서 내려준다
+    #   (즉, 시즌 확정되면 그때부터 팀명이 표시됨)
+    # ---------------------------------------------------------
+
+    # merged_rows 는 "결과 후보" (standings/tournament_ties 기반) 목록
+    # → 이를 season/champion_type 기준으로 빠르게 찾을 수 있게 맵으로 만든다.
+    merged_by_key: Dict[tuple, Dict[str, Any]] = {}
+    for r in merged_rows:
         try:
-            ls_int = int(latest_season)
+            s_int = int(r.get("season") or 0)
         except Exception:
-            ls_int = -1
+            continue
+        ctype = (r.get("champion_type") or "").strip()
+        if s_int > 0 and ctype:
+            merged_by_key[(s_int, ctype)] = r
 
-        if ls_int > 0 and _is_season_in_progress(ls_int):
-            season_champions = [
-                c for c in season_champions
-                if c.get("season") != latest_season
-            ]
+    def _blank_row(season_value: int, champion_type: str) -> Dict[str, Any]:
+        return {
+            "season": int(season_value),
+            "team_id": None,
+            "team_name": "",
+            "team_logo": None,
+            "points": None,
+            "champion_type": champion_type,
+        }
+
+    # 시즌 목록(seasons)은 matches 기준으로 이미 최신까지 포함됨
+    # → 여기서 "항상 박스 row 생성"을 보장한다.
+    season_champions_final: List[Dict[str, Any]] = []
+
+    for s in seasons:
+        try:
+            s_int = int(s)
+        except Exception:
+            continue
+        if s_int <= 0:
+            continue
+
+        in_progress = _is_season_in_progress(s_int)
+
+        if mode == "regular":
+            key = (s_int, "regular_season")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "regular_season"))
+
+        elif mode == "playoffs":
+            # ✅ 토너먼트/PO는 "남은 경기"로 판단 금지
+            # ✅ 우승 확정 = merged 결과에 team_id가 존재하는가
+            key = (s_int, "playoffs")
+            picked = merged_by_key.get(key)
+            winner_confirmed = bool(picked and picked.get("team_id"))
+            if winner_confirmed:
+                season_champions_final.append(picked)
+            else:
+                season_champions_final.append(_blank_row(s_int, "playoffs"))
+
+        elif mode == "knockout":
+            # ✅ 챔스/유로파 등: 우승 확정 = tournament winner(team_id) 존재
+            key = (s_int, "tournament")
+            picked = merged_by_key.get(key)
+            winner_confirmed = bool(picked and picked.get("team_id"))
+            if winner_confirmed:
+                season_champions_final.append(picked)
+            else:
+                season_champions_final.append(_blank_row(s_int, "tournament"))
+
+        elif mode == "regular+playoffs":
+            key_reg = (s_int, "regular_season")
+            key_po  = (s_int, "playoffs")
+
+            # regular은 기존 정책 유지 (진행중이면 블랭크)
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+            else:
+                season_champions_final.append(merged_by_key.get(key_reg) or _blank_row(s_int, "regular_season"))
+
+            # ✅ playoffs는 "winner 확정 여부"로만 블랭크
+            picked_po = merged_by_key.get(key_po)
+            po_winner_confirmed = bool(picked_po and picked_po.get("team_id"))
+            if po_winner_confirmed:
+                season_champions_final.append(picked_po)
+            else:
+                season_champions_final.append(_blank_row(s_int, "playoffs"))
+
+        else:
+            key = (s_int, "regular_season")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "regular_season"))
+
+
+    season_champions = season_champions_final
 
     return {
         "league_id": league_id,
         "seasons": seasons,
         "season_champions": season_champions,
     }
+
 
 
 

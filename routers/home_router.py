@@ -17,6 +17,26 @@ home_bp = Blueprint("home", __name__, url_prefix="/api/home")
 
 
 # ─────────────────────────────────────
+#  0) 서버 단일 기준(Home Config): /api/home/config
+# ─────────────────────────────────────
+@home_bp.route("/config")
+def route_home_config():
+    """
+    서버 단일 기준 설정 파일(home_config.py)을 앱이 그대로 읽게 내려준다.
+
+    포함:
+      - 지원 리그 목록
+      - 리그 필터(대륙/정렬 규칙 반영된 결과)
+      - 홈 매치리스트 섹션 순서 기준(5대리그 고정 + 나머지 규칙)
+    """
+    from services.home_config import get_home_config
+
+    cfg = get_home_config()
+    return jsonify({"ok": True, "config": cfg})
+
+
+
+# ─────────────────────────────────────
 #  1) 상단 리그 탭용: /api/home/leagues
 # ─────────────────────────────────────
 @home_bp.route("/leagues")

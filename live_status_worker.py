@@ -822,14 +822,20 @@ def fetch_standings(session: requests.Session, league_id: int, season: int) -> L
 
 def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]]) -> int:
     """
-    standings 테이블(네 스키마)에 맞춰 UPSERT
-    PK: (league_id, season, group_name, team_id)
+    ✅ standings 테이블(네 스키마)에 맞춰 REPLACE (league_id+season 단위 싹 교체)
+
+    - rows가 비면(응답 비정상/일시 빈값) 절대 삭제하지 않음
+    - BEGIN/COMMIT으로 "삭제→삽입 사이 잠깐 빈 상태"를 최소화
+    - PK: (league_id, season, group_name, team_id)
     """
     if not rows:
         return 0
 
     nowi = _now_iso_utc()
-    n = 0
+
+    # (선택) 매우 방어적으로, 같은 (group_name, team_id)가 중복으로 들어오면 마지막 값만 남기기
+    # - API-Sports는 보통 중복을 안 주지만, 혹시 모를 공급자 이상치 방어
+    dedup: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
     for r in rows:
         team = r.get("team") or {}
@@ -837,10 +843,30 @@ def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]
         if team_id is None:
             continue
 
+        group_name = (safe_text(r.get("group")) or "Overall").strip() or "Overall"
+        dedup[(group_name, int(team_id))] = r
+
+    if not dedup:
+        return 0
+
+    try:
+        execute("BEGIN")
+    except Exception:
+        # BEGIN 실패해도 동작은 하게(최악: 잠깐 빈 상태 가능)
+        pass
+
+    # ✅ 핵심: league+season 전체 삭제
+    execute(
+        "DELETE FROM standings WHERE league_id=%s AND season=%s",
+        (int(league_id), int(season)),
+    )
+
+    n = 0
+
+    for (group_name, team_id), r in dedup.items():
         rank = safe_int(r.get("rank")) or 0
         points = safe_int(r.get("points"))
         goals_diff = safe_int(r.get("goalsDiff"))
-        group_name = (safe_text(r.get("group")) or "Overall").strip() or "Overall"
         form = safe_text(r.get("form"))
         desc = safe_text(r.get("description"))
         update = safe_text(r.get("update")) or nowi
@@ -858,6 +884,8 @@ def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]
             gf = safe_int(goals_blk.get("for"))
             ga = safe_int(goals_blk.get("against"))
 
+        # ✅ REPLACE에서는 ON CONFLICT가 사실상 불필요하지만,
+        #    트랜잭션/중복 방어/재실행 안전성 때문에 "DO UPDATE"를 남겨둬도 무해함
         execute(
             """
             INSERT INTO standings (
@@ -879,19 +907,6 @@ def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]
                 form          = EXCLUDED.form,
                 updated_utc   = EXCLUDED.updated_utc,
                 description   = EXCLUDED.description
-            WHERE
-                standings.rank          IS DISTINCT FROM EXCLUDED.rank OR
-                standings.points        IS DISTINCT FROM EXCLUDED.points OR
-                standings.goals_diff    IS DISTINCT FROM EXCLUDED.goals_diff OR
-                standings.played        IS DISTINCT FROM EXCLUDED.played OR
-                standings.win           IS DISTINCT FROM EXCLUDED.win OR
-                standings.draw          IS DISTINCT FROM EXCLUDED.draw OR
-                standings.lose          IS DISTINCT FROM EXCLUDED.lose OR
-                standings.goals_for     IS DISTINCT FROM EXCLUDED.goals_for OR
-                standings.goals_against IS DISTINCT FROM EXCLUDED.goals_against OR
-                standings.form          IS DISTINCT FROM EXCLUDED.form OR
-                standings.updated_utc   IS DISTINCT FROM EXCLUDED.updated_utc OR
-                standings.description   IS DISTINCT FROM EXCLUDED.description
             """,
             (
                 int(league_id), int(season), group_name, int(rank), int(team_id),
@@ -901,7 +916,17 @@ def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]
         )
         n += 1
 
+    try:
+        execute("COMMIT")
+    except Exception:
+        try:
+            execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
     return n
+
 
 
 def _select_unconsumed_triggers(which: str, limit: int = 50) -> List[Dict[str, Any]]:
