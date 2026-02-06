@@ -85,21 +85,59 @@ def build_hockey_seasons_block(league_id: int) -> Dict[str, Any]:
     def _pick_champion_from_ties(league_id: int, season: int) -> Optional[int]:
         """
         hockey_tournament_ties 에서 Final winner 우선 추출.
-        - round/round_name 표기 변형이 많아서 'final' 포함 여부 기반으로 점수화
+
+        ✅ 핵심: DB에 실제 존재하는 라운드 컬럼명을 information_schema로 확인한 뒤,
+        그 컬럼만 SELECT에 넣는다. (없는 컬럼을 쿼리에 절대 포함시키지 않음)
         """
-        rows = hockey_fetch_all(
-            """
+
+        # 1) hockey_tournament_ties에 어떤 라운드 컬럼이 있는지 확인
+        #    (일반적으로 하키는 round, 축구는 round_name 같은 케이스가 많음)
+        has_round_name = bool(
+            hockey_fetch_one(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name   = 'hockey_tournament_ties'
+                  AND column_name  = 'round_name'
+                LIMIT 1
+                """,
+                (),
+            )
+        )
+        has_round = bool(
+            hockey_fetch_one(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name   = 'hockey_tournament_ties'
+                  AND column_name  = 'round'
+                LIMIT 1
+                """,
+                (),
+            )
+        )
+
+        # 2) 실제 존재하는 컬럼로만 SQL 구성
+        if has_round_name:
+            rnd_expr = "COALESCE(round_name, '')"
+        elif has_round:
+            rnd_expr = "COALESCE(round, '')"
+        else:
+            rnd_expr = "''"
+
+        q = f"""
             SELECT
               winner_team_id,
-              COALESCE(round_name, round, '') AS rnd
+              {rnd_expr} AS rnd
             FROM hockey_tournament_ties
             WHERE league_id = %s
               AND season = %s
               AND winner_team_id IS NOT NULL
-            """,
-            (league_id, season),
-        )
+        """
 
+        rows = hockey_fetch_all(q, (league_id, season))
         if not rows:
             return None
 
@@ -107,14 +145,12 @@ def build_hockey_seasons_block(league_id: int) -> Dict[str, Any]:
             rnd = (r.get("rnd") or "").lower()
             s = 0
 
-            # ✅ Final 최우선 (semi/final 혼동 방지)
+            # ✅ Final 최우선 (semi-final 혼동 방지)
             if "final" in rnd:
                 s += 2000
                 if "semi" in rnd:
-                    s -= 1500  # 'semi-final'이면 Final로 보지 않게 강하게 패널티
+                    s -= 1500
 
-            # 컨퍼런스/리그 파이널 같은 변형도 결국 final 포함이므로 위에서 커버
-            # 최종결정전이 아닌 것들(quarter 등)은 점수 낮음
             if "semi" in rnd:
                 s += 400
             if "quarter" in rnd:
@@ -124,9 +160,9 @@ def build_hockey_seasons_block(league_id: int) -> Dict[str, Any]:
 
             return s
 
-        rows_sorted = sorted(rows, key=_tie_score, reverse=True)
-        best = rows_sorted[0]
+        best = sorted(rows, key=_tie_score, reverse=True)[0]
         return int(best["winner_team_id"]) if best.get("winner_team_id") is not None else None
+
 
     for season in seasons:
         if season == current_season:
