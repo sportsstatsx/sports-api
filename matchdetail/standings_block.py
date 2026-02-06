@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, List, Tuple
 import re
+import datetime as dt
+
 
 from db import fetch_all
 
@@ -109,6 +111,107 @@ def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
             continue
 
     return None
+
+def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
+    """
+    DB/헤더에서 오는 date_utc 문자열을 UTC datetime으로 파싱 (방어적)
+    지원 예:
+      - "2026-02-06 13:29:37"
+      - "2026-02-06T13:29:37+00:00"
+      - "2026-02-06 13:29:37+00:00"
+    """
+    if not isinstance(s, str):
+        return None
+    txt = s.strip()
+    if not txt:
+        return None
+
+    # ISO offset 형태 우선
+    try:
+        # 공백 -> T 보정
+        iso = txt.replace(" ", "T")
+        d = dt.datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc)
+    except Exception:
+        pass
+
+    # "yyyy-mm-dd HH:MM:SS" (초 19자리) fallback
+    try:
+        head = txt.replace("T", " ").split("+", 1)[0].strip()[:19]
+        d = dt.datetime.strptime(head, "%Y-%m-%d %H:%M:%S")
+        return d.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _should_hide_standings_early_season(
+    *,
+    league_id: int,
+    season: int,
+    fixture_id: Optional[int],
+    rows_raw: List[Dict[str, Any]],
+    window_days: int = 14,
+    played_threshold: int = 15,
+) -> bool:
+    """
+    옵션 A:
+    - 시즌 시작 초반(window_days 이내)인데
+    - standings rows의 played가 비정상적으로 크면(played_threshold 이상)
+    => API-Sports가 지난 시즌 최종 테이블을 current season으로 잘못 내려준 케이스로 보고 숨김.
+    """
+    if not rows_raw:
+        return False
+
+    # max played 체크
+    max_played = 0
+    for r in rows_raw:
+        p = _coalesce_int(r.get("played"), 0)
+        if p > max_played:
+            max_played = p
+
+    if max_played < played_threshold:
+        return False
+
+    # 시즌 시작일(우리 DB fixtures 기준)
+    min_row = _fetch_one(
+        """
+        SELECT MIN(date_utc) AS min_date_utc
+        FROM fixtures
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+    season_start_dt = _parse_utc_dt((min_row or {}).get("min_date_utc"))
+    if season_start_dt is None:
+        return False
+
+    # 현재 경기(혹은 참조 시점) 날짜
+    ref_dt: Optional[dt.datetime] = None
+    if fixture_id is not None:
+        fx_row = _fetch_one(
+            """
+            SELECT date_utc
+            FROM fixtures
+            WHERE fixture_id = %s
+            LIMIT 1
+            """,
+            (fixture_id,),
+        )
+        ref_dt = _parse_utc_dt((fx_row or {}).get("date_utc"))
+
+    if ref_dt is None:
+        ref_dt = dt.datetime.now(dt.timezone.utc)
+
+    # 시즌 시작 후 window_days 이내면 "초반"
+    delta_days = (ref_dt - season_start_dt).total_seconds() / 86400.0
+    if delta_days <= window_days:
+        return True
+
+    return False
+
 
 
 def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
@@ -792,6 +895,34 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows_raw = []
 
     source = "standings_table" if rows_raw else "computed_from_matches"
+
+    # ─────────────────────────────────────────────────────────────
+    # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
+    # ─────────────────────────────────────────────────────────────
+    if rows_raw:
+        fixture_id_for_guard = fixture_id if "fixture_id" in locals() else _extract_fixture_id_from_header(header)
+        if _should_hide_standings_early_season(
+            league_id=league_id_int,
+            season=season_resolved,
+            fixture_id=fixture_id_for_guard,
+            rows_raw=rows_raw,
+            window_days=14,
+            played_threshold=15,
+        ):
+            return {
+                "league": {
+                    "league_id": league_id_int,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "mode": "TABLE",
+                "rows": [],
+                "bracket": None,
+                "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": "standings_table",
+            }
+
 
     # ─────────────────────────────────────────────────────────────
     # 2) standings 비어 있으면 → matches에서 계산 (기존 로직 유지)
