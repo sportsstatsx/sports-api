@@ -451,32 +451,98 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 v.pop("_source", None)
                 merged_rows.append(v)
 
-    season_champions = merged_rows
+    # ---------------------------------------------------------
+    # ✅ NEW POLICY:
+    # - 최신 시즌도 포함해서 "박스(Season row)"는 항상 표시
+    # - 단, 해당 시즌이 진행중이면(team/로고) 챔피언 정보는 비워서 내려준다
+    #   (즉, 시즌 확정되면 그때부터 팀명이 표시됨)
+    # ---------------------------------------------------------
 
-
-    # 3) ✅ 최신 시즌 제외: "진행중일 때만" 제외
-    try:
-        latest_season = resolve_season_for_league(league_id, None)
-    except Exception as e:
-        latest_season = None
-        print(f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}")
-
-    if latest_season is not None and season_champions:
+    # merged_rows 는 "결과 후보" (standings/tournament_ties 기반) 목록
+    # → 이를 season/champion_type 기준으로 빠르게 찾을 수 있게 맵으로 만든다.
+    merged_by_key: Dict[tuple, Dict[str, Any]] = {}
+    for r in merged_rows:
         try:
-            ls_int = int(latest_season)
+            s_int = int(r.get("season") or 0)
         except Exception:
-            ls_int = -1
+            continue
+        ctype = (r.get("champion_type") or "").strip()
+        if s_int > 0 and ctype:
+            merged_by_key[(s_int, ctype)] = r
 
-        if ls_int > 0 and _is_season_in_progress(ls_int):
-            # ✅ 최신 시즌이 진행중이면: 그 시즌의 챔피언 row(정규/PO/토너먼트) 모두 제외
-            season_champions = [c for c in season_champions if int(c.get("season") or 0) != ls_int]
+    def _blank_row(season_value: int, champion_type: str) -> Dict[str, Any]:
+        return {
+            "season": int(season_value),
+            "team_id": None,
+            "team_name": "",
+            "team_logo": None,
+            "points": None,
+            "champion_type": champion_type,
+        }
 
+    # 시즌 목록(seasons)은 matches 기준으로 이미 최신까지 포함됨
+    # → 여기서 "항상 박스 row 생성"을 보장한다.
+    season_champions_final: List[Dict[str, Any]] = []
+
+    for s in seasons:
+        try:
+            s_int = int(s)
+        except Exception:
+            continue
+        if s_int <= 0:
+            continue
+
+        in_progress = _is_season_in_progress(s_int)
+
+        if mode == "regular":
+            key = (s_int, "regular_season")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "regular_season"))
+
+        elif mode == "playoffs":
+            key = (s_int, "playoffs")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "playoffs"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "playoffs"))
+
+        elif mode == "knockout":
+            key = (s_int, "tournament")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "tournament"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "tournament"))
+
+        elif mode == "regular+playoffs":
+            # ✅ 한 시즌에 2개 박스(정규 + PO) 모두 항상 표시
+            key_reg = (s_int, "regular_season")
+            key_po  = (s_int, "playoffs")
+
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+                season_champions_final.append(_blank_row(s_int, "playoffs"))
+            else:
+                season_champions_final.append(merged_by_key.get(key_reg) or _blank_row(s_int, "regular_season"))
+                season_champions_final.append(merged_by_key.get(key_po)  or _blank_row(s_int, "playoffs"))
+
+        else:
+            # 폴백: 정규 1개만
+            key = (s_int, "regular_season")
+            if in_progress:
+                season_champions_final.append(_blank_row(s_int, "regular_season"))
+            else:
+                season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "regular_season"))
+
+    season_champions = season_champions_final
 
     return {
         "league_id": league_id,
         "seasons": seasons,
         "season_champions": season_champions,
     }
+
 
 
 
