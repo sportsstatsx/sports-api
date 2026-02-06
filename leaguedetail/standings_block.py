@@ -747,16 +747,15 @@ def build_standings_block(
         )
 
         if bracket:
-            return {
-                "league_id": league_id,
-                "season": season_resolved,
-                "league_name": league_name,
-                "rows": [],
-                "bracket": bracket,
-                "mode": "BRACKET",
-                "context_options": {"conferences": [], "groups": []},
-            }
-        # bracket 비면 기존 TABLE 로직으로 fallback
+            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
+            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
+            bracket_mode = "BRACKET"
+            bracket_data = bracket
+        else:
+            bracket_mode = None
+            bracket_data = None
+        # bracket 비면 기존 TABLE 로직으로 fallback (기존 로직 그대로)
+
 
 
     
@@ -1105,12 +1104,34 @@ def build_standings_block(
     context_options = _build_context_options_from_rows(context_rows)
 
 
-    return {
+    out = {
         "league_id": league_id,
         "season": season_resolved,
         "league_name": league_name,
         "rows": out_rows,
         "context_options": context_options,
+        # ✅ 기본 제공 (앱 파서가 mode/bracket 항상 읽을 수 있게)
+        "mode": "TABLE",
+        "bracket": None,
     }
+
+    # ✅ BRACKET이 있었으면: bracket 포함 + chips에 Play-offs 추가
+    if "bracket_data" in locals() and bracket_data:
+        out["mode"] = "BRACKET"
+        out["bracket"] = bracket_data
+
+        # UX-2: 기존 그룹칩 + Play-offs 혼합
+        try:
+            co = out.get("context_options") or {}
+            groups = list(co.get("groups") or [])
+            if not any((g or "").strip().lower() == "play-offs" for g in groups):
+                groups.append("Play-offs")
+            co["groups"] = groups
+            out["context_options"] = co
+        except Exception:
+            pass
+
+    return out
+
 
 
