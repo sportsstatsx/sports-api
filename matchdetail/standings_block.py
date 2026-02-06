@@ -194,17 +194,25 @@ def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
     if not s:
         return None
 
-    # ── Final / Semi / Quarter ─────────────────────────────
-    # 기존은 fullmatch라서 "Conference League Play-offs - Final" 같은 케이스가 안 잡힘
-    # → 문장 내 포함도 인식하도록 확장 (다른 로직 영향 최소화)
-    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
-        return "final"
+    # ── Elimination (Final 포함) ───────────────────────────
+    # "Elimination Final"이 먼저 final로 잡혀버리는 문제 방지
+    if "elimination" in s:
+        if re.search(r"(^|\s)elimination\s+final(s)?(\s|$)", s):
+            return "elimination_final"
+        return "elimination"
 
+    # ── Semi / Quarter / Final ─────────────────────────────
+    # ✅ Semi/Quarter를 Final보다 먼저 판정해야 "semi finals"가 final로 오염되지 않는다.
     if re.search(r"(^|\s)semi\s*finals?(\s|$)", s) or re.search(r"(^|\s)semifinals?(\s|$)", s):
         return "semi"
 
     if re.search(r"(^|\s)quarter\s*finals?(\s|$)", s) or re.search(r"(^|\s)quarterfinals?(\s|$)", s):
         return "quarter"
+
+    # Final은 가장 마지막에 판정 (semi/quarter/elimination final과 충돌 방지)
+    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
+        return "final"
+
 
 
     # ── Last N / 1/8 Finals / 1/16 Finals / Round of words ──
