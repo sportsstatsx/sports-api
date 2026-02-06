@@ -149,22 +149,21 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     ]
     CANON_ORDER_INDEX = {k: i for i, k in enumerate(CANON_ORDER)}
 
-    def _is_season_in_progress(season_value: int) -> bool:    def _is_season_in_progress(season_value: int) -> bool:
+    def _is_season_in_progress(season_value: int) -> bool:
         """
         진행중 판정(강화판)
 
         1) matches 에서 미종료가 있으면 진행중(True)
-        2) matches 에 미종료가 없어도, fixtures 에 미종료가 있으면 진행중(True)
+        2) matches 에 미종료가 없어도, fixtures 에 미종료(예정/진행)가 있으면 진행중(True)
            (⚠️ 챔스/유로파처럼 matches 에는 끝난 경기만 있고,
                fixtures 에만 예정경기가 들어있는 케이스 방어)
         3) 둘 다 없으면 진행중(False)
 
         주의:
-        - fixtures 테이블에 status_group 컬럼이 없을 수 있어서
-          fixtures 쪽에서는 status/status_short만으로 판정한다.
+        - fixtures 테이블에 status_group 컬럼이 없을 수 있으니 fixtures에서는 status/status_short만 사용
         """
         try:
-            # 1) matches 기준 (기존 로직 유지)
+            # 1) matches 기준
             rows = fetch_all(
                 """
                 SELECT COUNT(*) AS cnt
@@ -183,8 +182,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             if cnt > 0:
                 return True
 
-            # 2) fixtures 기준
-            # ✅ fixtures 테이블에는 status_group이 없을 수 있으니 사용하지 않는다.
+            # 2) fixtures 기준 (status_group 사용 금지)
             rows2 = fetch_all(
                 """
                 SELECT COUNT(*) AS cnt
@@ -206,9 +204,8 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 f"[build_seasons_block] _is_season_in_progress ERROR "
                 f"league_id={league_id} season={season_value}: {e}"
             )
-            # 에러면 '진행중'으로 보수적으로 처리해도 되지만,
-            # 여기서는 기존 의도대로 False 유지(원하면 True로 바꿔도 됨)
             return False
+
 
 
 
