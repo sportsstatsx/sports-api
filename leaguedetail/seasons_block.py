@@ -78,9 +78,16 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         if not s:
             return None
 
-        # Final 계열
+        # ✅ Qualifying/Preliminary Final 은 "진짜 우승 결승"이 아니므로 분리
+        if "qualifying" in s and "final" in s:
+            return "qualifying_final"
+        if "preliminary" in s and "final" in s:
+            return "preliminary_final"
+
+        # Final 계열 (✅ 진짜 Final만)
         if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
             return "final"
+
 
         # Semi / Quarter
         if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
@@ -129,6 +136,8 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     CANON_ORDER: List[str] = [
         "preliminary",
         "qualifying",
+        "preliminary_final",
+        "qualifying_final",
         "round_1",
         "round_2",
         "round_3",
@@ -284,19 +293,24 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 )
                 pick = finals[0]
             else:
-                known = [x for x in items if isinstance(x.get("canon_idx"), int)]
-                if known:
-                    known.sort(
-                        key=lambda x: (
-                            x["canon_idx"],
-                            x.get("tie_date_utc") is not None,
-                            x.get("tie_date_utc"),
-                        ),
-                        reverse=True,
-                    )
-                    pick = known[0]
+                # ✅ 챔스/유로파 같은 순수 토너먼트는 "Final" 없으면 우승 확정으로 보지 않는다
+                if league_id in KNOCKOUT_TOURNAMENT:
+                    pick = None
                 else:
-                    pick = items[0] if items else None
+                    # (기타 리그는 기존 폴백 유지)
+                    known = [x for x in items if isinstance(x.get("canon_idx"), int)]
+                    if known:
+                        known.sort(
+                            key=lambda x: (
+                                x["canon_idx"],
+                                x.get("tie_date_utc") is not None,
+                                x.get("tie_date_utc"),
+                            ),
+                            reverse=True,
+                        )
+                        pick = known[0]
+                    else:
+                        pick = items[0] if items else None
 
             if pick:
                 final_winner_map[s_int] = {
@@ -307,6 +321,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                     "points": None,
                     "_source": "tournament_winner",
                 }
+
 
     except Exception as e:
         print(f"[build_seasons_block] TOURNAMENT WINNER ERROR league_id={league_id}: {e}")
