@@ -150,31 +150,57 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     CANON_ORDER_INDEX = {k: i for i, k in enumerate(CANON_ORDER)}
 
     def _is_season_in_progress(season_value: int) -> bool:
-        """
-        최신 시즌 제외 정책을 '진행중인 경우에만' 적용하기 위한 판정.
-        - 해당 시즌에 미종료 경기가 1개라도 있으면 진행중(True)
-        - 전부 Finished(FT/AET/PEN 포함)면 진행중(False)
-        """
-        try:
-            rows = fetch_all(
-                """
-                SELECT COUNT(*) AS cnt
-                FROM matches
-                WHERE league_id = %s
-                  AND season = %s
-                  AND NOT (
-                    lower(coalesce(status_group,'')) = 'finished'
-                    OR coalesce(status,'') IN ('FT','AET','PEN')
-                    OR coalesce(status_short,'') IN ('FT','AET','PEN')
-                  )
-                """,
-                (league_id, season_value),
-            )
-            cnt = int((rows[0].get("cnt") if rows else 0) or 0)
-            return cnt > 0
-        except Exception as e:
-            print(f"[build_seasons_block] _is_season_in_progress ERROR league_id={league_id} season={season_value}: {e}")
-            return False
+    """
+    진행중 판정(강화판)
+
+    1) matches 에서 미종료가 있으면 진행중(True)
+    2) matches 에 미종료가 없어도, fixtures 에 미종료가 있으면 진행중(True)
+       (⚠️ 챔스/유로파처럼 matches 에는 끝난 경기만 있고,
+           fixtures 에만 예정경기가 들어있는 케이스 방어)
+    3) 둘 다 없으면 진행중(False)
+    """
+    try:
+        # 1) matches 기준
+        rows = fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM matches
+            WHERE league_id = %s
+              AND season = %s
+              AND NOT (
+                lower(coalesce(status_group,'')) = 'finished'
+                OR coalesce(status,'') IN ('FT','AET','PEN')
+                OR coalesce(status_short,'') IN ('FT','AET','PEN')
+              )
+            """,
+            (league_id, season_value),
+        )
+        cnt = int((rows[0].get("cnt") if rows else 0) or 0)
+        if cnt > 0:
+            return True
+
+        # 2) fixtures 기준(예정경기/진행중 경기 존재 여부)
+        rows2 = fetch_all(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM fixtures
+            WHERE league_id = %s
+              AND season = %s
+              AND NOT (
+                lower(coalesce(status_group,'')) = 'finished'
+                OR coalesce(status,'') IN ('FT','AET','PEN')
+                OR coalesce(status_short,'') IN ('FT','AET','PEN')
+              )
+            """,
+            (league_id, season_value),
+        )
+        cnt2 = int((rows2[0].get("cnt") if rows2 else 0) or 0)
+        return cnt2 > 0
+
+    except Exception as e:
+        print(f"[build_seasons_block] _is_season_in_progress ERROR league_id={league_id} season={season_value}: {e}")
+        return False
+
 
     # 1) 사용 가능한 시즌 목록 (matches 기준)
     try:
