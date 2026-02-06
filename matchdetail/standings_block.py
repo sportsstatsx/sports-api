@@ -730,20 +730,17 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         )
 
         if bracket:
-            return {
-                "league": {
-                    "league_id": league_id_int,
-                    "season": season_resolved,
-                    "name": league_name,
-                },
-                "mode": "BRACKET",
-                "rows": [],
-                "bracket": bracket,
-                "context_options": {"conferences": [], "groups": []},
-                "message": None,
-                "source": "tournament_ties",
-            }
-        # bracket이 비면 TABLE로 fallback
+            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
+            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
+            bracket_mode = "BRACKET"
+            bracket_data = bracket
+            bracket_source = "tournament_ties"
+        else:
+            bracket_mode = None
+            bracket_data = None
+            bracket_source = None
+        # bracket이 비면 기존 TABLE로 fallback (기존 로직 그대로)
+
 
     # ─────────────────────────────────────────────────────────────
     # 1) standings 테이블 우선
@@ -1077,12 +1074,32 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "season": season_resolved,
             "name": league_name,
         },
+        # ✅ 기본은 TABLE, bracket이 있으면 BRACKET으로만 바꿔 끼움
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
         "context_options": context_options,
         "source": source,
     }
+
+    # ✅ BRACKET이 있었으면: bracket을 추가로 포함 + chips에 Play-offs 추가
+    if "bracket_data" in locals() and bracket_data:
+        out["mode"] = "BRACKET"
+        out["bracket"] = bracket_data
+        out["source"] = bracket_source or out.get("source")
+
+        # UX-2: 기존 그룹칩 + Play-offs 혼합
+        try:
+            co = out.get("context_options") or {}
+            groups = list(co.get("groups") or [])
+            # case-insensitive 중복 방지
+            if not any((g or "").strip().lower() == "play-offs" for g in groups):
+                groups.append("Play-offs")
+            co["groups"] = groups
+            out["context_options"] = co
+        except Exception:
+            pass
+
 
     if not table:
         out["message"] = "Standings are not available yet.\nPlease check back later."
