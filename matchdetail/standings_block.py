@@ -697,8 +697,24 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
     # ─────────────────────────────────────────────────────────────
     fixture_id = _extract_fixture_id_from_header(header)
-    league_round = header.get("league_round")
+
+    # ✅ league_round 추출 보강: header 구조가 달라도 안정적으로 라운드 문자열 확보
+    league_round = None
+    if isinstance(header.get("league_round"), str):
+        league_round = header.get("league_round")
+
+    if league_round is None and isinstance(header.get("round"), str):
+        league_round = header.get("round")
+
+    league_info2 = header.get("league")
+    if league_round is None and isinstance(league_info2, dict):
+        if isinstance(league_info2.get("round"), str):
+            league_round = league_info2.get("round")
+        elif isinstance(league_info2.get("league_round"), str):
+            league_round = league_info2.get("league_round")
+
     league_round_str = league_round.strip() if isinstance(league_round, str) else None
+
 
     if fixture_id is not None and _is_knockout_round_for_bracket(league_id_int, league_round_str):
         tie_row = _fetch_one(
