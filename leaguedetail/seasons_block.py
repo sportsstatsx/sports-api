@@ -22,6 +22,44 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     season_champions: List[Dict[str, Any]] = []
 
     # ─────────────────────────────────────────────
+    # Champion decision types (league_id based)
+    # ─────────────────────────────────────────────
+    # ① 정규시즌 1위 = 챔피언
+    REGULAR_SEASON_CHAMPION = {
+        189, 219, 145, 71, 72, 169, 346, 40, 39, 61, 62, 79, 78, 290, 135, 136,
+        98, 99, 89, 88, 106, 107, 94, 95, 305, 307, 180, 293, 140, 141, 208,
+        207, 204, 203,
+    }
+
+    # ② 플레이오프 우승 = 챔피언
+    PLAYOFFS_CHAMPION = {188, 253}
+
+    # ③ 정규시즌 챔프 + 플레이오프 챔프 (2개 존재)
+    REGULAR_AND_PLAYOFFS = {218, 144, 345, 119, 292}
+
+    # ④ 플레이오프/스플릿이 있어도 “챔피언은 정규시즌 1위”
+    # (너가 준 분류 기준)
+    PLAYOFFS_BUT_REGULAR_IS_CHAMPION = {179}
+
+    # ⑤ 토너먼트 (정규시즌 개념 없음) = 최종 우승
+    KNOCKOUT_TOURNAMENT = {17, 16, 2, 848, 3}
+
+    def _champion_mode(lid: int) -> str:
+        if lid in KNOCKOUT_TOURNAMENT:
+            return "knockout"
+        if lid in REGULAR_AND_PLAYOFFS:
+            return "regular+playoffs"
+        if lid in PLAYOFFS_CHAMPION:
+            return "playoffs"
+        if lid in PLAYOFFS_BUT_REGULAR_IS_CHAMPION:
+            return "regular"
+        if lid in REGULAR_SEASON_CHAMPION:
+            return "regular"
+        # 안전 폴백: 기본은 정규시즌(standings) 우선
+        return "regular"
+
+
+    # ─────────────────────────────────────────────
     # local helpers
     # ─────────────────────────────────────────────
     def _norm_round_name(raw: Any) -> str:
@@ -278,16 +316,73 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] CHAMPIONS ERROR league_id={league_id}: {e}")
         standings_champ_map = {}
 
-    # 2-C) 병합: tournament 우선
-    merged: Dict[int, Dict[str, Any]] = {}
-    for s, v in standings_champ_map.items():
-        merged[s] = v
-    for s, v in final_winner_map.items():
-        merged[s] = v
+    # 2-C) ✅ 리그 타입별 챔피언 결정
+    mode = _champion_mode(league_id)
 
-    season_champions = [merged[s] for s in sorted(merged.keys(), reverse=True)]
-    for c in season_champions:
-        c.pop("_source", None)
+    merged_rows: List[Dict[str, Any]] = []
+
+    if mode == "regular":
+        # 정규시즌 1위만
+        for s in sorted(standings_champ_map.keys(), reverse=True):
+            v = standings_champ_map[s].copy()
+            v["champion_type"] = "regular_season"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    elif mode == "playoffs":
+        # 플레이오프 우승만
+        for s in sorted(final_winner_map.keys(), reverse=True):
+            v = final_winner_map[s].copy()
+            v["champion_type"] = "playoffs"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    elif mode == "regular+playoffs":
+        # 한 시즌에 2개: 정규(standings) + PO(tournament)
+        all_seasons = sorted(
+            set(list(standings_champ_map.keys()) + list(final_winner_map.keys())),
+            reverse=True,
+        )
+        for s in all_seasons:
+            if s in standings_champ_map:
+                v = standings_champ_map[s].copy()
+                v["champion_type"] = "regular_season"
+                v.pop("_source", None)
+                merged_rows.append(v)
+            if s in final_winner_map:
+                v = final_winner_map[s].copy()
+                v["champion_type"] = "playoffs"
+                v.pop("_source", None)
+                merged_rows.append(v)
+
+    elif mode == "knockout":
+        # 토너먼트는 최종 우승만 (tournament winner)
+        for s in sorted(final_winner_map.keys(), reverse=True):
+            v = final_winner_map[s].copy()
+            v["champion_type"] = "tournament"
+            v.pop("_source", None)
+            merged_rows.append(v)
+
+    else:
+        # 혹시 모를 폴백: 기존과 달리 "정규 우선, 없으면 PO"
+        all_seasons = sorted(
+            set(list(standings_champ_map.keys()) + list(final_winner_map.keys())),
+            reverse=True,
+        )
+        for s in all_seasons:
+            if s in standings_champ_map:
+                v = standings_champ_map[s].copy()
+                v["champion_type"] = "regular_season"
+                v.pop("_source", None)
+                merged_rows.append(v)
+            elif s in final_winner_map:
+                v = final_winner_map[s].copy()
+                v["champion_type"] = "playoffs"
+                v.pop("_source", None)
+                merged_rows.append(v)
+
+    season_champions = merged_rows
+
 
     # 3) ✅ 최신 시즌 제외: "진행중일 때만" 제외
     try:
@@ -296,17 +391,16 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         latest_season = None
         print(f"[build_seasons_block] resolve_season_for_league ERROR league_id={league_id}: {e}")
 
-    if latest_season is not None and len(season_champions) > 1:
+    if latest_season is not None and season_champions:
         try:
             ls_int = int(latest_season)
         except Exception:
             ls_int = -1
 
         if ls_int > 0 and _is_season_in_progress(ls_int):
-            season_champions = [
-                c for c in season_champions
-                if c.get("season") != latest_season
-            ]
+            # ✅ 최신 시즌이 진행중이면: 그 시즌의 챔피언 row(정규/PO/토너먼트) 모두 제외
+            season_champions = [c for c in season_champions if int(c.get("season") or 0) != ls_int]
+
 
     return {
         "league_id": league_id,
