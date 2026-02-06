@@ -142,23 +142,32 @@ def build_hockey_seasons_block(league_id: int) -> Dict[str, Any]:
             return None
 
         def _tie_score(r: Dict[str, Any]) -> int:
+            import re
+
             rnd = (r.get("rnd") or "").lower()
             s = 0
 
-            # ✅ Final 최우선 (semi-final 혼동 방지)
-            if "final" in rnd:
-                s += 2000
-                if "semi" in rnd:
-                    s -= 1500
+            # ✅ quarter-finals / semi-finals 처럼 "finals"가 들어가도 Final로 오인하지 않게
+            is_quarter = "quarter" in rnd
+            is_semi = "semi" in rnd
 
-            if "semi" in rnd:
+            # ✅ "final" 또는 "finals"를 '단어'로만 매칭
+            # - "quarter-finals" 는 finals 앞이 '-'라서 단어 finals로 매칭되긴 하지만
+            #   위에서 quarter/semi 를 먼저 걸러서 Final 취급을 막는다.
+            is_final_word = bool(re.search(r"\bfinal\b", rnd) or re.search(r"\bfinals\b", rnd))
+
+            if is_final_word and (not is_quarter) and (not is_semi):
+                # 진짜 결승(또는 컨퍼런스 파이널/리그 파이널 등)
+                s += 2000
+            elif is_semi:
                 s += 400
-            if "quarter" in rnd:
+            elif is_quarter:
                 s += 200
-            if "round of" in rnd:
+            elif "round of" in rnd:
                 s += 100
 
             return s
+
 
         best = sorted(rows, key=_tie_score, reverse=True)[0]
         return int(best["winner_team_id"]) if best.get("winner_team_id") is not None else None
