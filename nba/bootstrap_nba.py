@@ -595,40 +595,52 @@ def main() -> int:
             print("[1/6] meta leagues/seasons")
             ingest_meta(conn, base, api_key)
             _save_state(conn, league, season, "teams", last_game_index)
+            stage = "teams"
 
         # 2) teams
-        if stage in ("init", "meta", "teams"):
+        if stage in ("teams", "init", "meta"):
             print("[2/6] teams")
             team_ids = ingest_teams(conn, base, api_key)
             _save_state(conn, league, season, "players", last_game_index)
+            stage = "players"
         else:
             team_ids = [int(r["id"]) for r in _fetchall(conn, "SELECT id FROM nba_teams ORDER BY id")]
 
         # 3) rosters (팀별 시즌 로스터)
-        if stage in ("init", "meta", "teams", "players"):
+        if stage in ("players", "init", "meta", "teams"):
             print(f"[3/6] rosters season={season} teams={len(team_ids)}")
             ingest_rosters(conn, base, api_key, season, team_ids)
             _save_state(conn, league, season, "games", last_game_index)
+            stage = "games"
 
         # 4) games
-        if stage in ("init", "meta", "teams", "players", "games"):
+        if stage in ("games", "init", "meta", "teams", "players"):
             print(f"[4/6] games league={league} season={season}")
             finished_ids = ingest_games(conn, base, api_key, league, season)
             _save_state(conn, league, season, "standings", last_game_index)
+            stage = "standings"
         else:
             finished_ids = [int(r["id"]) for r in _fetchall(conn, "SELECT id FROM nba_games WHERE season=%s AND status_long='Finished' ORDER BY id", (season,))]
 
         # stage 필터(프리시즌 stats 포함 여부)
         if not args.include_stage1:
-            # stage=2만 stats
-            stage2_ids = set(int(r["id"]) for r in _fetchall(conn, "SELECT id FROM nba_games WHERE season=%s AND stage=2 AND status_long='Finished'", (season,)))
+            stage2_ids = set(
+                int(r["id"])
+                for r in _fetchall(
+                    conn,
+                    "SELECT id FROM nba_games WHERE season=%s AND stage=2 AND status_long='Finished'",
+                    (season,),
+                )
+            )
             finished_ids = [gid for gid in finished_ids if gid in stage2_ids]
 
-        # 5) standings
-        if stage in ("standings",):
+        # 5) standings  ✅ 이제 첫 실행에서도 무조건 탐
+        if stage in ("standings", "init", "meta", "teams", "players", "games"):
             print(f"[5/6] standings league={league} season={season}")
             ingest_standings(conn, base, api_key, league, season)
             _save_state(conn, league, season, "stats", last_game_index)
+            stage = "stats"
+
 
         # 6) stats (옵션)
         if args.stats:
