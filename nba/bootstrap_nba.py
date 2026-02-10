@@ -296,24 +296,35 @@ def ingest_meta(conn, base: str, api_key: str) -> None:
     leagues = _http_get_json(base, "leagues", api_key)
     seasons = _http_get_json(base, "seasons", api_key)
 
-    # leagues
-    for it in (leagues.get("response") or []):
-        lid = int(it.get("id"))
-        cols = {
-            "name": it.get("name"),
-            "type": it.get("type"),
-            "seasons": json.dumps(it.get("seasons")),
-        }
-        _upsert_json_by_id(conn, "nba_leagues", lid, it, cols)
+    # leagues: response = ["standard", ...] (list[str])
+    lresp = leagues.get("response") or []
+    for code in lresp:
+        if not isinstance(code, str):
+            raise RuntimeError(f"Unexpected leagues item type: {type(code)} value={code}")
+        payload = {"code": code}
+        _exec(
+            conn,
+            """
+            INSERT INTO nba_leagues (id, raw_json, updated_utc)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (id) DO UPDATE SET
+              raw_json=EXCLUDED.raw_json,
+              updated_utc=EXCLUDED.updated_utc
+            """,
+            (code, json.dumps(payload), _iso_now_utc()),
+        )
 
-    # seasons (API가 [2015..] 같은 int 리스트로 내려올 가능성도 있으니 방어)
-    for s in (seasons.get("response") or []):
-        try:
-            season_val = int(s)
+    # seasons: response = [2015,2016,...] (list[int])
+    sresp = seasons.get("response") or []
+    for s in sresp:
+        if isinstance(s, int):
+            season_val = s
             payload = {"season": season_val}
-        except Exception:
+        else:
+            # 혹시 dict로 오는 케이스 방어(근데 지금은 int임)
             season_val = int(s.get("season"))
             payload = dict(s)
+
         _exec(
             conn,
             """
@@ -327,6 +338,7 @@ def ingest_meta(conn, base: str, api_key: str) -> None:
         )
 
     conn.commit()
+
 
 
 def ingest_teams(conn, base: str, api_key: str) -> List[int]:
