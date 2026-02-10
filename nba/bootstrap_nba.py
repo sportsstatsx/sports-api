@@ -228,6 +228,16 @@ def _create_schema(conn) -> None:
     )
     conn.commit()
 
+def _db_scalar(v: Any) -> Any:
+    """
+    psycopg 파라미터로 바로 못 넣는 dict/list를 안전하게 문자열(JSON)로 변환.
+    (raw_json은 원래 json.dumps로 들어가니 여기서는 컬럼값만 보호)
+    """
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
 
 def _upsert_json_by_id(conn, table: str, row_id: int, payload: Dict[str, Any], columns: Dict[str, Any]) -> None:
     """
@@ -236,7 +246,7 @@ def _upsert_json_by_id(conn, table: str, row_id: int, payload: Dict[str, Any], c
     raw_json/updated_utc는 내부에서 강제 세팅.
     """
     cols = ["id"] + list(columns.keys()) + ["raw_json", "updated_utc"]
-    vals = [row_id] + list(columns.values()) + [json.dumps(payload), _iso_now_utc()]
+    vals = [row_id] + [_db_scalar(v) for v in columns.values()] + [json.dumps(payload, ensure_ascii=False), _iso_now_utc()]
     placeholders = ", ".join(["%s"] * len(cols))
     set_clause = ", ".join([f"{c}=EXCLUDED.{c}" for c in cols[1:]])
 
