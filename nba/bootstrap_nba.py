@@ -121,13 +121,11 @@ def _create_schema(conn) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS nba_leagues (
-          id          INTEGER PRIMARY KEY,
-          name        TEXT,
-          type        TEXT,
-          seasons     JSONB,
+          id          TEXT PRIMARY KEY,   -- ✅ "standard" 같은 league code
           raw_json    JSONB,
           updated_utc TEXT NOT NULL
         );
+
 
         CREATE TABLE IF NOT EXISTS nba_seasons (
           season      INTEGER PRIMARY KEY,
