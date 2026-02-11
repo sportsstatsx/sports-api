@@ -1,7 +1,8 @@
+# basketball/nba/nba_db.py
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
@@ -26,3 +27,15 @@ def nba_fetch_all(query: str, params: Optional[Sequence[Any]] = None) -> List[Di
 def nba_fetch_one(query: str, params: Optional[Sequence[Any]] = None) -> Optional[Dict[str, Any]]:
     rows = nba_fetch_all(query, params)
     return rows[0] if rows else None
+
+
+def nba_execute(query: str, params: Optional[Sequence[Any]] = None) -> None:
+    """
+    INSERT/UPDATE/DELETE 용.
+    (standings 구현에는 당장 필요 없지만, NBA 쪽 확장 시 반드시 필요해짐)
+    """
+    dsn = _nba_dsn()
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params or ())
+        conn.commit()
