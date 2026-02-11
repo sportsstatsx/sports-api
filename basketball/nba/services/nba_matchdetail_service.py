@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import psycopg  # psycopg v3
@@ -27,8 +27,7 @@ except Exception:
         dsn = (os.getenv("NBA_DATABASE_URL") or "").strip()
         if not dsn:
             raise RuntimeError("NBA_DATABASE_URL is not set")
-        conn = psycopg2.connect(dsn)
-        return conn
+        return psycopg2.connect(dsn)
 
 
 def nba_fetch_one(sql: str, params: tuple) -> Optional[Dict[str, Any]]:
@@ -97,7 +96,6 @@ def _to_utc_iso_z(dt: Any) -> Optional[str]:
     if dt is None:
         return None
     if isinstance(dt, str):
-        # 이미 문자열이면 그대로 (DB에 text로 들어온 경우 방어)
         return dt
     try:
         return (
@@ -111,9 +109,6 @@ def _to_utc_iso_z(dt: Any) -> Optional[str]:
 
 
 def _jget(obj: Any, *path: str) -> Any:
-    """
-    dict 경로 안전 접근: _jget(d, "a","b","c")
-    """
     cur = obj
     for k in path:
         if not isinstance(cur, dict):
@@ -122,17 +117,30 @@ def _jget(obj: Any, *path: str) -> Any:
     return cur
 
 
+def _as_dict_json(v: Any) -> Optional[Dict[str, Any]]:
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            o = json.loads(v)
+            return o if isinstance(o, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def _extract_points_from_game_raw(raw: Any) -> Dict[str, Optional[int]]:
     """
-    nba_games.raw_json 에서 점수 추출(구조가 바뀔 수 있으니 매우 보수적으로)
-    - 반환: {"home": int|None, "visitors": int|None}
+    nba_games.raw_json에서 점수 추출(구조가 일정치 않을 수 있으니 보수적으로)
+    반환: {"home": int|None, "visitors": int|None}
     """
     out = {"home": None, "visitors": None}
-
     if not isinstance(raw, dict):
         return out
 
-    # 흔한 케이스들: scores.home.points / scores.visitors.points
+    # 자주 쓰이는 케이스: scores.home.points / scores.visitors.points
     for key_home in (("scores", "home", "points"), ("scores", "home", "total")):
         v = _jget(raw, *key_home)
         if v is not None:
@@ -145,7 +153,7 @@ def _extract_points_from_game_raw(raw: Any) -> Dict[str, Optional[int]]:
             out["visitors"] = _safe_int(v)
             break
 
-    # 다른 케이스: scores.home / scores.visitors 가 숫자 바로인 경우
+    # scores.home 자체가 숫자인 케이스 방어
     if out["home"] is None:
         v = _jget(raw, "scores", "home")
         if isinstance(v, (int, float, str)):
@@ -159,19 +167,17 @@ def _extract_points_from_game_raw(raw: Any) -> Dict[str, Optional[int]]:
     return out
 
 
-def _extract_linescore(raw: Any) -> Dict[str, Any]:
+def _extract_linescore_blob(raw: Any) -> Dict[str, Any]:
     """
-    period/linescore가 raw_json에 있으면 그대로 내려줌(구조 추측 금지).
+    raw_json에 scores/linescore 등이 있으면 '있는 그대로' 내려줌(추측 가공 금지)
     """
     if not isinstance(raw, dict):
         return {}
 
-    # 일반적으로 scores.*.linescore 같은 형태가 많음. 있으면 원본 유지.
     scores = raw.get("scores")
     if isinstance(scores, dict):
         return {"scores": scores}
 
-    # 혹시 linescore 라는 키가 직접 있으면 그것도 유지
     ls = raw.get("linescore")
     if ls is not None:
         return {"linescore": ls}
@@ -179,14 +185,57 @@ def _extract_linescore(raw: Any) -> Dict[str, Any]:
     return {}
 
 
-def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
-    """
-    NBA game detail:
-    - nba_games + nba_teams(홈/원정) + nba_leagues(raw_json)
-    - nba_game_team_stats(raw_json) / nba_game_player_stats(raw_json + nba_players)
-    - override/admin 로직 없음
-    """
-    game_sql = """
+def _build_game_header_row(g: Dict[str, Any]) -> Dict[str, Any]:
+    game_raw = _as_dict_json(g.get("game_raw_json"))
+    pts = _extract_points_from_game_raw(game_raw)
+    linescore_blob = _extract_linescore_blob(game_raw)
+
+    league_raw = _as_dict_json(g.get("league_raw_json"))
+
+    header: Dict[str, Any] = {
+        "game_id": int(g["game_id"]),
+        "league": {
+            "id": _safe_text(g.get("league_id") or g.get("league")),
+            "name": _safe_text(_jget(league_raw, "name")),
+            "logo": _jget(league_raw, "logo"),
+            "raw": league_raw,
+        },
+        "season": _safe_int(g.get("season")),
+        "stage": _safe_int(g.get("stage")),
+        "date_utc": _to_utc_iso_z(g.get("date_start_utc")),
+        "status_long": _safe_text(g.get("status_long")),
+        "status_short": _safe_int(g.get("status_short")),
+        "arena": {
+            "name": _safe_text(g.get("arena_name")),
+            "city": _safe_text(g.get("arena_city")),
+            "state": _safe_text(g.get("arena_state")),
+        },
+        "home": {
+            "id": _safe_int(g.get("home_id")),
+            "name": _safe_text(g.get("home_name")),
+            "nickname": _safe_text(g.get("home_nickname")),
+            "code": _safe_text(g.get("home_code")),
+            "city": _safe_text(g.get("home_city")),
+            "logo": g.get("home_logo"),
+            "score": pts.get("home"),
+        },
+        "visitors": {
+            "id": _safe_int(g.get("visitor_id")),
+            "name": _safe_text(g.get("visitor_name")),
+            "nickname": _safe_text(g.get("visitor_nickname")),
+            "code": _safe_text(g.get("visitor_code")),
+            "city": _safe_text(g.get("visitor_city")),
+            "logo": g.get("visitor_logo"),
+            "score": pts.get("visitors"),
+        },
+        "raw": game_raw,
+    }
+
+    return {"header": header, "linescore": linescore_blob}
+
+
+def _fetch_game_base(game_id: int) -> Dict[str, Any]:
+    sql = """
         SELECT
             g.id AS game_id,
             g.league,
@@ -225,67 +274,14 @@ def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
         WHERE g.id = %s
         LIMIT 1
     """
-
-    g = nba_fetch_one(game_sql, (game_id,))
-    if not g:
+    row = nba_fetch_one(sql, (game_id,))
+    if not row:
         raise ValueError("GAME_NOT_FOUND")
+    return row
 
-    game_raw = g.get("game_raw_json")
-    if isinstance(game_raw, str):
-        # json string으로 들어온 케이스 방어
-        try:
-            game_raw = json.loads(game_raw)
-        except Exception:
-            game_raw = None
 
-    points = _extract_points_from_game_raw(game_raw)
-    linescore_blob = _extract_linescore(game_raw)
-
-    game_obj: Dict[str, Any] = {
-        "game_id": int(g["game_id"]),
-        "league": {
-            "id": _safe_text(g.get("league_id") or g.get("league")),
-            # nba_leagues는 raw_json만 있으니 name/logo는 raw_json에서 있으면 사용, 없으면 빈값
-            "name": _safe_text(_jget(g.get("league_raw_json"), "name")),
-            "logo": _jget(g.get("league_raw_json"), "logo"),
-            "raw": g.get("league_raw_json") if isinstance(g.get("league_raw_json"), dict) else None,
-        },
-        "season": _safe_int(g.get("season")),
-        "stage": _safe_int(g.get("stage")),
-        "date_utc": _to_utc_iso_z(g.get("date_start_utc")),
-        "status_long": _safe_text(g.get("status_long")),
-        "status_short": _safe_int(g.get("status_short")),
-        "arena": {
-            "name": _safe_text(g.get("arena_name")),
-            "city": _safe_text(g.get("arena_city")),
-            "state": _safe_text(g.get("arena_state")),
-        },
-        "home": {
-            "id": _safe_int(g.get("home_id")),
-            "name": _safe_text(g.get("home_name")),
-            "nickname": _safe_text(g.get("home_nickname")),
-            "code": _safe_text(g.get("home_code")),
-            "city": _safe_text(g.get("home_city")),
-            "logo": g.get("home_logo"),
-            "score": points.get("home"),
-        },
-        "visitors": {
-            "id": _safe_int(g.get("visitor_id")),
-            "name": _safe_text(g.get("visitor_name")),
-            "nickname": _safe_text(g.get("visitor_nickname")),
-            "code": _safe_text(g.get("visitor_code")),
-            "city": _safe_text(g.get("visitor_city")),
-            "logo": g.get("visitor_logo"),
-            "score": points.get("visitors"),
-        },
-        # 원본도 필요하면 앱에서 사용 가능
-        "raw": game_raw if isinstance(game_raw, dict) else None,
-    }
-
-    # -------------------------
-    # 2) TEAM STATS (raw_json 그대로)
-    # -------------------------
-    team_stats_rows = nba_fetch_all(
+def _fetch_team_stats(game_id: int, home_tid: Optional[int], vis_tid: Optional[int]) -> Dict[str, Any]:
+    rows = nba_fetch_all(
         """
         SELECT game_id, team_id, raw_json
         FROM nba_game_team_stats
@@ -294,8 +290,8 @@ def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
         (game_id,),
     )
 
-    team_stats_map: Dict[int, Any] = {}
-    for r in team_stats_rows:
+    by_team_id: Dict[int, Any] = {}
+    for r in rows:
         tid = _safe_int(r.get("team_id"))
         if tid is None:
             continue
@@ -305,21 +301,17 @@ def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
                 tj = json.loads(tj)
             except Exception:
                 pass
-        team_stats_map[int(tid)] = tj
+        by_team_id[int(tid)] = tj
 
-    home_tid = _safe_int(g.get("home_team_id"))
-    vis_tid = _safe_int(g.get("visitor_team_id"))
-
-    team_stats_out: Dict[str, Any] = {
-        "home": team_stats_map.get(int(home_tid)) if home_tid is not None else None,
-        "visitors": team_stats_map.get(int(vis_tid)) if vis_tid is not None else None,
-        "by_team_id": team_stats_map,  # 혹시 팀ID 기준으로도 필요하면 그대로 사용
+    return {
+        "home": by_team_id.get(int(home_tid)) if home_tid is not None else None,
+        "visitors": by_team_id.get(int(vis_tid)) if vis_tid is not None else None,
+        "by_team_id": by_team_id,
     }
 
-    # -------------------------
-    # 3) PLAYER STATS (raw_json + nba_players join)
-    # -------------------------
-    player_rows = nba_fetch_all(
+
+def _fetch_player_stats(game_id: int, home_tid: Optional[int], vis_tid: Optional[int]) -> Dict[str, Any]:
+    rows = nba_fetch_all(
         """
         SELECT
             s.game_id,
@@ -335,11 +327,11 @@ def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
         (game_id,),
     )
 
-    players_home: List[Dict[str, Any]] = []
-    players_vis: List[Dict[str, Any]] = []
-    players_all: List[Dict[str, Any]] = []
+    home_list: List[Dict[str, Any]] = []
+    vis_list: List[Dict[str, Any]] = []
+    all_list: List[Dict[str, Any]] = []
 
-    for r in player_rows:
+    for r in rows:
         pid = _safe_int(r.get("player_id"))
         tid = _safe_int(r.get("team_id"))
         stat_raw = r.get("stat_raw_json")
@@ -350,38 +342,130 @@ def nba_get_game_detail(game_id: int) -> Dict[str, Any]:
             except Exception:
                 pass
 
+        first = _safe_text(r.get("firstname"))
+        last = _safe_text(r.get("lastname"))
+        full = (f"{first} {last}").strip()
+
         item = {
             "player_id": pid,
             "team_id": tid,
-            "name": {
-                "first": _safe_text(r.get("firstname")),
-                "last": _safe_text(r.get("lastname")),
-                "full": (f"{_safe_text(r.get('firstname'))} {_safe_text(r.get('lastname'))}").strip(),
-            },
+            "name": {"first": first, "last": last, "full": full},
             "raw": stat_raw,
         }
-
-        players_all.append(item)
+        all_list.append(item)
 
         if home_tid is not None and tid == home_tid:
-            players_home.append(item)
+            home_list.append(item)
         elif vis_tid is not None and tid == vis_tid:
-            players_vis.append(item)
+            vis_list.append(item)
 
-    players_out = {
-        "home": players_home,
-        "visitors": players_vis,
-        "all": players_all,
-    }
+    return {"home": home_list, "visitors": vis_list, "all": all_list}
 
-    # -------------------------
-    # 4) FINAL RESPONSE
-    # -------------------------
+
+def _fetch_h2h_games(
+    team_a: int,
+    team_b: int,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """
+    H2H: A/B/C 기준
+    - status_long='Finished'만
+    - league 상관없이 전부
+    - 홈/원정 뒤바뀜 포함
+    """
+    limit = max(1, min(int(limit), 50))
+
+    sql = f"""
+        SELECT
+            g.id AS game_id,
+            g.league,
+            g.season,
+            g.stage,
+            g.status_long,
+            g.status_short,
+            g.date_start_utc,
+            g.home_team_id,
+            g.visitor_team_id,
+            g.arena_name,
+            g.arena_city,
+            g.arena_state,
+            g.raw_json AS game_raw_json,
+
+            lh.id AS league_id,
+            lh.raw_json AS league_raw_json,
+
+            th.id AS home_id,
+            th.name AS home_name,
+            th.nickname AS home_nickname,
+            th.code AS home_code,
+            th.city AS home_city,
+            th.logo AS home_logo,
+
+            tv.id AS visitor_id,
+            tv.name AS visitor_name,
+            tv.nickname AS visitor_nickname,
+            tv.code AS visitor_code,
+            tv.city AS visitor_city,
+            tv.logo AS visitor_logo
+        FROM nba_games g
+        LEFT JOIN nba_leagues lh ON lh.id = g.league
+        LEFT JOIN nba_teams th ON th.id = g.home_team_id
+        LEFT JOIN nba_teams tv ON tv.id = g.visitor_team_id
+        WHERE g.status_long = 'Finished'
+          AND (
+                (g.home_team_id = %s AND g.visitor_team_id = %s)
+             OR (g.home_team_id = %s AND g.visitor_team_id = %s)
+          )
+        ORDER BY g.date_start_utc DESC
+        LIMIT {limit}
+    """
+
+    rows = nba_fetch_all(sql, (team_a, team_b, team_b, team_a))
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        built = _build_game_header_row(r)
+        # H2H는 리스트용이니까 header + linescore만 담는다
+        out.append(
+            {
+                "header": built["header"],
+                "linescore": built["linescore"],
+            }
+        )
+    return out
+
+
+def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
+    """
+    NBA game detail + H2H
+    - override/admin 로직 없음
+    - H2H 기본 5개, 더보기는 h2h_limit으로 재호출
+    """
+    g = _fetch_game_base(game_id)
+
+    built = _build_game_header_row(g)
+    header = built["header"]
+    linescore_blob = built["linescore"]
+
+    home_tid = _safe_int(g.get("home_team_id"))
+    vis_tid = _safe_int(g.get("visitor_team_id"))
+
+    team_stats = _fetch_team_stats(game_id, home_tid, vis_tid)
+    player_stats = _fetch_player_stats(game_id, home_tid, vis_tid)
+
+    # H2H
+    h2h_rows: List[Dict[str, Any]] = []
+    if home_tid is not None and vis_tid is not None:
+        h2h_rows = _fetch_h2h_games(home_tid, vis_tid, h2h_limit)
+
     data: Dict[str, Any] = {
-        "header": game_obj,
-        "linescore": linescore_blob,   # 있으면 내려주고 없으면 {}
-        "team_stats": team_stats_out,  # raw_json 그대로
-        "player_stats": players_out,   # raw_json 그대로
+        "header": header,
+        "linescore": linescore_blob,
+        "team_stats": team_stats,
+        "player_stats": player_stats,
+        "h2h": {
+            "limit": int(max(1, min(int(h2h_limit), 50))),
+            "rows": h2h_rows,
+        },
     }
 
     return {"ok": True, "data": data}
