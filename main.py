@@ -73,6 +73,7 @@ from hockey.routers.hockey_insights_router import hockey_insights_bp
 from hockey.routers.hockey_notifications_router import hockey_notifications_bp
 from hockey.teamdetail.hockey_team_detail_routes import hockey_teamdetail_bp
 from hockey.leaguedetail.hockey_leaguedetail_routes import hockey_leaguedetail_bp
+from basketball.nba.routers.nba_fixtures_router import nba_fixtures_bp
 
 
 
@@ -107,6 +108,8 @@ app.register_blueprint(hockey_standings_bp)
 app.register_blueprint(hockey_insights_bp)
 app.register_blueprint(hockey_notifications_bp)
 app.register_blueprint(hockey_teamdetail_bp)
+
+app.register_blueprint(nba_fixtures_bp)
 
 
 # ─────────────────────────────────────────
@@ -2775,6 +2778,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
