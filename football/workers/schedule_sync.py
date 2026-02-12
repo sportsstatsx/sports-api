@@ -182,6 +182,14 @@ def main() -> None:
 
     print(f"[schedule_sync] done total_fixtures_seen={total_fixtures} total_upserts={total_upserts}")
 
+    # ✅ psycopg_pool 종료 경고 방지 (크론/짧은 프로세스에서 join 에러 방지)
+    try:
+        from db import close_pool
+        close_pool()
+    except Exception:
+        pass
+
+
 
 if __name__ == "__main__":
     main()
