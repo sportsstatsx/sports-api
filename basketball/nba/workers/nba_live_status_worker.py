@@ -18,6 +18,9 @@ logging.basicConfig(level=logging.INFO)
 
 BASE_URL = os.getenv("NBA_BASE", "https://v2.nba.api-sports.io").rstrip("/")
 
+# game_id별 stats 마지막 호출 시각(UTC timestamp)
+_last_stats_ts_by_game: Dict[int, float] = {}
+
 
 # ─────────────────────────────────────────
 # DB helpers
@@ -76,7 +79,15 @@ def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         timeout=45,
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+
+    # ✅ API-Sports는 HTTP 200이어도 errors로 실패할 수 있음
+    errs = data.get("errors") if isinstance(data, dict) else None
+    if isinstance(errs, dict) and errs:
+        raise RuntimeError(f"API-Sports error: {errs}")
+
+    return data
+
 
 
 def _jdump(obj: Any) -> str:
@@ -216,17 +227,14 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
           ON ps.game_id = g.id
         WHERE g.league = 'standard'
           AND (
+            -- (1) 프리 윈도우: now ~ now+pre_min
             (g.date_start_utc >= %s AND g.date_start_utc <= %s)
             OR
+            -- (2) 라이브/진행 윈도우: now-inplay_max ~ now+grace (Finished만 제외)
             (
               g.date_start_utc >= %s
               AND g.date_start_utc <= %s
               AND COALESCE(g.status_long,'') <> 'Finished'
-              AND (
-                COALESCE(g.status_long,'') NOT IN ('Scheduled')
-                OR (COALESCE(g.status_long,'') IN ('Scheduled') AND ps.start_called_at IS NOT NULL AND ps.finished_at IS NULL)
-                OR (COALESCE(g.status_long,'') IN ('Scheduled'))
-              )
             )
           )
         ORDER BY g.date_start_utc ASC
@@ -238,6 +246,7 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
             batch_limit,
         ),
     )
+
     return rows
 
 
@@ -255,93 +264,115 @@ def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
 
 def upsert_game(api_item: Dict[str, Any]) -> Optional[int]:
     """
-    nba_games에 스냅샷 반영.
-    ✅ 컬럼명은 너 DB에 맞춰서만 업데이트:
-      - id
-      - league, season
-      - date_start_utc
-      - status_long
-      - status_short (있으면)
-      - periods_current/total (있으면)
-      - scores json (있으면)
-      - raw_json
+    nba_games에 스냅샷 반영 (✅ 너 DB 스키마에 100% 맞춤)
+
+    nba_games columns:
+      id, league, season, stage,
+      status_long, status_short,
+      date_start_utc,
+      home_team_id, visitor_team_id,
+      arena_name, arena_city, arena_state,
+      raw_json, updated_utc
     """
     gid = _safe_int(api_item.get("id"))
     if gid is None:
         return None
 
+    # league/season/stage
     league = _safe_text(api_item.get("league")) or "standard"
     season = _safe_int(api_item.get("season"))
+    stage = _safe_int(api_item.get("stage"))
 
+    # date.start
     date_obj = api_item.get("date") if isinstance(api_item.get("date"), dict) else {}
     start_str = date_obj.get("start")
-    start_utc = None
+    start_utc: Optional[dt.datetime] = None
     if isinstance(start_str, str) and start_str:
         try:
             start_utc = dt.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
         except Exception:
             start_utc = None
 
+    # status
     status_obj = api_item.get("status") if isinstance(api_item.get("status"), dict) else {}
     status_long = _safe_text(status_obj.get("long"))
-    status_short = status_obj.get("short")  # int/str 둘 다 올 수 있어 일단 raw로
+    if not status_long:
+        # fallback: 혹시 다른 키로 오거나 비정상 케이스 방어
+        status_long = _safe_text(api_item.get("status_long")) or _safe_text(api_item.get("status"))
 
-    periods = api_item.get("periods") if isinstance(api_item.get("periods"), dict) else {}
-    p_current = _safe_int(periods.get("current"))
-    p_total = _safe_int(periods.get("total"))
 
-    # NBA API-Sports는 teams/score 구조가 케이스마다 다를 수 있어 raw_json을 신뢰하고,
-    # score는 가능한 경우만 score_json에 저장(없으면 NULL 유지)
-    score_json = None
-    try:
-        # 어떤 응답은 scores, 어떤 응답은 score 로 들어오는 케이스가 있어 방어
-        score_json = api_item.get("scores")
-        if score_json is None:
-            score_json = api_item.get("score")
-        if not isinstance(score_json, (dict, list)):
-            score_json = None
-    except Exception:
-        score_json = None
+    
 
-    # ✅ 너 DB의 실제 컬럼에 맞춰서만 사용해야 함
-    # (최소한 id, league, season, date_start_utc, status_long, raw_json은 거의 있을 확률 높음)
+    # 너 컬럼 status_short = integer
+    status_short = _safe_int(status_obj.get("short"))
+
+    # teams (API-Sports NBA: teams.home / teams.visitors)
+    teams = api_item.get("teams") if isinstance(api_item.get("teams"), dict) else {}
+    home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
+    visitors = teams.get("visitors") if isinstance(teams.get("visitors"), dict) else {}
+
+    home_team_id = _safe_int(home.get("id"))
+    visitor_team_id = _safe_int(visitors.get("id"))
+
+    # arena
+    arena = api_item.get("arena") if isinstance(api_item.get("arena"), dict) else {}
+    arena_name = _safe_text(arena.get("name"))
+    arena_city = _safe_text(arena.get("city"))
+    arena_state = _safe_text(arena.get("state"))
+
+    # updated_utc: text 컬럼이므로 ISO 문자열로
+    updated_utc = _utc_now().isoformat()
+
     _db_execute(
         """
         INSERT INTO nba_games (
-          id, league, season,
+          id,
+          league, season, stage,
+          status_long, status_short,
           date_start_utc,
-          status_long,
-          status_short,
-          periods_current, periods_total,
-          score_json,
-          raw_json
+          home_team_id, visitor_team_id,
+          arena_name, arena_city, arena_state,
+          raw_json,
+          updated_utc
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb)
+        VALUES (
+          %s,
+          %s,%s,%s,
+          %s,%s,
+          %s,
+          %s,%s,
+          %s,%s,%s,
+          %s::jsonb,
+          %s
+        )
         ON CONFLICT (id) DO UPDATE SET
           league = EXCLUDED.league,
           season = EXCLUDED.season,
-          date_start_utc = EXCLUDED.date_start_utc,
+          stage = EXCLUDED.stage,
           status_long = EXCLUDED.status_long,
           status_short = EXCLUDED.status_short,
-          periods_current = EXCLUDED.periods_current,
-          periods_total = EXCLUDED.periods_total,
-          score_json = EXCLUDED.score_json,
-          raw_json = EXCLUDED.raw_json
+          date_start_utc = EXCLUDED.date_start_utc,
+          home_team_id = EXCLUDED.home_team_id,
+          visitor_team_id = EXCLUDED.visitor_team_id,
+          arena_name = EXCLUDED.arena_name,
+          arena_city = EXCLUDED.arena_city,
+          arena_state = EXCLUDED.arena_state,
+          raw_json = EXCLUDED.raw_json,
+          updated_utc = EXCLUDED.updated_utc
         """,
         (
             gid,
-            league,
-            season,
+            league, season, stage,
+            status_long, status_short,
             start_utc,
-            status_long,
-            None if status_short is None else str(status_short),
-            p_current,
-            p_total,
-            _jdump(score_json) if score_json is not None else None,
+            home_team_id, visitor_team_id,
+            arena_name, arena_city, arena_state,
             _jdump(api_item),
+            updated_utc,
         ),
     )
     return gid
+
 
 
 def _try_ingest_game_stats(game_id: int) -> None:
@@ -500,13 +531,19 @@ def tick_once_windowed(
                 # 2) stats (너 비용/부하 고려해서 더 느리게)
                 #    - 라이브/하프타임일 때만 호출 권장
                 if db_status_long in LIVE_STATUS_LONG:
-                    # “stats_interval_sec”를 next_live_poll_at과 분리하고 싶으면 별도 컬럼이 필요하지만,
-                    # 일단 단순하게: live poll 주기 중 N초마다 stats도 같이 호출하도록 구성
-                    try:
-                        _try_ingest_game_stats(gid)
-                        stats_called += 1
-                    except Exception:
-                        pass
+                    now_ts = time.time()
+                    last_ts = _last_stats_ts_by_game.get(gid, 0.0)
+
+                    # ✅ stats_interval_sec마다만 호출
+                    if (now_ts - last_ts) >= float(stats_interval_sec):
+                        try:
+                            _try_ingest_game_stats(gid)
+                            stats_called += 1
+                            _last_stats_ts_by_game[gid] = now_ts
+                        except Exception:
+                            # 실패해도 last_ts 갱신 안 해서 다음에 재시도됨
+                            pass
+
 
                 _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=float(live_interval_sec)))
 
@@ -538,7 +575,7 @@ def main() -> None:
     _db_execute(
         """
         CREATE TABLE IF NOT EXISTS nba_live_poll_state (
-          game_id           BIGINT PRIMARY KEY,
+          game_id           INTEGER PRIMARY KEY,
           pre_called_at     TIMESTAMPTZ,
           start_called_at   TIMESTAMPTZ,
           end_called_at     TIMESTAMPTZ,
@@ -549,6 +586,7 @@ def main() -> None:
         );
         """
     )
+
 
     while True:
         try:
