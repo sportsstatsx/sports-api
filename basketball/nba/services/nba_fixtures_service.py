@@ -93,22 +93,47 @@ def nba_get_fixtures_by_utc_range(
 
             -- scores: 여러 구조 방어
             COALESCE(
-              NULLIF((g.raw_json::jsonb -> 'scores' -> 'home' ->> 'points'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'scores' -> 'home' ->> 'total'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'scores' ->> 'home'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  -> 'home' ->> 'total'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  ->> 'home'), '')::int
+              CASE
+                WHEN (g.raw_json::jsonb -> 'scores' -> 'home' ->> 'points') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'scores' -> 'home' ->> 'points')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'scores' -> 'home' ->> 'total') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'scores' -> 'home' ->> 'total')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'score'  -> 'home' ->> 'total') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'score'  -> 'home' ->> 'total')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'score'  ->> 'home') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'score'  ->> 'home')::int
+              END
             ) AS home_score,
 
             COALESCE(
-              NULLIF((g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'points'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'total'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'scores' ->> 'visitors'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  -> 'away' ->> 'total'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  ->> 'away'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  -> 'visitors' ->> 'total'), '')::int,
-              NULLIF((g.raw_json::jsonb -> 'score'  -> 'visitors' ->> 'total'), '')::int
+              CASE
+                WHEN (g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'points') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'points')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'total') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'scores' -> 'visitors' ->> 'total')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'score'  -> 'away' ->> 'total') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'score'  -> 'away' ->> 'total')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'score'  ->> 'away') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'score'  ->> 'away')::int
+              END,
+              CASE
+                WHEN (g.raw_json::jsonb -> 'score'  -> 'visitors' ->> 'total') ~ '^[0-9]+$'
+                THEN (g.raw_json::jsonb -> 'score'  -> 'visitors' ->> 'total')::int
+              END
             ) AS away_score
+
 
         FROM nba_games g
         JOIN nba_teams th ON th.id = g.home_team_id
