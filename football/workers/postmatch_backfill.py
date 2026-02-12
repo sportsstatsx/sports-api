@@ -166,6 +166,40 @@ def backfill_teams_meta(team_ids: List[int]) -> None:
         except Exception as e:
             print(f"[meta] teams batch failed ids={batch}: {e}", file=sys.stderr)
 
+def backfill_teams_meta_single(team_ids: List[int]) -> None:
+    """
+    team_ids 중 teams 테이블에 없는 것만 /teams?id= "단건" 호출로 채운다.
+    - 일부 환경에서 /teams?id=1,2,3 (콤마 다건)이 API 에러를 내는 케이스가 있어서 단건이 안전.
+    """
+    team_ids = sorted({int(x) for x in (team_ids or []) if x is not None})
+    missing = _missing_team_ids(team_ids)
+    if not missing:
+        return
+
+    print(f"[meta] missing teams(single): {len(missing)}")
+
+    ok = 0
+    fail = 0
+    for tid in missing:
+        try:
+            data = _safe_get("/teams", params={"id": int(tid)})
+            resp = data.get("response") or []
+            inserted = False
+            for r in resp:
+                if isinstance(r, dict):
+                    _upsert_team_from_api(r)
+                    ok += 1
+                    inserted = True
+                    break
+            if not inserted:
+                fail += 1
+        except Exception as e:
+            fail += 1
+            print(f"[meta] team fetch failed id={tid}: {e}", file=sys.stderr)
+
+    print(f"[meta] teams(single) done ok={ok} fail={fail}")
+
+
 
 def backfill_leagues_meta(league_ids: List[int]) -> None:
     """
@@ -1674,6 +1708,7 @@ def main() -> None:
                 backfill_leagues_meta(sorted(seen_league_ids))
             if seen_team_ids:
                 backfill_teams_meta(sorted(seen_team_ids))
+                backfill_teams_meta_single(sorted(seen_team_ids))
         except Exception as me:
             print(f"[meta] backfill failed: {me}", file=sys.stderr)
 
@@ -1824,6 +1859,7 @@ def main() -> None:
                 backfill_leagues_meta(sorted(seen_league_ids))
             if seen_team_ids:
                 backfill_teams_meta(sorted(seen_team_ids))
+                backfill_teams_meta_single(sorted(seen_team_ids))
         except Exception as me:
             print(f"[meta] backfill failed: {me}", file=sys.stderr)
 
@@ -1998,6 +2034,7 @@ def main() -> None:
             backfill_leagues_meta(sorted(seen_league_ids))
         if seen_team_ids:
             backfill_teams_meta(sorted(seen_team_ids))
+            backfill_teams_meta_single(sorted(seen_team_ids))
     except Exception as me:
         print(f"[meta] backfill failed: {me}", file=sys.stderr)
 
