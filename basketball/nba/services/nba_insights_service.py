@@ -266,7 +266,7 @@ def nba_get_game_insights(
     if last_n > 50:
         last_n = 50
 
-    available_seasons = _load_available_seasons_for_league(league, limit=2)
+    available_seasons = _load_available_seasons_for_league(league, limit=6)
 
     if season is not None:
         mode = "season"
@@ -655,6 +655,15 @@ def nba_get_game_insights(
                 "home": len(home_ids),
                 "away": len(away_ids),
             },
+                        "filter_options": {
+                "last_n": [3, 5, 7, 10, 20],
+                "seasons": available_seasons,
+            },
+            "echo": {
+                "requested_last_n": last_n,
+                "requested_season": season,
+            },
+
             "sample_label": f"T={len(totals_ids)} / H={len(home_ids)} / A={len(away_ids)}",
 
         },
