@@ -457,12 +457,21 @@ def nba_get_game_insights(
                 "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
             )
 
-        # Quarter + OT
+        # Quarters
+        if seg_key in ("Q1", "Q2", "Q3", "Q4"):
+            return (
+                "기준점(baseline)=해당 쿼터 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+                "Over 라인: baseline-2, baseline-1, baseline, baseline+1, baseline+2. "
+                "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
+            )
+
+        # OT
         return (
-            "기준점(baseline)=해당 구간 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+            "기준점(baseline)=OT Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
             "Over 라인: baseline-2, baseline-1, baseline, baseline+1, baseline+2. "
             "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
         )
+
 
 
     def _ot_sample_rule_text() -> str:
