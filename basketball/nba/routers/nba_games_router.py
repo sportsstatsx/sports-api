@@ -114,8 +114,8 @@ def nba_list_games():
     rows = nba_fetch_all(sql, tuple(params + [limit]))
 
     # ✅ league logo (server-hosted static)
-    # - 앱이 외부 위키/차단 이슈 없이 항상 이 경로만 쓰게 만들기
-    league_logo_url = request.host_url.rstrip("/") + "/static/nba/Basketball_Nba_League_logo.svg"
+    # - 프록시/Cloudflare 환경에서 request.host_url 이 http 로 잡힐 수 있어서 https 로 고정
+    league_logo_url = f"https://{request.host}/static/nba/Basketball_Nba_League_logo.svg"
 
     # hockey처럼 live=1이면 status_long을 "Live ... clock"로 가공(있을 때만)
     if rows:
