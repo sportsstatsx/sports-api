@@ -650,6 +650,18 @@ def metrics():
 # ─────────────────────────────────────────
 STATIC_DIR = os.path.join(app.root_path, "static")
 
+# ─────────────────────────────────────────
+# NBA static assets (league logo etc.)
+# - serve files under basketball/nba/static
+#   URL: /static/nba/<filename>
+# ─────────────────────────────────────────
+NBA_STATIC_DIR = os.path.join(app.root_path, "basketball", "nba", "static")
+
+@app.route("/static/nba/<path:filename>")
+def nba_static(filename: str):
+    return send_from_directory(NBA_STATIC_DIR, filename)
+
+
 @app.route("/privacy")
 def privacy_en():
     # EN main
@@ -2788,6 +2800,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
