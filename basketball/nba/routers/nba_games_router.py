@@ -113,12 +113,25 @@ def nba_list_games():
 
     rows = nba_fetch_all(sql, tuple(params + [limit]))
 
+    # ✅ league logo (server-hosted static)
+    # - 앱이 외부 위키/차단 이슈 없이 항상 이 경로만 쓰게 만들기
+    league_logo_url = request.host_url.rstrip("/") + "/static/nba/Basketball_Nba_League_logo.svg"
+
     # hockey처럼 live=1이면 status_long을 "Live ... clock"로 가공(있을 때만)
-    if live == 1 and rows:
+    if rows:
         for r in rows:
-            st = (r.get("status_long") or "").strip()
-            clock = (r.get("live_clock") or "").strip()
-            if clock:
-                r["status_long"] = f"{st} {clock}"
+            # ✅ games 응답에도 league 로고 포함
+            r["league_logo"] = league_logo_url
+
+            # (선택) league_name도 필요하면 같이 내려줌
+            # - 앱에서 "standard" 대신 "NBA" 같은 표시가 필요할 때 유용
+            if "league_name" not in r or r.get("league_name") in (None, ""):
+                r["league_name"] = "NBA"
+
+            if live == 1:
+                st = (r.get("status_long") or "").strip()
+                clock = (r.get("live_clock") or "").strip()
+                if clock:
+                    r["status_long"] = f"{st} {clock}"
 
     return jsonify({"ok": True, "count": len(rows), "rows": rows})
