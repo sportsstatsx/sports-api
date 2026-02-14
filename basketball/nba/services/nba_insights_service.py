@@ -540,46 +540,28 @@ def nba_get_game_insights(
                 denom_filter=denom_filter,
             )
 
-        # baseline rows are "설명 텍스트"
         rows: List[Dict[str, Any]] = []
 
-        # OT만 Sample Rule도 추가
-        if seg_key == "OT_ALL":
-            rows.append(
-                {
-                    "label": "[Sample Rule]",
-                    "values": _triple(
-                        {
-                            "totals": (
-                                "✅ 모수(분모)=OT(연장)까지 간 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
-                                "OT 없는 경기는 제외."
-                            ),
-                            "home": (
-                                "✅ 모수(분모)=OT(연장)까지 간 홈 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
-                                "OT 없는 경기는 제외."
-                            ),
-                            "away": (
-                                "✅ 모수(분모)=OT(연장)까지 간 원정 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
-                                "OT 없는 경기는 제외."
-                            ),
-                        }
-                    ),
-                }
-            )
+        def _fmt_line(x: float) -> str:
+            # 23.0 -> "23", 23.5 -> "23.5"
+            if abs(x - round(x)) < 1e-9:
+                return str(int(round(x)))
+            return f"{x:.1f}".rstrip("0").rstrip(".")
 
-
-        rows.append(
-            {
-                "label": "[Baseline Rule]",
-                "values": _triple(
-                    {
-                        "totals": _baseline_rule_text(seg_key),
-                        "home": _baseline_rule_text(seg_key),
-                        "away": _baseline_rule_text(seg_key),
-                    }
-                ),
+        def _row_bucket_only(label: str, bucket: str, v: Any) -> Dict[str, Any]:
+            # bucket 하나만 값 넣고 나머지는 None -> 앱에서 "-"로 보임
+            return {
+                "label": label,
+                "values": {
+                    "totals": v if bucket == "totals" else None,
+                    "home": v if bucket == "home" else None,
+                    "away": v if bucket == "away" else None,
+                },
             }
-        )
+
+        # ✅ OT 샘플룰은 rows에 넣지 말고 subtitle에만 짧게(원하면 제거 가능)
+        subtitle_extra = " · OT games only" if seg_key == "OT_ALL" else ""
+
 
 
         # W/D/L
@@ -590,41 +572,47 @@ def nba_get_game_insights(
         ]
 
         # Team Avg + Over lines (baseline offsets)
+        # Team Avg (숫자는 셀에 표시)
         rows.append({"label": f"{prefix} Team Score Avg", "values": _triple(team_avg)})
+
+        # ✅ Team baseline (숫자는 셀에 표시)
+        rows.append({"label": f"{prefix} Team Baseline", "values": _triple(baseline_team_by)})
+
+        # ✅ Team Over lines: bucket별로 라벨에 "숫자라인" 박아서 내려줌
         for off in line_offsets:
-            # label 문구는 네 문서 그대로 느낌 유지
-            if seg_key == "FT_REG":
-                label_off = (
-                    f"{prefix} Team (기준점{int(off):+d})+ Over"
-                    if off != 0
-                    else f"{prefix} Team (Baseline={prefix} Team Avg 스냅)+ Over"
-                )
-            else:
-                if off == 0:
-                    label_off = f"{prefix} Team (Baseline={prefix} Team Avg 스냅)+ Over"
-                else:
-                    label_off = f"{prefix} Team (기준점{int(off):+d})+ Over"
-            rows.append({"label": label_off, "values": _triple(_over_prob_bucket(use_total=False, offset=off))})
+            for b in ("totals", "home", "away"):
+                base = baseline_team_by.get(b)
+                if base is None:
+                    continue
+                line = float(base) + float(off)
+                prob = _over_prob_bucket(use_total=False, offset=off).get(b)
+                label = f"{b.capitalize()} · {prefix} Team {_fmt_line(line)}+ Over"
+                rows.append(_row_bucket_only(label=label, bucket=b, v=prob))
+
 
         # Total Avg + Over lines
+        # Total Avg
         rows.append({"label": f"{prefix} Total Score Avg", "values": _triple(total_avg)})
+
+        # ✅ Total baseline
+        rows.append({"label": f"{prefix} Total Baseline", "values": _triple(baseline_total_by)})
+
+        # ✅ Total Over lines: bucket별 "숫자라인" 라벨
         for off in line_offsets:
-            if seg_key == "FT_REG":
-                label_off = (
-                    f"{prefix} Total (기준점{int(off):+d})+ Over"
-                    if off != 0
-                    else f"{prefix} Total (Baseline={prefix} Total Avg 스냅)+ Over"
-                )
-            else:
-                if off == 0:
-                    label_off = f"{prefix} Total (Baseline={prefix} Total Avg 스냅)+ Over"
-                else:
-                    label_off = f"{prefix} Total (기준점{int(off):+d})+ Over"
-            rows.append({"label": label_off, "values": _triple(_over_prob_bucket(use_total=True, offset=off))})
+            for b in ("totals", "home", "away"):
+                base = baseline_total_by.get(b)
+                if base is None:
+                    continue
+                line = float(base) + float(off)
+                prob = _over_prob_bucket(use_total=True, offset=off).get(b)
+                label = f"{b.capitalize()} · {prefix} Total {_fmt_line(line)}+ Over"
+                rows.append(_row_bucket_only(label=label, bucket=b, v=prob))
+
 
         # subtitle은 앱 fallback용 (너 하키에서 쓰던 포맷 유지)
-        subtitle = f"T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}"
+        subtitle = f"T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}{subtitle_extra}"
         return _build_section(title=seg_title, rows=rows, counts=cnt, subtitle=subtitle)
+
 
     sections = [
         _build_segment_section("Full Time"),
