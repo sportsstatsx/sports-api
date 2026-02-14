@@ -67,4 +67,16 @@ def nba_list_fixtures():
         league=league if not leagues else None,
     ) or []
 
+    # ✅ league_logo fallback: DB(nba_leagues)에 로고가 없으면 서버 static 경로로 고정
+    # - 앱이 외부 위키/깃허브 직접 안 물도록 서버가 책임짐
+    base_url = request.url_root.rstrip("/")  # 예: https://api-dev.sportsstatsx.com
+    fallback_logo = f"{base_url}/static/nba/Basketball_Nba_League_logo.svg"
+
+    for g in games:
+        li = g.get("league_info") or {}
+        if not li.get("logo"):
+            li["logo"] = fallback_logo
+            g["league_info"] = li
+
     return jsonify({"ok": True, "games": games})
+
