@@ -578,16 +578,20 @@ def nba_get_game_insights(
         # ✅ Team baseline (숫자는 셀에 표시)
         rows.append({"label": f"{prefix} Team Baseline", "values": _triple(baseline_team_by)})
 
-        # ✅ Team Over lines: bucket별로 라벨에 "숫자라인" 박아서 내려줌
+        # ✅ Team Over lines: 라벨 숫자라인은 Totals baseline 기준(표 기준)으로 고정
+        # ✅ 확률 값은 각 컬럼(Totals/Home/Away)별 baseline 기준으로 계산된 값을 그대로 넣음
         for off in line_offsets:
-            for b in ("totals", "home", "away"):
-                base = baseline_team_by.get(b)
-                if base is None:
-                    continue
-                line = float(base) + float(off)
-                prob = _over_prob_bucket(use_total=False, offset=off).get(b)
-                label = f"{b.capitalize()} · {prefix} Team {_fmt_line(line)}+ Over"
-                rows.append(_row_bucket_only(label=label, bucket=b, v=prob))
+            base_t = baseline_team_by.get("totals")
+            if base_t is None:
+                continue
+            line_t = float(base_t) + float(off)
+
+            label = f"{prefix} Team {_fmt_line(line_t)}+ Over"
+            rows.append({
+                "label": label,
+                "values": _triple(_over_prob_bucket(use_total=False, offset=off))
+            })
+
 
 
         # Total Avg + Over lines
@@ -597,21 +601,29 @@ def nba_get_game_insights(
         # ✅ Total baseline
         rows.append({"label": f"{prefix} Total Baseline", "values": _triple(baseline_total_by)})
 
-        # ✅ Total Over lines: bucket별 "숫자라인" 라벨
+        # ✅ Total Over lines: 라벨 숫자라인은 Totals baseline 기준(표 기준)으로 고정
+        # ✅ 확률 값은 각 컬럼(Totals/Home/Away)별 baseline 기준으로 계산된 값을 그대로 넣음
         for off in line_offsets:
-            for b in ("totals", "home", "away"):
-                base = baseline_total_by.get(b)
-                if base is None:
-                    continue
-                line = float(base) + float(off)
-                prob = _over_prob_bucket(use_total=True, offset=off).get(b)
-                label = f"{b.capitalize()} · {prefix} Total {_fmt_line(line)}+ Over"
-                rows.append(_row_bucket_only(label=label, bucket=b, v=prob))
+            base_t = baseline_total_by.get("totals")
+            if base_t is None:
+                continue
+            line_t = float(base_t) + float(off)
+
+            label = f"{prefix} Total {_fmt_line(line_t)}+ Over"
+            rows.append({
+                "label": label,
+                "values": _triple(_over_prob_bucket(use_total=True, offset=off))
+            })
 
 
-        # subtitle은 앱 fallback용 (너 하키에서 쓰던 포맷 유지)
-        subtitle = f"T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}{subtitle_extra}"
+
+        # ✅ 섹션별 T/H/A 표시는 제거 (앱에서 Last N 필터 바로 아래 1회만 표시할 것)
+        # ✅ 단, OT는 섹션 타이틀 오른쪽에 보여주고 싶으니 subtitle로만 남김
+        subtitle = None
+        if seg_key == "OT_ALL":
+            subtitle = f"OT: T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}"
         return _build_section(title=seg_title, rows=rows, counts=cnt, subtitle=subtitle)
+
 
 
     sections = [
@@ -643,5 +655,7 @@ def nba_get_game_insights(
                 "home": len(home_ids),
                 "away": len(away_ids),
             },
+            "sample_label": f"T={len(totals_ids)} / H={len(home_ids)} / A={len(away_ids)}",
+
         },
     }
