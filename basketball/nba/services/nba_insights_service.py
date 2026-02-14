@@ -95,24 +95,24 @@ class _Bucket:
     home_flags: Dict[int, bool]  # game_id -> is_home_for_selected
 
 
-def _load_available_seasons_for_league(league: str, limit: int = 2) -> List[int]:
+def _load_available_seasons_for_league(league: str, limit: int = 6) -> List[int]:
     sql = """
         SELECT DISTINCT g.season
         FROM nba_games g
         WHERE
             g.league = %s
-            AND g.status_short = %s
             AND g.season IS NOT NULL
         ORDER BY g.season DESC
         LIMIT %s
     """
-    rows = nba_fetch_all(sql, (league, FINISHED_STATUS_SHORT, limit))
+    rows = nba_fetch_all(sql, (league, limit))
     out: List[int] = []
     for r in rows:
         y = _safe_int(r.get("season"))
         if y is not None:
             out.append(y)
     return out
+
 
 
 def _load_recent_games(team_id: int, last_n: int, league: str) -> _Bucket:
