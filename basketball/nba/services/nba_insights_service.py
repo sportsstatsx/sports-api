@@ -436,30 +436,34 @@ def nba_get_game_insights(
         """
         if seg_title == "Full Time":
             return ("FT_REG", "FT", [-10, -5, 0, +5, +10])  # baseline +/- {10,5,0}
-        if seg_title == "1 Quater":
+        if seg_title == "1 Quarter":
             return ("Q1", "1Q", [-2, -1, 0, +1, +2])
-        if seg_title == "2 Quater":
+        if seg_title == "2 Quarter":
             return ("Q2", "2Q", [-2, -1, 0, +1, +2])
-        if seg_title == "3 Quater":
+        if seg_title == "3 Quarter":
             return ("Q3", "3Q", [-2, -1, 0, +1, +2])
-        if seg_title == "4 Quater":
+        if seg_title == "4 Quarter":
             return ("Q4", "4Q", [-2, -1, 0, +1, +2])
-        # Over Time
+        # OT
         return ("OT_ALL", "OT", [-2, -1, 0, +1, +2])
 
-    def _baseline_rule_text(seg_title: str) -> str:
-        if seg_title == "Full Time":
+
+    def _baseline_rule_text(seg_key: str) -> str:
+        # FT
+        if seg_key == "FT_REG":
             return (
                 "기준점(baseline)=해당 섹션 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
                 "Over 라인: baseline-10, baseline-5, baseline, baseline+5, baseline+10. "
                 "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
             )
-        # Quarters + OT
+
+        # Quarter + OT
         return (
-            "기준점(baseline)=해당 쿼터 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+            "기준점(baseline)=해당 구간 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
             "Over 라인: baseline-2, baseline-1, baseline, baseline+1, baseline+2. "
             "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
         )
+
 
     def _ot_sample_rule_text() -> str:
         return (
@@ -537,26 +541,37 @@ def nba_get_game_insights(
                     "label": "[Sample Rule]",
                     "values": _triple(
                         {
-                            "totals": _ot_sample_rule_text(),
-                            "home": _ot_sample_rule_text().replace("경기만 포함", "홈 경기만 포함"),
-                            "away": _ot_sample_rule_text().replace("경기만 포함", "원정 경기만 포함"),
+                            "totals": (
+                                "✅ 모수(분모)=OT(연장)까지 간 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
+                                "OT 없는 경기는 제외."
+                            ),
+                            "home": (
+                                "✅ 모수(분모)=OT(연장)까지 간 홈 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
+                                "OT 없는 경기는 제외."
+                            ),
+                            "away": (
+                                "✅ 모수(분모)=OT(연장)까지 간 원정 경기만 포함(정규시간 종료 시 동점으로 연장 발생한 경기). "
+                                "OT 없는 경기는 제외."
+                            ),
                         }
                     ),
                 }
             )
+
 
         rows.append(
             {
                 "label": "[Baseline Rule]",
                 "values": _triple(
                     {
-                        "totals": _baseline_rule_text("Full Time" if seg_key == "FT_REG" else "Quarter"),
-                        "home": _baseline_rule_text("Full Time" if seg_key == "FT_REG" else "Quarter"),
-                        "away": _baseline_rule_text("Full Time" if seg_key == "FT_REG" else "Quarter"),
+                        "totals": _baseline_rule_text(seg_key),
+                        "home": _baseline_rule_text(seg_key),
+                        "away": _baseline_rule_text(seg_key),
                     }
                 ),
             }
         )
+
 
         # W/D/L
         rows += [
@@ -604,12 +619,13 @@ def nba_get_game_insights(
 
     sections = [
         _build_segment_section("Full Time"),
-        _build_segment_section("1 Quater"),
-        _build_segment_section("2 Quater"),
-        _build_segment_section("3 Quater"),
-        _build_segment_section("4 Quater"),
-        _build_segment_section("Over Time"),
+        _build_segment_section("1 Quarter"),
+        _build_segment_section("2 Quarter"),
+        _build_segment_section("3 Quarter"),
+        _build_segment_section("4 Quarter"),
+        _build_segment_section("OT"),
     ]
+
 
     return {
         "ok": True,
