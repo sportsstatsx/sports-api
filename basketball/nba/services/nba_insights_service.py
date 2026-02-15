@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import ceil
+from math import ceil, floor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from basketball.nba.nba_db import nba_fetch_all, nba_fetch_one
@@ -47,8 +47,10 @@ def _safe_div(n: int, d: int) -> Optional[float]:
 
 
 def _snap_half(x: float) -> float:
-    # baseline = ROUND(avg*2)/2
-    return round(x * 2.0) / 2.0
+    # ✅ baseline은 항상 ".5" 고정: floor(avg) + 0.5
+    # 예) 117.0 -> 117.5, 117.8 -> 117.5
+    return float(floor(x)) + 0.5
+
 
 
 def _ceil_line(line: float) -> int:
@@ -521,25 +523,28 @@ def nba_get_game_insights(
         # FT
         if seg_key == "FT_REG":
             return (
-                "기준점(baseline)=해당 섹션 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+                "기준점(baseline)=해당 섹션 Avg에서 정수 부분을 취한 뒤 +0.5 (floor(avg)+0.5). "
                 "Over 라인: baseline-10, baseline-5, baseline, baseline+5, baseline+10. "
                 "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
             )
 
+
         # Quarters
         if seg_key in ("Q1", "Q2", "Q3", "Q4"):
             return (
-                "기준점(baseline)=해당 쿼터 Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+                "기준점(baseline)=해당 쿼터 Avg에서 정수 부분을 취한 뒤 +0.5 (floor(avg)+0.5). "
                 "Over 라인: baseline-2, baseline-1, baseline, baseline+1, baseline+2. "
                 "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
             )
 
+
         # OT
         return (
-            "기준점(baseline)=OT Avg를 0.5 단위로 스냅(ROUND(avg*2)/2). "
+            "기준점(baseline)=OT Avg에서 정수 부분을 취한 뒤 +0.5 (floor(avg)+0.5). "
             "Over 라인: baseline-2, baseline-1, baseline, baseline+1, baseline+2. "
             "Over 판정은 점수가 정수이므로 score >= CEIL(line)로 계산하면 동일."
         )
+
 
 
 
