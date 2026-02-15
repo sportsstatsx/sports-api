@@ -115,7 +115,17 @@ def _load_available_seasons_for_league(league: str, limit: int = 6) -> List[int]
 
 
 
-def _load_recent_games(team_id: int, last_n: int, league: str) -> _Bucket:
+def _load_recent_games(
+    team_id: int,
+    last_n: int,
+    league: str,
+    cutoff_utc: Optional[Any] = None,
+    exclude_game_id: Optional[int] = None,
+) -> _Bucket:
+    """
+    ✅ 현재 matchdetail 경기(exclude_game_id)는 항상 제외
+    ✅ cutoff_utc(=현재 경기 시작시각) 이전(Finished) 경기만 대상으로 last_n 추출
+    """
     sql = """
         SELECT
             g.id AS game_id,
@@ -126,10 +136,25 @@ def _load_recent_games(team_id: int, last_n: int, league: str) -> _Bucket:
             g.league = %s
             AND g.status_short = %s
             AND (g.home_team_id = %s OR g.visitor_team_id = %s)
+            AND (%s IS NULL OR g.date_start_utc < %s)
+            AND (%s IS NULL OR g.id <> %s)
         ORDER BY g.date_start_utc DESC NULLS LAST, g.id DESC
         LIMIT %s
     """
-    rows = nba_fetch_all(sql, (league, FINISHED_STATUS_SHORT, team_id, team_id, last_n))
+    rows = nba_fetch_all(
+        sql,
+        (
+            league,
+            FINISHED_STATUS_SHORT,
+            team_id,
+            team_id,
+            cutoff_utc,
+            cutoff_utc,
+            exclude_game_id,
+            exclude_game_id,
+            last_n,
+        ),
+    )
 
     games: List[int] = []
     home_flags: Dict[int, bool] = {}
@@ -143,7 +168,18 @@ def _load_recent_games(team_id: int, last_n: int, league: str) -> _Bucket:
     return _Bucket(games=games, home_flags=home_flags)
 
 
-def _load_games_for_season(team_id: int, league: str, season: int) -> _Bucket:
+
+def _load_games_for_season(
+    team_id: int,
+    league: str,
+    season: int,
+    cutoff_utc: Optional[Any] = None,
+    exclude_game_id: Optional[int] = None,
+) -> _Bucket:
+    """
+    ✅ 현재 matchdetail 경기(exclude_game_id)는 항상 제외
+    ✅ cutoff_utc(=현재 경기 시작시각) 이전(Finished) 경기만 대상으로 시즌 표본 구성
+    """
     sql = """
         SELECT
             g.id AS game_id,
@@ -155,10 +191,25 @@ def _load_games_for_season(team_id: int, league: str, season: int) -> _Bucket:
             AND g.status_short = %s
             AND g.season = %s
             AND (g.home_team_id = %s OR g.visitor_team_id = %s)
+            AND (%s IS NULL OR g.date_start_utc < %s)
+            AND (%s IS NULL OR g.id <> %s)
         ORDER BY g.date_start_utc DESC NULLS LAST, g.id DESC
         LIMIT 5000
     """
-    rows = nba_fetch_all(sql, (league, FINISHED_STATUS_SHORT, season, team_id, team_id))
+    rows = nba_fetch_all(
+        sql,
+        (
+            league,
+            FINISHED_STATUS_SHORT,
+            season,
+            team_id,
+            team_id,
+            cutoff_utc,
+            cutoff_utc,
+            exclude_game_id,
+            exclude_game_id,
+        ),
+    )
 
     games: List[int] = []
     home_flags: Dict[int, bool] = {}
@@ -170,6 +221,7 @@ def _load_games_for_season(team_id: int, league: str, season: int) -> _Bucket:
         home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
 
     return _Bucket(games=games, home_flags=home_flags)
+
 
 
 def _load_games_raw(game_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -245,19 +297,23 @@ def nba_get_game_insights(
     # 0) game 존재 확인 + 기본 team_id 결정 + league/season 확보
     g = nba_fetch_one(
         """
-        SELECT id, league, season, home_team_id, visitor_team_id
+        SELECT id, league, season, date_start_utc, home_team_id, visitor_team_id
         FROM nba_games
         WHERE id = %s
         LIMIT 1
         """,
         (game_id,),
     )
+
     if not g:
         raise ValueError("GAME_NOT_FOUND")
 
     league = (g.get("league") or "standard").strip() or "standard"
     default_team_id = _safe_int(g.get("home_team_id"))
     sel_team_id = _safe_int(team_id) or default_team_id
+    cutoff_utc = g.get("date_start_utc")  # 현재 경기 시작시각(UTC)
+    exclude_game_id = int(game_id)        # 현재 보고있는 경기는 항상 표본에서 제외
+
     if sel_team_id is None:
         return {"ok": True, "game_id": game_id, "sections": [], "meta": {"reason": "TEAM_ID_MISSING"}}
 
@@ -270,10 +326,23 @@ def nba_get_game_insights(
 
     if season is not None:
         mode = "season"
-        bucket = _load_games_for_season(sel_team_id, league, season)
+        bucket = _load_games_for_season(
+            sel_team_id,
+            league,
+            season,
+            cutoff_utc=cutoff_utc,
+            exclude_game_id=exclude_game_id,
+        )
     else:
         mode = "last_n"
-        bucket = _load_recent_games(sel_team_id, last_n, league)
+        bucket = _load_recent_games(
+            sel_team_id,
+            last_n,
+            league,
+            cutoff_utc=cutoff_utc,
+            exclude_game_id=exclude_game_id,
+        )
+
 
     game_ids = bucket.games
     game_raw = _load_games_raw(game_ids)
