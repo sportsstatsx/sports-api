@@ -507,7 +507,22 @@ def nba_get_game_insights(
         # 실제 over 라인별 확률 계산: bucket별 baseline이 달라서 bucket별로 라인도 달라짐
         # => "baseline±k" 텍스트는 label에 박고, 확률은 bucket baseline 기준으로 계산
         def _over_prob_bucket(use_total: bool, offset: float) -> Dict[str, Optional[float]]:
+            """
+            ✅ 확률 계산 기준점을 "Totals baseline" 하나로 통일
+            - 라벨에 표시되는 기준점(=Totals baseline ± offset)과
+              Totals/Home/Away 컬럼의 Over 확률 계산이 반드시 일치해야 함.
+            """
             out: Dict[str, Optional[float]] = {}
+
+            base_src = (baseline_total_by if use_total else baseline_team_by)
+            base_t = base_src.get("totals")
+            if base_t is None:
+                # 기준점 자체가 없으면 전부 None
+                return {"totals": None, "home": None, "away": None}
+
+            line = float(base_t) + float(offset)
+            thr = _ceil_line(line)
+
             for b in ("totals", "home", "away"):
                 ids0 = iter_bucket(b)
                 ids = [gid for gid in ids0 if (denom_filter(gid) if denom_filter else True)]
@@ -516,14 +531,6 @@ def nba_get_game_insights(
                     out[b] = None
                     continue
 
-                base = (baseline_total_by if use_total else baseline_team_by).get(b)
-                if base is None:
-                    out[b] = None
-                    continue
-
-                line = float(base) + float(offset)
-                thr = _ceil_line(line)
-
                 num = 0
                 for gid in ids:
                     tp, op = _points_for_game(gid, seg_key)
@@ -531,7 +538,9 @@ def nba_get_game_insights(
                     if int(sc) >= thr:
                         num += 1
                 out[b] = _safe_div(num, n)
+
             return out
+
 
         # W/D/L
         def _prob_res(res: str) -> Dict[str, Optional[float]]:
@@ -575,11 +584,8 @@ def nba_get_game_insights(
         # Team Avg (숫자는 셀에 표시)
         rows.append({"label": f"{prefix} Team Score Avg", "values": _triple(team_avg)})
 
-        # ✅ Team baseline (숫자는 셀에 표시)
-        rows.append({"label": f"{prefix} Team Baseline", "values": _triple(baseline_team_by)})
-
         # ✅ Team Over lines: 라벨 숫자라인은 Totals baseline 기준(표 기준)으로 고정
-        # ✅ 확률 값은 각 컬럼(Totals/Home/Away)별 baseline 기준으로 계산된 값을 그대로 넣음
+        # ✅ 확률 값도 Totals baseline 기준으로 통일(아래 _over_prob_bucket 패치로 반영)
         for off in line_offsets:
             base_t = baseline_team_by.get("totals")
             if base_t is None:
@@ -594,15 +600,13 @@ def nba_get_game_insights(
 
 
 
+
         # Total Avg + Over lines
         # Total Avg
         rows.append({"label": f"{prefix} Total Score Avg", "values": _triple(total_avg)})
 
-        # ✅ Total baseline
-        rows.append({"label": f"{prefix} Total Baseline", "values": _triple(baseline_total_by)})
-
         # ✅ Total Over lines: 라벨 숫자라인은 Totals baseline 기준(표 기준)으로 고정
-        # ✅ 확률 값은 각 컬럼(Totals/Home/Away)별 baseline 기준으로 계산된 값을 그대로 넣음
+        # ✅ 확률 값도 Totals baseline 기준으로 통일(아래 _over_prob_bucket 패치로 반영)
         for off in line_offsets:
             base_t = baseline_total_by.get("totals")
             if base_t is None:
@@ -614,6 +618,7 @@ def nba_get_game_insights(
                 "label": label,
                 "values": _triple(_over_prob_bucket(use_total=True, offset=off))
             })
+
 
 
 
