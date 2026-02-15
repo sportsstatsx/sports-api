@@ -400,7 +400,7 @@ def nba_get_game_insights(
     # ─────────────────────────────
     # 공통 통계 유틸 (bucket별)
     # ─────────────────────────────
-    def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
+def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {}
     for b in ("totals", "home", "away"):
         ids0 = iter_bucket(b)
@@ -414,6 +414,7 @@ def nba_get_game_insights(
             s += int(getter(gid))
         out[b] = float(s) / float(n)
     return out
+
 
 
     def _prob(pred, denom_filter=None) -> Dict[str, Optional[float]]:
