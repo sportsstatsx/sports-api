@@ -400,22 +400,20 @@ def nba_get_game_insights(
     # ─────────────────────────────
     # 공통 통계 유틸 (bucket별)
     # ─────────────────────────────
-def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
-    out: Dict[str, Optional[float]] = {}
-    for b in ("totals", "home", "away"):
-        ids0 = iter_bucket(b)
-        ids = [gid for gid in ids0 if (denom_filter(gid) if denom_filter else True)]
-        n = len(ids)
-        if n <= 0:
-            out[b] = None
-            continue
-        s = 0
-        for gid in ids:
-            s += int(getter(gid))
-        out[b] = float(s) / float(n)
-    return out
-
-
+    def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
+        out: Dict[str, Optional[float]] = {}
+        for b in ("totals", "home", "away"):
+            ids0 = iter_bucket(b)
+            ids = [gid for gid in ids0 if (denom_filter(gid) if denom_filter else True)]
+            n = len(ids)
+            if n <= 0:
+                out[b] = None
+                continue
+            s = 0
+            for gid in ids:
+                s += int(getter(gid))
+            out[b] = float(s) / float(n)
+        return out
 
     def _prob(pred, denom_filter=None) -> Dict[str, Optional[float]]:
         """
@@ -459,7 +457,6 @@ def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
           baseline_by_bucket
           over_prob_by_bucket[line] = prob
         """
-        # avg -> baseline(snap 0.5)
         def get_score(gid: int) -> int:
             tp, op = _points_for_game(gid, seg)
             return (tp + op) if use_total else tp
@@ -477,7 +474,6 @@ def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
                 over_probs_by[b] = {float(x): None for x in lines}
                 continue
 
-            # baseline = snap(avg)
             avgv = avg_by.get(b)
             if avgv is None:
                 baseline_by[b] = None
@@ -487,7 +483,6 @@ def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
             base = _snap_half(float(avgv))
             baseline_by[b] = base
 
-            # over probs for each line: score >= ceil(line)
             probs: Dict[float, Optional[float]] = {}
             for ln in lines:
                 thr = _ceil_line(float(ln))
@@ -500,6 +495,7 @@ def _avg(getter, denom_filter=None) -> Dict[str, Optional[float]]:
             over_probs_by[b] = probs
 
         return baseline_by, over_probs_by
+
 
     # ─────────────────────────────
     # 섹션 구성: 네가 준 스펙(FT/1Q~4Q/OT)
