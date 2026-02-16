@@ -239,7 +239,25 @@ def get_match_detail_bundle(
     dt_ai = time.perf_counter() - t_ai0
 
 
+    # ✅ total 먼저 확정
+    dt_total = time.perf_counter() - t0
+
+    # ✅ 응답/헤더/디버그에서 그대로 활용할 수 있도록 perf dict 구성
+    perf = {
+        "total": float(dt_total),
+        "header": float(dt_header),
+        "form": float(dt_form),
+        "timeline": float(dt_timeline),
+        "lineups": float(dt_lineups),
+        "stats": float(dt_stats),
+        "h2h": float(dt_h2h),
+        "standings": float(dt_standings),
+        "insights": float(dt_insights),
+        "ai": float(dt_ai),
+    }
+
     bundle = {
+        "_perf": perf,  # ✅ 추가
         "header": header,
         "form": form,
         "timeline": timeline,
@@ -255,7 +273,7 @@ def get_match_detail_bundle(
     if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
-    dt_total = time.perf_counter() - t0
+    # ✅ (선택) 로그는 유지. Render에서 안 보이더라도 perf는 응답에 포함됨.
     try:
         print(
             "[match_detail_bundle]"
@@ -275,6 +293,7 @@ def get_match_detail_bundle(
         pass
 
     return bundle
+
 
 
 
