@@ -640,6 +640,8 @@ def main() -> int:
     ap.add_argument("--include-stage1", action="store_true", help="preseason(stage=1) finished도 stats까지 백필")
     ap.add_argument("--stats", action="store_true", help="finished game stats까지 수행")
     args = ap.parse_args()
+    ap.add_argument("--stats-force-range", action="store_true", help="from/to 범위 내 게임은 status 상관없이 stats 강제 수집")
+
 
 
     base = os.environ.get("NBA_BASE", "https://v2.nba.api-sports.io")
@@ -715,6 +717,50 @@ def main() -> int:
             ingest_standings(conn, base, api_key, league, season)
             _save_state(conn, league, season, "stats", last_game_index)
             stage = "stats"
+
+
+        # ✅ [ADD] 범위 내 게임은 status_long과 무관하게 stats 강제 수집
+        if args.stats and args.stats_force_range and (args.from_kst or args.to_kst):
+            # KST 날짜 범위를 UTC 구간으로 변환
+            kst = dt.timezone(dt.timedelta(hours=9))
+            utc_start = None
+            utc_end_excl = None
+
+            if args.from_kst:
+                y, m, d0 = [int(x) for x in args.from_kst.split("-")]
+                utc_start = dt.datetime(y, m, d0, 0, 0, 0, tzinfo=kst).astimezone(dt.timezone.utc)
+
+            if args.to_kst:
+                y, m, d1 = [int(x) for x in args.to_kst.split("-")]
+                utc_end_excl = (
+                    dt.datetime(y, m, d1, 0, 0, 0, tzinfo=kst) + dt.timedelta(days=1)
+                ).astimezone(dt.timezone.utc)
+
+            wh = []
+            params = []
+            if utc_start is not None:
+                wh.append("date_start_utc >= %s")
+                params.append(utc_start)
+            if utc_end_excl is not None:
+                wh.append("date_start_utc < %s")
+                params.append(utc_end_excl)
+
+            where_sql = " AND ".join(wh) if wh else "TRUE"
+
+            rows = _fetchall(
+                conn,
+                f"""
+                SELECT id
+                FROM nba_games
+                WHERE season=%s AND {where_sql}
+                ORDER BY date_start_utc, id
+                """,
+                tuple([season] + params),
+            )
+            finished_ids = [int(r["id"]) for r in rows]
+            last_game_index = 0  # 범위 강제 수집은 항상 0부터
+            print(f"[FORCE] stats_force_range games_in_range={len(finished_ids)}")
+
 
 
         # 6) stats (옵션)
