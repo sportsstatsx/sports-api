@@ -696,11 +696,20 @@ def nba_get_game_insights(
 
 
         # ✅ 섹션별 T/H/A 표시는 제거 (앱에서 Last N 필터 바로 아래 1회만 표시할 것)
-        # ✅ 단, OT는 섹션 타이틀 오른쪽에 보여주고 싶으니 subtitle로만 남김
+        # ✅ 단, OT는 OT 경기만 카운트(denom_filter=_is_ot_game)라서 OT subtitle 유지
+        # ✅ Full Time은 "전체 표본(=FT 기준)" Game Sample을 subtitle로 제공
         subtitle = None
+
+        if seg_key == "FT_REG":
+            # 축구 느낌 포맷: Game Sample: 22 (H10, A12)
+            subtitle = f"Game Sample: {cnt['totals']} (H{cnt['home']}, A{cnt['away']})"
+
         if seg_key == "OT_ALL":
+            # OT는 OT 경기만 모수로 잡는 별도 카운트
             subtitle = f"OT: T={cnt['totals']} / H={cnt['home']} / A={cnt['away']}"
+
         return _build_section(title=seg_title, rows=rows, counts=cnt, subtitle=subtitle)
+
 
 
 
