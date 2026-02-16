@@ -639,8 +639,12 @@ def main() -> int:
 
     ap.add_argument("--include-stage1", action="store_true", help="preseason(stage=1) finished도 stats까지 백필")
     ap.add_argument("--stats", action="store_true", help="finished game stats까지 수행")
-    args = ap.parse_args()
+
+    # ✅ [ADD] 범위 내 게임은 status 상관없이 stats 강제 수집
     ap.add_argument("--stats-force-range", action="store_true", help="from/to 범위 내 게임은 status 상관없이 stats 강제 수집")
+
+    args = ap.parse_args()
+
 
 
 
