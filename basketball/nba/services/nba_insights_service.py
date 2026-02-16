@@ -127,6 +127,7 @@ def _load_recent_games(
     """
     ✅ 현재 matchdetail 경기(exclude_game_id)는 항상 제외
     ✅ cutoff_utc(=현재 경기 시작시각) 이전(Finished) 경기만 대상으로 last_n 추출
+    ✅ 정규시즌만 포함: raw_json->>'stage' = '2'
     """
     sql = """
         SELECT
@@ -138,11 +139,13 @@ def _load_recent_games(
             g.league = %s
             AND g.status_short = %s
             AND (g.home_team_id = %s OR g.visitor_team_id = %s)
+            AND COALESCE(g.raw_json->>'stage','') = '2'
             AND (%s IS NULL OR g.date_start_utc < %s)
             AND (%s IS NULL OR g.id <> %s)
         ORDER BY g.date_start_utc DESC NULLS LAST, g.id DESC
         LIMIT %s
     """
+
     rows = nba_fetch_all(
         sql,
         (
@@ -181,6 +184,7 @@ def _load_games_for_season(
     """
     ✅ 현재 matchdetail 경기(exclude_game_id)는 항상 제외
     ✅ cutoff_utc(=현재 경기 시작시각) 이전(Finished) 경기만 대상으로 시즌 표본 구성
+    ✅ 정규시즌만 포함: raw_json->>'stage' = '2'
     """
     sql = """
         SELECT
@@ -193,11 +197,13 @@ def _load_games_for_season(
             AND g.status_short = %s
             AND g.season = %s
             AND (g.home_team_id = %s OR g.visitor_team_id = %s)
+            AND COALESCE(g.raw_json->>'stage','') = '2'
             AND (%s IS NULL OR g.date_start_utc < %s)
             AND (%s IS NULL OR g.id <> %s)
         ORDER BY g.date_start_utc DESC NULLS LAST, g.id DESC
         LIMIT 5000
     """
+
     rows = nba_fetch_all(
         sql,
         (
