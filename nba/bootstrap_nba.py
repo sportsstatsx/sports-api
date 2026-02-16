@@ -408,20 +408,59 @@ def ingest_rosters(conn, base: str, api_key: str, season: int, team_ids: List[in
         time.sleep(0.15)  # 호출 과속 방지(너 key limit 300/분 느낌이라 안전하게)
 
 
-def ingest_games(conn, base: str, api_key: str, league: str, season: int) -> List[int]:
+def ingest_games(
+    conn,
+    base: str,
+    api_key: str,
+    league: str,
+    season: int,
+    from_kst: Optional[str] = None,
+    to_kst: Optional[str] = None,
+) -> List[int]:
     d = _http_get_json(base, f"games?league={league}&season={season}", api_key)
     games = d.get("response") or []
     finished_ids: List[int] = []
 
+    # ✅ [ADD] KST 날짜 범위를 UTC 구간으로 변환
+    # - from_kst/to_kst가 없으면 전체 시즌 처리 (기존 동작)
+    kst = dt.timezone(dt.timedelta(hours=9))
+
+    utc_start: Optional[dt.datetime] = None
+    utc_end_excl: Optional[dt.datetime] = None  # end는 exclusive
+
+    if from_kst:
+        y, m, d0 = [int(x) for x in from_kst.split("-")]
+        utc_start = dt.datetime(y, m, d0, 0, 0, 0, tzinfo=kst).astimezone(dt.timezone.utc)
+
+    if to_kst:
+        y, m, d1 = [int(x) for x in to_kst.split("-")]
+        # inclusive end -> 다음날 00:00 KST를 exclusive end로
+        utc_end_excl = (
+            dt.datetime(y, m, d1, 0, 0, 0, tzinfo=kst)
+            + dt.timedelta(days=1)
+        ).astimezone(dt.timezone.utc)
+
+
     for g in games:
         gid = int(g.get("id"))
+
+        date_start = _parse_iso_z(((g.get("date") or {}).get("start")))
+        # ✅ [ADD] 날짜 없으면 스킵 (방어)
+        if date_start is None:
+            continue
+
+        # ✅ [ADD] KST 범위 필터(UTC 기준으로 비교)
+        if utc_start is not None and date_start < utc_start:
+            continue
+        if utc_end_excl is not None and date_start >= utc_end_excl:
+            continue
+
         status = g.get("status") or {}
         status_long = status.get("long")
         status_short = status.get("short")
         if status_long == "Finished":
             finished_ids.append(gid)
 
-        date_start = _parse_iso_z(((g.get("date") or {}).get("start")))
 
         teams = g.get("teams") or {}
         v_id = ((teams.get("visitors") or {}).get("id"))
@@ -591,9 +630,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--league", default="standard")
     ap.add_argument("--season", type=int, required=True)
+
+    # ✅ [ADD] 날짜 범위 필터 (KST 기준 날짜)
+    # 예) --from-kst 2026-02-10 --to-kst 2026-02-17
+    # - to-kst는 "포함" (즉 2/17까지 포함)
+    ap.add_argument("--from-kst", dest="from_kst", help="KST date start (YYYY-MM-DD), inclusive")
+    ap.add_argument("--to-kst", dest="to_kst", help="KST date end (YYYY-MM-DD), inclusive")
+
     ap.add_argument("--include-stage1", action="store_true", help="preseason(stage=1) finished도 stats까지 백필")
     ap.add_argument("--stats", action="store_true", help="finished game stats까지 수행")
     args = ap.parse_args()
+
 
     base = os.environ.get("NBA_BASE", "https://v2.nba.api-sports.io")
     api_key = os.environ.get("API_KEY")
@@ -635,10 +682,15 @@ def main() -> int:
 
         # 4) games
         if stage in ("games", "init", "meta", "teams", "players"):
-            print(f"[4/6] games league={league} season={season}")
-            finished_ids = ingest_games(conn, base, api_key, league, season)
+            print(f"[4/6] games league={league} season={season} from_kst={args.from_kst} to_kst={args.to_kst}")
+            finished_ids = ingest_games(
+                conn, base, api_key, league, season,
+                from_kst=args.from_kst,
+                to_kst=args.to_kst,
+            )
             _save_state(conn, league, season, "standings", last_game_index)
             stage = "standings"
+
         else:
             finished_ids = [int(r["id"]) for r in _fetchall(conn, "SELECT id FROM nba_games WHERE season=%s AND status_long='Finished' ORDER BY id", (season,))]
 
