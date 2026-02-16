@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, Optional
 import json
+import time
+
 
 from db import fetch_one
 
@@ -110,11 +112,16 @@ def get_match_detail_bundle(
     - 그 외 키(예: timeline/insights_overall 같은 블록 override)는 bundle 완성 후 최종 merge
     """
 
+    t0 = time.perf_counter()
+
+    t_header0 = time.perf_counter()
     header = build_header_block(
         fixture_id=fixture_id,
         league_id=league_id,
         season=season,
     )
+    dt_header = time.perf_counter() - t_header0
+
 
     # ✅ 근본 해결: season/league_id가 틀려도 fixture_id 기준으로 1회 자동 보정(fallback)
     # - 앱/클라이언트가 이전 시즌(예: 2025)을 보내도, DB에 실제 시즌(예: 2026)이 있으면 그걸로 재시도
@@ -198,15 +205,39 @@ def get_match_detail_bundle(
                 header = _deep_merge(header, header_patch)
                 _reconcile_header_aliases(header)
 
-    # 블록 생성 (override 반영된 header 기반)
+    # 블록 생성 (override 반영된 header 기반) + 타이밍
+    t_form0 = time.perf_counter()
     form = build_form_block(header)
+    dt_form = time.perf_counter() - t_form0
+
+    t_timeline0 = time.perf_counter()
     timeline = build_timeline_block(header)
+    dt_timeline = time.perf_counter() - t_timeline0
+
+    t_lineups0 = time.perf_counter()
     lineups = build_lineups_block(header)
+    dt_lineups = time.perf_counter() - t_lineups0
+
+    t_stats0 = time.perf_counter()
     stats = build_stats_block(header)
+    dt_stats = time.perf_counter() - t_stats0
+
+    t_h2h0 = time.perf_counter()
     h2h = build_h2h_block(header)
+    dt_h2h = time.perf_counter() - t_h2h0
+
+    t_stand0 = time.perf_counter()
     standings = build_standings_block(header)
+    dt_standings = time.perf_counter() - t_stand0
+
+    t_ins0 = time.perf_counter()
     insights_overall = build_insights_overall_block(header)
+    dt_insights = time.perf_counter() - t_ins0
+
+    t_ai0 = time.perf_counter()
     ai_predictions = build_ai_predictions_block(header, insights_overall)
+    dt_ai = time.perf_counter() - t_ai0
+
 
     bundle = {
         "header": header,
@@ -224,6 +255,26 @@ def get_match_detail_bundle(
     if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
+    dt_total = time.perf_counter() - t0
+    try:
+        print(
+            "[match_detail_bundle]"
+            f" fixture_id={fixture_id} league_id={league_id} season={season}"
+            f" total={dt_total:.3f}s"
+            f" header={dt_header:.3f}s"
+            f" form={dt_form:.3f}s"
+            f" timeline={dt_timeline:.3f}s"
+            f" lineups={dt_lineups:.3f}s"
+            f" stats={dt_stats:.3f}s"
+            f" h2h={dt_h2h:.3f}s"
+            f" standings={dt_standings:.3f}s"
+            f" insights={dt_insights:.3f}s"
+            f" ai={dt_ai:.3f}s"
+        )
+    except Exception:
+        pass
+
     return bundle
+
 
 
