@@ -78,7 +78,28 @@ def match_detail_bundle():
         if not bundle:
             return jsonify({"ok": False, "error": "Match not found"}), 404
 
-        return jsonify({"ok": True, "data": bundle})
+        resp = jsonify({"ok": True, "data": bundle})
+
+        # ✅ bundle_service에서 만든 타이밍(있으면) 헤더로 노출
+        # - prod에서는 나중에 제거하거나 ADMIN만 허용
+        try:
+            if isinstance(bundle, dict):
+                perf = bundle.get("_perf")
+                if isinstance(perf, dict):
+                    # 문자열로 축약해서 헤더 1개에 담기
+                    # 예: total=1.05;header=0.12;stats=0.40...
+                    parts = []
+                    for k in ("total","header","form","timeline","lineups","stats","h2h","standings","insights","ai"):
+                        v = perf.get(k)
+                        if isinstance(v, (int, float)):
+                            parts.append(f"{k}={v:.3f}")
+                    if parts:
+                        resp.headers["X-MD-Perf"] = ";".join(parts)
+        except Exception:
+            pass
+
+        return resp
+
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
