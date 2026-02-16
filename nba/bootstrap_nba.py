@@ -643,9 +643,12 @@ def main() -> int:
 
 
     base = os.environ.get("NBA_BASE", "https://v2.nba.api-sports.io")
-    api_key = os.environ.get("API_KEY")
+
+    # ✅ API_KEY 또는 APISPORTS_KEY 둘 다 지원
+    api_key = os.environ.get("API_KEY") or os.environ.get("APISPORTS_KEY")
     if not api_key:
-        raise RuntimeError("API_KEY is required")
+        raise RuntimeError("API_KEY or APISPORTS_KEY is required")
+
 
     league = args.league
     season = int(args.season)
