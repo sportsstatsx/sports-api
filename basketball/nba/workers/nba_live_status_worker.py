@@ -14,12 +14,15 @@ import psycopg
 from basketball.nba.bootstrap_nba import ingest_game_stats
 
 log = logging.getLogger("nba_live_status_worker")
-logging.basicConfig(level=logging.INFO)
+
+# ✅ 워커 단독 실행이 아니라면 basicConfig가 전체 앱 로그 설정을 덮을 수 있음.
+#    루트 핸들러가 없을 때만 설정하도록 가드.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 BASE_URL = os.getenv("NBA_BASE", "https://v2.nba.api-sports.io").rstrip("/")
 
-# game_id별 stats 마지막 호출 시각(UTC timestamp)
-_last_stats_ts_by_game: Dict[int, float] = {}
+_last_schedule_scan_ts: float = 0.0
 
 
 # ─────────────────────────────────────────
@@ -33,36 +36,53 @@ def _dsn() -> str:
     return dsn
 
 
-def _db_fetch_one(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    with psycopg.connect(_dsn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
-            if not row:
-                return None
-            cols = [d.name for d in cur.description]
-            return {cols[i]: row[i] for i in range(len(cols))}
+def _db_fetch_one(sql: str, params: tuple = (), *, conn: Optional[psycopg.Connection] = None) -> Optional[Dict[str, Any]]:
+    if conn is None:
+        with psycopg.connect(_dsn()) as c:
+            return _db_fetch_one(sql, params, conn=c)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = [d.name for d in cur.description]
+        return {cols[i]: row[i] for i in range(len(cols))}
 
 
-def _db_fetch_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    with psycopg.connect(_dsn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            cols = [d.name for d in cur.description]
-            return [{cols[i]: r[i] for i in range(len(cols))} for r in rows]
+def _db_fetch_all(sql: str, params: tuple = (), *, conn: Optional[psycopg.Connection] = None) -> List[Dict[str, Any]]:
+    if conn is None:
+        with psycopg.connect(_dsn()) as c:
+            return _db_fetch_all(sql, params, conn=c)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [d.name for d in cur.description]
+        return [{cols[i]: r[i] for i in range(len(cols))} for r in rows]
 
 
-def _db_execute(sql: str, params: tuple = ()) -> None:
-    with psycopg.connect(_dsn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-        conn.commit()
+def _db_execute(sql: str, params: tuple = (), *, conn: Optional[psycopg.Connection] = None) -> None:
+    if conn is None:
+        with psycopg.connect(_dsn()) as c:
+            _db_execute(sql, params, conn=c)
+            c.commit()
+            return
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+
 
 
 # ─────────────────────────────────────────
 # API helpers
 # ─────────────────────────────────────────
+
+class ApiRetryableError(RuntimeError):
+    def __init__(self, message: str, retry_after_sec: float = 30.0):
+        super().__init__(message)
+        self.retry_after_sec = float(retry_after_sec)
+
 
 def _headers() -> Dict[str, str]:
     key = (os.getenv("API_KEY") or os.getenv("APISPORTS_KEY") or os.getenv("API_SPORTS_KEY") or "").strip()
@@ -72,21 +92,54 @@ def _headers() -> Dict[str, str]:
 
 
 def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.get(
-        f"{BASE_URL}{path}",
-        headers=_headers(),
-        params=params,
-        timeout=45,
-    )
+    url = f"{BASE_URL}{path}"
+    try:
+        r = requests.get(
+            url,
+            headers=_headers(),
+            params=params,
+            timeout=45,
+        )
+    except requests.Timeout as e:
+        # ✅ timeout은 재시도 가치가 큼
+        raise ApiRetryableError(f"timeout: {url} params={params} err={e}", retry_after_sec=30.0)
+    except requests.RequestException as e:
+        # ✅ 네트워크류도 대체로 재시도
+        raise ApiRetryableError(f"request failed: {url} params={params} err={e}", retry_after_sec=30.0)
+
+    # ✅ HTTP 레벨 분기
+    if r.status_code == 429:
+        # Retry-After 헤더가 있으면 존중
+        ra = r.headers.get("Retry-After")
+        retry_after = 60.0
+        try:
+            if ra:
+                retry_after = float(ra)
+        except Exception:
+            pass
+        raise ApiRetryableError(f"rate limited(429): {url} params={params}", retry_after_sec=max(30.0, retry_after))
+
+    if 500 <= r.status_code <= 599:
+        raise ApiRetryableError(f"server error({r.status_code}): {url} params={params}", retry_after_sec=60.0)
+
+    # 그 외는 기존대로 raise
     r.raise_for_status()
-    data = r.json()
+
+    # JSON 파싱
+    try:
+        data = r.json()
+    except Exception as e:
+        raise ApiRetryableError(f"bad json: {url} params={params} err={e}", retry_after_sec=30.0)
 
     # ✅ API-Sports는 HTTP 200이어도 errors로 실패할 수 있음
     errs = data.get("errors") if isinstance(data, dict) else None
     if isinstance(errs, dict) and errs:
-        raise RuntimeError(f"API-Sports error: {errs}")
+        # errors가 레이트리밋/일시 오류일 수도 있으니 retryable로 취급
+        # (치명적이면 그냥 RuntimeError로 바꿔도 됨)
+        raise ApiRetryableError(f"API-Sports error: {errs}", retry_after_sec=60.0)
 
     return data
+
 
 
 
@@ -139,24 +192,27 @@ def _float_env(name: str, default: float) -> float:
 # ─────────────────────────────────────────
 # API-Sports NBA에서 status.long이 예: "Scheduled", "In Play", "Live", "Halftime", "Finished"
 LIVE_STATUS_LONG = {"In Play", "Live", "Halftime"}
+
+# ✅ 종료 / 취소 / 연기 상태를 폭넓게 인지 (API-Sports가 어떤 문자열을 쓰더라도 최소한 후보에 활용 가능)
 FINISHED_STATUS_LONG = {"Finished"}
-NOT_STARTED_STATUS_LONG = {"Scheduled"}
+CANCELED_OR_POSTPONED_STATUS_LONG = {"Postponed", "Cancelled", "Canceled", "Suspended", "Delayed"}
+
+NOT_STARTED_STATUS_LONG = {"Scheduled", "Time TBD"}
+
 
 
 def _is_finished_status(status_long: str, start_utc: Optional[dt.datetime]) -> bool:
     x = (status_long or "").strip()
     if x in FINISHED_STATUS_LONG:
         return True
+    # ✅ 취소/연기류는 finished로 취급하지 않음 (스케줄 재스캔으로 새 일정 반영 가능하게)
+    if x in CANCELED_OR_POSTPONED_STATUS_LONG:
+        return False
 
-    # 시간 기반 fallback: 시작시간이 오래 전인데도 Scheduled로 남아있는 경우
-    if isinstance(start_utc, dt.datetime):
-        try:
-            age = _utc_now() - start_utc
-            if age > dt.timedelta(hours=6) and x in NOT_STARTED_STATUS_LONG:
-                return True
-        except Exception:
-            pass
+    # 시간 기반 fallback: "Scheduled"이 오래 유지되는 경우가 있어도 finished로 단정하지 말고 False 유지
+    # (대신 candidates window에서 자연히 빠지도록 설계하는게 안전)
     return False
+
 
 
 def _is_not_started(status_long: str) -> bool:
@@ -167,36 +223,92 @@ def _is_not_started(status_long: str) -> bool:
 # poll_state
 # ─────────────────────────────────────────
 
-def _poll_state_get_or_create(game_id: int) -> Dict[str, Any]:
-    row = _db_fetch_one("SELECT * FROM nba_live_poll_state WHERE game_id=%s", (game_id,))
+def _poll_state_get_or_create(game_id: int, *, conn: psycopg.Connection) -> Dict[str, Any]:
+    row = _db_fetch_one("SELECT * FROM nba_live_poll_state WHERE game_id=%s", (game_id,), conn=conn)
     if row:
         return dict(row)
 
     _db_execute(
         "INSERT INTO nba_live_poll_state (game_id) VALUES (%s) ON CONFLICT DO NOTHING",
         (game_id,),
+        conn=conn,
     )
-    row2 = _db_fetch_one("SELECT * FROM nba_live_poll_state WHERE game_id=%s", (game_id,))
+    row2 = _db_fetch_one("SELECT * FROM nba_live_poll_state WHERE game_id=%s", (game_id,), conn=conn)
     return dict(row2) if row2 else {"game_id": game_id}
 
 
-def _poll_state_update(game_id: int, **cols: Any) -> None:
+
+def _poll_state_update(game_id: int, *, conn: psycopg.Connection, **cols: Any) -> None:
     if not cols:
         return
-    keys = list(cols.keys())
+
+    # ✅ 방어: 허용 컬럼만 업데이트 (실수로 잘못된 키 전달 시 워커 크래시 방지)
+    allowed = {
+        "pre_called_at",
+        "start_called_at",
+        "end_called_at",
+        "post_called_at",
+        "finished_at",
+        "next_live_poll_at",
+        "next_stats_poll_at",
+    }
+
+    safe_cols = {k: v for k, v in cols.items() if k in allowed}
+    if not safe_cols:
+        return
+
+    keys = list(safe_cols.keys())
     sets = ", ".join([f"{k}=%s" for k in keys])
-    values = [cols[k] for k in keys]
+    values = [safe_cols[k] for k in keys]
+
     _db_execute(
         f"UPDATE nba_live_poll_state SET {sets}, updated_at=now() WHERE game_id=%s",
         tuple(values + [game_id]),
+        conn=conn,
     )
+
+
+def _date_range_ymd(start_utc: dt.datetime, days: int) -> List[str]:
+    base = start_utc.date()
+    return [(base + dt.timedelta(days=i)).isoformat() for i in range(days)]
+
+
+def _api_scan_schedule_by_dates(*, dates_ymd: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for d in dates_ymd:
+        payload = _get("/games", {"date": d})
+        resp = payload.get("response") if isinstance(payload, dict) else None
+        if isinstance(resp, list):
+            log.info("schedule scan: date=%s items=%s", d, len(resp))
+            for it in resp:
+                if isinstance(it, dict):
+                    out.append(it)
+
+    return out
+
+
+def _db_has_recent_postponed_or_canceled(*, conn: psycopg.Connection, days_back: int) -> bool:
+    # ✅ 최근 days_back일 동안 시작 예정/시작한 경기 중 "연기/취소/딜레이" 상태가 있으면 스케줄 재스캔 트리거
+    row = _db_fetch_one(
+        """
+        SELECT 1
+        FROM nba_games
+        WHERE league='standard'
+          AND date_start_utc >= (now() at time zone 'utc') - (%s || ' days')::interval
+          AND COALESCE(status_long,'') = ANY(%s)
+        LIMIT 1
+        """,
+        (int(days_back), list(CANCELED_OR_POSTPONED_STATUS_LONG)),
+        conn=conn,
+    )
+    return row is not None
 
 
 # ─────────────────────────────────────────
 # candidates window loader
 # ─────────────────────────────────────────
 
-def _load_live_window_game_rows() -> List[Dict[str, Any]]:
+def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """
     NBA는 league_id 개념 대신 league='standard' 중심.
     후보:
@@ -227,27 +339,24 @@ def _load_live_window_game_rows() -> List[Dict[str, Any]]:
           ON ps.game_id = g.id
         WHERE g.league = 'standard'
           AND (
-            -- (1) 프리 윈도우: now ~ now+pre_min
             (g.date_start_utc >= %s AND g.date_start_utc <= %s)
             OR
-            -- (2) 라이브/진행 윈도우: now-inplay_max ~ now+grace (Finished만 제외)
             (
               g.date_start_utc >= %s
               AND g.date_start_utc <= %s
               AND COALESCE(g.status_long,'') <> 'Finished'
+              AND COALESCE(g.status_long,'') <> ALL(%s)
             )
           )
+
         ORDER BY g.date_start_utc ASC
         LIMIT %s
         """,
-        (
-            now, upcoming_end,
-            inplay_start, inplay_end,
-            batch_limit,
-        ),
+        (now, upcoming_end, inplay_start, inplay_end, list(CANCELED_OR_POSTPONED_STATUS_LONG), batch_limit),
+        conn=conn,
     )
-
     return rows
+
 
 
 # ─────────────────────────────────────────
@@ -262,28 +371,22 @@ def _api_get_game_by_id(game_id: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def upsert_game(api_item: Dict[str, Any]) -> Optional[int]:
+def upsert_game(api_item: Dict[str, Any], *, conn: psycopg.Connection) -> Optional[Dict[str, Any]]:
     """
-    nba_games에 스냅샷 반영 (✅ 너 DB 스키마에 100% 맞춤)
-
-    nba_games columns:
-      id, league, season, stage,
-      status_long, status_short,
-      date_start_utc,
-      home_team_id, visitor_team_id,
-      arena_name, arena_city, arena_state,
-      raw_json, updated_utc
+    nba_games에 스냅샷 반영
+    return: {"id": gid, "status_long": status_long, "date_start_utc": start_utc}
     """
     gid = _safe_int(api_item.get("id"))
     if gid is None:
         return None
 
-    # league/season/stage
-    league = _safe_text(api_item.get("league")) or "standard"
+    # ✅ NBA는 이 워커 기준으로 league='standard'만 운영 (후보쿼리/스캔 기준도 동일)
+    #    API 응답에서 league가 객체로 오는 경우가 있어 문자열화되면 후보쿼리에서 누락될 수 있으니 강제한다.
+    league = "standard"
     season = _safe_int(api_item.get("season"))
     stage = _safe_int(api_item.get("stage"))
 
-    # date.start
+
     date_obj = api_item.get("date") if isinstance(api_item.get("date"), dict) else {}
     start_str = date_obj.get("start")
     start_utc: Optional[dt.datetime] = None
@@ -293,20 +396,13 @@ def upsert_game(api_item: Dict[str, Any]) -> Optional[int]:
         except Exception:
             start_utc = None
 
-    # status
     status_obj = api_item.get("status") if isinstance(api_item.get("status"), dict) else {}
     status_long = _safe_text(status_obj.get("long"))
     if not status_long:
-        # fallback: 혹시 다른 키로 오거나 비정상 케이스 방어
         status_long = _safe_text(api_item.get("status_long")) or _safe_text(api_item.get("status"))
 
-
-    
-
-    # 너 컬럼 status_short = integer
     status_short = _safe_int(status_obj.get("short"))
 
-    # teams (API-Sports NBA: teams.home / teams.visitors)
     teams = api_item.get("teams") if isinstance(api_item.get("teams"), dict) else {}
     home = teams.get("home") if isinstance(teams.get("home"), dict) else {}
     visitors = teams.get("visitors") if isinstance(teams.get("visitors"), dict) else {}
@@ -314,13 +410,11 @@ def upsert_game(api_item: Dict[str, Any]) -> Optional[int]:
     home_team_id = _safe_int(home.get("id"))
     visitor_team_id = _safe_int(visitors.get("id"))
 
-    # arena
     arena = api_item.get("arena") if isinstance(api_item.get("arena"), dict) else {}
     arena_name = _safe_text(arena.get("name"))
     arena_city = _safe_text(arena.get("city"))
     arena_state = _safe_text(arena.get("state"))
 
-    # updated_utc: text 컬럼이므로 ISO 문자열로
     updated_utc = _utc_now().isoformat()
 
     _db_execute(
@@ -370,8 +464,11 @@ def upsert_game(api_item: Dict[str, Any]) -> Optional[int]:
             _jdump(api_item),
             updated_utc,
         ),
+        conn=conn,
     )
-    return gid
+
+    return {"id": gid, "status_long": status_long, "date_start_utc": start_utc}
+
 
 
 
@@ -393,11 +490,13 @@ def _try_ingest_game_stats(game_id: int) -> None:
 def tick_once_windowed(
     rows: List[Dict[str, Any]],
     *,
+    conn: psycopg.Connection,
     pre_min: int,
     post_min: int,
     live_interval_sec: float,
     stats_interval_sec: float,
 ) -> Tuple[int, int, int]:
+
     """
     하키 tick 구조를 NBA로 이식:
       - pre 1회
@@ -425,13 +524,29 @@ def tick_once_windowed(
             except Exception:
                 db_start = None
 
-        st = _poll_state_get_or_create(gid)
+        # ✅ start 시간이 없거나 파싱 실패한 경우: /games?id로 한 번 채워 넣어서 유령 상태 방지
+        if db_start is None:
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+            except Exception as e:
+                log.warning("start_utc fill failed: game=%s err=%s", gid, e)
+
+
+        st = _poll_state_get_or_create(gid, conn=conn)
         pre_called_at = st.get("pre_called_at")
         start_called_at = st.get("start_called_at")
         end_called_at = st.get("end_called_at")
         post_called_at = st.get("post_called_at")
         finished_at = st.get("finished_at")
         next_live_poll_at = st.get("next_live_poll_at")
+        next_stats_poll_at = st.get("next_stats_poll_at")
+
 
         # (A) pre 1회
         if (
@@ -442,9 +557,13 @@ def tick_once_windowed(
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
-                    upsert_game(api_item)
-                    games_upserted += 1
-                    _poll_state_update(gid, pre_called_at=now)
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+                    _poll_state_update(gid, conn=conn, pre_called_at=now)
+
             except Exception as e:
                 log.warning("pre-call /games?id failed: game=%s err=%s", gid, e)
             continue
@@ -459,14 +578,13 @@ def tick_once_windowed(
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
-                    upsert_game(api_item)
-                    games_upserted += 1
-                    _poll_state_update(gid, start_called_at=now)
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+                    _poll_state_update(gid, conn=conn, start_called_at=now)
 
-                    cur = _db_fetch_one("SELECT status_long, date_start_utc FROM nba_games WHERE id=%s", (gid,))
-                    if cur:
-                        db_status_long = (cur.get("status_long") or db_status_long).strip()
-                        db_start = cur.get("date_start_utc") or db_start
             except Exception as e:
                 log.warning("start-call /games?id failed: game=%s err=%s", gid, e)
 
@@ -475,9 +593,13 @@ def tick_once_windowed(
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
-                    upsert_game(api_item)
-                    games_upserted += 1
-                    _poll_state_update(gid, end_called_at=now, finished_at=now)
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+                    _poll_state_update(gid, conn=conn, end_called_at=now, finished_at=now)
+
             except Exception as e:
                 log.warning("end-call /games?id failed: game=%s err=%s", gid, e)
             continue
@@ -492,9 +614,13 @@ def tick_once_windowed(
             try:
                 api_item = _api_get_game_by_id(gid)
                 if isinstance(api_item, dict):
-                    upsert_game(api_item)
-                    games_upserted += 1
-                    _poll_state_update(gid, post_called_at=now)
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+                    _poll_state_update(gid, conn=conn, post_called_at=now)
+
             except Exception as e:
                 log.warning("post-call /games?id failed: game=%s err=%s", gid, e)
             continue
@@ -516,36 +642,59 @@ def tick_once_windowed(
                 try:
                     api_item = _api_get_game_by_id(gid)
                     if isinstance(api_item, dict):
-                        upsert_game(api_item)
-                        games_upserted += 1
+                        res = upsert_game(api_item, conn=conn)
+                        if res:
+                            games_upserted += 1
+                            db_status_long = (res.get("status_long") or db_status_long).strip()
+                            db_start = res.get("date_start_utc") or db_start
 
-                        cur = _db_fetch_one("SELECT status_long, date_start_utc FROM nba_games WHERE id=%s", (gid,))
-                        if cur:
-                            db_status_long = (cur.get("status_long") or db_status_long).strip()
-                            db_start = cur.get("date_start_utc") or db_start
-                except Exception as e:
-                    log.warning("live /games?id failed: game=%s err=%s", gid, e)
-                    _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=max(5.0, float(live_interval_sec))))
+                except ApiRetryableError as e:
+                    log.warning("live /games?id retryable: game=%s err=%s retry_after=%.1fs", gid, e, e.retry_after_sec)
+                    _poll_state_update(
+                        gid,
+                        conn=conn,
+                        next_live_poll_at=now + dt.timedelta(seconds=max(float(e.retry_after_sec), float(live_interval_sec))),
+                    )
                     continue
 
-                # 2) stats (너 비용/부하 고려해서 더 느리게)
-                #    - 라이브/하프타임일 때만 호출 권장
-                if db_status_long in LIVE_STATUS_LONG:
-                    now_ts = time.time()
-                    last_ts = _last_stats_ts_by_game.get(gid, 0.0)
+                except Exception as e:
+                    log.warning("live /games?id failed: game=%s err=%s", gid, e)
+                    _poll_state_update(
+                        gid,
+                        conn=conn,
+                        next_live_poll_at=now + dt.timedelta(seconds=max(10.0, float(live_interval_sec))),
+                    )
+                    continue
 
-                    # ✅ stats_interval_sec마다만 호출
-                    if (now_ts - last_ts) >= float(stats_interval_sec):
+                # 2) stats (DB poll_state 기반 스케줄)
+                if db_status_long in LIVE_STATUS_LONG:
+                    stats_due = False
+                    if next_stats_poll_at is None:
+                        stats_due = True
+                    else:
+                        try:
+                            stats_due = now >= next_stats_poll_at
+                        except Exception:
+                            stats_due = True
+
+                    if stats_due:
                         try:
                             _try_ingest_game_stats(gid)
                             stats_called += 1
-                            _last_stats_ts_by_game[gid] = now_ts
                         except Exception:
-                            # 실패해도 last_ts 갱신 안 해서 다음에 재시도됨
                             pass
+                        _poll_state_update(
+                            gid,
+                            conn=conn,
+                            next_stats_poll_at=now + dt.timedelta(seconds=float(stats_interval_sec)),
+                        )
 
+                _poll_state_update(
+                    gid,
+                    conn=conn,
+                    next_live_poll_at=now + dt.timedelta(seconds=float(live_interval_sec)),
+                )
 
-                _poll_state_update(gid, next_live_poll_at=now + dt.timedelta(seconds=float(live_interval_sec)))
 
     return (games_upserted, stats_called, len(rows))
 
@@ -571,45 +720,118 @@ def main() -> None:
         pre_min, post_min, live_interval_sec, idle_interval_sec, stats_interval_sec, BASE_URL
     )
 
-    # (선택) poll_state 테이블 존재 보장 (원하면 여기서 create)
-    _db_execute(
-        """
-        CREATE TABLE IF NOT EXISTS nba_live_poll_state (
-          game_id           INTEGER PRIMARY KEY,
-          pre_called_at     TIMESTAMPTZ,
-          start_called_at   TIMESTAMPTZ,
-          end_called_at     TIMESTAMPTZ,
-          post_called_at    TIMESTAMPTZ,
-          finished_at       TIMESTAMPTZ,
-          next_live_poll_at TIMESTAMPTZ,
-          updated_at        TIMESTAMPTZ DEFAULT now()
-        );
-        """
-    )
 
+
+
+
+    global _last_schedule_scan_ts
+
+    schedule_scan_interval_sec = _float_env("NBA_SCHEDULE_SCAN_INTERVAL_SEC", 3600.0)  # 1시간
+    schedule_scan_past_days = _int_env("NBA_SCHEDULE_SCAN_PAST_DAYS", 7)
+    schedule_scan_future_days = _int_env("NBA_SCHEDULE_SCAN_FUTURE_DAYS", 7)
 
     while True:
         try:
-            rows = _load_live_window_game_rows()
-            if not rows:
-                time.sleep(idle_interval_sec)
-                continue
+            with psycopg.connect(_dsn()) as conn:
+                # ✅ (A) poll_state 테이블 create는 커넥션 재사용해서 수행
+                _db_execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS nba_live_poll_state (
+                      game_id            INTEGER PRIMARY KEY,
+                      pre_called_at      TIMESTAMPTZ,
+                      start_called_at    TIMESTAMPTZ,
+                      end_called_at      TIMESTAMPTZ,
+                      post_called_at     TIMESTAMPTZ,
+                      finished_at        TIMESTAMPTZ,
+                      next_live_poll_at  TIMESTAMPTZ,
+                      next_stats_poll_at TIMESTAMPTZ,
+                      updated_at         TIMESTAMPTZ DEFAULT now()
+                    );
+                    """,
+                    conn=conn,
+                )
+                conn.commit()
 
-            g_up, s_up, cand = tick_once_windowed(
-                rows,
-                pre_min=pre_min,
-                post_min=post_min,
-                live_interval_sec=live_interval_sec,
-                stats_interval_sec=stats_interval_sec,
-            )
-            log.info("tick done: candidates=%s games_upserted=%s stats_called=%s", cand, g_up, s_up)
+                # ✅ 기존 테이블이 이미 존재하는 환경(구버전)에서도 컬럼을 보장
+                _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS next_stats_poll_at TIMESTAMPTZ;", conn=conn)
+                _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS next_live_poll_at TIMESTAMPTZ;", conn=conn)
+                _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();", conn=conn)
+                conn.commit()
 
-            # 너무 빡세게 돌지 않게 약간 sleep (per-league 분리 안 했으니 단순)
+
+                now_ts = time.time()
+
+                # ✅ (B) 최근 연기/취소 이슈가 있거나, 주기 도래 시 스케줄 재스캔
+                schedule_due = (now_ts - float(_last_schedule_scan_ts)) >= float(schedule_scan_interval_sec)
+                need_rescan = False
+                try:
+                    if schedule_due:
+                        # 최근 연기/취소가 있는지 빠르게 DB에서 체크
+                        need_rescan = _db_has_recent_postponed_or_canceled(conn=conn, days_back=schedule_scan_past_days)
+                except Exception as e:
+                    # 체크 실패해도 스캔 자체를 막을 필요는 없음. 다만 로그만.
+                    log.warning("schedule precheck failed: %s", e)
+
+                if schedule_due or need_rescan:
+                    try:
+                        base_now = _utc_now()
+                        # 과거 7일 + 미래 7일 날짜 목록
+                        past_dates = _date_range_ymd(base_now - dt.timedelta(days=schedule_scan_past_days), schedule_scan_past_days)
+                        future_dates = _date_range_ymd(base_now, schedule_scan_future_days)
+
+                        api_items = _api_scan_schedule_by_dates(dates_ymd=(past_dates + future_dates))
+
+                        up_cnt = 0
+                        for it in api_items:
+                            # ✅ API-Sports 응답에서 league 필드는 문자열/객체 등 형태가 다양할 수 있음.
+                            #    스캔 단계에서 필터링하면 오히려 누락 위험이 커서 제거하고,
+                            #    DB에는 upsert_game에서 league 기본값 standard로 저장되도록 둔다.
+                            r = upsert_game(it, conn=conn)
+                            if r:
+                                up_cnt += 1
+
+
+                        conn.commit()
+                        _last_schedule_scan_ts = now_ts
+                        log.info("schedule scan done: upserted=%s (past=%s days, future=%s days)", up_cnt, schedule_scan_past_days, schedule_scan_future_days)
+
+                    except ApiRetryableError as e:
+                        # ✅ 폭주 방지 + 너무 오래 방치 방지:
+                        #    last_scan_ts를 "지금 - (interval - retry_after)" 형태로 당겨서
+                        #    retry_after 이후에 다시 due가 되도록 만든다.
+                        retry_after = max(30.0, float(e.retry_after_sec))
+                        _last_schedule_scan_ts = now_ts - max(0.0, float(schedule_scan_interval_sec) - retry_after)
+                        log.warning("schedule scan retryable: %s (retry_after=%.1fs)", e, retry_after)
+
+                    except Exception as e:
+                        _last_schedule_scan_ts = now_ts
+                        log.warning("schedule scan failed: %s", e)
+
+                # ✅ (C) 라이브 후보 로드 + tick
+                rows = _load_live_window_game_rows(conn=conn)
+                if not rows:
+                    conn.commit()
+                    time.sleep(idle_interval_sec)
+                    continue
+
+                g_up, s_up, cand = tick_once_windowed(
+                    rows,
+                    conn=conn,
+                    pre_min=pre_min,
+                    post_min=post_min,
+                    live_interval_sec=live_interval_sec,
+                    stats_interval_sec=stats_interval_sec,
+                )
+
+                conn.commit()
+                log.info("tick done: candidates=%s games_upserted=%s stats_called=%s", cand, g_up, s_up)
+
             time.sleep(min(1.0, max(0.2, float(live_interval_sec) / 5.0)))
 
         except Exception as e:
             log.exception("tick failed: %s", e)
             time.sleep(idle_interval_sec)
+
 
 
 if __name__ == "__main__":
