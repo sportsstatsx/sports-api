@@ -166,6 +166,25 @@ def _safe_text(v: Any) -> Optional[str]:
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
+def _safe_dt(v: Any) -> Optional[dt.datetime]:
+    """
+    psycopg/환경에 따라 TIMESTAMPTZ가 datetime 또는 str로 올 수 있어 방어.
+    """
+    if v is None:
+        return None
+    if isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
+
+
 
 def _int_env(name: str, default: int) -> int:
     v = (os.getenv(name) or "").strip()
@@ -539,13 +558,14 @@ def tick_once_windowed(
 
 
         st = _poll_state_get_or_create(gid, conn=conn)
-        pre_called_at = st.get("pre_called_at")
-        start_called_at = st.get("start_called_at")
-        end_called_at = st.get("end_called_at")
-        post_called_at = st.get("post_called_at")
-        finished_at = st.get("finished_at")
-        next_live_poll_at = st.get("next_live_poll_at")
-        next_stats_poll_at = st.get("next_stats_poll_at")
+        pre_called_at = _safe_dt(st.get("pre_called_at"))
+        start_called_at = _safe_dt(st.get("start_called_at"))
+        end_called_at = _safe_dt(st.get("end_called_at"))
+        post_called_at = _safe_dt(st.get("post_called_at"))
+        finished_at = _safe_dt(st.get("finished_at"))
+        next_live_poll_at = _safe_dt(st.get("next_live_poll_at"))
+        next_stats_poll_at = _safe_dt(st.get("next_stats_poll_at"))
+
 
 
         # (A) pre 1회
