@@ -19,6 +19,14 @@ def match_detail_bundle():
         comp = request.args.get("comp")
         last_n = request.args.get("last_n")
 
+        # ✅ optional: 부분 로딩용 parts
+        # 예) parts=header,form  /  parts=timeline  /  parts=stats,h2h
+        parts_raw = request.args.get("parts")
+        parts = None
+        if parts_raw:
+            parts = [p.strip() for p in str(parts_raw).split(",") if p.strip()]
+
+
         ao_raw = request.args.get("apply_override")
         if ao_raw is None:
             apply_override = True
@@ -73,7 +81,9 @@ def match_detail_bundle():
             comp=comp,
             last_n=last_n,
             apply_override=apply_override,
+            parts=parts,  # ✅ 추가
         )
+
 
         if not bundle:
             return jsonify({"ok": False, "error": "Match not found"}), 404
