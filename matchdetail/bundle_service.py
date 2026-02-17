@@ -100,7 +100,9 @@ def get_match_detail_bundle(
     comp: Optional[str] = None,
     last_n: Optional[str] = None,
     apply_override: bool = True,
+    parts: Optional[list[str]] = None,  # ✅ 추가: 요청된 블럭만 생성
 ) -> Optional[Dict[str, Any]]:
+
 
     """
     매치디테일 번들의 진입점 (sync 버전).
@@ -205,38 +207,60 @@ def get_match_detail_bundle(
                 header = _deep_merge(header, header_patch)
                 _reconcile_header_aliases(header)
 
+    # ✅ parts 없으면 기존(전체 생성) 유지 → 앱 패치 전에도 깨지지 않게 백워드 호환
+    parts_set = None
+    if parts:
+        parts_set = {str(x).strip() for x in parts if str(x).strip()}
+
+    def _need(name: str) -> bool:
+        return (parts_set is None) or (name in parts_set)
+
+    # 기본값
+    form = timeline = lineups = stats = h2h = standings = insights_overall = ai_predictions = None
+    dt_form = dt_timeline = dt_lineups = dt_stats = dt_h2h = dt_standings = dt_insights = dt_ai = 0.0
+
     # 블록 생성 (override 반영된 header 기반) + 타이밍
-    t_form0 = time.perf_counter()
-    form = build_form_block(header)
-    dt_form = time.perf_counter() - t_form0
+    if _need("form"):
+        t_form0 = time.perf_counter()
+        form = build_form_block(header)
+        dt_form = time.perf_counter() - t_form0
 
-    t_timeline0 = time.perf_counter()
-    timeline = build_timeline_block(header)
-    dt_timeline = time.perf_counter() - t_timeline0
+    if _need("timeline"):
+        t_timeline0 = time.perf_counter()
+        timeline = build_timeline_block(header)
+        dt_timeline = time.perf_counter() - t_timeline0
 
-    t_lineups0 = time.perf_counter()
-    lineups = build_lineups_block(header)
-    dt_lineups = time.perf_counter() - t_lineups0
+    if _need("lineups"):
+        t_lineups0 = time.perf_counter()
+        lineups = build_lineups_block(header)
+        dt_lineups = time.perf_counter() - t_lineups0
 
-    t_stats0 = time.perf_counter()
-    stats = build_stats_block(header)
-    dt_stats = time.perf_counter() - t_stats0
+    if _need("stats"):
+        t_stats0 = time.perf_counter()
+        stats = build_stats_block(header)
+        dt_stats = time.perf_counter() - t_stats0
 
-    t_h2h0 = time.perf_counter()
-    h2h = build_h2h_block(header)
-    dt_h2h = time.perf_counter() - t_h2h0
+    if _need("h2h"):
+        t_h2h0 = time.perf_counter()
+        h2h = build_h2h_block(header)
+        dt_h2h = time.perf_counter() - t_h2h0
 
-    t_stand0 = time.perf_counter()
-    standings = build_standings_block(header)
-    dt_standings = time.perf_counter() - t_stand0
+    if _need("standings"):
+        t_stand0 = time.perf_counter()
+        standings = build_standings_block(header)
+        dt_standings = time.perf_counter() - t_stand0
 
-    t_ins0 = time.perf_counter()
-    insights_overall = build_insights_overall_block(header)
-    dt_insights = time.perf_counter() - t_ins0
+    # ✅ ai_predictions 의존성: ai를 원하면 insights_overall도 반드시 먼저 생성
+    if _need("insights_overall") or _need("ai_predictions"):
+        t_ins0 = time.perf_counter()
+        insights_overall = build_insights_overall_block(header)
+        dt_insights = time.perf_counter() - t_ins0
 
-    t_ai0 = time.perf_counter()
-    ai_predictions = build_ai_predictions_block(header, insights_overall)
-    dt_ai = time.perf_counter() - t_ai0
+    if _need("ai_predictions"):
+        t_ai0 = time.perf_counter()
+        ai_predictions = build_ai_predictions_block(header, insights_overall)
+        dt_ai = time.perf_counter() - t_ai0
+
 
 
     # ✅ total 먼저 확정
