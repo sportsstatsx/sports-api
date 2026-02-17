@@ -361,6 +361,192 @@ def _fetch_player_stats(game_id: int, home_tid: Optional[int], vis_tid: Optional
 
     return {"home": home_list, "visitors": vis_list, "all": all_list}
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _parse_pct(v: Any) -> Optional[float]:
+    """
+    DB raw_json에서 퍼센트가 "49" / "33.3" / 49 / 33.3 등으로 올 수 있어서 통일
+    - 0~100 스케일의 float로 반환
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        s = str(v).strip().replace("%", "")
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _parse_min_to_int(v: Any) -> Optional[int]:
+    """
+    선수 min: "19" / "19:00" / 19 등 케이스 방어 -> 분(int)
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        s = str(v).strip()
+        if s == "":
+            return None
+        if ":" in s:
+            # "19:00" -> 19
+            s = s.split(":", 1)[0].strip()
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _extract_team_stat_obj(team_raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    nba_game_team_stats.raw_json:
+      {"team": {...}, "statistics": [ { ... } ] }
+    statistics[0]만 사용 (추측 가공 금지, 존재하는 키만 core로 정규화)
+    """
+    if not isinstance(team_raw, dict):
+        return None
+    st = team_raw.get("statistics")
+    if isinstance(st, list) and st:
+        obj = st[0]
+        return obj if isinstance(obj, dict) else None
+    # 혹시 statistics가 dict로 오는 케이스 방어
+    if isinstance(st, dict):
+        return st
+    return None
+
+
+def _team_stats_core(team_raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    '정확하게 보여줄 수 있는 것만' core로 뽑는다.
+    (샘플 16319 기준으로 확실히 존재하는 키만 사용)
+    """
+    st = _extract_team_stat_obj(team_raw)
+    if not isinstance(st, dict):
+        return None
+
+    fgm = _safe_int(st.get("fgm"))
+    fga = _safe_int(st.get("fga"))
+    fgp = _parse_pct(st.get("fgp"))
+
+    tpm = _safe_int(st.get("tpm"))
+    tpa = _safe_int(st.get("tpa"))
+    tpp = _parse_pct(st.get("tpp"))
+
+    ftm = _safe_int(st.get("ftm"))
+    fta = _safe_int(st.get("fta"))
+    ftp = _parse_pct(st.get("ftp"))
+
+    off_reb = _safe_int(st.get("offReb"))
+    def_reb = _safe_int(st.get("defReb"))
+    tot_reb = _safe_int(st.get("totReb"))
+
+    ast = _safe_int(st.get("assists"))
+    to = _safe_int(st.get("turnovers"))
+    stl = _safe_int(st.get("steals"))
+    blk = _safe_int(st.get("blocks"))
+    pf = _safe_int(st.get("pFouls"))
+
+    ast_to: Optional[float] = None
+    if ast is not None and to is not None:
+        ast_to = float(ast) / float(max(1, to))
+
+    return {
+        "shooting": {
+            "fg": {"m": fgm, "a": fga, "pct": fgp},
+            "tp": {"m": tpm, "a": tpa, "pct": tpp},  # 3PT
+            "ft": {"m": ftm, "a": fta, "pct": ftp},
+        },
+        "flow": {
+            "reb": {"off": off_reb, "def": def_reb, "total": tot_reb},
+            "ast": ast,
+            "to": to,
+            "ast_to": ast_to,  # assists / max(1, turnovers)
+        },
+        "defense": {
+            "stl": stl,
+            "blk": blk,
+        },
+        "discipline": {
+            "pf": pf,
+        },
+    }
+
+
+def _player_raw(item: Dict[str, Any]) -> Dict[str, Any]:
+    r = item.get("raw")
+    return r if isinstance(r, dict) else {}
+
+
+def _is_played_player(item: Dict[str, Any]) -> bool:
+    r = _player_raw(item)
+    # DNP류는 comment에 들어오는 케이스가 있으니 방어
+    c = r.get("comment")
+    if isinstance(c, str) and c.strip():
+        # comment가 있으면 대부분 미출전/특이케이스
+        # (정확하게 보여줄 수 있는 것만: 미출전은 리더에서 제외)
+        return False
+    m = _parse_min_to_int(r.get("min"))
+    return (m is not None) and (m > 0)
+
+
+def _leader_pick(players: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    """
+    리더 선정: key(points/totReb/assists)
+    타이브레이크: min desc -> fga desc -> player_id asc
+    """
+    cand: List[Tuple[int, int, int, Dict[str, Any]]] = []
+    for it in players:
+        if not _is_played_player(it):
+            continue
+        r = _player_raw(it)
+        v = _safe_int(r.get(key))
+        if v is None:
+            continue
+        m = _parse_min_to_int(r.get("min")) or 0
+        fga = _safe_int(r.get("fga")) or 0
+        pid = _safe_int(it.get("player_id")) or 0
+        cand.append((v, m, fga, {"item": it, "value": v, "min": m, "fga": fga, "pid": pid}))
+
+    if not cand:
+        return None
+
+    # sort: value desc, min desc, fga desc, pid asc
+    cand.sort(key=lambda x: (-x[0], -x[1], -x[2], x[3]["pid"]))
+    best = cand[0][3]["item"]
+    r = _player_raw(best)
+
+    name = (best.get("name") or {})
+    full = _safe_text(name.get("full")) or _safe_text(_jget(r, "player", "firstname")) + " " + _safe_text(_jget(r, "player", "lastname"))
+    full = full.strip()
+
+    return {
+        "player_id": _safe_int(best.get("player_id")),
+        "name": full,
+        "pos": _safe_text(r.get("pos")),
+        "min": _parse_min_to_int(r.get("min")),
+        "value": _safe_int(r.get(key)),
+    }
+
+
+def _leaders_core(player_stats_side: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "pts": _leader_pick(player_stats_side, "points"),
+        "reb": _leader_pick(player_stats_side, "totReb"),
+        "ast": _leader_pick(player_stats_side, "assists"),
+    }
+
+
 
 def _fetch_h2h_games(
     team_a: int,
@@ -457,11 +643,23 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     if home_tid is not None and vis_tid is not None:
         h2h_rows = _fetch_h2h_games(home_tid, vis_tid, h2h_limit)
 
+    stats_core = {
+        "team": {
+            "home": _team_stats_core(team_stats.get("home")),
+            "visitors": _team_stats_core(team_stats.get("visitors")),
+        },
+        "leaders": {
+            "home": _leaders_core(player_stats.get("home") or []),
+            "visitors": _leaders_core(player_stats.get("visitors") or []),
+        },
+    }
+
     data: Dict[str, Any] = {
         "header": header,
         "linescore": linescore_blob,
         "team_stats": team_stats,
         "player_stats": player_stats,
+        "stats_core": stats_core,  # ✅ 앱 StatsTab은 이거만 써도 됨
         "h2h": {
             "limit": int(max(1, min(int(h2h_limit), 50))),
             "rows": h2h_rows,
@@ -469,3 +667,4 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     }
 
     return {"ok": True, "data": data}
+
