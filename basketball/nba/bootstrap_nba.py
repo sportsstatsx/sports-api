@@ -1,4 +1,4 @@
-# src/nba/bootstrap_nba.py
+# src/basketball/nba/bootstrap_nba.py
 from __future__ import annotations
 
 import os
