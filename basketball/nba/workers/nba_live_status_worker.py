@@ -268,6 +268,7 @@ def _poll_state_update(game_id: int, *, conn: psycopg.Connection, **cols: Any) -
         "finished_at",
         "next_live_poll_at",
         "next_stats_poll_at",
+        "last_standings_at",
     }
 
     safe_cols = {k: v for k, v in cols.items() if k in allowed}
@@ -559,6 +560,102 @@ def _try_ingest_game_stats(game_id: int, *, conn: psycopg.Connection) -> None:
     """
     _ingest_game_stats_live(game_id, conn=conn)
 
+def _ingest_standings_live(*, league: str, season: int, conn: psycopg.Connection) -> int:
+    """
+    bootstrap_nba.ingest_standings() 로직을 워커에 이식.
+    return: upsert rows count
+    """
+    d = _get("/standings", {"league": league, "season": int(season)})
+    rows = d.get("response") or []
+    if not isinstance(rows, list):
+        return 0
+
+    up = 0
+    now_iso = _utc_now().isoformat()
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        team = r.get("team") if isinstance(r.get("team"), dict) else {}
+        tid = _safe_int(team.get("id"))
+        if tid is None:
+            continue
+
+        conf = r.get("conference") if isinstance(r.get("conference"), dict) else {}
+        div = r.get("division") if isinstance(r.get("division"), dict) else {}
+
+        win_obj = r.get("win") if isinstance(r.get("win"), dict) else {}
+        loss_obj = r.get("loss") if isinstance(r.get("loss"), dict) else {}
+
+        _db_execute(
+            """
+            INSERT INTO nba_standings (
+              league, season, team_id,
+              conference_name, conference_rank,
+              division_name, division_rank,
+              win, loss, streak,
+              raw_json, updated_utc
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+            ON CONFLICT (league, season, team_id) DO UPDATE SET
+              conference_name=EXCLUDED.conference_name,
+              conference_rank=EXCLUDED.conference_rank,
+              division_name=EXCLUDED.division_name,
+              division_rank=EXCLUDED.division_rank,
+              win=EXCLUDED.win,
+              loss=EXCLUDED.loss,
+              streak=EXCLUDED.streak,
+              raw_json=EXCLUDED.raw_json,
+              updated_utc=EXCLUDED.updated_utc
+            """,
+            (
+                league,
+                int(season),
+                int(tid),
+                _safe_text(conf.get("name")),
+                _safe_int(conf.get("rank")),
+                _safe_text(div.get("name")),
+                _safe_int(div.get("rank")),
+                _safe_int(win_obj.get("total")),
+                _safe_int(loss_obj.get("total")),
+                _safe_int(r.get("streak")),
+                _jdump(r),
+                now_iso,
+            ),
+            conn=conn,
+        )
+        up += 1
+
+    return up
+
+
+def _try_ingest_standings_if_due(
+    *,
+    league: str,
+    season: int,
+    poll_state: Dict[str, Any],
+    now: dt.datetime,
+    conn: psycopg.Connection,
+) -> int:
+    """
+    시즌 단위 standings는 너무 자주 호출하면 비용/레이트리밋 위험 → throttle.
+    - poll_state.last_standings_at 기준
+    - 기본 15분, env로 조절 가능: NBA_STANDINGS_INTERVAL_SEC
+    """
+    interval_sec = _float_env("NBA_STANDINGS_INTERVAL_SEC", 900.0)  # 15분
+
+    last_at = _safe_dt(poll_state.get("last_standings_at"))
+    if last_at is not None:
+        try:
+            if now < (last_at + dt.timedelta(seconds=float(interval_sec))):
+                return 0
+        except Exception:
+            pass
+
+    up = _ingest_standings_live(league=league, season=int(season), conn=conn)
+    _poll_state_update(int(poll_state["game_id"]), conn=conn, last_standings_at=now)
+    return up
+
 
 # ─────────────────────────────────────────
 # tick core (windowed)
@@ -666,17 +763,6 @@ def tick_once_windowed(
             except Exception as e:
                 log.warning("start-call /games?id failed: game=%s err=%s", gid, e)
 
-        # (C) end 1회
-        if _is_finished_status(db_status_long, db_start) and end_called_at is None:
-            try:
-                api_item = _api_get_game_by_id(gid)
-                if isinstance(api_item, dict):
-                    res = upsert_game(api_item, conn=conn)
-                    if res:
-                        games_upserted += 1
-                        db_status_long = (res.get("status_long") or db_status_long).strip()
-                        db_start = res.get("date_start_utc") or db_start
-
                     # ✅ [ADD] 종료 시점 stats 마무리 1회
                     try:
                         _try_ingest_game_stats(gid, conn=conn)
@@ -684,27 +770,21 @@ def tick_once_windowed(
                     except Exception as e:
                         log.warning("end stats failed: game=%s err=%s", gid, e)
 
+                    # ✅ [ADD] 종료 시점 standings 마무리 (throttle 적용)
+                    try:
+                        season_i = _safe_int(r.get("season")) or _safe_int(api_item.get("season"))
+                        if season_i is not None:
+                            _try_ingest_standings_if_due(
+                                league="standard",
+                                season=int(season_i),
+                                poll_state=st,
+                                now=now,
+                                conn=conn,
+                            )
+                    except Exception as e:
+                        log.warning("end standings failed: game=%s err=%s", gid, e)
+
                     _poll_state_update(gid, conn=conn, end_called_at=now, finished_at=now)
-
-            except Exception as e:
-                log.warning("end-call /games?id failed: game=%s err=%s", gid, e)
-            continue
-
-        # (D) post 1회 (finished + post_min)
-        if (
-            finished_at is not None
-            and post_called_at is None
-            and isinstance(finished_at, dt.datetime)
-            and now >= (finished_at + dt.timedelta(minutes=post_min))
-        ):
-            try:
-                api_item = _api_get_game_by_id(gid)
-                if isinstance(api_item, dict):
-                    res = upsert_game(api_item, conn=conn)
-                    if res:
-                        games_upserted += 1
-                        db_status_long = (res.get("status_long") or db_status_long).strip()
-                        db_start = res.get("date_start_utc") or db_start
 
                     # ✅ [ADD] 종료 후 post 구간에서 stats 추가 1회(지연 반영 대비)
                     try:
@@ -713,11 +793,21 @@ def tick_once_windowed(
                     except Exception as e:
                         log.warning("post stats failed: game=%s err=%s", gid, e)
 
-                    _poll_state_update(gid, conn=conn, post_called_at=now)
+                    # ✅ [ADD] 종료 후 post standings 추가 1회(지연 반영 대비, throttle 적용)
+                    try:
+                        season_i = _safe_int(r.get("season")) or _safe_int(api_item.get("season"))
+                        if season_i is not None:
+                            _try_ingest_standings_if_due(
+                                league="standard",
+                                season=int(season_i),
+                                poll_state=st,
+                                now=now,
+                                conn=conn,
+                            )
+                    except Exception as e:
+                        log.warning("post standings failed: game=%s err=%s", gid, e)
 
-            except Exception as e:
-                log.warning("post-call /games?id failed: game=%s err=%s", gid, e)
-            continue
+                    _poll_state_update(gid, conn=conn, post_called_at=now)
 
         # (E) live periodic
         # ✅ start_called_at 이후에는 status_long이 Scheduled로 남아도(전환 지연) /games는 계속 폴링
@@ -857,6 +947,7 @@ def main() -> None:
                       finished_at        TIMESTAMPTZ,
                       next_live_poll_at  TIMESTAMPTZ,
                       next_stats_poll_at TIMESTAMPTZ,
+                      last_standings_at  TIMESTAMPTZ,
                       updated_at         TIMESTAMPTZ DEFAULT now()
                     );
                     """,
@@ -867,6 +958,7 @@ def main() -> None:
                 # ✅ 기존 테이블이 이미 존재하는 환경(구버전)에서도 컬럼을 보장
                 _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS next_stats_poll_at TIMESTAMPTZ;", conn=conn)
                 _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS next_live_poll_at TIMESTAMPTZ;", conn=conn)
+                _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS last_standings_at TIMESTAMPTZ;", conn=conn)
                 _db_execute("ALTER TABLE nba_live_poll_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();", conn=conn)
                 conn.commit()
 
