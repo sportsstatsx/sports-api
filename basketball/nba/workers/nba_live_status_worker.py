@@ -11,8 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import psycopg
 
-from basketball.nba.bootstrap_nba import ingest_game_stats
-
 log = logging.getLogger("nba_live_status_worker")
 
 # ✅ 워커 단독 실행이 아니라면 basicConfig가 전체 앱 로그 설정을 덮을 수 있음.
@@ -491,15 +489,75 @@ def upsert_game(api_item: Dict[str, Any], *, conn: psycopg.Connection) -> Option
 
 
 
-def _try_ingest_game_stats(game_id: int) -> None:
+def _ingest_game_stats_live(game_id: int, *, conn: psycopg.Connection) -> None:
     """
-    ✅ 너가 이미 갖고 있는 ingest_game_stats 재사용.
-    - live 중에도 호출해도 됨(네 DB/요금 상황에 따라 빈도 조절)
+    bootstrap_nba.ingest_game_stats() 로직을 워커에 이식.
+    - /games/statistics?id=GAME  -> nba_game_team_stats upsert
+    - /players/statistics?game= -> nba_game_player_stats upsert
     """
-    try:
-        ingest_game_stats(game_id=game_id)
-    except Exception as e:
-        log.info("ingest_game_stats skipped/failed: game=%s err=%s", game_id, e)
+    now_iso = _utc_now().isoformat()
+
+    # (1) 팀 스탯
+    d = _get("/games/statistics", {"id": int(game_id)})
+    for trow in (d.get("response") or []):
+        if not isinstance(trow, dict):
+            continue
+        team = trow.get("team") if isinstance(trow.get("team"), dict) else {}
+        tid = _safe_int(team.get("id"))
+        if tid is None:
+            continue
+
+        _db_execute(
+            """
+            INSERT INTO nba_game_team_stats (game_id, team_id, raw_json, updated_utc)
+            VALUES (%s,%s,%s::jsonb,%s)
+            ON CONFLICT (game_id, team_id) DO UPDATE SET
+              raw_json=EXCLUDED.raw_json,
+              updated_utc=EXCLUDED.updated_utc
+            """,
+            (int(game_id), int(tid), _jdump(trow), now_iso),
+            conn=conn,
+        )
+
+    # (2) 선수 스탯
+    p = _get("/players/statistics", {"game": int(game_id)})
+    for prow in (p.get("response") or []):
+        if not isinstance(prow, dict):
+            continue
+        player = prow.get("player") if isinstance(prow.get("player"), dict) else {}
+        pid = _safe_int(player.get("id"))
+        if pid is None:
+            continue
+
+        team = prow.get("team") if isinstance(prow.get("team"), dict) else {}
+        tid_i = _safe_int(team.get("id"))
+
+        _db_execute(
+            """
+            INSERT INTO nba_game_player_stats (game_id, player_id, team_id, raw_json, updated_utc)
+            VALUES (%s,%s,%s,%s::jsonb,%s)
+            ON CONFLICT (game_id, player_id) DO UPDATE SET
+              team_id=EXCLUDED.team_id,
+              raw_json=EXCLUDED.raw_json,
+              updated_utc=EXCLUDED.updated_utc
+            """,
+            (
+                int(game_id),
+                int(pid),
+                int(tid_i) if tid_i is not None else None,
+                _jdump(prow),
+                now_iso,
+            ),
+            conn=conn,
+        )
+
+
+def _try_ingest_game_stats(game_id: int, *, conn: psycopg.Connection) -> None:
+    """
+    라이브워커용 stats ingest.
+    - ApiRetryableError는 상위에서 next_stats_poll_at 늘리는 용도로 활용 가능
+    """
+    _ingest_game_stats_live(game_id, conn=conn)
 
 
 # ─────────────────────────────────────────
@@ -618,6 +676,14 @@ def tick_once_windowed(
                         games_upserted += 1
                         db_status_long = (res.get("status_long") or db_status_long).strip()
                         db_start = res.get("date_start_utc") or db_start
+
+                    # ✅ [ADD] 종료 시점 stats 마무리 1회
+                    try:
+                        _try_ingest_game_stats(gid, conn=conn)
+                        stats_called += 1
+                    except Exception as e:
+                        log.warning("end stats failed: game=%s err=%s", gid, e)
+
                     _poll_state_update(gid, conn=conn, end_called_at=now, finished_at=now)
 
             except Exception as e:
@@ -639,6 +705,14 @@ def tick_once_windowed(
                         games_upserted += 1
                         db_status_long = (res.get("status_long") or db_status_long).strip()
                         db_start = res.get("date_start_utc") or db_start
+
+                    # ✅ [ADD] 종료 후 post 구간에서 stats 추가 1회(지연 반영 대비)
+                    try:
+                        _try_ingest_game_stats(gid, conn=conn)
+                        stats_called += 1
+                    except Exception as e:
+                        log.warning("post stats failed: game=%s err=%s", gid, e)
+
                     _poll_state_update(gid, conn=conn, post_called_at=now)
 
             except Exception as e:
@@ -699,15 +773,33 @@ def tick_once_windowed(
 
                     if stats_due:
                         try:
-                            _try_ingest_game_stats(gid)
+                            _try_ingest_game_stats(gid, conn=conn)
                             stats_called += 1
-                        except Exception:
-                            pass
-                        _poll_state_update(
-                            gid,
-                            conn=conn,
-                            next_stats_poll_at=now + dt.timedelta(seconds=float(stats_interval_sec)),
-                        )
+                        except ApiRetryableError as e:
+                            log.warning(
+                                "stats retryable: game=%s err=%s retry_after=%.1fs",
+                                gid, e, e.retry_after_sec
+                            )
+                            _poll_state_update(
+                                gid,
+                                conn=conn,
+                                next_stats_poll_at=now + dt.timedelta(
+                                    seconds=max(float(e.retry_after_sec), float(stats_interval_sec))
+                                ),
+                            )
+                        except Exception as e:
+                            log.warning("stats failed: game=%s err=%s", gid, e)
+                            _poll_state_update(
+                                gid,
+                                conn=conn,
+                                next_stats_poll_at=now + dt.timedelta(seconds=max(30.0, float(stats_interval_sec))),
+                            )
+                        else:
+                            _poll_state_update(
+                                gid,
+                                conn=conn,
+                                next_stats_poll_at=now + dt.timedelta(seconds=float(stats_interval_sec)),
+                            )
 
                 _poll_state_update(
                     gid,
