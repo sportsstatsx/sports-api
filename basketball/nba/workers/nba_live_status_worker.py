@@ -759,18 +759,28 @@ def tick_once_windowed(
                         db_status_long = (res.get("status_long") or db_status_long).strip()
                         db_start = res.get("date_start_utc") or db_start
                     _poll_state_update(gid, conn=conn, start_called_at=now)
-
             except Exception as e:
                 log.warning("start-call /games?id failed: game=%s err=%s", gid, e)
 
-                    # ✅ [ADD] 종료 시점 stats 마무리 1회
+        # (C) end 1회
+        if _is_finished_status(db_status_long, db_start) and end_called_at is None:
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+
+                    # ✅ 종료 시점 stats 마무리 1회
                     try:
                         _try_ingest_game_stats(gid, conn=conn)
                         stats_called += 1
                     except Exception as e:
                         log.warning("end stats failed: game=%s err=%s", gid, e)
 
-                    # ✅ [ADD] 종료 시점 standings 마무리 (throttle 적용)
+                    # ✅ 종료 시점 standings 마무리 (throttle 적용)
                     try:
                         season_i = _safe_int(r.get("season")) or _safe_int(api_item.get("season"))
                         if season_i is not None:
@@ -786,14 +796,34 @@ def tick_once_windowed(
 
                     _poll_state_update(gid, conn=conn, end_called_at=now, finished_at=now)
 
-                    # ✅ [ADD] 종료 후 post 구간에서 stats 추가 1회(지연 반영 대비)
+            except Exception as e:
+                log.warning("end-call /games?id failed: game=%s err=%s", gid, e)
+            continue
+
+        # (D) post 1회 (finished + post_min)
+        if (
+            finished_at is not None
+            and post_called_at is None
+            and isinstance(finished_at, dt.datetime)
+            and now >= (finished_at + dt.timedelta(minutes=post_min))
+        ):
+            try:
+                api_item = _api_get_game_by_id(gid)
+                if isinstance(api_item, dict):
+                    res = upsert_game(api_item, conn=conn)
+                    if res:
+                        games_upserted += 1
+                        db_status_long = (res.get("status_long") or db_status_long).strip()
+                        db_start = res.get("date_start_utc") or db_start
+
+                    # ✅ 종료 후 post 구간 stats 추가 1회(지연 반영 대비)
                     try:
                         _try_ingest_game_stats(gid, conn=conn)
                         stats_called += 1
                     except Exception as e:
                         log.warning("post stats failed: game=%s err=%s", gid, e)
 
-                    # ✅ [ADD] 종료 후 post standings 추가 1회(지연 반영 대비, throttle 적용)
+                    # ✅ 종료 후 post standings 추가 1회(지연 반영 대비, throttle 적용)
                     try:
                         season_i = _safe_int(r.get("season")) or _safe_int(api_item.get("season"))
                         if season_i is not None:
@@ -808,6 +838,10 @@ def tick_once_windowed(
                         log.warning("post standings failed: game=%s err=%s", gid, e)
 
                     _poll_state_update(gid, conn=conn, post_called_at=now)
+
+            except Exception as e:
+                log.warning("post-call /games?id failed: game=%s err=%s", gid, e)
+            continue
 
         # (E) live periodic
         # ✅ start_called_at 이후에는 status_long이 Scheduled로 남아도(전환 지연) /games는 계속 폴링
