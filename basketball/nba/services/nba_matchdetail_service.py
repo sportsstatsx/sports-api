@@ -184,6 +184,147 @@ def _extract_linescore_blob(raw: Any) -> Dict[str, Any]:
 
     return {}
 
+def _safe_upper(v: Any) -> str:
+    return _safe_text(v).upper()
+
+
+def _jget_first(obj: Any, paths: List[Tuple[str, ...]]) -> Any:
+    """
+    여러 후보 경로 중 첫 번째로 값이 잡히는 걸 반환
+    """
+    for p in paths:
+        v = _jget(obj, *p)
+        if v is not None:
+            return v
+    return None
+
+
+def _extract_nba_live_state(raw: Any) -> Dict[str, Any]:
+    """
+    matchdetail에서 내려줄 LIVE 상태(시간/쿼터/Break)를 raw_json에서 최대한 보수적으로 추출.
+    - 절대 '없던 정보'를 만들어내지 않는다.
+    - 있으면 정규화(time_text), 없으면 빈 값.
+    반환 예:
+      {
+        "is_live": bool,
+        "status_long": str,
+        "status_short": int|None,
+        "period": int|None,            # 1..4, 5=OT (추정은 최소)
+        "clock": "4:30"|"04:30"|"" ,
+        "time_text": "Q2 4:30" | "2Q End Break" | "" ,
+        "raw": { ...원본에서 참고한 조각... }
+      }
+    """
+    out: Dict[str, Any] = {
+        "is_live": False,
+        "status_long": "",
+        "status_short": None,
+        "period": None,
+        "clock": "",
+        "time_text": "",
+        "raw": {},
+    }
+
+    if not isinstance(raw, dict):
+        return out
+
+    # ─────────────────────────────────────────
+    # status
+    # (API 공급원마다 status 구조가 달라서 여러 케이스를 허용)
+    # ─────────────────────────────────────────
+    status_obj = raw.get("status") if isinstance(raw.get("status"), dict) else {}
+    status_long = _safe_text(status_obj.get("long") if isinstance(status_obj, dict) else raw.get("status_long") or raw.get("status"))
+    status_short = _safe_int(status_obj.get("short") if isinstance(status_obj, dict) else raw.get("status_short"))
+
+    out["status_long"] = status_long
+    out["status_short"] = status_short
+
+    up_long = status_long.upper()
+
+    # LIVE 판정은 "Finished/Not Started" 같은 명확한 케이스 제외 후 보수적으로
+    # (너의 matches/fixtures 쪽에서 LIVE 판단 이미 하고 있으니, 여기서는 보조값)
+    if up_long and ("FINISHED" not in up_long) and ("NOT START" not in up_long) and ("SCHEDULE" not in up_long):
+        # In Play / Live / Playing / Break 등은 live로 취급
+        if ("IN PLAY" in up_long) or ("LIVE" in up_long) or ("PLAY" in up_long) or ("BREAK" in up_long) or ("HALF" in up_long):
+            out["is_live"] = True
+
+    # ─────────────────────────────────────────
+    # period(쿼터) / clock 추출 후보들
+    # (가능한 '있는 키'만)
+    # ─────────────────────────────────────────
+    period_val = _jget_first(raw, [
+        ("period",),
+        ("periods", "current"),
+        ("game", "period"),
+        ("game", "quarter"),
+        ("status", "period"),
+        ("status", "quarter"),
+    ])
+    period = _safe_int(period_val)
+
+    # OT는 종종 "OT" 문자열로 들어오므로 방어
+    if period is None:
+        ptxt = _safe_upper(period_val)
+        if ptxt == "OT" or "OVERTIME" in ptxt:
+            period = 5
+
+    out["period"] = period
+
+    clock_val = _jget_first(raw, [
+        ("clock",),
+        ("timer",),
+        ("time",),
+        ("status", "timer"),
+        ("status", "clock"),
+        ("game", "clock"),
+        ("game", "timer"),
+    ])
+    clock = _safe_text(clock_val)
+
+    # "04:30" 형태만 남기고 싶으면 여기서 더 줄일 수도 있으나,
+    # 앱에서 4' 변환을 하고 있으니 서버에서는 raw 기반으로만.
+    out["clock"] = clock
+
+    # ─────────────────────────────────────────
+    # time_text 구성 (fixtures에서 하던 'Break 표기' 우선)
+    # - Break면 "2Q End Break" 같은 텍스트를 만들어주되,
+    #   period를 모르면 그냥 "Break"만
+    # - clock이 있으면 "Q2 04:30" 형태
+    # - 둘 다 없으면 빈 문자열
+    # ─────────────────────────────────────────
+    is_break = ("BREAK" in up_long) or ("HALFTIME" in up_long) or ("HALF TIME" in up_long)
+
+    time_text = ""
+
+    if is_break:
+        if period is not None and 1 <= period <= 4:
+            time_text = f"{period}Q End Break"
+        elif period == 5:
+            time_text = "OT End Break"
+        else:
+            time_text = "Break"
+    else:
+        # clock이 있을 때만 쿼터 라벨을 붙여준다(없는 정보 생성 금지)
+        if clock:
+            if period is not None and 1 <= period <= 4:
+                time_text = f"Q{period} {clock}"
+            elif period == 5:
+                time_text = f"OT {clock}"
+            else:
+                # period를 모르면 clock만 내려준다(앱에서 그냥 표시 가능)
+                time_text = clock
+
+    out["time_text"] = time_text
+
+    # 디버깅/검증용으로 어떤 원본을 참조했는지 최소 raw 조각만 포함
+    out["raw"] = {
+        "status": status_obj if isinstance(status_obj, dict) else None,
+        "period_val": period_val,
+        "clock_val": clock_val,
+    }
+
+    return out
+
 
 def _build_game_header_row(g: Dict[str, Any]) -> Dict[str, Any]:
     game_raw = _as_dict_json(g.get("game_raw_json"))
@@ -632,6 +773,10 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     header = built["header"]
     linescore_blob = built["linescore"]
 
+    # ✅ matchdetail에서도 LIVE 표시용 time_text / Break 정보를 내려준다
+    game_raw = _as_dict_json(g.get("game_raw_json"))
+    live_state = _extract_nba_live_state(game_raw)
+
     home_tid = _safe_int(g.get("home_team_id"))
     vis_tid = _safe_int(g.get("visitor_team_id"))
 
@@ -657,6 +802,11 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     data: Dict[str, Any] = {
         "header": header,
         "linescore": linescore_blob,
+
+        # ✅ 추가: matchdetail 전용 LIVE 상태
+        # - 앱은 data.live_state.time_text 를 MatchItem.timeText에 매핑해서 쓰면 됨
+        "live_state": live_state,
+
         "team_stats": team_stats,
         "player_stats": player_stats,
         "stats_core": stats_core,  # ✅ 앱 StatsTab은 이거만 써도 됨
