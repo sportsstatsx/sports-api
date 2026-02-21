@@ -2463,8 +2463,8 @@ if (se != null) {
     qsMerged.set("apply_override", "1");
 
     // ✅ match_detail_bundle도 adminPath 아래에서는 토큰이 필요할 수 있음 → api() 사용
-    const r1 = await api(adminUrl("/api/match_detail_bundle?" + qsRaw.toString()), { method: "GET" });
-    const r2 = await api(adminUrl("/api/match_detail_bundle?" + qsMerged.toString()), { method: "GET" });
+    const r1 = await api("/api/match_detail_bundle?" + qsRaw.toString(), { method: "GET" });
+    const r2 = await api("/api/match_detail_bundle?" + qsMerged.toString(), { method: "GET" });
 
 
     bundleRaw = (r1.status < 400 && r1.data && r1.data.ok) ? (r1.data.data || null) : null;
