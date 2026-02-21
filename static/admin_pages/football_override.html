@@ -2434,7 +2434,8 @@ if (awayLogo) {
     const lg = selectedFixture.league_id;
     const se = selectedFixture.season;
 
-    if (fx == null || lg == null || se == null) {
+    // ✅ season은 서버에서 보정/강제 고정 가능하므로 필수 체크에서 제외
+    if (fx == null || lg == null) {
       document.getElementById("bundlePreviewRaw").textContent = "{}";
       document.getElementById("bundlePreviewMerged").textContent = "{}";
       document.getElementById("bundlePreviewDiff").textContent = "[]";
@@ -2446,8 +2447,12 @@ if (awayLogo) {
     const base = new URLSearchParams({
       fixture_id: String(fx),
       league_id: String(lg),
-      season: String(se),
     });
+
+// ✅ season이 있을 때만 보냄(없으면 서버가 matches/resolve로 처리)
+if (se != null) {
+  base.set("season", String(se));
+}
 
     // raw (override 미적용)
     const qsRaw = new URLSearchParams(base);
