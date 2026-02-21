@@ -175,15 +175,19 @@ def _completed_units(raw: dict) -> int:
 
 
 def _is_inplay(status_short: Any, status_long: str) -> bool:
-    if str(status_short) == "2":
-        return True
-    s = (status_long or "").lower()
-    return ("in play" in s) or ("live" in s)
+    # DB 분포 확정: 2 = In Play
+    try:
+        return int(status_short) == 2
+    except Exception:
+        return str(status_long or "").strip().lower() == "in play"
 
 
-def _is_final(status_long: str) -> bool:
-    s = (status_long or "").strip().lower()
-    return ("final" in s) or ("finished" in s) or (s == "ft")
+def _is_final(status_short: Any, status_long: str) -> bool:
+    # DB 분포 확정: 3 = Finished (Final)
+    try:
+        return int(status_short) == 3
+    except Exception:
+        return str(status_long or "").strip().lower() == "finished"
 
 
 # ─────────────────────────────────────────
@@ -219,8 +223,8 @@ def _detect_phase(
     - clock 유무 + completed_units(완료된 구간 수) + (Q4_END sent 여부)로 OT를 추정.
     - 단계당 1회만 보내도록 event_key는 kind+index로 고정.
     """
-    if _is_final(status_long):
-        return Phase("FINAL", 0, "Final")
+    if _is_final(status_short, status_long):
+    return Phase("FINAL", 0, "Final")
 
     if not _is_inplay(status_short, status_long):
         return None
