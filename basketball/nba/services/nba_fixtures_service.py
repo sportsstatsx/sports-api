@@ -91,6 +91,13 @@ def nba_get_fixtures_by_utc_range(
             -- clock (API-Sports basketball: status.clock)
             (g.raw_json::jsonb -> 'status' ->> 'clock') AS clock,
 
+            -- ✅ (추가) status 전체 (halftime 플래그 포함)
+            (g.raw_json::jsonb -> 'status') AS status_obj,
+
+            -- ✅ (추가) scores 전체 (linescore로 완료 쿼터 수 계산)
+            (g.raw_json::jsonb -> 'scores') AS scores_obj,
+
+
             -- scores: 여러 구조 방어
             COALESCE(
               CASE
@@ -156,6 +163,49 @@ def nba_get_fixtures_by_utc_range(
 
         clock_text = (r.get("clock") or "").strip() or None
 
+        status_obj = r.get("status_obj") or {}
+        scores_obj = r.get("scores_obj") or {}
+
+        # ✅ halftime 플래그 (너가 확인한 그대로 status_obj에 있음)
+        halftime = False
+        try:
+            halftime = bool(status_obj.get("halftime") is True)
+        except Exception:
+            halftime = False
+
+        # ✅ linescore로 완료된 쿼터 수 계산 ("" 제외)
+        def _count_filled_linescore(team_scores: dict) -> int:
+            ls = (team_scores or {}).get("linescore") or []
+            if not isinstance(ls, list):
+                return 0
+            return sum(1 for x in ls if str(x).strip() != "")
+
+        home_ls = _count_filled_linescore((scores_obj or {}).get("home") or {})
+        away_ls = _count_filled_linescore((scores_obj or {}).get("visitors") or {})
+        completed_q = max(home_ls, away_ls)  # 0~4
+
+        # ✅ clock 없으면 브레이크/쿼터전환/하프타임으로 간주 (API-Sports 특성)
+        clock_missing = (clock_text is None) or (clock_text.strip() == "")
+
+        timer_text = None
+
+        if status_short == 2:  # In Play
+            if clock_missing:
+                # ✅ 16333 케이스: halftime=true + clock=null + completed_q=2
+                # => "2Q End Break"
+                if halftime and completed_q == 2:
+                    timer_text = "2Q End Break"
+                # ✅ 쿼터 전환 브레이크: completed_q가 1~3이면 "nQ End Break"
+                elif completed_q in (1, 2, 3):
+                    timer_text = f"{completed_q}Q End Break"
+                else:
+                    timer_text = None
+            else:
+                # ✅ clock이 있을 때는 현재 진행 쿼터 추정:
+                # completed_q=0이면 Q1, 1이면 Q2, 2이면 Q3, 3이면 Q4
+                current_q = min(4, max(1, completed_q + 1))
+                timer_text = f"Q{current_q} {clock_text}"
+
         fixtures.append(
             {
                 "game_id": r["game_id"],
@@ -167,10 +217,13 @@ def nba_get_fixtures_by_utc_range(
 
                 "status": status_short,
                 "status_long": status_long,
-                "clock": clock_text,
-                "timer": clock_text,  # 하키 형식 호환
 
-                # 라운드/주차 개념은 NBA에서 week 컬럼이 없으므로 null
+                # clock 원문은 유지
+                "clock": clock_text,
+
+                # ✅ 핵심: 앱이 읽는 timeText/timer에 브레이크 문자열 생성
+                "timer": timer_text,
+
                 "week": None,
                 "round_raw": None,
                 "round_chip": None,
