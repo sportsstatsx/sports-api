@@ -363,28 +363,52 @@ def _score_line(home_name: str, away_name: str, hs: Optional[int], as_: Optional
     return f"{hn} {hst} : {ast} {an}"
 
 
-def build_nba_message(phase: Phase, home_name: str, away_name: str, hs: Optional[int], as_: Optional[int]) -> Tuple[str, str]:
+def build_nba_message(
+    phase: Phase,
+    home_name: str,
+    away_name: str,
+    hs: Optional[int],
+    as_: Optional[int],
+) -> Tuple[str, str]:
     line = _score_line(home_name, away_name, hs, as_)
 
+    def T(s: str) -> str:
+        # 모든 알림 타이틀 앞에 농구공 이모지 고정
+        return f"🏀 {s}"
+
+    def B(s: str) -> str:
+        # 모든 알림 바디 앞에도 농구공 이모지 고정
+        return f"🏀 {s}"
+
     if phase.kind == "GAME_START":
-        return ("▶ Game Start", f"{home_name} vs {away_name}\n{line}")
+        return (T("Game started"), B(f"{home_name} vs {away_name}\n{line}"))
 
     if phase.kind == "Q_START":
-        return (f"▶ {phase.index}Q Start", line)
+        # 🏀 Start of Q1
+        return (T(f"Start of Q{phase.index}"), B(line))
 
     if phase.kind == "Q_END":
-        return (f"⏸ {phase.index}Q End", line)
+        # 🏀 Halftime (end of Q2)
+        if phase.index == 2:
+            return (T("Halftime"), B(line))
+        # 🏀 End of Q1 / Q3 / Q4
+        return (T(f"End of Q{phase.index}"), B(line))
 
     if phase.kind == "OT_START":
-        return (f"▶ OT{phase.index} Start", line)
+        # 🏀 Overtime (OT1), 🏀 Start of OT2 ...
+        if phase.index == 1:
+            return (T("Overtime"), B(line))
+        return (T(f"Start of OT{phase.index}"), B(line))
 
     if phase.kind == "OT_END":
-        return (f"⏸ OT{phase.index} End", line)
+        # 🏀 End of OT1 ...
+        return (T(f"End of OT{phase.index}"), B(line))
 
     if phase.kind == "FINAL":
-        return ("⏱ Final", line)
+        # 🏀 Final
+        return (T("Final"), B(line))
 
-    return ("NBA Update", line)
+    return (T("NBA update"), B(line))
 
 
 def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
