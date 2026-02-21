@@ -461,6 +461,38 @@ def run_once() -> bool:
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
             continue
 
+        # ─────────────────────────────────────────
+        # ✅ OPTION 2: Finished인데 OT가 있었던 경기 보정
+        # - linescore completed_units >= 5 이면 OT 존재
+        # - FINAL 알림 전에 "OT End"를 1회 보정 발송(중복은 sent_keys로 차단)
+        # - notify_periods가 꺼져있으면 보정 OT End는 보내지 않음
+        # ─────────────────────────────────────────
+        if phase.kind == "FINAL":
+            completed = _completed_units(raw)  # 0..(4+OT)
+            if completed >= 5:
+                last_ot = max(1, completed - 4)  # completed=5 => OT1, 6 => OT2 ...
+                ote_key = f"ote:{last_ot}"
+
+                # 아직 OT End를 못 보냈고, period 알림이 켜져있을 때만 보정 발송
+                if notify_periods and (ote_key not in sent_keys):
+                    ot_phase = Phase("OT_END", last_ot, f"OT{last_ot} End")
+                    ot_title, ot_body = build_nba_message(ot_phase, home_name, away_name, hs, as_)
+
+                    if send_push(token, ot_title, ot_body, {"sport": "nba", "game_id": str(game_id), "event": ote_key}):
+                        sent += 1
+                        sent_keys.append(ote_key)
+
+                        # 🔒 즉시 저장(하키와 동일) - OT End 보정 먼저 확정
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                        time.sleep(SEND_SLEEP_SEC)
+                    else:
+                        # 실패해도 스냅샷 저장(키는 추가하지 않음)
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+
+            # NOTE:
+            # 여기서 continue 하지 않는다.
+            # 같은 tick에서 이어서 FINAL(ek="final")도 정상적으로 판단/발송되도록 둔다.
+
 
         if phase.kind in ("Q_START", "Q_END", "OT_START", "OT_END") and not notify_periods:
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
