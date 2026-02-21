@@ -184,6 +184,70 @@ def _extract_linescore_blob(raw: Any) -> Dict[str, Any]:
 
     return {}
 
+# ✅ fixtures에서 검증된 NBA LIVE timer 생성 로직(이 파일에 그대로 이식)
+def _count_filled_linescore(team_scores: Any) -> int:
+    """
+    scores.home.linescore / scores.visitors.linescore에서
+    ""(빈값) 제외하고 채워진 쿼터 개수 카운트
+    """
+    if not isinstance(team_scores, dict):
+        return 0
+    ls = team_scores.get("linescore") or []
+    if not isinstance(ls, list):
+        return 0
+    return sum(1 for x in ls if str(x).strip() != "")
+
+
+def _build_nba_timer_text_from_game_raw(
+    *,
+    status_short: Optional[int],
+    status_obj: Any,
+    scores_obj: Any,
+    clock_text: Optional[str],
+) -> Optional[str]:
+    """
+    fixtures에서 이미 검증된 규칙을 matchdetail에도 동일 적용.
+
+    반환:
+      - LIVE(In Play)일 때만 timer 문자열 생성
+      - 그 외는 None
+
+    규칙:
+      - status_short == 2 (In Play)만 처리
+      - clock 없으면 break/halftime 판단:
+          halftime=true & completed_q=2 => "2Q End Break"
+          completed_q in (1,2,3)       => "nQ End Break"
+      - clock 있으면:
+          completed_q=0 => Q1, 1=>Q2, 2=>Q3, 3=>Q4 로 "Q{current_q} {clock}"
+    """
+    if status_short != 2:
+        return None
+
+    halftime = False
+    if isinstance(status_obj, dict):
+        try:
+            halftime = bool(status_obj.get("halftime") is True)
+        except Exception:
+            halftime = False
+
+    completed_q = 0
+    if isinstance(scores_obj, dict):
+        home_ls = _count_filled_linescore((scores_obj.get("home") or {}) if isinstance(scores_obj.get("home"), dict) else {})
+        away_ls = _count_filled_linescore((scores_obj.get("visitors") or {}) if isinstance(scores_obj.get("visitors"), dict) else {})
+        completed_q = max(home_ls, away_ls)
+
+    clock_missing = (clock_text is None) or (str(clock_text).strip() == "")
+
+    if clock_missing:
+        if halftime and completed_q == 2:
+            return "2Q End Break"
+        if completed_q in (1, 2, 3):
+            return f"{completed_q}Q End Break"
+        return None
+
+    current_q = min(4, max(1, completed_q + 1))
+    return f"Q{current_q} {str(clock_text).strip()}"
+
 def _safe_upper(v: Any) -> str:
     return _safe_text(v).upper()
 
@@ -773,9 +837,25 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     header = built["header"]
     linescore_blob = built["linescore"]
 
-    # ✅ matchdetail에서도 LIVE 표시용 time_text / Break 정보를 내려준다
-    game_raw = _as_dict_json(g.get("game_raw_json"))
-    live_state = _extract_nba_live_state(game_raw)
+    # ✅ fixtures와 동일한 방식으로 LIVE timer 생성 (추정/멀티경로 금지)
+    game_raw = _as_dict_json(g.get("game_raw_json")) or {}
+    status_obj = game_raw.get("status") if isinstance(game_raw.get("status"), dict) else {}
+    scores_obj = game_raw.get("scores") if isinstance(game_raw.get("scores"), dict) else {}
+
+    clock_text = None
+    if isinstance(status_obj, dict):
+        c = status_obj.get("clock")
+        if isinstance(c, str) and c.strip():
+            clock_text = c.strip()
+
+    status_short = _safe_int(g.get("status_short"))
+
+    timer_text = _build_nba_timer_text_from_game_raw(
+        status_short=status_short,
+        status_obj=status_obj,
+        scores_obj=scores_obj,
+        clock_text=clock_text,
+    )
 
     home_tid = _safe_int(g.get("home_team_id"))
     vis_tid = _safe_int(g.get("visitor_team_id"))
@@ -803,9 +883,15 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
         "header": header,
         "linescore": linescore_blob,
 
-        # ✅ 추가: matchdetail 전용 LIVE 상태
-        # - 앱은 data.live_state.time_text 를 MatchItem.timeText에 매핑해서 쓰면 됨
-        "live_state": live_state,
+        # ✅ fixtures와 동일한 LIVE 표기(단일 경로)
+        # - 앱은 data.live.timer 를 MatchItem.timeText 로 매핑해서 쓰면 됨
+        "live": {
+            "clock": clock_text,
+            "timer": timer_text,
+            "status_short": status_short,
+            # 디버깅용(원하면 나중에 제거 가능)
+            "halftime": bool(status_obj.get("halftime") is True) if isinstance(status_obj, dict) else False,
+        },
 
         "team_stats": team_stats,
         "player_stats": player_stats,
