@@ -446,7 +446,7 @@ def run_once() -> bool:
         # ✅ 구독 직후(last_status가 None인 최초 tick)은 "스냅샷 동기화만" 하고 알림은 보내지 않는다.
         # (중간 구독/워커 재시작 시 과거 단계 알림 폭탄 방지)
         if st.get("last_status") is None:
-            save_state(device_id, game_id, str(status_short), hs, as_, sent_keys)
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
             continue
 
         # phase 판정 (쿼터/OT/Final)
@@ -455,7 +455,7 @@ def run_once() -> bool:
             status_long=status_long,
             raw=raw,
             sent_keys=sent_keys,
-        ))
+        )
         if not phase:
             # 스냅샷만 동기화
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
@@ -471,7 +471,7 @@ def run_once() -> bool:
             continue
 
         # event_key (중복 방지)
-        elif phase.kind == "FINAL":
+        if phase.kind == "FINAL":
             ek = "final"
         elif phase.kind == "Q_START":
             ek = f"qs:{phase.index}"
