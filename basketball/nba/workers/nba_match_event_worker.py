@@ -219,52 +219,51 @@ def _detect_phase(
 ) -> Optional[Phase]:
     """
     원칙:
-    - score 알림은 절대 안 함.
-    - clock 유무 + completed_units(완료된 구간 수) + (Q4_END sent 여부)로 OT를 추정.
+    - 실시간 스코어 변동 알림은 안 함(단, 메시지 바디에 현재 스코어는 표시).
+    - clock 유무 + completed_units(=linescore 채워진 개수)로 "Start/End"를 추정.
     - 단계당 1회만 보내도록 event_key는 kind+index로 고정.
     """
-    if _is_final(status_short, status_long):
-    return Phase("FINAL", 0, "Final")
 
+    # ✅ FINAL은 status_short=3으로 확정
+    if _is_final(status_short, status_long):
+        return Phase("FINAL", 0, "Final")
+
+    # ✅ In Play만 쿼터/OT 이벤트 생성
     if not _is_inplay(status_short, status_long):
         return None
 
     clock = _clock_text(raw)
     completed = _completed_units(raw)  # 0..(4+OT)
 
-    # 공통: "게임 시작"은 InPlay 첫 진입에서 한 번
-    # (네가 원하면 켜고, 아니면 그냥 주석 처리 가능)
-    if "gs" not in sent_keys:
-        # 첫 InPlay 감지 시점에만
-        return Phase("GAME_START", 0, "Game Start")
-
-    # clock이 있으면 "진행 시작" 상태
+    # ─────────────────────────────
+    # clock 존재 => "진행 시작(Start)" 상태로 간주
+    # ─────────────────────────────
     if clock:
-        # 1) 아직 Q1~Q4 범위일 가능성이 높음 (completed<=3이면 확정)
+        # completed 0~3 => Q1~Q4 Start
         if completed <= 3:
-            q = completed + 1  # 0->Q1, 1->Q2, 2->Q3, 3->Q4
+            q = completed + 1
             return Phase("Q_START", q, f"{q}Q Start")
 
-        # 2) completed>=4인 상태에서 clock이 다시 생기면 OT로 봐야 함
-        #    OT1 시작은 "Q4 End를 이미 보냈다"를 기준으로 잡는다.
+        # completed >=4 => OT Start 후보
+        # Q4 End(=qe:4)를 이미 보낸 뒤에만 OT로 인정(오탐 방지)
         if "qe:4" in sent_keys:
-            # OT index는 "현재까지 완료된 구간 수 - 3"
             # completed=4 (OT1 진행중) => 1
             # completed=5 (OT2 진행중) => 2
             ot = max(1, completed - 3)
             return Phase("OT_START", ot, f"OT{ot} Start")
 
-        # Q4가 아직 끝났다고 확정 못했으면 Q4 진행중 취급
+        # qe:4가 없으면 아직 4Q 진행중으로 간주
         return Phase("Q_START", 4, "4Q Start")
 
-    # clock이 없으면 "구간 종료/브레이크" 상태로 간주
-    # halftime 플래그는 결국 Q2 종료 케이스라서 그냥 completed 기반 종료를 만든다.
+    # ─────────────────────────────
+    # clock 없음 => "구간 종료/브레이크(End)" 상태로 간주
+    # ─────────────────────────────
     if 1 <= completed <= 4:
-        # completed가 1이면 Q1 끝남, 2면 Q2 끝남 ...
+        # completed=1 => 1Q End, 2 => 2Q End(halftime), 3 => 3Q End, 4 => 4Q End
         return Phase("Q_END", completed, f"{completed}Q End")
 
     if completed >= 5:
-        # completed=5 => OT1 끝남, completed=6 => OT2 끝남 ...
+        # completed=5 => OT1 End, 6 => OT2 End ...
         ot = completed - 4
         return Phase("OT_END", ot, f"OT{ot} End")
 
@@ -444,24 +443,24 @@ def run_once() -> bool:
         st = load_state(device_id, game_id)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
-        # phase 판정 (쿼터/OT/Final/GameStart)
+        # ✅ 구독 직후(last_status가 None인 최초 tick)은 "스냅샷 동기화만" 하고 알림은 보내지 않는다.
+        # (중간 구독/워커 재시작 시 과거 단계 알림 폭탄 방지)
+        if st.get("last_status") is None:
+            save_state(device_id, game_id, str(status_short), hs, as_, sent_keys)
+            continue
+
+        # phase 판정 (쿼터/OT/Final)
         phase = _detect_phase(
             status_short=status_short,
             status_long=status_long,
             raw=raw,
             sent_keys=sent_keys,
-        )
+        ))
         if not phase:
             # 스냅샷만 동기화
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
             continue
 
-        # 어떤 phase를 보낼지 옵션에 따라 필터
-        if phase.kind == "GAME_START" and not notify_game_start:
-            # gs 키는 기록해서 이후 OT판정 흐름은 유지(원하면 제거 가능)
-            sent_keys.append("gs")
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
-            continue
 
         if phase.kind in ("Q_START", "Q_END", "OT_START", "OT_END") and not notify_periods:
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
@@ -472,8 +471,6 @@ def run_once() -> bool:
             continue
 
         # event_key (중복 방지)
-        if phase.kind == "GAME_START":
-            ek = "gs"
         elif phase.kind == "FINAL":
             ek = "final"
         elif phase.kind == "Q_START":
