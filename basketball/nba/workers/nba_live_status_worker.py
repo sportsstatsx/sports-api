@@ -10,8 +10,36 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import psycopg
+import sys
+import faulthandler
+import signal
+import traceback
 
 log = logging.getLogger("nba_live_status_worker")
+
+# ✅ 치명 크래시(세그폴트/abort 등)도 stderr로 덤프
+faulthandler.enable(all_threads=True)
+
+# ✅ SIGTERM(렌더가 죽일 때) 잡아서 마지막 로그 남기기
+def _on_term(signum, frame):
+    try:
+        log.error("🔥 received signal=%s; dumping traceback then exiting", signum)
+        traceback.print_stack(frame)
+    finally:
+        raise SystemExit(1)
+
+signal.signal(signal.SIGTERM, _on_term)
+signal.signal(signal.SIGINT, _on_term)
+
+# ✅ 잡히지 않은 예외도 무조건 남기기
+def _excepthook(exc_type, exc, tb):
+    try:
+        log.error("🔥 unhandled exception", exc_info=(exc_type, exc, tb))
+    finally:
+        sys.__excepthook__(exc_type, exc, tb)
+
+sys.excepthook = _excepthook
+
 
 # ✅ 워커 단독 실행이 아니라면 basicConfig가 전체 앱 로그 설정을 덮을 수 있음.
 #    루트 핸들러가 없을 때만 설정하도록 가드.
