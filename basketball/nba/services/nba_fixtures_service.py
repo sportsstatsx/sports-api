@@ -201,32 +201,33 @@ def nba_get_fixtures_by_utc_range(
 
         if status_short == 2:  # In Play
             if clock_missing:
+                # ✅ OT인데 clock이 비어있는 케이스가 실제로 있음 (API-Sports)
+                # 이때는 Break로 단정하지 말고 "OT/OT2" 라벨만이라도 내려준다.
+                if completed_q >= 5:
+                    ot_n = max(1, completed_q - 4)
+                    ot_label = "OT" if ot_n == 1 else f"OT{ot_n}"
+                    timer_text = ot_label
+
                 # ✅ halftime=true + clock=null + completed_q=2 => "2Q End Break"
-                if halftime and completed_q == 2:
+                elif halftime and completed_q == 2:
                     timer_text = "2Q End Break"
 
                 # ✅ 쿼터 전환 브레이크: completed_q가 1~4이면 "nQ End Break"
-                # - completed_q=4 는 정규 4쿼터 종료(OT 들어가기 전) 브레이크로 자주 등장
                 elif completed_q in (1, 2, 3, 4):
                     timer_text = f"{completed_q}Q End Break"
-
-                # ✅ OT 브레이크: completed_q>=5 이면 직전 OT가 끝났다고 보고 "OT{n} End Break"
-                # - completed_q=5 => OT(1OT) End Break
-                # - completed_q=6 => OT2 End Break ...
-                elif completed_q >= 5:
-                    last_ot_label = _ot_label_from_completed_q(completed_q - 1)
-                    timer_text = f"{last_ot_label} End Break"
-
                 else:
                     timer_text = None
             else:
                 # ✅ clock이 있을 때:
-                # - completed_q<=3: Q{completed_q+1} 진행
-                # - completed_q>=4: OT 진행 (OT, OT2, OT3...)
-                if completed_q >= 4:
-                    timer_text = f"{_ot_label_from_completed_q(completed_q)} {clock_text}"
+                # - completed_q=0 : 아주 초반(라인스코어 아직 안찼음) -> Q1로 처리
+                # - completed_q=1~4 : 현재 쿼터 = completed_q
+                # - completed_q>=5 : OTn (completed_q-4)
+                if completed_q >= 5:
+                    ot_n = max(1, completed_q - 4)
+                    ot_label = "OT" if ot_n == 1 else f"OT{ot_n}"
+                    timer_text = f"{ot_label} {clock_text}"
                 else:
-                    current_q = max(1, completed_q + 1)  # 1~4
+                    current_q = max(1, min(4, completed_q if completed_q > 0 else 1))
                     timer_text = f"Q{current_q} {clock_text}"
 
         fixtures.append(
