@@ -224,59 +224,89 @@ def _detect_phase(
     - 단계당 1회만 보내도록 event_key는 kind+index로 고정.
     """
 
-    # ✅ FINAL은 status_short=3으로 확정
-    if _is_final(status_short, status_long):
+    # ─────────────────────────────
+    # ✅ RAW status/periods 우선 파싱
+    # - DB 컬럼(status_short/status_long)은 lag로 실제 raw와 불일치할 수 있음
+    # - raw_json.status.short 가 숫자 문자열('2','3')로 들어오는 케이스 존재
+    # ─────────────────────────────
+    def _raw_status_long() -> str:
+        try:
+            s = (raw.get("status") or {}).get("long")
+            return str(s or "").strip()
+        except Exception:
+            return ""
+
+    def _raw_status_short_int() -> Optional[int]:
+        try:
+            v = (raw.get("status") or {}).get("short")
+        except Exception:
+            v = None
+        return _safe_int(v)
+
+    rs_long = _raw_status_long() or str(status_long or "").strip()
+    rs_short = _raw_status_short_int()
+    ss = rs_short if rs_short is not None else status_short
+
+    # ✅ FINAL (raw 우선)
+    if _is_final(ss, rs_long):
         return Phase("FINAL", 0, "Final")
 
-    # ✅ In Play만 쿼터/OT 이벤트 생성
-    if not _is_inplay(status_short, status_long):
+    # ✅ In Play만 쿼터/OT 이벤트 생성 (raw 우선)
+    if not _is_inplay(ss, rs_long):
         return None
 
     clock = _clock_text(raw)
+
+    # ✅ periods.current: 현재 구간(쿼터/OT)을 직접 알려줌
+    # - 1..4: Q1..Q4
+    # - 5.. : OT1(=5), OT2(=6)...
+    pc = _safe_int(((raw.get("periods") or {}).get("current")))
+    eop = bool(((raw.get("periods") or {}).get("endOfPeriod")) is True)
+
+    # linescore 기반은 fallback 용으로만 사용
     completed = _completed_units(raw)  # 0..(4+OT)
 
     # ─────────────────────────────
-    # ✅ 보정:
-    # API가 새 쿼터 시작 시 linescore에 "0" 등을 미리 채우면
-    # completed_units가 '진행중 구간'까지 포함되어 1 크게 잡힐 수 있음.
-    #
-    # clock이 있는 동안은 "Start" 판정이므로,
-    # qe:{completed} (해당 구간 End)가 아직 안 보내진 상태면
-    # completed가 진행중 포함일 가능성이 높아 1을 빼서 정규화한다.
-    # ─────────────────────────────
-    if clock and completed >= 1:
-        if f"qe:{completed}" not in sent_keys:
-            completed = max(0, completed - 1)
-
-    # ─────────────────────────────
-    # clock 존재 => "진행 시작(Start)" 상태로 간주
+    # clock 존재 => "진행(Start)" 상태
     # ─────────────────────────────
     if clock:
-        # completed 0~3 => Q1~Q4 Start
+        # ✅ 1순위: periods.current
+        if pc is not None and pc >= 1:
+            if pc <= 4:
+                return Phase("Q_START", pc, f"{pc}Q Start")
+            ot = pc - 4
+            return Phase("OT_START", ot, f"OT{ot} Start")
+
+        # ✅ fallback: 기존 completed 기반(정확도 낮음)
         if completed <= 3:
             q = completed + 1
             return Phase("Q_START", q, f"{q}Q Start")
 
-        # completed >=4 => OT Start 후보
-        # Q4 End(=qe:4)를 이미 보낸 뒤에만 OT로 인정(오탐 방지)
         if "qe:4" in sent_keys:
-            # completed=4 (OT1 진행중) => 1
-            # completed=5 (OT2 진행중) => 2
             ot = max(1, completed - 3)
             return Phase("OT_START", ot, f"OT{ot} Start")
 
-        # qe:4가 없으면 아직 4Q 진행중으로 간주
         return Phase("Q_START", 4, "4Q Start")
 
     # ─────────────────────────────
-    # clock 없음 => "구간 종료/브레이크(End)" 상태로 간주
+    # clock 없음 => "구간 종료/브레이크(End)" 후보
     # ─────────────────────────────
+    # ✅ 1순위: endOfPeriod + periods.current
+    if eop and pc is not None and pc >= 1:
+        if pc <= 4:
+            return Phase("Q_END", pc, f"{pc}Q End")
+        ot = pc - 4
+        return Phase("OT_END", ot, f"OT{ot} End")
+
+    # halftime 플래그만 있는 경우(일부 응답)
+    if _halftime_flag(raw):
+        return Phase("Q_END", 2, "2Q End")
+
+    # ✅ fallback: 기존 completed 기반
     if 1 <= completed <= 4:
-        # completed=1 => 1Q End, 2 => 2Q End(halftime), 3 => 3Q End, 4 => 4Q End
         return Phase("Q_END", completed, f"{completed}Q End")
 
     if completed >= 5:
-        # completed=5 => OT1 End, 6 => OT2 End ...
         ot = completed - 4
         return Phase("OT_END", ot, f"OT{ot} End")
 
@@ -474,7 +504,12 @@ def run_once() -> bool:
         away_name = str(r.get("away_name") or "Away")
         hs, as_ = _extract_scores_from_raw(raw)
 
-        if _is_inplay(status_short, status_long):
+        raw_long = str(((raw.get("status") or {}).get("long")) or "").strip()
+        raw_short = _safe_int(((raw.get("status") or {}).get("short")))
+        eff_long = raw_long or status_long
+        eff_short = raw_short if raw_short is not None else status_short
+
+        if _is_inplay(eff_short, eff_long):
             has_fast = True
 
         st = load_state(device_id, game_id)
