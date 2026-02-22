@@ -357,19 +357,39 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
           ON ps.game_id = g.id
         WHERE g.league = 'standard'
           AND (
+            -- (1) 프리/임박 구간은 그대로
             (g.date_start_utc >= %s AND g.date_start_utc <= %s)
+
             OR
+
+            -- (2) 라이브 후보 구간: Finished도 포함 (단, 취소/연기 제외)
             (
               g.date_start_utc >= %s
               AND g.date_start_utc <= %s
-              AND COALESCE(g.status_long,'') <> 'Finished'
               AND COALESCE(g.status_long,'') <> ALL(%s)
             )
-          )
 
+            OR
+
+            -- (3) ✅ 최근 종료 경기 중 end/post 미처리면 강제로 후보에 포함
+            (
+              COALESCE(g.status_long,'') = 'Finished'
+              AND g.date_start_utc >= %s
+              AND (ps.end_called_at IS NULL OR ps.post_called_at IS NULL)
+            )
+          )
         ORDER BY g.date_start_utc ASC
         LIMIT %s
         """,
+        (
+            now, upcoming_end,
+            inplay_start, inplay_end, list(CANCELED_OR_POSTPONED_STATUS_LONG),
+            # 최근 종료 포함 윈도우(예: 48시간) - 필요하면 env로 빼도 됨
+            now - dt.timedelta(hours=48),
+            batch_limit,
+        ),
+        conn=conn,
+    )
         (now, upcoming_end, inplay_start, inplay_end, list(CANCELED_OR_POSTPONED_STATUS_LONG), batch_limit),
         conn=conn,
     )
