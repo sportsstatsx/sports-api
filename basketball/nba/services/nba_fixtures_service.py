@@ -201,9 +201,10 @@ def nba_get_fixtures_by_utc_range(
                 else:
                     timer_text = None
             else:
-                # ✅ clock이 있을 때는 현재 진행 쿼터 추정:
-                # completed_q=0이면 Q1, 1이면 Q2, 2이면 Q3, 3이면 Q4
-                current_q = min(4, max(1, completed_q + 1))
+                # ✅ clock이 있으면: linescore 기준 보정 (+1 금지)
+                # API-Sports NBA는 현재 쿼터도 linescore에 값이 들어오는 케이스가 있음
+                # → completed_q 그대로 현재 쿼터로 사용
+                current_q = min(4, max(1, completed_q))
                 timer_text = f"Q{current_q} {clock_text}"
 
         fixtures.append(
