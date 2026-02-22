@@ -331,7 +331,8 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
     NBA는 league_id 개념 대신 league='standard' 중심.
     후보:
       (1) pre: now ~ now+pre_min
-      (2) in-play: now - inplay_max_min ~ now + grace_min, 그리고 Finished 제외
+      (2) in-play: now - inplay_max_min ~ now + grace_min (취소/연기 제외)
+      (3) 최근 종료(Finished)인데 end/post 미처리면 후보에 포함 (스탠딩/마무리 처리 목적)
     """
     pre_min = _int_env("NBA_LIVE_PRESTART_MIN", 60)
     inplay_max_min = _int_env("NBA_LIVE_INPLAY_MAX_MIN", 240)
@@ -343,6 +344,9 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
 
     inplay_start = now - dt.timedelta(minutes=inplay_max_min)
     inplay_end = now + dt.timedelta(minutes=grace_min)
+
+    # 최근 종료 경기(예: 48시간) 중 end/post 미처리 구제 윈도우
+    finished_recent_start = now - dt.timedelta(hours=48)
 
     rows = _db_fetch_all(
         """
@@ -357,12 +361,12 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
           ON ps.game_id = g.id
         WHERE g.league = 'standard'
           AND (
-            -- (1) 프리/임박 구간은 그대로
+            -- (1) 프리/임박 구간
             (g.date_start_utc >= %s AND g.date_start_utc <= %s)
 
             OR
 
-            -- (2) 라이브 후보 구간: Finished도 포함 (단, 취소/연기 제외)
+            -- (2) 라이브 후보 구간: 취소/연기 제외 (Finished 포함)
             (
               g.date_start_utc >= %s
               AND g.date_start_utc <= %s
@@ -371,7 +375,7 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
 
             OR
 
-            -- (3) ✅ 최근 종료 경기 중 end/post 미처리면 강제로 후보에 포함
+            -- (3) ✅ 최근 종료(Finished) + end/post 미처리 구제
             (
               COALESCE(g.status_long,'') = 'Finished'
               AND g.date_start_utc >= %s
@@ -384,13 +388,9 @@ def _load_live_window_game_rows(*, conn: psycopg.Connection) -> List[Dict[str, A
         (
             now, upcoming_end,
             inplay_start, inplay_end, list(CANCELED_OR_POSTPONED_STATUS_LONG),
-            # 최근 종료 포함 윈도우(예: 48시간) - 필요하면 env로 빼도 됨
-            now - dt.timedelta(hours=48),
+            finished_recent_start,
             batch_limit,
         ),
-        conn=conn,
-    )
-        (now, upcoming_end, inplay_start, inplay_end, list(CANCELED_OR_POSTPONED_STATUS_LONG), batch_limit),
         conn=conn,
     )
     return rows
