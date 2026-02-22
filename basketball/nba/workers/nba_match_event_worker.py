@@ -298,17 +298,24 @@ def _detect_phase(
         ot = pc - 4
         return Phase("OT_END", ot, f"OT{ot} End")
 
+    # ✅ 핵심 방어:
+    # periods.current(pc)가 있는데 endOfPeriod(eop)가 FALSE인 경우,
+    # clock null은 "진행중인데 clock만 누락"일 수 있으므로 END 추정 금지.
+    if (pc is not None and pc >= 1) and (eop is False):
+        return None
+
     # halftime 플래그만 있는 경우(일부 응답)
     if _halftime_flag(raw):
         return Phase("Q_END", 2, "2Q End")
 
-    # ✅ fallback: 기존 completed 기반
-    if 1 <= completed <= 4:
-        return Phase("Q_END", completed, f"{completed}Q End")
+    # ✅ fallback(정확도 낮음)은 periods 자체가 없을 때만 허용
+    if pc is None:
+        if 1 <= completed <= 4:
+            return Phase("Q_END", completed, f"{completed}Q End")
 
-    if completed >= 5:
-        ot = completed - 4
-        return Phase("OT_END", ot, f"OT{ot} End")
+        if completed >= 5:
+            ot = completed - 4
+            return Phase("OT_END", ot, f"OT{ot} End")
 
     return None
 
