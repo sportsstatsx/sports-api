@@ -245,7 +245,7 @@ def _build_nba_timer_text_from_game_raw(
             return f"{completed_q}Q End Break"
         return None
 
-    current_q = min(4, max(1, completed_q + 1))
+    current_q = min(4, max(1, completed_q))
     return f"Q{current_q} {str(clock_text).strip()}"
 
 def _safe_upper(v: Any) -> str:
