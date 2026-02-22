@@ -236,6 +236,19 @@ def _detect_phase(
     completed = _completed_units(raw)  # 0..(4+OT)
 
     # ─────────────────────────────
+    # ✅ 보정:
+    # API가 새 쿼터 시작 시 linescore에 "0" 등을 미리 채우면
+    # completed_units가 '진행중 구간'까지 포함되어 1 크게 잡힐 수 있음.
+    #
+    # clock이 있는 동안은 "Start" 판정이므로,
+    # qe:{completed} (해당 구간 End)가 아직 안 보내진 상태면
+    # completed가 진행중 포함일 가능성이 높아 1을 빼서 정규화한다.
+    # ─────────────────────────────
+    if clock and completed >= 1:
+        if f"qe:{completed}" not in sent_keys:
+            completed = max(0, completed - 1)
+
+    # ─────────────────────────────
     # clock 존재 => "진행 시작(Start)" 상태로 간주
     # ─────────────────────────────
     if clock:
