@@ -2,6 +2,8 @@
 
 from typing import Any, Dict, Optional
 import json
+import time
+
 
 from db import fetch_one
 
@@ -98,7 +100,9 @@ def get_match_detail_bundle(
     comp: Optional[str] = None,
     last_n: Optional[str] = None,
     apply_override: bool = True,
+    parts: Optional[list[str]] = None,  # ✅ 추가: 요청된 블럭만 생성
 ) -> Optional[Dict[str, Any]]:
+
 
     """
     매치디테일 번들의 진입점 (sync 버전).
@@ -110,11 +114,16 @@ def get_match_detail_bundle(
     - 그 외 키(예: timeline/insights_overall 같은 블록 override)는 bundle 완성 후 최종 merge
     """
 
+    t0 = time.perf_counter()
+
+    t_header0 = time.perf_counter()
     header = build_header_block(
         fixture_id=fixture_id,
         league_id=league_id,
         season=season,
     )
+    dt_header = time.perf_counter() - t_header0
+
 
     # ✅ 근본 해결: season/league_id가 틀려도 fixture_id 기준으로 1회 자동 보정(fallback)
     # - 앱/클라이언트가 이전 시즌(예: 2025)을 보내도, DB에 실제 시즌(예: 2026)이 있으면 그걸로 재시도
@@ -198,17 +207,81 @@ def get_match_detail_bundle(
                 header = _deep_merge(header, header_patch)
                 _reconcile_header_aliases(header)
 
-    # 블록 생성 (override 반영된 header 기반)
-    form = build_form_block(header)
-    timeline = build_timeline_block(header)
-    lineups = build_lineups_block(header)
-    stats = build_stats_block(header)
-    h2h = build_h2h_block(header)
-    standings = build_standings_block(header)
-    insights_overall = build_insights_overall_block(header)
-    ai_predictions = build_ai_predictions_block(header, insights_overall)
+    # ✅ parts 없으면 기존(전체 생성) 유지 → 앱 패치 전에도 깨지지 않게 백워드 호환
+    parts_set = None
+    if parts:
+        parts_set = {str(x).strip() for x in parts if str(x).strip()}
+
+    def _need(name: str) -> bool:
+        return (parts_set is None) or (name in parts_set)
+
+    # 기본값
+    form = timeline = lineups = stats = h2h = standings = insights_overall = ai_predictions = None
+    dt_form = dt_timeline = dt_lineups = dt_stats = dt_h2h = dt_standings = dt_insights = dt_ai = 0.0
+
+    # 블록 생성 (override 반영된 header 기반) + 타이밍
+    if _need("form"):
+        t_form0 = time.perf_counter()
+        form = build_form_block(header)
+        dt_form = time.perf_counter() - t_form0
+
+    if _need("timeline"):
+        t_timeline0 = time.perf_counter()
+        timeline = build_timeline_block(header)
+        dt_timeline = time.perf_counter() - t_timeline0
+
+    if _need("lineups"):
+        t_lineups0 = time.perf_counter()
+        lineups = build_lineups_block(header)
+        dt_lineups = time.perf_counter() - t_lineups0
+
+    if _need("stats"):
+        t_stats0 = time.perf_counter()
+        stats = build_stats_block(header)
+        dt_stats = time.perf_counter() - t_stats0
+
+    if _need("h2h"):
+        t_h2h0 = time.perf_counter()
+        h2h = build_h2h_block(header)
+        dt_h2h = time.perf_counter() - t_h2h0
+
+    if _need("standings"):
+        t_stand0 = time.perf_counter()
+        standings = build_standings_block(header)
+        dt_standings = time.perf_counter() - t_stand0
+
+    # ✅ ai_predictions 의존성: ai를 원하면 insights_overall도 반드시 먼저 생성
+    if _need("insights_overall") or _need("ai_predictions"):
+        t_ins0 = time.perf_counter()
+        insights_overall = build_insights_overall_block(header)
+        dt_insights = time.perf_counter() - t_ins0
+
+    if _need("ai_predictions"):
+        t_ai0 = time.perf_counter()
+        ai_predictions = build_ai_predictions_block(header, insights_overall)
+        dt_ai = time.perf_counter() - t_ai0
+
+
+
+    # ✅ total 먼저 확정
+    dt_total = time.perf_counter() - t0
+
+    # ✅ 응답/헤더/디버그에서 그대로 활용할 수 있도록 perf dict 구성
+    perf = {
+        "total": float(dt_total),
+        "header": float(dt_header),
+        "form": float(dt_form),
+        "timeline": float(dt_timeline),
+        "lineups": float(dt_lineups),
+        "stats": float(dt_stats),
+        "h2h": float(dt_h2h),
+        "standings": float(dt_standings),
+        "insights": float(dt_insights),
+        "ai": float(dt_ai),
+    }
 
     bundle = {
+        "_perf": perf,  # ✅ 추가
         "header": header,
         "form": form,
         "timeline": timeline,
@@ -224,6 +297,27 @@ def get_match_detail_bundle(
     if bundle_patch:
         bundle = _deep_merge(bundle, bundle_patch)
 
+    # ✅ (선택) 로그는 유지. Render에서 안 보이더라도 perf는 응답에 포함됨.
+    try:
+        print(
+            "[match_detail_bundle]"
+            f" fixture_id={fixture_id} league_id={league_id} season={season}"
+            f" total={dt_total:.3f}s"
+            f" header={dt_header:.3f}s"
+            f" form={dt_form:.3f}s"
+            f" timeline={dt_timeline:.3f}s"
+            f" lineups={dt_lineups:.3f}s"
+            f" stats={dt_stats:.3f}s"
+            f" h2h={dt_h2h:.3f}s"
+            f" standings={dt_standings:.3f}s"
+            f" insights={dt_insights:.3f}s"
+            f" ai={dt_ai:.3f}s"
+        )
+    except Exception:
+        pass
+
     return bundle
+
+
 
 

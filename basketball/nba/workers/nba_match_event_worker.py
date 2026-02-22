@@ -1,0 +1,669 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from basketball.nba.nba_db import nba_execute, nba_fetch_all, nba_fetch_one
+from notifications.fcm_client import FCMClient
+
+log = logging.getLogger("nba_match_event_worker")
+logging.basicConfig(level=logging.INFO)
+
+# ─────────────────────────────────────────
+# ENV (하키 스타일)
+# ─────────────────────────────────────────
+def _env_str(key: str, default: str = "") -> str:
+    v = os.environ.get(key)
+    if v is None:
+        v = os.environ.get(key.upper())
+    if v is None:
+        v = os.environ.get(key.lower())
+    return str(v).strip() if v is not None else default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(float(_env_str(key, str(default)) or default))
+    except Exception:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(_env_str(key, str(default)) or default)
+    except Exception:
+        return default
+
+
+DATABASE_URL = _env_str("NBA_DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("NBA_DATABASE_URL is not set")
+
+INTERVAL_SEC = _env_int("NBA_NOTIF_INTERVAL_SEC", 10)
+
+# 후보 경기 window
+LOOKBACK_MIN = _env_int("NBA_NOTIF_LOOKBACK_MIN", 240)   # 기본 4시간
+LOOKAHEAD_MIN = _env_int("NBA_NOTIF_LOOKAHEAD_MIN", 60)  # 기본 1시간
+
+# send sleep
+SEND_SLEEP_SEC = _env_float("NBA_NOTIF_SEND_SLEEP_SEC", 0.08)
+
+# fast/slow
+FAST_INTERVAL_SEC = _env_int("NBA_NOTIF_FAST_INTERVAL_SEC", 2)
+SLOW_INTERVAL_SEC = _env_int("NBA_NOTIF_SLOW_INTERVAL_SEC", 10)
+
+
+# ─────────────────────────────────────────
+# TABLES (이미 존재하지만 보강)
+# ─────────────────────────────────────────
+def ensure_tables() -> None:
+    nba_execute(
+        """
+        CREATE TABLE IF NOT EXISTS nba_game_notification_states (
+          device_id TEXT NOT NULL,
+          game_id INTEGER NOT NULL,
+          last_status TEXT,
+          last_home_score INTEGER,
+          last_away_score INTEGER,
+          last_event_id BIGINT,
+          created_at TIMESTAMPTZ DEFAULT now(),
+          updated_at TIMESTAMPTZ DEFAULT now(),
+          sent_event_keys TEXT[] DEFAULT '{}'::text[],
+          PRIMARY KEY (device_id, game_id)
+        );
+        """,
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] DEFAULT '{}'::text[];",
+        (),
+    )
+
+
+# ─────────────────────────────────────────
+# JSON / parse helpers (너 fixtures 규칙 최대한 유지)
+# ─────────────────────────────────────────
+def _safe_int(x: Any) -> Optional[int]:
+    try:
+        if x is None or isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).strip()
+        if not s:
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _json_obj(x: Any) -> dict:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_scores_from_raw(raw: dict) -> Tuple[Optional[int], Optional[int]]:
+    cand_home = [
+        (raw.get("scores") or {}).get("home", {}).get("points"),
+        (raw.get("scores") or {}).get("home", {}).get("total"),
+        (raw.get("score") or {}).get("home", {}).get("total"),
+        (raw.get("score") or {}).get("home"),
+    ]
+    cand_away = [
+        (raw.get("scores") or {}).get("visitors", {}).get("points"),
+        (raw.get("scores") or {}).get("visitors", {}).get("total"),
+        (raw.get("score") or {}).get("away", {}).get("total"),
+        (raw.get("score") or {}).get("away"),
+        (raw.get("score") or {}).get("visitors", {}).get("total"),
+    ]
+    home = next((v for v in (_safe_int(x) for x in cand_home) if v is not None), None)
+    away = next((v for v in (_safe_int(x) for x in cand_away) if v is not None), None)
+    return home, away
+
+
+def _clock_text(raw: dict) -> Optional[str]:
+    try:
+        c = (((raw or {}).get("status") or {}).get("clock") or "")
+        c = str(c).strip()
+        return c or None
+    except Exception:
+        return None
+
+
+def _halftime_flag(raw: dict) -> bool:
+    try:
+        return bool((((raw or {}).get("status") or {}).get("halftime") is True))
+    except Exception:
+        return False
+
+
+def _count_filled_linescore(team_scores: dict) -> int:
+    ls = (team_scores or {}).get("linescore") or []
+    if not isinstance(ls, list):
+        return 0
+    return sum(1 for x in ls if str(x).strip() != "")
+
+
+def _completed_units(raw: dict) -> int:
+    """
+    linescore에서 '이미 완료된 구간 수'를 계산.
+    - Q1~Q4 = 1~4
+    - OT1이 확정(라인스코어 5번째가 채워짐)되면 5
+    - OT2 확정되면 6 ...
+    """
+    scores = raw.get("scores") or {}
+    if not isinstance(scores, dict):
+        return 0
+    home_units = _count_filled_linescore(scores.get("home") or {})
+    away_units = _count_filled_linescore(scores.get("visitors") or {})
+    return max(home_units, away_units)
+
+
+def _is_inplay(status_short: Any, status_long: str) -> bool:
+    # DB 분포 확정: 2 = In Play
+    try:
+        return int(status_short) == 2
+    except Exception:
+        return str(status_long or "").strip().lower() == "in play"
+
+
+def _is_final(status_short: Any, status_long: str) -> bool:
+    # DB 분포 확정: 3 = Finished (Final)
+    try:
+        return int(status_short) == 3
+    except Exception:
+        return str(status_long or "").strip().lower() == "finished"
+
+
+# ─────────────────────────────────────────
+# PHASE 판정 (쿼터/OT 시작/종료만)
+# ─────────────────────────────────────────
+@dataclass
+class Phase:
+    """
+    kind:
+      - Q_START / Q_END
+      - OT_START / OT_END
+      - FINAL
+      - GAME_START (옵션)
+    index:
+      - Q: 1..4
+      - OT: 1..N
+    """
+    kind: str
+    index: int = 0
+    label: str = ""  # 알림 타이틀용(예: "1Q Start", "OT1 End")
+
+
+def _detect_phase(
+    *,
+    status_short: Any,
+    status_long: str,
+    raw: dict,
+    sent_keys: List[str],
+) -> Optional[Phase]:
+    """
+    원칙:
+    - 실시간 스코어 변동 알림은 안 함(단, 메시지 바디에 현재 스코어는 표시).
+    - clock 유무 + completed_units(=linescore 채워진 개수)로 "Start/End"를 추정.
+    - 단계당 1회만 보내도록 event_key는 kind+index로 고정.
+    """
+
+    # ─────────────────────────────
+    # ✅ RAW status/periods 우선 파싱
+    # - DB 컬럼(status_short/status_long)은 lag로 실제 raw와 불일치할 수 있음
+    # - raw_json.status.short 가 숫자 문자열('2','3')로 들어오는 케이스 존재
+    # ─────────────────────────────
+    def _raw_status_long() -> str:
+        try:
+            s = (raw.get("status") or {}).get("long")
+            return str(s or "").strip()
+        except Exception:
+            return ""
+
+    def _raw_status_short_int() -> Optional[int]:
+        try:
+            v = (raw.get("status") or {}).get("short")
+        except Exception:
+            v = None
+        return _safe_int(v)
+
+    rs_long = _raw_status_long() or str(status_long or "").strip()
+    rs_short = _raw_status_short_int()
+    ss = rs_short if rs_short is not None else status_short
+
+    # ✅ FINAL (raw 우선)
+    if _is_final(ss, rs_long):
+        return Phase("FINAL", 0, "Final")
+
+    # ✅ In Play만 쿼터/OT 이벤트 생성 (raw 우선)
+    if not _is_inplay(ss, rs_long):
+        return None
+
+    clock = _clock_text(raw)
+
+    # ✅ periods.current: 현재 구간(쿼터/OT)을 직접 알려줌
+    # - 1..4: Q1..Q4
+    # - 5.. : OT1(=5), OT2(=6)...
+    pc = _safe_int(((raw.get("periods") or {}).get("current")))
+    eop = bool(((raw.get("periods") or {}).get("endOfPeriod")) is True)
+
+    # linescore 기반은 fallback 용으로만 사용
+    completed = _completed_units(raw)  # 0..(4+OT)
+
+    # ─────────────────────────────
+    # clock 존재 => "진행(Start)" 상태
+    # ─────────────────────────────
+    if clock:
+        # ✅ 1순위: periods.current
+        if pc is not None and pc >= 1:
+            if pc <= 4:
+                return Phase("Q_START", pc, f"{pc}Q Start")
+            ot = pc - 4
+            return Phase("OT_START", ot, f"OT{ot} Start")
+
+        # ✅ fallback: 기존 completed 기반(정확도 낮음)
+        if completed <= 3:
+            q = completed + 1
+            return Phase("Q_START", q, f"{q}Q Start")
+
+        if "qe:4" in sent_keys:
+            ot = max(1, completed - 3)
+            return Phase("OT_START", ot, f"OT{ot} Start")
+
+        return Phase("Q_START", 4, "4Q Start")
+
+    # ─────────────────────────────
+    # clock 없음 => "구간 종료/브레이크(End)" 후보
+    # ─────────────────────────────
+    # ✅ 1순위: endOfPeriod + periods.current
+    if eop and pc is not None and pc >= 1:
+        if pc <= 4:
+            return Phase("Q_END", pc, f"{pc}Q End")
+        ot = pc - 4
+        return Phase("OT_END", ot, f"OT{ot} End")
+
+    # ✅ 핵심 방어:
+    # periods.current(pc)가 있는데 endOfPeriod(eop)가 FALSE인 경우,
+    # clock null은 "진행중인데 clock만 누락"일 수 있으므로 END 추정 금지.
+    if (pc is not None and pc >= 1) and (eop is False):
+        return None
+
+    # halftime 플래그만 있는 경우(일부 응답)
+    if _halftime_flag(raw):
+        return Phase("Q_END", 2, "2Q End")
+
+    # ✅ fallback(정확도 낮음)은 periods 자체가 없을 때만 허용
+    if pc is None:
+        if 1 <= completed <= 4:
+            return Phase("Q_END", completed, f"{completed}Q End")
+
+        if completed >= 5:
+            ot = completed - 4
+            return Phase("OT_END", ot, f"OT{ot} End")
+
+    return None
+
+
+# ─────────────────────────────────────────
+# DB fetch (구독 우선 조인)
+# ─────────────────────────────────────────
+def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
+    start = now_utc - timedelta(minutes=LOOKBACK_MIN)
+    end = now_utc + timedelta(minutes=LOOKAHEAD_MIN)
+
+    return nba_fetch_all(
+        """
+        SELECT
+          s.device_id,
+          d.fcm_token,
+          s.game_id,
+          s.notify_game_start,
+          s.notify_game_end,
+          s.notify_periods,
+
+          g.status_short,
+          g.status_long,
+          g.raw_json,
+
+          th.name AS home_name,
+          tv.name AS away_name
+
+        FROM nba_game_notification_subscriptions s
+        JOIN nba_user_devices d ON d.device_id = s.device_id
+        JOIN nba_games g ON g.id = s.game_id
+        LEFT JOIN nba_teams th ON th.id = g.home_team_id
+        LEFT JOIN nba_teams tv ON tv.id = g.visitor_team_id
+        WHERE g.date_start_utc >= %s
+          AND g.date_start_utc <= %s
+          AND COALESCE(d.notifications_enabled, TRUE) = TRUE
+          AND d.fcm_token IS NOT NULL
+          AND BTRIM(d.fcm_token) <> ''
+          AND LOWER(BTRIM(d.fcm_token)) <> 'none'
+        """,
+        (start, end),
+    ) or []
+
+
+def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
+    row = nba_fetch_one(
+        """
+        SELECT last_status, last_home_score, last_away_score, sent_event_keys
+        FROM nba_game_notification_states
+        WHERE device_id=%s AND game_id=%s
+        """,
+        (device_id, game_id),
+    )
+    return row or {
+        "last_status": None,
+        "last_home_score": None,
+        "last_away_score": None,
+        "sent_event_keys": [],
+    }
+
+
+def save_state(
+    device_id: str,
+    game_id: int,
+    last_status: Optional[str],
+    last_home_score: Optional[int],
+    last_away_score: Optional[int],
+    sent_event_keys: List[str],
+) -> None:
+    nba_execute(
+        """
+        INSERT INTO nba_game_notification_states
+          (device_id, game_id, last_status, last_home_score, last_away_score, sent_event_keys, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+        ON CONFLICT (device_id, game_id)
+        DO UPDATE SET
+          last_status = EXCLUDED.last_status,
+          last_home_score = EXCLUDED.last_home_score,
+          last_away_score = EXCLUDED.last_away_score,
+          sent_event_keys = EXCLUDED.sent_event_keys,
+          updated_at = now()
+        """,
+        (device_id, game_id, last_status, last_home_score, last_away_score, sent_event_keys),
+    )
+
+
+# ─────────────────────────────────────────
+# MESSAGE / SEND
+# ─────────────────────────────────────────
+def _score_line(home_name: str, away_name: str, hs: Optional[int], as_: Optional[int]) -> str:
+    hn = home_name or "Home"
+    an = away_name or "Away"
+    hst = "?" if hs is None else str(hs)
+    ast = "?" if as_ is None else str(as_)
+    return f"{hn} {hst} : {ast} {an}"
+
+
+def build_nba_message(
+    phase: Phase,
+    home_name: str,
+    away_name: str,
+    hs: Optional[int],
+    as_: Optional[int],
+) -> Tuple[str, str]:
+    line = _score_line(home_name, away_name, hs, as_)
+
+    def T(s: str) -> str:
+        # 모든 알림 타이틀 앞에 농구공 이모지 고정
+        return f"🏀 {s}"
+
+    def B(s: str) -> str:
+        # 모든 알림 바디 앞에도 농구공 이모지 고정
+        return f"🏀 {s}"
+
+    if phase.kind == "GAME_START":
+        return (T("Game started"), B(f"{home_name} vs {away_name}\n{line}"))
+
+    if phase.kind == "Q_START":
+        # 🏀 Start of Q1
+        return (T(f"Start of Q{phase.index}"), B(line))
+
+    if phase.kind == "Q_END":
+        # 🏀 Halftime (end of Q2)
+        if phase.index == 2:
+            return (T("Halftime"), B(line))
+        # 🏀 End of Q1 / Q3 / Q4
+        return (T(f"End of Q{phase.index}"), B(line))
+
+    if phase.kind == "OT_START":
+        # 🏀 Overtime (OT1), 🏀 Start of OT2 ...
+        if phase.index == 1:
+            return (T("Overtime"), B(line))
+        return (T(f"Start of OT{phase.index}"), B(line))
+
+    if phase.kind == "OT_END":
+        # 🏀 End of OT1 ...
+        return (T(f"End of OT{phase.index}"), B(line))
+
+    if phase.kind == "FINAL":
+        # 🏀 Final
+        return (T("Final"), B(line))
+
+    return (T("NBA update"), B(line))
+
+
+def send_push(token: str, title: str, body: str, data: Optional[Dict[str, str]] = None) -> bool:
+    if not token:
+        return False
+    try:
+        fcm = FCMClient()
+        fcm.send_to_tokens(
+            tokens=[token],
+            title=title,
+            body=body,
+            data=data or {},
+        )
+        return True
+    except Exception as e:
+        log.warning("FCM send failed: %s", e)
+        return False
+
+
+# ─────────────────────────────────────────
+# TICK
+# ─────────────────────────────────────────
+def run_once() -> bool:
+    now_utc = datetime.now(timezone.utc)
+    rows = fetch_subscription_rows(now_utc)
+
+    if not rows:
+        log.info("tick: subs=0 (window=%s/%s min)", LOOKBACK_MIN, LOOKAHEAD_MIN)
+        return False
+
+    has_fast = False
+    sent = 0
+
+    for r in rows:
+        device_id = str(r.get("device_id") or "").strip()
+        token = str(r.get("fcm_token") or "").strip()
+        game_id = int(r.get("game_id") or 0)
+        if not (device_id and token and game_id):
+            continue
+
+        notify_game_start = bool(r.get("notify_game_start", True))
+        notify_game_end = bool(r.get("notify_game_end", True))
+        notify_periods = bool(r.get("notify_periods", True))
+
+        status_short = r.get("status_short")
+        status_long = str(r.get("status_long") or "").strip()
+        raw = _json_obj(r.get("raw_json"))
+
+        home_name = str(r.get("home_name") or "Home")
+        away_name = str(r.get("away_name") or "Away")
+        hs, as_ = _extract_scores_from_raw(raw)
+
+        raw_long = str(((raw.get("status") or {}).get("long")) or "").strip()
+        raw_short = _safe_int(((raw.get("status") or {}).get("short")))
+        eff_long = raw_long or status_long
+        eff_short = raw_short if raw_short is not None else status_short
+
+        if _is_inplay(eff_short, eff_long):
+            has_fast = True
+
+        st = load_state(device_id, game_id)
+        sent_keys: List[str] = list(st.get("sent_event_keys") or [])
+
+        # ✅ 구독 직후(last_status가 None인 최초 tick)은 "스냅샷 동기화만" 하고 알림은 보내지 않는다.
+        # (중간 구독/워커 재시작 시 과거 단계 알림 폭탄 방지)
+        if st.get("last_status") is None:
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        # phase 판정 (쿼터/OT/Final)
+        phase = _detect_phase(
+            status_short=status_short,
+            status_long=status_long,
+            raw=raw,
+            sent_keys=sent_keys,
+        )
+        if not phase:
+            # 스냅샷만 동기화
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        # ─────────────────────────────────────────
+        # ✅ OPTION 2: Finished인데 OT가 있었던 경기 보정
+        # - linescore completed_units >= 5 이면 OT 존재
+        # - FINAL 알림 전에 "OT End"를 1회 보정 발송(중복은 sent_keys로 차단)
+        # - notify_periods가 꺼져있으면 보정 OT End는 보내지 않음
+        # ─────────────────────────────────────────
+        if phase.kind == "FINAL":
+            completed = _completed_units(raw)  # 0..(4+OT)
+            if completed >= 5:
+                last_ot = max(1, completed - 4)  # completed=5 => OT1, 6 => OT2 ...
+                ote_key = f"ote:{last_ot}"
+
+                # 아직 OT End를 못 보냈고, period 알림이 켜져있을 때만 보정 발송
+                if notify_periods and (ote_key not in sent_keys):
+                    ot_phase = Phase("OT_END", last_ot, f"OT{last_ot} End")
+                    ot_title, ot_body = build_nba_message(ot_phase, home_name, away_name, hs, as_)
+
+                    if send_push(token, ot_title, ot_body, {"sport": "nba", "game_id": str(game_id), "event": ote_key}):
+                        sent += 1
+                        sent_keys.append(ote_key)
+
+                        # 🔒 즉시 저장(하키와 동일) - OT End 보정 먼저 확정
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                        time.sleep(SEND_SLEEP_SEC)
+                    else:
+                        # 실패해도 스냅샷 저장(키는 추가하지 않음)
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+
+            # NOTE:
+            # 여기서 continue 하지 않는다.
+            # 같은 tick에서 이어서 FINAL(ek="final")도 정상적으로 판단/발송되도록 둔다.
+
+
+        if phase.kind in ("Q_START", "Q_END", "OT_START", "OT_END") and not notify_periods:
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        if phase.kind == "FINAL" and not notify_game_end:
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        # event_key (중복 방지)
+        if phase.kind == "FINAL":
+            ek = "final"
+        elif phase.kind == "Q_START":
+            ek = f"qs:{phase.index}"
+        elif phase.kind == "Q_END":
+            ek = f"qe:{phase.index}"
+        elif phase.kind == "OT_START":
+            ek = f"ots:{phase.index}"
+        elif phase.kind == "OT_END":
+            ek = f"ote:{phase.index}"
+        else:
+            ek = f"x:{phase.kind}:{phase.index}"
+
+        if ek in sent_keys:
+            # 이미 보냈으면 스냅샷만 저장
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        title, body = build_nba_message(phase, home_name, away_name, hs, as_)
+
+        if send_push(token, title, body, {"sport": "nba", "game_id": str(game_id), "event": ek}):
+            sent += 1
+            sent_keys.append(ek)
+
+            # 🔒 즉시 저장(하키와 동일)
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            time.sleep(SEND_SLEEP_SEC)
+        else:
+            # 실패해도 스냅샷 저장은 해두자(다만 ek는 추가하지 않음)
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+
+    log.info("tick: sent=%d", sent)
+    return has_fast
+
+
+def run_forever(interval_sec: int) -> None:
+    ensure_tables()
+
+    log.info(
+        "worker start: window=%s/%s min fast=%ss slow=%ss send_sleep=%ss",
+        LOOKBACK_MIN,
+        LOOKAHEAD_MIN,
+        FAST_INTERVAL_SEC,
+        SLOW_INTERVAL_SEC,
+        SEND_SLEEP_SEC,
+    )
+
+    # ✅ BOOTSTRAP: 재시작 직후 알림 폭탄 방지
+    # - states를 현재 스냅샷으로만 동기화
+    # - sent_keys는 유지(없으면 빈 배열)
+    try:
+        now_utc = datetime.now(timezone.utc)
+        rows = fetch_subscription_rows(now_utc)
+        for r in rows:
+            device_id = str(r.get("device_id") or "").strip()
+            game_id = int(r.get("game_id") or 0)
+            if not (device_id and game_id):
+                continue
+            raw = _json_obj(r.get("raw_json"))
+            hs, as_ = _extract_scores_from_raw(raw)
+            status_short = r.get("status_short")
+            status_long = str(r.get("status_long") or "").strip()
+
+            st = load_state(device_id, game_id)
+            sent_keys: List[str] = list(st.get("sent_event_keys") or [])
+
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+
+        log.info("bootstrap: synced %d subscription rows (no notifications)", len(rows))
+    except Exception:
+        log.exception("bootstrap failed (will continue normal loop)")
+
+    while True:
+        use_fast = False
+        try:
+            use_fast = run_once()
+        except Exception:
+            log.exception("tick failed")
+
+        sleep_sec = max(1, FAST_INTERVAL_SEC) if use_fast else max(1, SLOW_INTERVAL_SEC)
+        time.sleep(sleep_sec)
+
+
+if __name__ == "__main__":
+    run_forever(INTERVAL_SEC)

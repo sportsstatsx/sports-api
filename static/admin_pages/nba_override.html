@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SportsStatsX Admin (NBA)</title>
+  <!-- ✅ CSS는 너가 준 그대로 (생략 없이 그대로 붙여넣어도 됨) -->
+  <style>
+    /* === 너가 준 CSS 전체 그대로 === */
+    body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+    .muted { color:#666; font-size:12px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .card { border:1px solid #ddd; border-radius:10px; padding:14px; }
+    .card h2 { margin:0 0 10px 0; font-size: 16px; }
+    input, textarea, button, select { font-size: 14px; }
+    input, textarea, select {
+      width: 100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #ccc;
+      background:#fff;
+    }
+    textarea { min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    button { padding:10px 12px; border-radius:8px; border:1px solid #ccc; background:#fff; cursor:pointer; }
+    button.primary { border-color:#000; }
+    button.danger { border-color:#d33; color:#d33; }
+    button.soft { opacity:0.9; }
+    .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:12px; align-items:start; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+
+    /* ... (너가 준 CSS 전부 그대로) ... */
+
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 style="margin:0 0 6px 0;">SportsStatsX Admin (NBA)</h1>
+      <div class="muted">
+        경로: <span id="adminPathText" class="mono"></span> · API 헤더: <span class="mono">X-Admin-Token</span> 필요
+      </div>
+    </div>
+    <div class="muted" id="statusLine"></div>
+  </div>
+
+  <div class="grid" style="margin-top:14px;">
+    <!-- LEFT -->
+    <div class="card">
+      <h2 data-help="fxBrowser">Fixtures Browser</h2>
+
+      <!-- ✅ UI 전체 너가 준 그대로 -->
+      <div class="fxFilters">
+        <div class="fxFromBlock">
+          <label class="muted" data-help="fxDateFrom">Date (From)</label>
+          <input id="fxDate" type="date"/>
+        </div>
+
+        <div class="fxToBlock">
+          <label class="muted" data-help="fxDateTo">Date (To)</label>
+          <input id="fxDateTo" type="date"/>
+        </div>
+
+        <div class="fxTzBlock">
+          <label class="muted" data-help="fxTz">Timezone</label>
+          <select id="fxTz">
+            <option value="Asia/Seoul">Asia/Seoul</option>
+            <option value="UTC">UTC</option>
+            <option value="Europe/London">Europe/London</option>
+            <option value="America/New_York">America/New_York</option>
+            <option value="America/Los_Angeles">America/Los_Angeles</option>
+          </select>
+        </div>
+
+        <div class="fxActionsBlock">
+          <label class="muted" data-help="fxActions">Actions</label>
+          <div class="fxBtnCol">
+            <button class="primary" onclick="loadFixtures()" data-help="btnLoadFixtures">불러오기</button>
+            <button id="btnOverridesOnly" onclick="loadOverridesOnly()" data-help="btnOverridesOnly">OVR만 보기</button>
+          </div>
+        </div>
+
+        <div class="fxSearchBlock">
+          <label class="muted" data-help="fxSearch">Search (team/league)</label>
+          <input id="fxSearch" placeholder="예: Lakers / Warriors / NBA"/>
+        </div>
+
+        <div class="fxLeagueBlock">
+          <label class="muted" data-help="fxLeagueFilter">League Filter (from loaded list)</label>
+
+          <div class="leagueBar">
+            <select id="fxLeaguePick">
+              <option value="">(전체 리그)</option>
+            </select>
+
+            <div class="leagueBtns">
+              <button class="btnsm" type="button" onclick="fxAddLeagueFromPick()" data-help="btnFxLeagueAdd">+</button>
+              <button class="btnsm" type="button" onclick="fxRemoveLeagueFromPick()" data-help="btnFxLeagueRemove">−</button>
+              <button class="btnsm" type="button" onclick="fxClearLeagueFilter()" data-help="btnFxLeagueAll">ALL</button>
+            </div>
+          </div>
+
+          <div id="fxLeaguePills" class="leaguePills"></div>
+          <input id="fxLeagueIds" type="hidden" />
+        </div>
+      </div>
+
+      <div class="muted" style="margin-top:10px;" id="fxHint"></div>
+
+      <div class="listWrap" style="margin-top:10px;">
+        <div id="fxList"></div>
+      </div>
+
+      <div class="tabs">
+        <button class="tabbtn active" id="tab_now_btn" onclick="showTab('now')" data-help="tabNow">현재(노출)</button>
+        <button class="tabbtn" id="tab_raw_btn" onclick="showTab('raw')" data-help="tabRaw">원본(raw)</button>
+        <button class="tabbtn" id="tab_patch_btn" onclick="showTab('patch')" data-help="tabPatch">override patch</button>
+        <button class="tabbtn" id="tab_diff_btn" onclick="showTab('diff')" data-help="tabDiff">diff</button>
+        <button class="tabbtn" id="tab_bundle_raw_btn" onclick="showTab('bundle_raw')" data-help="tabBundleRaw">bundle(raw)</button>
+        <button class="tabbtn" id="tab_bundle_merged_btn" onclick="showTab('bundle_merged')" data-help="tabBundleMerged">bundle(merged)</button>
+        <button class="tabbtn" id="tab_bundle_diff_btn" onclick="showTab('bundle_diff')" data-help="tabBundleDiff">bundle diff</button>
+      </div>
+
+      <div class="tabpane active" id="tab_now">
+        <div class="muted">선택된 경기(override 반영 결과)</div>
+        <pre class="mono" id="fxPreviewNow">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_raw">
+        <div class="muted">선택된 경기(override 미적용 원본)</div>
+        <pre class="mono" id="fxPreviewRaw">{}</pre>
+        <div class="muted" style="margin-top:8px;" id="rawHint"></div>
+      </div>
+
+      <div class="tabpane" id="tab_patch">
+        <div class="muted">현재 override patch</div>
+        <pre class="mono" id="fxPreviewPatch">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_diff">
+        <div class="muted">원본(raw) → 현재(노출) 변경 요약</div>
+        <pre class="mono" id="fxPreviewDiff">[]</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_raw">
+        <div class="muted">선택된 경기(bundle 원본: override 미적용)</div>
+        <pre class="mono" id="bundlePreviewRaw">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_merged">
+        <div class="muted">선택된 경기(bundle merged: override 적용)</div>
+        <pre class="mono" id="bundlePreviewMerged">{}</pre>
+      </div>
+
+      <div class="tabpane" id="tab_bundle_diff">
+        <div class="muted">bundle(raw) → bundle(merged) 변경 요약</div>
+        <pre class="mono" id="bundlePreviewDiff">[]</pre>
+      </div>
+    </div>
+
+    <!-- RIGHT -->
+    <div class="row" style="align-items:stretch;">
+      <div class="card" style="flex: 1 1 520px;">
+        <h2 data-help="ovEditor">Override Editor</h2>
+
+        <div id="selSummary" class="subcard" style="margin:8px 0 10px 0; display:none;">
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
+            <div style="min-width:0;">
+              <div class="mini muted mono" id="selSummaryMeta"></div>
+              <div style="display:flex; gap:10px; align-items:center; margin-top:6px; flex-wrap:wrap;">
+                <div style="display:flex; gap:6px; align-items:center; min-width:0;">
+                  <img id="selHomeLogo" src="" style="width:18px;height:18px;border-radius:4px; display:none;">
+                  <span class="k" id="selHomeName" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"></span>
+                </div>
+                <span class="mono k" id="selScore" style="font-size:16px;"></span>
+                <div style="display:flex; gap:6px; align-items:center; min-width:0;">
+                  <img id="selAwayLogo" src="" style="width:18px;height:18px;border-radius:4px; display:none;">
+                  <span class="k" id="selAwayName" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:240px;"></span>
+                </div>
+              </div>
+            </div>
+            <div style="text-align:right;">
+              <div id="selBadges"></div>
+              <div class="mini muted mono" id="selHt"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ovEditor">
+          <div class="ovTop">
+            <div class="ovBox">
+              <label class="muted" data-help="fixtureId">Game ID (fixture_id로 취급)</label>
+              <input id="fixtureId" placeholder="예: 16337"/>
+            </div>
+
+            <div class="ovBox ovActions">
+              <label class="muted" data-help="quickActions">Quick actions</label>
+              <div class="btnGrid">
+                <button onclick="getOverride()" data-help="btnGetOverride">조회</button>
+                <button class="danger" onclick="deleteOverride()" data-help="btnDeleteOverride">삭제(원복)</button>
+                <button onclick="hideFixture()" data-help="btnHideFixture">숨김(hidden=true)</button>
+                <button onclick="unhideFixture()" data-help="btnUnhideFixture">숨김해제(hidden=false)</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top:10px;" class="muted">Quick Edit → Patch 생성</div>
+
+          <div class="ovFields">
+            <div class="ovField">
+              <label class="muted" data-help="qeVenue">Venue</label>
+              <input id="qeVenue" placeholder="venue_name"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeRound">League Round</label>
+              <input id="qeRound" placeholder="league_round"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusLong">Status Long</label>
+              <input id="qeStatusLong" placeholder="status_long"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeElapsed">Elapsed</label>
+              <input id="qeElapsed" type="number" placeholder="elapsed (ex: 24)"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatusGroup">Status Group</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusGroupPreset">
+                  <option value="">(preset)</option>
+                  <option value="UPCOMING">UPCOMING</option>
+                  <option value="INPLAY">INPLAY</option>
+                  <option value="FINISHED">FINISHED</option>
+                  <option value="PST">PST</option>
+                  <option value="SUSP">SUSP</option>
+                  <option value="CANC">CANC</option>
+                  <option value="TBD">TBD</option>
+                </select>
+                <input id="qeStatusGroup" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeStatus">Status</label>
+              <div class="ovPresetRow">
+                <select id="qeStatusPreset">
+                  <option value="">(preset)</option>
+                  <option value="NS">NS</option>
+                  <option value="Q1">Q1</option>
+                  <option value="HT">HT</option>
+                  <option value="Q3">Q3</option>
+                  <option value="Q4">Q4</option>
+                  <option value="OT">OT</option>
+                  <option value="FT">FT</option>
+                  <option value="PST">PST</option>
+                  <option value="CANC">CANC</option>
+                  <option value="LIVE">LIVE</option>
+                </select>
+                <input id="qeStatus" placeholder="(keep) 또는 직접 입력" autocomplete="off" inputmode="latin"/>
+              </div>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeFt">Home FT</label>
+              <input id="qeHomeFt" type="number" placeholder="home.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayFt">Away FT</label>
+              <input id="qeAwayFt" type="number" placeholder="away.ft"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeHomeHt">Home HT</label>
+              <input id="qeHomeHt" type="number" placeholder="home.ht"/>
+            </div>
+
+            <div class="ovField">
+              <label class="muted" data-help="qeAwayHt">Away HT</label>
+              <input id="qeAwayHt" type="number" placeholder="away.ht"/>
+            </div>
+          </div>
+
+          <div style="margin-top:10px;" class="ovBottomBtns">
+            <button class="primary" onclick="applyQuickEditToPatch()" data-help="btnApplyQuickEdit">
+              Quick Edit → Patch JSON 반영
+            </button>
+            <button onclick="upsertOverride()" data-help="btnUpsertOverride">
+              저장(Upsert)
+            </button>
+          </div>
+        </div>
+
+        <!-- ✅ Event Editor / Patch JSON / Help 시스템 / JS 로직은 너가 준 것 그대로 유지 -->
+        <!-- ✅ 단, API 호출 경로만 nba_admin 쪽으로 이미 adminUrl()이 자동 처리함 -->
+        <div style="height:12px;"></div>
+
+        <!-- (여기부터 아래는 너가 준 HTML 그대로 붙여넣기)
+             - Event Editor 전체
+             - Patch textarea
+             - 아래 script 전체
+           ✅ 단! script 안의 최초 loadFixtures(); 는 그대로 OK
+        -->
+        <!-- ======= IMPORTANT =======
+          너가 준 <script> 블록 전체를 그대로 여기 붙여넣어.
+          (이 파일에서 따로 수정할 건 없음)
+        ========================== -->
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ✅ 너가 준 script 2개(메인 + theme) 그대로 붙여넣기 -->
+</body>
+</html>

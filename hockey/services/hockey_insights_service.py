@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
+from hockey.regular_season_config import get_regular_season_start_utc
 
 
 FINISHED_STATUSES = ("FT", "AOT", "AP")  # 종료 경기만
@@ -156,7 +157,12 @@ class _Bucket:
     home_flags: Dict[int, bool]
 
 
-def _load_recent_games(team_id: int, last_n: int, league_id: Optional[int] = None) -> _Bucket:
+def _load_recent_games(
+    team_id: int,
+    last_n: int,
+    league_id: Optional[int] = None,
+    season: Optional[int] = None,  # ✅ 추가: 정규시즌 시작일 lookup용
+) -> _Bucket:
     sql = """
         SELECT
             g.id AS game_id,
@@ -172,6 +178,13 @@ def _load_recent_games(team_id: int, last_n: int, league_id: Optional[int] = Non
     if league_id is not None:
         sql += " AND g.league_id = %s\n"
         params.append(league_id)
+
+    # ✅ 프리시즌 제거: (league_id, season) 정규시즌 시작 UTC가 있으면 그 이후 경기만 포함
+    if league_id is not None and season is not None:
+        rs_start_utc = get_regular_season_start_utc(int(league_id), int(season))
+        if rs_start_utc is not None:
+            sql += " AND g.game_date >= %s\n"
+            params.append(rs_start_utc)
 
     sql += """
         ORDER BY g.game_date DESC NULLS LAST, g.id DESC
@@ -191,6 +204,7 @@ def _load_recent_games(team_id: int, last_n: int, league_id: Optional[int] = Non
         home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
 
     return _Bucket(games=games, home_flags=home_flags)
+
 
 def _load_available_seasons_for_league(league_id: int, limit: int = 2) -> List[int]:
     sql = """
@@ -224,13 +238,21 @@ def _load_games_for_season(team_id: int, league_id: int, season: int) -> _Bucket
             AND g.league_id = %s
             AND g.season = %s
             AND (g.home_team_id = %s OR g.away_team_id = %s)
+    """
+    params: List[Any] = [list(FINISHED_STATUSES), league_id, season, team_id, team_id]
+
+    # ✅ 프리시즌 제거 (정규시즌 시작 UTC 이후만)
+    rs_start_utc = get_regular_season_start_utc(int(league_id), int(season))
+    if rs_start_utc is not None:
+        sql += " AND g.game_date >= %s\n"
+        params.append(rs_start_utc)
+
+    sql += """
         ORDER BY g.game_date DESC NULLS LAST, g.id DESC
         LIMIT 5000
     """
-    rows = hockey_fetch_all(
-        sql,
-        (list(FINISHED_STATUSES), league_id, season, team_id, team_id),
-    )
+
+    rows = hockey_fetch_all(sql, tuple(params))
 
     games: List[int] = []
     home_flags: Dict[int, bool] = {}
@@ -242,6 +264,7 @@ def _load_games_for_season(team_id: int, league_id: int, season: int) -> _Bucket
         home_flags[gid] = (_safe_int(r.get("home_team_id")) == team_id)
 
     return _Bucket(games=games, home_flags=home_flags)
+
 
 
 
@@ -401,6 +424,9 @@ def hockey_get_game_insights(
     threshold_minute = 20 - last_minutes  # 기본 17
 
     league_id = _safe_int(g.get("league_id"))
+    game_season = _safe_int(g.get("season"))
+    season_for_filter = _safe_int(season) or game_season  # ✅ 프리시즌 필터 기준 시즌
+
     if league_id is None:
         # league_id 없으면 기존 동작(최악의 경우라도 동작은 하게)
         bucket = _load_recent_games(sel_team_id, last_n)
@@ -411,10 +437,16 @@ def hockey_get_game_insights(
 
         if season is not None:
             mode = "season"
-            bucket = _load_games_for_season(sel_team_id, league_id, season)
+            bucket = _load_games_for_season(sel_team_id, league_id, int(season))
         else:
             mode = "last_n"
-            bucket = _load_recent_games(sel_team_id, last_n, league_id=league_id)
+            bucket = _load_recent_games(
+                sel_team_id,
+                last_n,
+                league_id=league_id,
+                season=season_for_filter,  # ✅ 여기서 프리시즌 제거
+            )
+
 
     game_ids = bucket.games
 
@@ -1190,8 +1222,16 @@ def hockey_get_game_insights(
             return 0
         return _goal_count_by_comment_reg(gid, opp, "short")
 
+    # ✅ Full Time 섹션 Game Sample(=T/H/A 경기수) 제공 + "(Regular Time)" 제거
+    ft_counts = {
+        "totals": len(totals_ids),
+        "home": len(home_ids),
+        "away": len(away_ids),
+    }
+
     sec_full_time = _build_section(
-        title="Full Time (Regular Time)",
+        title="Full Time",
+        counts=ft_counts,  # ✅ 앱에서 오른쪽 Game Sample 표시에 사용
         rows=[
             {"label": "RT W", "values": _triple(_ft_result_prob("W"))},
             {"label": "RT D", "values": _triple(_ft_result_prob("D"))},
@@ -1235,6 +1275,8 @@ def hockey_get_game_insights(
             {"label": "RT PPGA/PK", "values": _triple(_rate_by_bucket(_ft_opp_pp_goals, _ft_pk_opportunities))},
         ],
     )
+
+
 
 
 

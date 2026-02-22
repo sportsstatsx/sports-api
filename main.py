@@ -74,6 +74,12 @@ from hockey.routers.hockey_notifications_router import hockey_notifications_bp
 from hockey.teamdetail.hockey_team_detail_routes import hockey_teamdetail_bp
 from hockey.leaguedetail.hockey_leaguedetail_routes import hockey_leaguedetail_bp
 
+from basketball.nba.routers.nba_fixtures_router import nba_fixtures_bp
+from basketball.nba.routers.nba_matchdetail_router import nba_matchdetail_bp
+from basketball.nba.routers.nba_standings_router import nba_standings_bp
+from basketball.nba.routers.nba_games_router import nba_games_bp
+from basketball.nba.routers.nba_notifications_router import nba_notifications_bp
+from basketball.nba.routers.nba_insights_router import nba_insights_bp
 
 
 import traceback
@@ -107,6 +113,13 @@ app.register_blueprint(hockey_standings_bp)
 app.register_blueprint(hockey_insights_bp)
 app.register_blueprint(hockey_notifications_bp)
 app.register_blueprint(hockey_teamdetail_bp)
+
+app.register_blueprint(nba_fixtures_bp)
+app.register_blueprint(nba_matchdetail_bp)
+app.register_blueprint(nba_standings_bp)
+app.register_blueprint(nba_games_bp)
+app.register_blueprint(nba_notifications_bp)
+app.register_blueprint(nba_insights_bp)
 
 
 
@@ -637,6 +650,18 @@ def metrics():
 # Policy: Privacy Policy / Terms (EN main + KO split)
 # ─────────────────────────────────────────
 STATIC_DIR = os.path.join(app.root_path, "static")
+
+# ─────────────────────────────────────────
+# NBA static assets (league logo etc.)
+# - serve files under basketball/nba/static
+#   URL: /static/nba/<filename>
+# ─────────────────────────────────────────
+NBA_STATIC_DIR = os.path.join(app.root_path, "basketball", "nba", "static")
+
+@app.route("/static/nba/<path:filename>")
+def nba_static(filename: str):
+    return send_from_directory(NBA_STATIC_DIR, filename)
+
 
 @app.route("/privacy")
 def privacy_en():
@@ -2776,6 +2801,11 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
+
+
+
+
 
 
 
