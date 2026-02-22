@@ -201,52 +201,42 @@ def _count_filled_linescore(team_scores: Any) -> int:
 def _build_nba_timer_text_from_game_raw(
     *,
     status_short: Optional[int],
-    status_obj: Any,
-    scores_obj: Any,
+    periods_obj: Any,
     clock_text: Optional[str],
 ) -> Optional[str]:
     """
-    fixtures에서 이미 검증된 규칙을 matchdetail에도 동일 적용.
-
-    반환:
-      - LIVE(In Play)일 때만 timer 문자열 생성
-      - 그 외는 None
-
-    규칙:
-      - status_short == 2 (In Play)만 처리
-      - clock 없으면 break/halftime 판단:
-          halftime=true & completed_q=2 => "2Q End Break"
-          completed_q in (1,2,3)       => "nQ End Break"
-      - clock 있으면:
-          completed_q=0 => Q1, 1=>Q2, 2=>Q3, 3=>Q4 로 "Q{current_q} {clock}"
+    API-Sports 원본 periods(current/endOfPeriod) 기준으로만 timer 생성.
+    - clock이 null이어도 In Play면 Break로 만들지 않는다.
     """
     if status_short != 2:
         return None
 
-    halftime = False
-    if isinstance(status_obj, dict):
-        try:
-            halftime = bool(status_obj.get("halftime") is True)
-        except Exception:
-            halftime = False
+    p = periods_obj if isinstance(periods_obj, dict) else {}
 
-    completed_q = 0
-    if isinstance(scores_obj, dict):
-        home_ls = _count_filled_linescore((scores_obj.get("home") or {}) if isinstance(scores_obj.get("home"), dict) else {})
-        away_ls = _count_filled_linescore((scores_obj.get("visitors") or {}) if isinstance(scores_obj.get("visitors"), dict) else {})
-        completed_q = max(home_ls, away_ls)
+    cur: Optional[int] = None
+    eop: Optional[bool] = None
 
-    clock_missing = (clock_text is None) or (str(clock_text).strip() == "")
+    try:
+        v = p.get("current")
+        cur = int(v) if v is not None else None
+    except Exception:
+        cur = None
 
-    if clock_missing:
-        if halftime and completed_q == 2:
-            return "2Q End Break"
-        if completed_q in (1, 2, 3):
-            return f"{completed_q}Q End Break"
-        return None
+    try:
+        v = p.get("endOfPeriod")
+        eop = bool(v) if v is not None else None
+    except Exception:
+        eop = None
 
-    current_q = min(4, max(1, completed_q))
-    return f"Q{current_q} {str(clock_text).strip()}"
+    if eop is True and cur in (1, 2, 3, 4):
+        return f"{cur}Q End Break"
+
+    if cur in (1, 2, 3, 4):
+        if clock_text and str(clock_text).strip():
+            return f"Q{cur} {str(clock_text).strip()}"
+        return f"Q{cur}"
+
+    return None
 
 def _safe_upper(v: Any) -> str:
     return _safe_text(v).upper()
@@ -840,7 +830,7 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
     # ✅ fixtures와 동일한 방식으로 LIVE timer 생성 (추정/멀티경로 금지)
     game_raw = _as_dict_json(g.get("game_raw_json")) or {}
     status_obj = game_raw.get("status") if isinstance(game_raw.get("status"), dict) else {}
-    scores_obj = game_raw.get("scores") if isinstance(game_raw.get("scores"), dict) else {}
+    periods_obj = game_raw.get("periods") if isinstance(game_raw.get("periods"), dict) else {}
 
     clock_text = None
     if isinstance(status_obj, dict):
@@ -852,8 +842,7 @@ def nba_get_game_detail(game_id: int, h2h_limit: int = 5) -> Dict[str, Any]:
 
     timer_text = _build_nba_timer_text_from_game_raw(
         status_short=status_short,
-        status_obj=status_obj,
-        scores_obj=scores_obj,
+        periods_obj=periods_obj,
         clock_text=clock_text,
     )
 
