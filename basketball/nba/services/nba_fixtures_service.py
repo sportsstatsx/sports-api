@@ -97,6 +97,8 @@ def nba_get_fixtures_by_utc_range(
             -- ✅ (추가) scores 전체 (linescore로 완료 쿼터 수 계산)
             (g.raw_json::jsonb -> 'scores') AS scores_obj,
 
+            -- ✅ (추가) periods 전체 (current / endOfPeriod)
+            (g.raw_json::jsonb -> 'periods') AS periods_obj,
 
             -- scores: 여러 구조 방어
             COALESCE(
@@ -173,39 +175,41 @@ def nba_get_fixtures_by_utc_range(
         except Exception:
             halftime = False
 
-        # ✅ linescore로 완료된 쿼터 수 계산 ("" 제외)
-        def _count_filled_linescore(team_scores: dict) -> int:
-            ls = (team_scores or {}).get("linescore") or []
-            if not isinstance(ls, list):
-                return 0
-            return sum(1 for x in ls if str(x).strip() != "")
+        # ✅ periods API 원본 기반으로 current/endOfPeriod 추출 (1순위)
+        periods_obj = r.get("periods_obj") or {}
+        if not isinstance(periods_obj, dict):
+            periods_obj = {}
 
-        home_ls = _count_filled_linescore((scores_obj or {}).get("home") or {})
-        away_ls = _count_filled_linescore((scores_obj or {}).get("visitors") or {})
-        completed_q = max(home_ls, away_ls)  # 0~4
+        api_current: Optional[int] = None
+        api_end_of_period: Optional[bool] = None
 
-        # ✅ clock 없으면 브레이크/쿼터전환/하프타임으로 간주 (API-Sports 특성)
-        clock_missing = (clock_text is None) or (clock_text.strip() == "")
+        try:
+            v = periods_obj.get("current")
+            api_current = int(v) if v is not None else None
+        except Exception:
+            api_current = None
+
+        try:
+            v = periods_obj.get("endOfPeriod")
+            api_end_of_period = bool(v) if v is not None else None
+        except Exception:
+            api_end_of_period = None
 
         timer_text = None
 
         if status_short == 2:  # In Play
-            if clock_missing:
-                # ✅ 16333 케이스: halftime=true + clock=null + completed_q=2
-                # => "2Q End Break"
-                if halftime and completed_q == 2:
-                    timer_text = "2Q End Break"
-                # ✅ 쿼터 전환 브레이크: completed_q가 1~3이면 "nQ End Break"
-                elif completed_q in (1, 2, 3):
-                    timer_text = f"{completed_q}Q End Break"
+            # ✅ 쿼터 종료/브레이크는 endOfPeriod=true일 때만
+            if api_end_of_period is True and api_current in (1, 2, 3, 4):
+                timer_text = f"{api_current}Q End Break"
+            else:
+                # ✅ 진행중: clock이 null이어도 Break로 만들지 않는다
+                if api_current in (1, 2, 3, 4):
+                    if clock_text:
+                        timer_text = f"Q{api_current} {clock_text}"
+                    else:
+                        timer_text = f"Q{api_current}"
                 else:
                     timer_text = None
-            else:
-                # ✅ clock이 있으면: linescore 기준 보정 (+1 금지)
-                # API-Sports NBA는 현재 쿼터도 linescore에 값이 들어오는 케이스가 있음
-                # → completed_q 그대로 현재 쿼터로 사용
-                current_q = min(4, max(1, completed_q))
-                timer_text = f"Q{current_q} {clock_text}"
 
         fixtures.append(
             {
