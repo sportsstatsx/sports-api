@@ -24,9 +24,12 @@ faulthandler.enable(all_threads=True)
 def _on_term(signum, frame):
     try:
         log.error("🔥 received signal=%s; dumping traceback then exiting", signum)
+        # frame 기반 스택 출력
         traceback.print_stack(frame)
+        # 현재 스레드 스택도 로그로(가능하면)
+        log.error("🔥 stack (current):\n%s", "".join(traceback.format_stack()))
     finally:
-        raise SystemExit(1)
+        raise SystemExit(0)
 
 signal.signal(signal.SIGTERM, _on_term)
 signal.signal(signal.SIGINT, _on_term)
