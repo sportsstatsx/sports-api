@@ -203,7 +203,6 @@ def _detect_phase(
     #   "OT 진행 중인데 Final" 오탐이 나오는 것을 막는다.
     # - 또한 Q4 종료 시점 동점이면 Final로 확정하지 않고 OT 흐름으로 보낸다.
     pc_for_final = _safe_int(((raw.get("periods") or {}).get("current")))
-    clock_for_final = str(((raw.get("status") or {}).get("clock")) or "").strip()
     hs_for_final, as_for_final = _extract_scores_from_raw(raw)
     is_tied = (hs_for_final is not None and as_for_final is not None and hs_for_final == as_for_final)
 
@@ -217,9 +216,11 @@ def _detect_phase(
         is_finished = True
 
     if is_finished:
-        # ✅ OT 진행 중인데 Finished가 튀는 케이스 방지:
-        # - periods.current >= 5(OT) 이고 clock이 존재하면 "진행중"으로 보고 Final 금지
-        if (pc_for_final is not None and pc_for_final >= 5) and clock_for_final:
+        # ✅ OT 진행 중인데 Finished가 튀는 케이스 방지 (clock 사용 금지)
+        # - 확정 필드만 사용: periods.current + periods.endOfPeriod
+        # - OT(current>=5)이고 endOfPeriod=False면 "아직 OT 진행"이므로 Final 금지
+        eop_for_final = (raw.get("periods") or {}).get("endOfPeriod")
+        if (pc_for_final is not None and pc_for_final >= 5) and (eop_for_final is False):
             return None
 
         # ✅ Q4 종료 직후 동점(OT로 갈 경기)은 Final 금지 (OT Start/End 흐름으로)
