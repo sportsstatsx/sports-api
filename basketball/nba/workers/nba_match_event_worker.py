@@ -203,8 +203,7 @@ def _detect_phase(
     #   "OT 진행 중인데 Final" 오탐이 나오는 것을 막는다.
     # - 또한 Q4 종료 시점 동점이면 Final로 확정하지 않고 OT 흐름으로 보낸다.
     pc_for_final = _safe_int(((raw.get("periods") or {}).get("current")))
-    hs_for_final, as_for_final = _extract_scores_from_raw(raw)
-    is_tied = (hs_for_final is not None and as_for_final is not None and hs_for_final == as_for_final)
+
 
     is_finished = False
     if ss is not None:
@@ -223,9 +222,7 @@ def _detect_phase(
         if (pc_for_final is not None and pc_for_final >= 5) and (eop_for_final is False):
             return None
 
-        # ✅ Q4 종료 직후 동점(OT로 갈 경기)은 Final 금지 (OT Start/End 흐름으로)
-        if (pc_for_final == 4) and is_tied:
-            return None
+
 
         return Phase("FINAL", 0, "Final")
 
@@ -250,19 +247,14 @@ def _detect_phase(
     # ✅ endOfPeriod=True => "End" 이벤트
     if eop:
         # ─────────────────────────────────────────
-        # 정책:
-        # - Q4 종료:
-        #   * 동점(OT 진입)일 때만 "4Q End" 보냄
-        #   * 동점이 아니면 "4Q End"는 생략하고 Final만(나중에) 보냄
-        # - OT 종료(OT End)는 아예 보내지 않음. Final만 보냄.
+        # 정책(추론 금지):
+        # - Q1~Q4 End는 "후보"로 반환한다.
+        #   * 단, Q4 End는 run_once에서 '보류(pending)' 처리 후
+        #     OT_START가 실제로 오면 그때 보내고,
+        #     FINAL이 오면 영원히 보내지 않는다.
+        # - OT End는 알림을 아예 만들지 않는다(Final만).
         # ─────────────────────────────────────────
         if pc <= 4:
-            if pc == 4:
-                hs_end, as_end = _extract_scores_from_raw(raw)
-                is_tied_end = (hs_end is not None and as_end is not None and hs_end == as_end)
-                if not is_tied_end:
-                    # 연장 없는 정상 종료: 4Q End 알림 생략
-                    return None
             return Phase("Q_END", pc, f"{pc}Q End")
 
         # OT End는 보내지 않는다 (Final만)
@@ -521,6 +513,69 @@ def run_once() -> bool:
             # 스냅샷만 동기화
             save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
             continue
+
+        # ─────────────────────────────────────────
+        # ✅ Q4 End 보류(pending) 정책 (추론 금지)
+        #
+        # - Q4 End가 감지되어도 즉시 보내지 않고 pending 마커만 저장한다.
+        # - 이후 OT_START가 실제로 오면:
+        #     (notify_periods 켜져있을 때만) pending Q4 End를 먼저 보내고
+        #     이어서 OT_START를 보낸다.
+        # - 이후 FINAL이 오면:
+        #     pending은 폐기하고 FINAL만 보낸다.
+        # ─────────────────────────────────────────
+        PEND_Q4_END = "pend:qe4"
+
+        # 1) Q4 End는 즉시 발송하지 않고 pending만 저장
+        if phase.kind == "Q_END" and phase.index == 4:
+            if (PEND_Q4_END not in sent_keys) and ("qe:4" not in sent_keys):
+                sent_keys.append(PEND_Q4_END)
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            else:
+                # 이미 pending 또는 qe:4 확정 상태면 스냅샷만
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
+
+        # 2) OT_START가 오면: pending Q4 End를 먼저(옵션: notify_periods) 보낸다
+        if phase.kind == "OT_START" and (PEND_Q4_END in sent_keys) and ("qe:4" not in sent_keys):
+            if notify_periods:
+                pre_phase = Phase("Q_END", 4, "4Q End")
+                pre_ek = "qe:4"
+
+                pre_title, pre_body = build_nba_message(pre_phase, home_name, away_name, hs, as_)
+
+                # qe:4 중복 방지(안전)
+                if pre_ek not in sent_keys:
+                    if send_push(token, pre_title, pre_body, {"sport": "nba", "game_id": str(game_id), "event": pre_ek}):
+                        sent += 1
+                        sent_keys.append(pre_ek)
+                        # pending 제거
+                        try:
+                            sent_keys.remove(PEND_Q4_END)
+                        except ValueError:
+                            pass
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                        time.sleep(SEND_SLEEP_SEC)
+                    else:
+                        # 실패 시에는 pending 유지(다음 tick 재시도 가능)
+                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            else:
+                # period 알림이 꺼져있으면 pending은 의미 없으니 제거만 한다
+                try:
+                    sent_keys.remove(PEND_Q4_END)
+                except ValueError:
+                    pass
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                # OT_START도 period 알림 off면 아래에서 continue될 것임
+
+        # 3) FINAL이 오면: pending Q4 End는 폐기 (연장 없는 경기 포함)
+        if phase.kind == "FINAL" and (PEND_Q4_END in sent_keys):
+            try:
+                sent_keys.remove(PEND_Q4_END)
+            except ValueError:
+                pass
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            # 여기서 continue 하지 않는다. FINAL은 아래 로직에서 정상 발송되도록 둔다.
 
 
 
