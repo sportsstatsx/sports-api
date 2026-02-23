@@ -198,11 +198,34 @@ def _detect_phase(
     ss = rs_short if rs_short is not None else _safe_int(status_short)
     sl = rs_long or str(status_long or "").strip()
 
-    # ✅ FINAL (확정)
-    if ss is not None and int(ss) == 3:
-        return Phase("FINAL", 0, "Final")
-    if str(sl).lower() == "finished":
-        # ss가 누락된 드문 케이스 보조
+    # ✅ FINAL (확정) + OT 중 오탐 방지 + Q4 동점(OT 예정) 오탐 방지
+    # - API/DB 갱신 타이밍으로 Finished(3)가 잠깐 튀는 경우가 있어,
+    #   "OT 진행 중인데 Final" 오탐이 나오는 것을 막는다.
+    # - 또한 Q4 종료 시점 동점이면 Final로 확정하지 않고 OT 흐름으로 보낸다.
+    pc_for_final = _safe_int(((raw.get("periods") or {}).get("current")))
+    clock_for_final = str(((raw.get("status") or {}).get("clock")) or "").strip()
+    hs_for_final, as_for_final = _extract_scores_from_raw(raw)
+    is_tied = (hs_for_final is not None and as_for_final is not None and hs_for_final == as_for_final)
+
+    is_finished = False
+    if ss is not None:
+        try:
+            is_finished = int(ss) == 3
+        except Exception:
+            is_finished = False
+    if not is_finished and str(sl).lower() == "finished":
+        is_finished = True
+
+    if is_finished:
+        # ✅ OT 진행 중인데 Finished가 튀는 케이스 방지:
+        # - periods.current >= 5(OT) 이고 clock이 존재하면 "진행중"으로 보고 Final 금지
+        if (pc_for_final is not None and pc_for_final >= 5) and clock_for_final:
+            return None
+
+        # ✅ Q4 종료 직후 동점(OT로 갈 경기)은 Final 금지 (OT Start/End 흐름으로)
+        if (pc_for_final == 4) and is_tied:
+            return None
+
         return Phase("FINAL", 0, "Final")
 
     # ✅ In Play만 처리 (확정)
@@ -225,10 +248,24 @@ def _detect_phase(
 
     # ✅ endOfPeriod=True => "End" 이벤트
     if eop:
+        # ─────────────────────────────────────────
+        # 정책:
+        # - Q4 종료:
+        #   * 동점(OT 진입)일 때만 "4Q End" 보냄
+        #   * 동점이 아니면 "4Q End"는 생략하고 Final만(나중에) 보냄
+        # - OT 종료(OT End)는 아예 보내지 않음. Final만 보냄.
+        # ─────────────────────────────────────────
         if pc <= 4:
+            if pc == 4:
+                hs_end, as_end = _extract_scores_from_raw(raw)
+                is_tied_end = (hs_end is not None and as_end is not None and hs_end == as_end)
+                if not is_tied_end:
+                    # 연장 없는 정상 종료: 4Q End 알림 생략
+                    return None
             return Phase("Q_END", pc, f"{pc}Q End")
-        ot = pc - 4
-        return Phase("OT_END", ot, f"OT{ot} End")
+
+        # OT End는 보내지 않는다 (Final만)
+        return None
 
     # ✅ endOfPeriod=False => "Start" 이벤트
     # (단, eop가 False일 때만 Start를 인정한다. clock/linescore로 보정하지 않는다.)
