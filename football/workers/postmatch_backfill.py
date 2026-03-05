@@ -1614,6 +1614,11 @@ def main() -> None:
     except Exception as e:
         print(f"[meta] countries backfill failed: {e}", file=sys.stderr)
 
+    # ✅ countries만 채우고 종료
+    if (os.environ.get("COUNTRIES_ONLY") or "").strip().lower() in ("1", "true", "yes", "y"):
+        print("[postmatch_backfill] COUNTRIES_ONLY=1 → countries만 백필하고 종료")
+        return
+
     target_season = get_target_season()
     target_dates = get_target_dates()  # 시즌 모드가 아니면 기존대로 날짜 모드 사용
 
