@@ -223,7 +223,57 @@ def backfill_leagues_meta(league_ids: List[int]) -> None:
             print(f"[meta] leagues fetch failed id={lid}: {e}", file=sys.stderr)
 
 
+# ─────────────────────────────────────
+#  ✅ Countries meta backfill (ADD ONLY)
+# ─────────────────────────────────────
 
+def ensure_countries_table() -> None:
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS countries (
+          code TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          flag TEXT
+        );
+        """
+    )
+
+
+def backfill_countries_meta() -> int:
+    """
+    API /countries 전체를 받아 countries(code,name,flag) 저장.
+    - 국기 URL은 response[].flag 로 내려옴 (예: https://media.api-sports.io/flags/kr.svg)
+    """
+    ensure_countries_table()
+
+    data = _safe_get("/countries", params={})
+    resp = data.get("response") or []
+    if not isinstance(resp, list):
+        return 0
+
+    n = 0
+    for c in resp:
+        if not isinstance(c, dict):
+            continue
+        code = (c.get("code") or "").strip()
+        name = (c.get("name") or "").strip()
+        flag = (c.get("flag") or "").strip() or None
+        if not code or not name:
+            continue
+
+        execute(
+            """
+            INSERT INTO countries (code, name, flag)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (code) DO UPDATE SET
+                name = EXCLUDED.name,
+                flag = EXCLUDED.flag
+            """,
+            (code, name, flag),
+        )
+        n += 1
+
+    return n
 
 # ─────────────────────────────────────
 #  ENV / 유틸
@@ -1556,6 +1606,13 @@ def main() -> None:
         ensure_ft_triggers_table()
     except Exception:
         pass
+
+    # ✅ countries(국기) 메타 1회 백필
+    try:
+        cnt = backfill_countries_meta()
+        print(f"[meta] countries upserted={cnt}")
+    except Exception as e:
+        print(f"[meta] countries backfill failed: {e}", file=sys.stderr)
 
     target_season = get_target_season()
     target_dates = get_target_dates()  # 시즌 모드가 아니면 기존대로 날짜 모드 사용
