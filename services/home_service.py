@@ -527,6 +527,29 @@ def get_home_league_directory(
         timezone_str=timezone_str,
     )
 
+    # ✅ countries(name->flag) 맵을 만들어서, config item에 country_flag를 주입
+    try:
+        crow = fetch_all("SELECT name, flag FROM countries", tuple())
+        name_to_flag: Dict[str, str] = {}
+        for r in crow or []:
+            n = (r.get("name") or "").strip().lower()
+            f = (r.get("flag") or "").strip()
+            if n and f:
+                name_to_flag[n] = f
+
+        for sec in (full_sections or []):
+            items = sec.get("items") or []
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                cname = (it.get("country") or "").strip().lower()
+                if cname:
+                    it["country_flag"] = name_to_flag.get(cname)
+    except Exception:
+        pass
+
     # 2) 오늘(로컬 date) 기준 UTC 범위
     utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
 
