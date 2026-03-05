@@ -530,22 +530,33 @@ def get_home_league_directory(
     # ✅ countries(name->flag) 맵을 만들어서, config item에 country_flag를 주입
     try:
         crow = fetch_all("SELECT name, flag FROM countries", tuple())
+
         name_to_flag: Dict[str, str] = {}
-        for r in crow or []:
-            n = (r.get("name") or "").strip().lower()
-            f = (r.get("flag") or "").strip()
+        for r in (crow or []):
+            n = ""
+            f = ""
+
+            # ✅ fetch_all 구현에 따라 dict 또는 tuple/list로 올 수 있어서 둘 다 처리
+            if isinstance(r, dict):
+                n = (r.get("name") or "").strip()
+                f = (r.get("flag") or "").strip()
+            elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                n = (str(r[0]) if r[0] is not None else "").strip()
+                f = (str(r[1]) if r[1] is not None else "").strip()
+            else:
+                continue
+
             if n and f:
-                name_to_flag[n] = f
+                name_to_flag[n.lower()] = f
 
-        print("[dbg] countries rows=", len(crow or []), "italy_flag=", name_to_flag.get("italy"))
-        print("[dbg] full_sections type=", type(full_sections), "len=", len(full_sections or []))
-        print("[dbg] sample_section=", (full_sections or [{}])[0])
-
-
+        # ✅ full_sections에 주입
         for sec in (full_sections or []):
+            if not isinstance(sec, dict):
+                continue
             items = sec.get("items") or []
             if not isinstance(items, list):
                 continue
+
             for it in items:
                 if not isinstance(it, dict):
                     continue
@@ -553,8 +564,14 @@ def get_home_league_directory(
                 flag = name_to_flag.get(cname)
                 if flag:
                     it["country_flag"] = flag
-    except Exception:
-        pass
+
+    except Exception as e:
+        # ✅ 조용히 삼키지 말고 서버 로그에 남겨서 다음에 바로 잡히게
+        try:
+            import logging
+            logging.getLogger("home_service").exception("country_flag inject failed: %s", e)
+        except Exception:
+            pass
 
     # 2) 오늘(로컬 date) 기준 UTC 범위
     utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
