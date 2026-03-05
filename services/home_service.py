@@ -622,17 +622,30 @@ def get_home_league_directory(
         today_items: List[Dict[str, Any]] = []
         nog_items: List[Dict[str, Any]] = []
 
+        # ✅ 최종 응답에 확실히 country_flag가 남도록 "복사본"으로 넣는다.
         for it in items:
+            if not isinstance(it, dict):
+                continue
+
             lid = it.get("league_id")
             try:
                 lid_int = int(lid)
             except Exception:
                 continue
 
+            # ✅ 원본이 어떤 경로에서 재생성/딥카피돼도 상관없이
+            #    여기서 최종 응답 item을 확정한다.
+            out_it = dict(it)
+
+            cname = (out_it.get("country") or "").strip().lower()
+            flag = name_to_flag.get(cname)
+            if flag:
+                out_it["country_flag"] = flag
+
             if lid_int in today_ids:
-                today_items.append(it)
+                today_items.append(out_it)
             else:
-                nog_items.append(it)
+                nog_items.append(out_it)
 
         if today_items:
             today_out.append({"continent": continent, "count": len(today_items), "items": today_items})
