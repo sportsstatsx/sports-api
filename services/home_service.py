@@ -529,7 +529,7 @@ def get_home_league_directory(
 
     # ✅ countries(name->flag) 맵을 만들어서, config item에 country_flag를 주입
     try:
-        crow = fetch_all("SELECT name, flag FROM countries", tuple())
+        crow = fetch_all("SELECT name, flag FROM countries")
         name_to_flag: Dict[str, str] = {}
         for r in crow or []:
             n = (r.get("name") or "").strip().lower()
@@ -545,8 +545,9 @@ def get_home_league_directory(
                 if not isinstance(it, dict):
                     continue
                 cname = (it.get("country") or "").strip().lower()
-                if cname:
-                    it["country_flag"] = name_to_flag.get(cname)
+                flag = name_to_flag.get(cname)
+                if flag:
+                    it["country_flag"] = flag
     except Exception:
         pass
 
