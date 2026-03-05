@@ -173,25 +173,24 @@ def hockey_get_fixtures_by_utc_range(
         if norm_status in ("P1", "P2", "P3", "OT", "SO") and clock_text:
             status_long_out = f"{norm_status_long} {clock_text}"
 
-        # ✅ [ADD] BT(Break Time)일 때: "BT 1P End" / "BT 2P End" (요구사항: 1~2P까지만)
-        # - period_first/second는 DB raw_json.periods의 값이 null이면 비어있게 옴
-        # - third가 0:0으로 와도 우리는 "3P End"는 절대 만들지 않음
+        # ✅ [FIX] BT(Break Time)일 때: "1P End Break" / "2P End Break" / "3P End Break"
+        # - periods.first/second/third 값 존재 여부로 "직전 종료 period"를 판단한다.
+        # - 3P 종료 후 동점으로 OT 가기 직전 BT도 "3P End Break"로 표시해야 한다.
         if norm_status == "BT":
             p1 = (r.get("period_first") or "").strip()
             p2 = (r.get("period_second") or "").strip()
+            p3 = (r.get("period_third") or "").strip()
 
             end_label = ""
-            if p2:
+            # ✅ 가장 마지막 period가 존재하면 그 period 종료 브레이크로 본다.
+            if p3:
+                end_label = "3P End"
+            elif p2:
                 end_label = "2P End"
             elif p1:
                 end_label = "1P End"
 
-            # ✅ end_label 있으면: "2P End Break" / "1P End Break"
-            # ✅ end_label 없으면: "Break" (Intermission 금지)
-            if end_label:
-                status_long_out = f"{end_label} Break"
-            else:
-                status_long_out = "Break"
+            status_long_out = f"{end_label} Break" if end_label else "Break"
 
 
 

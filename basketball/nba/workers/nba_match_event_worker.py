@@ -136,42 +136,14 @@ def _extract_scores_from_raw(raw: dict) -> Tuple[Optional[int], Optional[int]]:
     return home, away
 
 
-def _clock_text(raw: dict) -> Optional[str]:
-    try:
-        c = (((raw or {}).get("status") or {}).get("clock") or "")
-        c = str(c).strip()
-        return c or None
-    except Exception:
-        return None
 
 
-def _halftime_flag(raw: dict) -> bool:
-    try:
-        return bool((((raw or {}).get("status") or {}).get("halftime") is True))
-    except Exception:
-        return False
 
 
-def _count_filled_linescore(team_scores: dict) -> int:
-    ls = (team_scores or {}).get("linescore") or []
-    if not isinstance(ls, list):
-        return 0
-    return sum(1 for x in ls if str(x).strip() != "")
 
 
-def _completed_units(raw: dict) -> int:
-    """
-    linescore에서 '이미 완료된 구간 수'를 계산.
-    - Q1~Q4 = 1~4
-    - OT1이 확정(라인스코어 5번째가 채워짐)되면 5
-    - OT2 확정되면 6 ...
-    """
-    scores = raw.get("scores") or {}
-    if not isinstance(scores, dict):
-        return 0
-    home_units = _count_filled_linescore(scores.get("home") or {})
-    away_units = _count_filled_linescore(scores.get("visitors") or {})
-    return max(home_units, away_units)
+
+
 
 
 def _is_inplay(status_short: Any, status_long: str) -> bool:
@@ -182,12 +154,6 @@ def _is_inplay(status_short: Any, status_long: str) -> bool:
         return str(status_long or "").strip().lower() == "in play"
 
 
-def _is_final(status_short: Any, status_long: str) -> bool:
-    # DB 분포 확정: 3 = Finished (Final)
-    try:
-        return int(status_short) == 3
-    except Exception:
-        return str(status_long or "").strip().lower() == "finished"
 
 
 # ─────────────────────────────────────────
@@ -218,106 +184,88 @@ def _detect_phase(
     sent_keys: List[str],
 ) -> Optional[Phase]:
     """
-    원칙:
-    - 실시간 스코어 변동 알림은 안 함(단, 메시지 바디에 현재 스코어는 표시).
-    - clock 유무 + completed_units(=linescore 채워진 개수)로 "Start/End"를 추정.
-    - 단계당 1회만 보내도록 event_key는 kind+index로 고정.
+    ✅ 추론/예측 금지 버전.
+    - 오직 RAW의 확정 필드만 사용:
+      raw.status.short (int), raw.periods.current (int), raw.periods.endOfPeriod (bool)
+    - 위 필드가 없거나 애매하면 None(=알림 생성 금지, 스냅샷만 저장)
     """
 
-    # ─────────────────────────────
-    # ✅ RAW status/periods 우선 파싱
-    # - DB 컬럼(status_short/status_long)은 lag로 실제 raw와 불일치할 수 있음
-    # - raw_json.status.short 가 숫자 문자열('2','3')로 들어오는 케이스 존재
-    # ─────────────────────────────
-    def _raw_status_long() -> str:
+    # RAW 우선
+    rs_short = _safe_int(((raw.get("status") or {}).get("short")))
+    rs_long = str(((raw.get("status") or {}).get("long")) or "").strip()
+
+    # fallback은 status_short/status_long이 아니라 "FINAL 판단" 정도로만 보조
+    ss = rs_short if rs_short is not None else _safe_int(status_short)
+    sl = rs_long or str(status_long or "").strip()
+
+    # ✅ FINAL (확정) + OT 중 오탐 방지 + Q4 동점(OT 예정) 오탐 방지
+    # - API/DB 갱신 타이밍으로 Finished(3)가 잠깐 튀는 경우가 있어,
+    #   "OT 진행 중인데 Final" 오탐이 나오는 것을 막는다.
+    # - 또한 Q4 종료 시점 동점이면 Final로 확정하지 않고 OT 흐름으로 보낸다.
+    pc_for_final = _safe_int(((raw.get("periods") or {}).get("current")))
+
+
+    is_finished = False
+    if ss is not None:
         try:
-            s = (raw.get("status") or {}).get("long")
-            return str(s or "").strip()
+            is_finished = int(ss) == 3
         except Exception:
-            return ""
+            is_finished = False
+    if not is_finished and str(sl).lower() == "finished":
+        is_finished = True
 
-    def _raw_status_short_int() -> Optional[int]:
-        try:
-            v = (raw.get("status") or {}).get("short")
-        except Exception:
-            v = None
-        return _safe_int(v)
+    if is_finished:
+        # ✅ OT 진행 중인데 Finished가 튀는 케이스 방지 (clock 사용 금지)
+        # - 확정 필드만 사용: periods.current + periods.endOfPeriod
+        # - OT(current>=5)이고 endOfPeriod=False면 "아직 OT 진행"이므로 Final 금지
+        eop_for_final = (raw.get("periods") or {}).get("endOfPeriod")
+        if (pc_for_final is not None and pc_for_final >= 5) and (eop_for_final is False):
+            return None
 
-    rs_long = _raw_status_long() or str(status_long or "").strip()
-    rs_short = _raw_status_short_int()
-    ss = rs_short if rs_short is not None else status_short
 
-    # ✅ FINAL (raw 우선)
-    if _is_final(ss, rs_long):
+
         return Phase("FINAL", 0, "Final")
 
-    # ✅ In Play만 쿼터/OT 이벤트 생성 (raw 우선)
-    if not _is_inplay(ss, rs_long):
+    # ✅ In Play만 처리 (확정)
+    if ss is None:
+        # status.short 자체가 없으면 추론 금지
+        return None
+    if int(ss) != 2:
         return None
 
-    clock = _clock_text(raw)
-
-    # ✅ periods.current: 현재 구간(쿼터/OT)을 직접 알려줌
-    # - 1..4: Q1..Q4
-    # - 5.. : OT1(=5), OT2(=6)...
     pc = _safe_int(((raw.get("periods") or {}).get("current")))
-    eop = bool(((raw.get("periods") or {}).get("endOfPeriod")) is True)
+    eop_val = (raw.get("periods") or {}).get("endOfPeriod")
 
-    # linescore 기반은 fallback 용으로만 사용
-    completed = _completed_units(raw)  # 0..(4+OT)
+    # ✅ periods.current / endOfPeriod 둘 중 하나라도 확정이 아니면 추론 금지
+    if pc is None or pc < 1:
+        return None
+    if not isinstance(eop_val, bool):
+        return None
 
-    # ─────────────────────────────
-    # clock 존재 => "진행(Start)" 상태
-    # ─────────────────────────────
-    if clock:
-        # ✅ 1순위: periods.current
-        if pc is not None and pc >= 1:
-            if pc <= 4:
-                return Phase("Q_START", pc, f"{pc}Q Start")
-            ot = pc - 4
-            return Phase("OT_START", ot, f"OT{ot} Start")
+    eop = bool(eop_val)
 
-        # ✅ fallback: 기존 completed 기반(정확도 낮음)
-        if completed <= 3:
-            q = completed + 1
-            return Phase("Q_START", q, f"{q}Q Start")
-
-        if "qe:4" in sent_keys:
-            ot = max(1, completed - 3)
-            return Phase("OT_START", ot, f"OT{ot} Start")
-
-        return Phase("Q_START", 4, "4Q Start")
-
-    # ─────────────────────────────
-    # clock 없음 => "구간 종료/브레이크(End)" 후보
-    # ─────────────────────────────
-    # ✅ 1순위: endOfPeriod + periods.current
-    if eop and pc is not None and pc >= 1:
+    # ✅ endOfPeriod=True => "End" 이벤트
+    if eop:
+        # ─────────────────────────────────────────
+        # 정책(추론 금지):
+        # - Q1~Q4 End는 "후보"로 반환한다.
+        #   * 단, Q4 End는 run_once에서 '보류(pending)' 처리 후
+        #     OT_START가 실제로 오면 그때 보내고,
+        #     FINAL이 오면 영원히 보내지 않는다.
+        # - OT End는 알림을 아예 만들지 않는다(Final만).
+        # ─────────────────────────────────────────
         if pc <= 4:
             return Phase("Q_END", pc, f"{pc}Q End")
-        ot = pc - 4
-        return Phase("OT_END", ot, f"OT{ot} End")
 
-    # ✅ 핵심 방어:
-    # periods.current(pc)가 있는데 endOfPeriod(eop)가 FALSE인 경우,
-    # clock null은 "진행중인데 clock만 누락"일 수 있으므로 END 추정 금지.
-    if (pc is not None and pc >= 1) and (eop is False):
+        # OT End는 보내지 않는다 (Final만)
         return None
 
-    # halftime 플래그만 있는 경우(일부 응답)
-    if _halftime_flag(raw):
-        return Phase("Q_END", 2, "2Q End")
-
-    # ✅ fallback(정확도 낮음)은 periods 자체가 없을 때만 허용
-    if pc is None:
-        if 1 <= completed <= 4:
-            return Phase("Q_END", completed, f"{completed}Q End")
-
-        if completed >= 5:
-            ot = completed - 4
-            return Phase("OT_END", ot, f"OT{ot} End")
-
-    return None
+    # ✅ endOfPeriod=False => "Start" 이벤트
+    # (단, eop가 False일 때만 Start를 인정한다. clock/linescore로 보정하지 않는다.)
+    if pc <= 4:
+        return Phase("Q_START", pc, f"{pc}Q Start")
+    ot = pc - 4
+    return Phase("OT_START", ot, f"OT{ot} Start")
 
 
 # ─────────────────────────────────────────
@@ -333,6 +281,7 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
           s.device_id,
           d.fcm_token,
           s.game_id,
+          s.created_at AS sub_created_at,
           s.notify_game_start,
           s.notify_game_end,
           s.notify_periods,
@@ -363,7 +312,13 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
 def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
     row = nba_fetch_one(
         """
-        SELECT last_status, last_home_score, last_away_score, sent_event_keys
+        SELECT
+          last_status,
+          last_home_score,
+          last_away_score,
+          sent_event_keys,
+          created_at,
+          updated_at
         FROM nba_game_notification_states
         WHERE device_id=%s AND game_id=%s
         """,
@@ -374,6 +329,8 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
         "last_home_score": None,
         "last_away_score": None,
         "sent_event_keys": [],
+        "created_at": None,
+        "updated_at": None,
     }
 
 
@@ -519,8 +476,25 @@ def run_once() -> bool:
         if _is_inplay(eff_short, eff_long):
             has_fast = True
 
+        # ✅ 먼저 state 로드
         st = load_state(device_id, game_id)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
+
+        # ✅ 즐겨찾기(구독) 시각 이후 알림만 보장:
+        # - 예전에 구독했다가 해제 후 다시 구독하면 states가 남아있을 수 있다.
+        # - 이 경우 구독 created_at이 state.updated_at(또는 created_at)보다 최신이면,
+        #   state를 새 구독으로 간주하고 "스냅샷 동기화만" 하도록 리셋한다.
+        sub_created_at = r.get("sub_created_at")  # timestamptz
+        st_updated_at = st.get("updated_at") or st.get("created_at")
+
+        try:
+            if sub_created_at and st_updated_at and sub_created_at > st_updated_at:
+                # 새 구독인데 옛 state가 남아있는 상황 -> 리셋(=첫 tick 스냅샷만)
+                sent_keys = []
+                save_state(device_id, game_id, None, hs, as_, sent_keys)
+                continue
+        except Exception:
+            pass
 
         # ✅ 구독 직후(last_status가 None인 최초 tick)은 "스냅샷 동기화만" 하고 알림은 보내지 않는다.
         # (중간 구독/워커 재시작 시 과거 단계 알림 폭탄 방지)
@@ -541,36 +515,68 @@ def run_once() -> bool:
             continue
 
         # ─────────────────────────────────────────
-        # ✅ OPTION 2: Finished인데 OT가 있었던 경기 보정
-        # - linescore completed_units >= 5 이면 OT 존재
-        # - FINAL 알림 전에 "OT End"를 1회 보정 발송(중복은 sent_keys로 차단)
-        # - notify_periods가 꺼져있으면 보정 OT End는 보내지 않음
+        # ✅ Q4 End 보류(pending) 정책 (추론 금지)
+        #
+        # - Q4 End가 감지되어도 즉시 보내지 않고 pending 마커만 저장한다.
+        # - 이후 OT_START가 실제로 오면:
+        #     (notify_periods 켜져있을 때만) pending Q4 End를 먼저 보내고
+        #     이어서 OT_START를 보낸다.
+        # - 이후 FINAL이 오면:
+        #     pending은 폐기하고 FINAL만 보낸다.
         # ─────────────────────────────────────────
-        if phase.kind == "FINAL":
-            completed = _completed_units(raw)  # 0..(4+OT)
-            if completed >= 5:
-                last_ot = max(1, completed - 4)  # completed=5 => OT1, 6 => OT2 ...
-                ote_key = f"ote:{last_ot}"
+        PEND_Q4_END = "pend:qe4"
 
-                # 아직 OT End를 못 보냈고, period 알림이 켜져있을 때만 보정 발송
-                if notify_periods and (ote_key not in sent_keys):
-                    ot_phase = Phase("OT_END", last_ot, f"OT{last_ot} End")
-                    ot_title, ot_body = build_nba_message(ot_phase, home_name, away_name, hs, as_)
+        # 1) Q4 End는 즉시 발송하지 않고 pending만 저장
+        if phase.kind == "Q_END" and phase.index == 4:
+            if (PEND_Q4_END not in sent_keys) and ("qe:4" not in sent_keys):
+                sent_keys.append(PEND_Q4_END)
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            else:
+                # 이미 pending 또는 qe:4 확정 상태면 스냅샷만
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            continue
 
-                    if send_push(token, ot_title, ot_body, {"sport": "nba", "game_id": str(game_id), "event": ote_key}):
+        # 2) OT_START가 오면: pending Q4 End를 먼저(옵션: notify_periods) 보낸다
+        if phase.kind == "OT_START" and (PEND_Q4_END in sent_keys) and ("qe:4" not in sent_keys):
+            if notify_periods:
+                pre_phase = Phase("Q_END", 4, "4Q End")
+                pre_ek = "qe:4"
+
+                pre_title, pre_body = build_nba_message(pre_phase, home_name, away_name, hs, as_)
+
+                # qe:4 중복 방지(안전)
+                if pre_ek not in sent_keys:
+                    if send_push(token, pre_title, pre_body, {"sport": "nba", "game_id": str(game_id), "event": pre_ek}):
                         sent += 1
-                        sent_keys.append(ote_key)
-
-                        # 🔒 즉시 저장(하키와 동일) - OT End 보정 먼저 확정
+                        sent_keys.append(pre_ek)
+                        # pending 제거
+                        try:
+                            sent_keys.remove(PEND_Q4_END)
+                        except ValueError:
+                            pass
                         save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
                         time.sleep(SEND_SLEEP_SEC)
                     else:
-                        # 실패해도 스냅샷 저장(키는 추가하지 않음)
+                        # 실패 시에는 pending 유지(다음 tick 재시도 가능)
                         save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            else:
+                # period 알림이 꺼져있으면 pending은 의미 없으니 제거만 한다
+                try:
+                    sent_keys.remove(PEND_Q4_END)
+                except ValueError:
+                    pass
+                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                # OT_START도 period 알림 off면 아래에서 continue될 것임
 
-            # NOTE:
-            # 여기서 continue 하지 않는다.
-            # 같은 tick에서 이어서 FINAL(ek="final")도 정상적으로 판단/발송되도록 둔다.
+        # 3) FINAL이 오면: pending Q4 End는 폐기 (연장 없는 경기 포함)
+        if phase.kind == "FINAL" and (PEND_Q4_END in sent_keys):
+            try:
+                sent_keys.remove(PEND_Q4_END)
+            except ValueError:
+                pass
+            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            # 여기서 continue 하지 않는다. FINAL은 아래 로직에서 정상 발송되도록 둔다.
+
 
 
         if phase.kind in ("Q_START", "Q_END", "OT_START", "OT_END") and not notify_periods:
