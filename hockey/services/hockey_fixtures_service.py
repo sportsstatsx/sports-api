@@ -80,6 +80,8 @@ def hockey_get_fixtures_by_utc_range(
             l.name AS league_name,
             l.logo AS league_logo,
             c.name AS league_country,
+            c.code AS league_country_code,
+            c.flag AS league_country_flag,
 
             th.id AS home_id,
             th.name AS home_name,
@@ -221,6 +223,8 @@ def hockey_get_fixtures_by_utc_range(
                     "name": r["league_name"],
                     "logo": r["league_logo"],
                     "country": r["league_country"],
+                    "country_code": r["league_country_code"],
+                    "country_flag": r["league_country_flag"],
                 },
                 "home": {
                     "id": r["home_id"],
