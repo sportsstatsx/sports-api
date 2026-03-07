@@ -77,6 +77,9 @@ def ensure_tables() -> None:
           last_end_home_score INTEGER,
           last_end_away_score INTEGER,
           last_end_phase_key TEXT,
+          last_phase_key TEXT,
+          last_period_current INTEGER,
+          last_end_of_period BOOLEAN,
           PRIMARY KEY (device_id, game_id)
         );
         """,
@@ -100,6 +103,21 @@ def ensure_tables() -> None:
     nba_execute(
         "ALTER TABLE nba_game_notification_states "
         "ADD COLUMN IF NOT EXISTS last_end_phase_key TEXT;",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_phase_key TEXT;",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_period_current INTEGER;",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_end_of_period BOOLEAN;",
         (),
     )
 
@@ -285,6 +303,30 @@ def _detect_phase(
     ot = pc - 4
     return Phase("OT_START", ot, f"OT{ot} Start")
 
+def _current_period_current(raw: dict) -> Optional[int]:
+    return _safe_int(((raw.get("periods") or {}).get("current")))
+
+
+def _current_end_of_period(raw: dict) -> Optional[bool]:
+    eop = (raw.get("periods") or {}).get("endOfPeriod")
+    return eop if isinstance(eop, bool) else None
+
+
+def _phase_key_for_compare(phase: Optional[Phase]) -> Optional[str]:
+    if not phase:
+        return None
+    if phase.kind == "FINAL":
+        return "final"
+    if phase.kind == "Q_START":
+        return f"qs:{phase.index}"
+    if phase.kind == "Q_END":
+        return f"qe:{phase.index}"
+    if phase.kind == "OT_START":
+        return f"ots:{phase.index}"
+    if phase.kind == "OT_END":
+        return f"ote:{phase.index}"
+    return f"x:{phase.kind}:{phase.index}"
+
 
 # ─────────────────────────────────────────
 # DB fetch (구독 우선 조인)
@@ -338,6 +380,9 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
           last_end_home_score,
           last_end_away_score,
           last_end_phase_key,
+          last_phase_key,
+          last_period_current,
+          last_end_of_period,
           created_at,
           updated_at
         FROM nba_game_notification_states
@@ -353,6 +398,9 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
         "last_end_home_score": None,
         "last_end_away_score": None,
         "last_end_phase_key": None,
+        "last_phase_key": None,
+        "last_period_current": None,
+        "last_end_of_period": None,
         "created_at": None,
         "updated_at": None,
     }
@@ -368,6 +416,9 @@ def save_state(
     last_end_home_score: Optional[int] = None,
     last_end_away_score: Optional[int] = None,
     last_end_phase_key: Optional[str] = None,
+    last_phase_key: Optional[str] = None,
+    last_period_current: Optional[int] = None,
+    last_end_of_period: Optional[bool] = None,
 ) -> None:
     nba_execute(
         """
@@ -382,10 +433,13 @@ def save_state(
             last_end_home_score,
             last_end_away_score,
             last_end_phase_key,
+            last_phase_key,
+            last_period_current,
+            last_end_of_period,
             created_at,
             updated_at
           )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
         ON CONFLICT (device_id, game_id)
         DO UPDATE SET
           last_status = EXCLUDED.last_status,
@@ -395,6 +449,9 @@ def save_state(
           last_end_home_score = EXCLUDED.last_end_home_score,
           last_end_away_score = EXCLUDED.last_end_away_score,
           last_end_phase_key = EXCLUDED.last_end_phase_key,
+          last_phase_key = EXCLUDED.last_phase_key,
+          last_period_current = EXCLUDED.last_period_current,
+          last_end_of_period = EXCLUDED.last_end_of_period,
           updated_at = now()
         """,
         (
@@ -407,6 +464,9 @@ def save_state(
             last_end_home_score,
             last_end_away_score,
             last_end_phase_key,
+            last_phase_key,
+            last_period_current,
+            last_end_of_period,
         ),
     )
 
@@ -587,12 +647,27 @@ def run_once() -> bool:
         last_end_away_score = _safe_int(st.get("last_end_away_score"))
         last_end_phase_key = str(st.get("last_end_phase_key") or "").strip() or None
 
+        last_phase_key = str(st.get("last_phase_key") or "").strip() or None
+        last_period_current = _safe_int(st.get("last_period_current"))
+        st_last_eop_raw = st.get("last_end_of_period")
+        last_end_of_period = st_last_eop_raw if isinstance(st_last_eop_raw, bool) else None
+
         # ✅ 즐겨찾기(구독) 시각 이후 알림만 보장:
         # - 예전에 구독했다가 해제 후 다시 구독하면 states가 남아있을 수 있다.
         # - 이 경우 구독 created_at이 state.updated_at(또는 created_at)보다 최신이면,
         #   state를 새 구독으로 간주하고 "스냅샷 동기화만" 하도록 리셋한다.
         sub_created_at = r.get("sub_created_at")  # timestamptz
         st_updated_at = st.get("updated_at") or st.get("created_at")
+
+        curr_period_current = _current_period_current(raw)
+        curr_end_of_period = _current_end_of_period(raw)
+        pre_phase = _detect_phase(
+            status_short=status_short,
+            status_long=status_long,
+            raw=raw,
+            sent_keys=sent_keys,
+        )
+        curr_phase_key = _phase_key_for_compare(pre_phase)
 
         try:
             if sub_created_at and st_updated_at and sub_created_at > st_updated_at:
@@ -608,6 +683,9 @@ def run_once() -> bool:
                     last_end_home_score=None,
                     last_end_away_score=None,
                     last_end_phase_key=None,
+                    last_phase_key=curr_phase_key,
+                    last_period_current=curr_period_current,
+                    last_end_of_period=curr_end_of_period,
                 )
                 continue
         except Exception:
@@ -626,16 +704,15 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             continue
 
         # phase 판정 (쿼터/OT/Final)
-        phase = _detect_phase(
-            status_short=status_short,
-            status_long=status_long,
-            raw=raw,
-            sent_keys=sent_keys,
-        )
+        phase = pre_phase
+
         if not phase:
             # 스냅샷만 동기화
             save_state(
@@ -648,6 +725,32 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
+            )
+            continue
+
+        # ✅ 구독 이후/이전 tick 이후 "상태 변화(edge)"가 있을 때만 알림 허용
+        # - 같은 phase/state가 반복되는 동안은 과거 알림/중복 알림 금지
+        same_phase = (curr_phase_key == last_phase_key)
+        same_period = (curr_period_current == last_period_current)
+        same_eop = (curr_end_of_period == last_end_of_period)
+
+        if same_phase and same_period and same_eop:
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             continue
 
@@ -677,6 +780,9 @@ def run_once() -> bool:
                     last_end_home_score=hs,
                     last_end_away_score=as_,
                     last_end_phase_key="qe:4",
+                    last_phase_key=curr_phase_key,
+                    last_period_current=curr_period_current,
+                    last_end_of_period=curr_end_of_period,
                 )
             else:
                 # 이미 pending 또는 qe:4 확정 상태면 스냅샷만
@@ -690,6 +796,9 @@ def run_once() -> bool:
                     last_end_home_score=hs,
                     last_end_away_score=as_,
                     last_end_phase_key="qe:4",
+                    last_phase_key=curr_phase_key,
+                    last_period_current=curr_period_current,
+                    last_end_of_period=curr_end_of_period,
                 )
             continue
 
@@ -730,6 +839,9 @@ def run_once() -> bool:
                             last_end_home_score=last_end_home_score,
                             last_end_away_score=last_end_away_score,
                             last_end_phase_key=last_end_phase_key,
+                            last_phase_key=curr_phase_key,
+                            last_period_current=curr_period_current,
+                            last_end_of_period=curr_end_of_period,
                         )
                         time.sleep(SEND_SLEEP_SEC)
                     else:
@@ -744,6 +856,9 @@ def run_once() -> bool:
                             last_end_home_score=last_end_home_score,
                             last_end_away_score=last_end_away_score,
                             last_end_phase_key=last_end_phase_key,
+                            last_phase_key=curr_phase_key,
+                            last_period_current=curr_period_current,
+                            last_end_of_period=curr_end_of_period,
                         )
             else:
                 # period 알림이 꺼져있으면 pending은 의미 없으니 제거만 한다
@@ -761,6 +876,9 @@ def run_once() -> bool:
                     last_end_home_score=last_end_home_score,
                     last_end_away_score=last_end_away_score,
                     last_end_phase_key=last_end_phase_key,
+                    last_phase_key=curr_phase_key,
+                    last_period_current=curr_period_current,
+                    last_end_of_period=curr_end_of_period,
                 )
                 # OT_START도 period 알림 off면 아래에서 continue될 것임
 
@@ -780,6 +898,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             # 여기서 continue 하지 않는다. FINAL은 아래 로직에서 정상 발송되도록 둔다.
 
@@ -805,6 +926,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             continue
 
@@ -819,6 +943,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             continue
 
@@ -859,6 +986,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             continue
 
@@ -888,6 +1018,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
             time.sleep(SEND_SLEEP_SEC)
         else:
@@ -911,6 +1044,9 @@ def run_once() -> bool:
                 last_end_home_score=last_end_home_score,
                 last_end_away_score=last_end_away_score,
                 last_end_phase_key=last_end_phase_key,
+                last_phase_key=curr_phase_key,
+                last_period_current=curr_period_current,
+                last_end_of_period=curr_end_of_period,
             )
 
     log.info("tick: sent=%d", sent)
@@ -948,6 +1084,16 @@ def run_forever(interval_sec: int) -> None:
             st = load_state(device_id, game_id)
             sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
+            boot_phase = _detect_phase(
+                status_short=status_short,
+                status_long=status_long,
+                raw=raw,
+                sent_keys=sent_keys,
+            )
+            boot_phase_key = _phase_key_for_compare(boot_phase)
+            boot_period_current = _current_period_current(raw)
+            boot_end_of_period = _current_end_of_period(raw)
+
             save_state(
                 device_id,
                 game_id,
@@ -958,6 +1104,9 @@ def run_forever(interval_sec: int) -> None:
                 last_end_home_score=_safe_int(st.get("last_end_home_score")),
                 last_end_away_score=_safe_int(st.get("last_end_away_score")),
                 last_end_phase_key=str(st.get("last_end_phase_key") or "").strip() or None,
+                last_phase_key=boot_phase_key,
+                last_period_current=boot_period_current,
+                last_end_of_period=boot_end_of_period,
             )
 
         log.info("bootstrap: synced %d subscription rows (no notifications)", len(rows))
