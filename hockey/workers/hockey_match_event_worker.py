@@ -309,7 +309,52 @@ def extract_ui_scores(score_json: Any, raw_json: Any) -> Tuple[Optional[int], Op
 
     return None, None
 
+def extract_db_scores_only(score_json: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    알림용 canonical score:
+    - hockey_games.score_json만 사용
+    - raw_json fallback 사용 금지
+    - 값이 없으면 None 반환 -> caller에서 last score 유지
+    """
+    def _safe_int(x: Any) -> Optional[int]:
+        try:
+            if x is None or isinstance(x, bool):
+                return None
+            if isinstance(x, (int, float)):
+                return int(x)
+            s = str(x).strip()
+            if not s:
+                return None
+            return int(float(s))
+        except Exception:
+            return None
 
+    sj = score_json
+    if isinstance(sj, str):
+        try:
+            sj = json.loads(sj)
+        except Exception:
+            sj = None
+
+    if not isinstance(sj, dict):
+        return None, None
+
+    # 1) 가장 우선: direct home/away
+    h = _safe_int(sj.get("home"))
+    a = _safe_int(sj.get("away"))
+    if h is not None or a is not None:
+        return h, a
+
+    # 2) nested total/final/score
+    for k in ("total", "totals", "final", "score"):
+        v = sj.get(k)
+        if isinstance(v, dict):
+            hh = _safe_int(v.get("home"))
+            aa = _safe_int(v.get("away"))
+            if hh is not None or aa is not None:
+                return hh, aa
+
+    return None, None
 
 def is_final_status(status: Optional[str]) -> bool:
     s = (status or "").strip().upper()
@@ -348,7 +393,31 @@ def normalize_status(status: Any) -> str:
 
     return s
 
+SCORE_NOTIFY_LIVE_STATUSES = {"1P", "2P", "3P", "OT", "SO"}
 
+def is_score_notify_live_status(status_norm: str) -> bool:
+    return status_norm in SCORE_NOTIFY_LIVE_STATUSES
+
+def _is_subscription_newer_than_state(
+    subscribed_at: Any,
+    state_updated_at: Any,
+) -> bool:
+    """
+    구독(updated_at)이 state(updated_at)보다 더 최신이면
+    '재구독/재설정 이후'로 보고 baseline 재시드해야 함.
+    """
+    if subscribed_at is None:
+        return False
+    if state_updated_at is None:
+        return True
+
+    if isinstance(subscribed_at, datetime) and isinstance(state_updated_at, datetime):
+        return subscribed_at > state_updated_at
+
+    try:
+        return str(subscribed_at) > str(state_updated_at)
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────
 # MODELS
@@ -374,19 +443,25 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
           last_status,
           last_home_score,
           last_away_score,
-          sent_event_keys
+          sent_event_keys,
+          updated_at
         FROM hockey_game_notification_states
         WHERE device_id=%s AND game_id=%s
         """,
         (device_id, game_id),
     )
 
-    # ✅ state가 아직 없을 때 기본값 명확히
-    return row or {
+    if row:
+        row["_exists"] = True
+        return row
+
+    return {
+        "_exists": False,
         "last_status": None,
         "last_home_score": 0,
         "last_away_score": 0,
         "sent_event_keys": [],
+        "updated_at": None,
     }
 
 
@@ -546,7 +621,7 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
     - 구독된 game_id를 먼저 확정하고,
     - hockey_games를 조인해서 (점수/상태/팀명 포함) 한 번에 가져온다.
     - game_date window로만 제한해서 "오래된 구독"은 매 tick마다 보지 않게 한다.
-    - UI(/api/hockey/fixtures)와 동일한 스코어 산출을 위해 raw_json 포함
+    - 알림 baseline용으로 subscription.updated_at 포함
     """
     time_min = now_utc.timestamp() - (PAST_DAYS * 86400)
     time_max = now_utc.timestamp() + (FUTURE_DAYS * 86400)
@@ -560,6 +635,7 @@ def fetch_subscription_rows(now_utc: datetime) -> List[Dict[str, Any]]:
           s.notify_game_start,
           s.notify_game_end,
           s.notify_periods,
+          s.updated_at AS subscribed_at,
 
           g.league_id,
           g.game_date,
@@ -738,6 +814,7 @@ def run_once() -> bool:
                 "status_long": r.get("status_long"),
                 "score_json": r.get("score_json"),
                 "raw_json": r.get("raw_json"),
+                "subscribed_at": r.get("subscribed_at"),
                 "home_team_id": r.get("home_team_id"),
                 "away_team_id": r.get("away_team_id"),
                 "home_name": r.get("home_name"),
@@ -759,11 +836,53 @@ def run_once() -> bool:
 
         # ✅ 먼저 state 로드해서 last_* 확보
         st = load_state(sub.device_id, sub.game_id)
+        state_exists = bool(st.get("_exists"))
+
+        status_raw = str(g.get("status") or "").strip()
+        status_norm = normalize_status(status_raw)
+
+        # ✅ 알림은 canonical DB score_json만 사용
+        db_home, db_away = extract_db_scores_only(g.get("score_json"))
+
+        subscribed_at = g.get("subscribed_at")
+        state_updated_at = st.get("updated_at")
+        needs_reseed = (not state_exists) or _is_subscription_newer_than_state(
+            subscribed_at,
+            state_updated_at,
+        )
+
+        if needs_reseed:
+            # ✅ 신규 구독 or 재구독/재설정:
+            # 현재 DB 상태를 baseline으로 저장만 하고, 이 tick에서는 어떤 알림도 보내지 않음
+            last_status = None
+            last_status_norm = ""
+
+            baseline_home = db_home if db_home is not None else 0
+            baseline_away = db_away if db_away is not None else 0
+
+            save_state(
+                device_id=sub.device_id,
+                game_id=sub.game_id,
+                last_status=status_raw,
+                last_home_score=baseline_home,
+                last_away_score=baseline_away,
+                sent_event_keys=["__score_epoch:0"],
+            )
+            continue
+
         last_status = st.get("last_status")
         last_status_norm = normalize_status(last_status)
         last_home = _to_int(st.get("last_home_score"), 0)
         last_away = _to_int(st.get("last_away_score"), 0)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
+
+        # - 둘 다 None → 점수 미확정 tick → last 값 유지
+        # - 한쪽만 None → 그쪽만 last 유지
+        if db_home is None and db_away is None:
+            home, away = last_home, last_away
+        else:
+            home = db_home if db_home is not None else last_home
+            away = db_away if db_away is not None else last_away
 
         # ─────────────────────────
         # score epoch (취소 후 재득점 재알림용)
@@ -777,7 +896,6 @@ def run_once() -> bool:
                     score_epoch = int(k.split(":", 1)[1])
                 except Exception:
                     score_epoch = 0
-        # epoch marker는 1개만 유지
         sent_keys = [k for k in sent_keys if not (isinstance(k, str) and k.startswith("__score_epoch:"))]
         sent_keys.append(f"__score_epoch:{score_epoch}")
 
@@ -786,23 +904,6 @@ def run_once() -> bool:
             score_epoch = max(0, int(new_epoch))
             sent_keys = [k for k in sent_keys if not (isinstance(k, str) and k.startswith("__score_epoch:"))]
             sent_keys.append(f"__score_epoch:{score_epoch}")
-
-        status_raw = str(g.get("status") or "").strip()
-        status_norm = normalize_status(status_raw)
-
-        # ✅ UI와 동일 스코어 규칙
-        ui_home, ui_away = extract_ui_scores(
-            g.get("score_json"),
-            g.get("raw_json"),
-        )
-
-        # - 둘 다 None → 점수 미확정 tick → last 값 유지
-        # - 한쪽만 None → 그쪽만 last 유지
-        if ui_home is None and ui_away is None:
-            home, away = last_home, last_away
-        else:
-            home = ui_home if ui_home is not None else last_home
-            away = ui_away if ui_away is not None else last_away
 
         # ─────────────────────────
         # 공통: 이벤트 1회 발송 dedupe + 즉시 state 저장
@@ -881,13 +982,15 @@ def run_once() -> bool:
         score_increased = (home > last_home) or (away > last_away)
         score_decreased = (home < last_home) or (away < last_away)
 
-        became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
-        decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed
+        # ✅ 점수 알림은 실제 경기 진행 상태에서만 허용
+        #    BT/NS/FT/AP/AOT 에서는 점수 변동을 state에만 반영하고 알림은 보내지 않음
+        score_notify_live = is_score_notify_live_status(status_norm)
 
-        # ✅ 정정/취소(감소) 알림
-        if sub.notify_score and score_decreased:
-            # 취소/정정이 한 번이라도 있으면 epoch를 올려서,
-            # 이후 동일 스코어 재도달(재득점)도 다시 알림 가능하게
+        became_final = is_final_status(status_norm) and not is_final_status(last_status_norm)
+        decided_in_ot_or_so = last_status_norm in ("OT", "SO") and score_changed and is_final_status(status_norm)
+
+        # ✅ 정정/취소(감소) 알림: 경기 진행 중일 때만
+        if sub.notify_score and score_notify_live and score_decreased:
             _set_epoch(score_epoch + 1)
 
             team_name = ""
@@ -908,16 +1011,14 @@ def run_once() -> bool:
                 )
                 _send_once(corr_key, t, b)
 
-        # ✅ 골 알림(증가)
-        if sub.notify_score and score_increased:
+        # ✅ 골 알림(증가): 경기 진행 중일 때만
+        if sub.notify_score and score_notify_live and score_increased:
             team_name = ""
             if home > last_home:
                 team_name = g.get("home_name") or "Home"
             elif away > last_away:
                 team_name = g.get("away_name") or "Away"
 
-            # 기존: goal:{game_id}:{home}:{away}
-            # 변경: epoch + 전이 포함 (취소 후 재득점 재알림 가능)
             goal_key = f"goal:{sub.game_id}:e{score_epoch}:{last_home}-{last_away}->{home}-{away}"
             if goal_key not in sent_keys:
                 t, b = build_hockey_message(
@@ -929,6 +1030,10 @@ def run_once() -> bool:
                     period=status_norm,
                 )
                 _send_once(goal_key, t, b)
+
+        # ✅ BT/종료상태에서 점수가 흔들려도 다음 재득점 알림 꼬이지 않게 epoch/state는 흡수
+        if sub.notify_score and (not score_notify_live) and score_decreased:
+            _set_epoch(score_epoch + 1)
 
         # Final 중복 방지
         if sub.notify_game_end and (became_final or decided_in_ot_or_so):
