@@ -74,6 +74,9 @@ def ensure_tables() -> None:
           created_at TIMESTAMPTZ DEFAULT now(),
           updated_at TIMESTAMPTZ DEFAULT now(),
           sent_event_keys TEXT[] DEFAULT '{}'::text[],
+          last_end_home_score INTEGER,
+          last_end_away_score INTEGER,
+          last_end_phase_key TEXT,
           PRIMARY KEY (device_id, game_id)
         );
         """,
@@ -82,6 +85,21 @@ def ensure_tables() -> None:
     nba_execute(
         "ALTER TABLE nba_game_notification_states "
         "ADD COLUMN IF NOT EXISTS sent_event_keys TEXT[] DEFAULT '{}'::text[];",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_end_home_score INTEGER;",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_end_away_score INTEGER;",
+        (),
+    )
+    nba_execute(
+        "ALTER TABLE nba_game_notification_states "
+        "ADD COLUMN IF NOT EXISTS last_end_phase_key TEXT;",
         (),
     )
 
@@ -317,6 +335,9 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
           last_home_score,
           last_away_score,
           sent_event_keys,
+          last_end_home_score,
+          last_end_away_score,
+          last_end_phase_key,
           created_at,
           updated_at
         FROM nba_game_notification_states
@@ -329,6 +350,9 @@ def load_state(device_id: str, game_id: int) -> Dict[str, Any]:
         "last_home_score": None,
         "last_away_score": None,
         "sent_event_keys": [],
+        "last_end_home_score": None,
+        "last_end_away_score": None,
+        "last_end_phase_key": None,
         "created_at": None,
         "updated_at": None,
     }
@@ -341,21 +365,49 @@ def save_state(
     last_home_score: Optional[int],
     last_away_score: Optional[int],
     sent_event_keys: List[str],
+    last_end_home_score: Optional[int] = None,
+    last_end_away_score: Optional[int] = None,
+    last_end_phase_key: Optional[str] = None,
 ) -> None:
     nba_execute(
         """
         INSERT INTO nba_game_notification_states
-          (device_id, game_id, last_status, last_home_score, last_away_score, sent_event_keys, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, now(), now())
+          (
+            device_id,
+            game_id,
+            last_status,
+            last_home_score,
+            last_away_score,
+            sent_event_keys,
+            last_end_home_score,
+            last_end_away_score,
+            last_end_phase_key,
+            created_at,
+            updated_at
+          )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
         ON CONFLICT (device_id, game_id)
         DO UPDATE SET
           last_status = EXCLUDED.last_status,
           last_home_score = EXCLUDED.last_home_score,
           last_away_score = EXCLUDED.last_away_score,
           sent_event_keys = EXCLUDED.sent_event_keys,
+          last_end_home_score = EXCLUDED.last_end_home_score,
+          last_end_away_score = EXCLUDED.last_end_away_score,
+          last_end_phase_key = EXCLUDED.last_end_phase_key,
           updated_at = now()
         """,
-        (device_id, game_id, last_status, last_home_score, last_away_score, sent_event_keys),
+        (
+            device_id,
+            game_id,
+            last_status,
+            last_home_score,
+            last_away_score,
+            sent_event_keys,
+            last_end_home_score,
+            last_end_away_score,
+            last_end_phase_key,
+        ),
     )
 
 
@@ -368,6 +420,57 @@ def _score_line(home_name: str, away_name: str, hs: Optional[int], as_: Optional
     hst = "?" if hs is None else str(hs)
     ast = "?" if as_ is None else str(as_)
     return f"{hn} {hst} : {ast} {an}"
+
+def _resolve_phase_scores(
+    phase: Phase,
+    st: Dict[str, Any],
+    current_hs: Optional[int],
+    current_as: Optional[int],
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    알림 메시지에 사용할 점수 결정 규칙
+
+    - 1Q Start  -> 0:0 고정
+    - 2Q/3Q/4Q Start -> 직전 Q End 점수
+    - OT Start -> 직전 End(4Q End 또는 직전 OT End) 점수
+    - Q End / Final -> 현재 점수
+    """
+
+    if phase.kind == "Q_START":
+        if phase.index == 1:
+            return 0, 0
+
+        end_hs = _safe_int(st.get("last_end_home_score"))
+        end_as = _safe_int(st.get("last_end_away_score"))
+        end_key = str(st.get("last_end_phase_key") or "").strip()
+
+        expected_prev = f"qe:{phase.index - 1}"
+        if end_hs is not None and end_as is not None and end_key == expected_prev:
+            return end_hs, end_as
+
+        # fallback: 종료점수 없으면 마지막 스냅샷이라도 사용
+        prev_hs = _safe_int(st.get("last_home_score"))
+        prev_as = _safe_int(st.get("last_away_score"))
+        return prev_hs, prev_as
+
+    if phase.kind == "OT_START":
+        end_hs = _safe_int(st.get("last_end_home_score"))
+        end_as = _safe_int(st.get("last_end_away_score"))
+        end_key = str(st.get("last_end_phase_key") or "").strip()
+
+        if phase.index == 1:
+            expected_prev = "qe:4"
+        else:
+            expected_prev = f"ote:{phase.index - 1}"
+
+        if end_hs is not None and end_as is not None and end_key == expected_prev:
+            return end_hs, end_as
+
+        prev_hs = _safe_int(st.get("last_home_score"))
+        prev_as = _safe_int(st.get("last_away_score"))
+        return prev_hs, prev_as
+
+    return current_hs, current_as
 
 
 def build_nba_message(
@@ -480,6 +583,10 @@ def run_once() -> bool:
         st = load_state(device_id, game_id)
         sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
+        last_end_home_score = _safe_int(st.get("last_end_home_score"))
+        last_end_away_score = _safe_int(st.get("last_end_away_score"))
+        last_end_phase_key = str(st.get("last_end_phase_key") or "").strip() or None
+
         # ✅ 즐겨찾기(구독) 시각 이후 알림만 보장:
         # - 예전에 구독했다가 해제 후 다시 구독하면 states가 남아있을 수 있다.
         # - 이 경우 구독 created_at이 state.updated_at(또는 created_at)보다 최신이면,
@@ -491,7 +598,17 @@ def run_once() -> bool:
             if sub_created_at and st_updated_at and sub_created_at > st_updated_at:
                 # 새 구독인데 옛 state가 남아있는 상황 -> 리셋(=첫 tick 스냅샷만)
                 sent_keys = []
-                save_state(device_id, game_id, None, hs, as_, sent_keys)
+                save_state(
+                    device_id,
+                    game_id,
+                    None,
+                    hs,
+                    as_,
+                    sent_keys,
+                    last_end_home_score=None,
+                    last_end_away_score=None,
+                    last_end_phase_key=None,
+                )
                 continue
         except Exception:
             pass
@@ -499,7 +616,17 @@ def run_once() -> bool:
         # ✅ 구독 직후(last_status가 None인 최초 tick)은 "스냅샷 동기화만" 하고 알림은 보내지 않는다.
         # (중간 구독/워커 재시작 시 과거 단계 알림 폭탄 방지)
         if st.get("last_status") is None:
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             continue
 
         # phase 판정 (쿼터/OT/Final)
@@ -511,7 +638,17 @@ def run_once() -> bool:
         )
         if not phase:
             # 스냅샷만 동기화
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             continue
 
         # ─────────────────────────────────────────
@@ -530,10 +667,30 @@ def run_once() -> bool:
         if phase.kind == "Q_END" and phase.index == 4:
             if (PEND_Q4_END not in sent_keys) and ("qe:4" not in sent_keys):
                 sent_keys.append(PEND_Q4_END)
-                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                save_state(
+                    device_id,
+                    game_id,
+                    status_long or str(status_short),
+                    hs,
+                    as_,
+                    sent_keys,
+                    last_end_home_score=hs,
+                    last_end_away_score=as_,
+                    last_end_phase_key="qe:4",
+                )
             else:
                 # 이미 pending 또는 qe:4 확정 상태면 스냅샷만
-                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                save_state(
+                    device_id,
+                    game_id,
+                    status_long or str(status_short),
+                    hs,
+                    as_,
+                    sent_keys,
+                    last_end_home_score=hs,
+                    last_end_away_score=as_,
+                    last_end_phase_key="qe:4",
+                )
             continue
 
         # 2) OT_START가 오면: pending Q4 End를 먼저(옵션: notify_periods) 보낸다
@@ -542,30 +699,69 @@ def run_once() -> bool:
                 pre_phase = Phase("Q_END", 4, "4Q End")
                 pre_ek = "qe:4"
 
-                pre_title, pre_body = build_nba_message(pre_phase, home_name, away_name, hs, as_)
+                pre_hs = _safe_int(st.get("last_end_home_score"))
+                pre_as = _safe_int(st.get("last_end_away_score"))
+
+                if pre_hs is None or pre_as is None:
+                    pre_hs, pre_as = hs, as_
+
+                pre_title, pre_body = build_nba_message(pre_phase, home_name, away_name, pre_hs, pre_as)
 
                 # qe:4 중복 방지(안전)
                 if pre_ek not in sent_keys:
                     if send_push(token, pre_title, pre_body, {"sport": "nba", "game_id": str(game_id), "event": pre_ek}):
                         sent += 1
                         sent_keys.append(pre_ek)
+                        last_end_home_score = pre_hs
+                        last_end_away_score = pre_as
+                        last_end_phase_key = "qe:4"
                         # pending 제거
                         try:
                             sent_keys.remove(PEND_Q4_END)
                         except ValueError:
                             pass
-                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                        save_state(
+                            device_id,
+                            game_id,
+                            status_long or str(status_short),
+                            hs,
+                            as_,
+                            sent_keys,
+                            last_end_home_score=last_end_home_score,
+                            last_end_away_score=last_end_away_score,
+                            last_end_phase_key=last_end_phase_key,
+                        )
                         time.sleep(SEND_SLEEP_SEC)
                     else:
                         # 실패 시에는 pending 유지(다음 tick 재시도 가능)
-                        save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                        save_state(
+                            device_id,
+                            game_id,
+                            status_long or str(status_short),
+                            hs,
+                            as_,
+                            sent_keys,
+                            last_end_home_score=last_end_home_score,
+                            last_end_away_score=last_end_away_score,
+                            last_end_phase_key=last_end_phase_key,
+                        )
             else:
                 # period 알림이 꺼져있으면 pending은 의미 없으니 제거만 한다
                 try:
                     sent_keys.remove(PEND_Q4_END)
                 except ValueError:
                     pass
-                save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+                save_state(
+                    device_id,
+                    game_id,
+                    status_long or str(status_short),
+                    hs,
+                    as_,
+                    sent_keys,
+                    last_end_home_score=last_end_home_score,
+                    last_end_away_score=last_end_away_score,
+                    last_end_phase_key=last_end_phase_key,
+                )
                 # OT_START도 period 알림 off면 아래에서 continue될 것임
 
         # 3) FINAL이 오면: pending Q4 End는 폐기 (연장 없는 경기 포함)
@@ -574,17 +770,56 @@ def run_once() -> bool:
                 sent_keys.remove(PEND_Q4_END)
             except ValueError:
                 pass
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             # 여기서 continue 하지 않는다. FINAL은 아래 로직에서 정상 발송되도록 둔다.
 
 
 
         if phase.kind in ("Q_START", "Q_END", "OT_START", "OT_END") and not notify_periods:
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            if phase.kind == "Q_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"qe:{phase.index}"
+            elif phase.kind == "OT_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"ote:{phase.index}"
+
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             continue
 
         if phase.kind == "FINAL" and not notify_game_end:
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             continue
 
         # event_key (중복 방지)
@@ -601,23 +836,82 @@ def run_once() -> bool:
         else:
             ek = f"x:{phase.kind}:{phase.index}"
 
+        msg_hs, msg_as_ = _resolve_phase_scores(phase, st, hs, as_)
+
         if ek in sent_keys:
             # 이미 보냈으면 스냅샷만 저장
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            if phase.kind == "Q_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"qe:{phase.index}"
+            elif phase.kind == "OT_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"ote:{phase.index}"
+
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             continue
 
-        title, body = build_nba_message(phase, home_name, away_name, hs, as_)
+        title, body = build_nba_message(phase, home_name, away_name, msg_hs, msg_as_)
 
         if send_push(token, title, body, {"sport": "nba", "game_id": str(game_id), "event": ek}):
             sent += 1
             sent_keys.append(ek)
 
+            if phase.kind == "Q_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"qe:{phase.index}"
+            elif phase.kind == "OT_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"ote:{phase.index}"
+
             # 🔒 즉시 저장(하키와 동일)
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
             time.sleep(SEND_SLEEP_SEC)
         else:
             # 실패해도 스냅샷 저장은 해두자(다만 ek는 추가하지 않음)
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            if phase.kind == "Q_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"qe:{phase.index}"
+            elif phase.kind == "OT_END":
+                last_end_home_score = hs
+                last_end_away_score = as_
+                last_end_phase_key = f"ote:{phase.index}"
+
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=last_end_home_score,
+                last_end_away_score=last_end_away_score,
+                last_end_phase_key=last_end_phase_key,
+            )
 
     log.info("tick: sent=%d", sent)
     return has_fast
@@ -654,7 +948,17 @@ def run_forever(interval_sec: int) -> None:
             st = load_state(device_id, game_id)
             sent_keys: List[str] = list(st.get("sent_event_keys") or [])
 
-            save_state(device_id, game_id, status_long or str(status_short), hs, as_, sent_keys)
+            save_state(
+                device_id,
+                game_id,
+                status_long or str(status_short),
+                hs,
+                as_,
+                sent_keys,
+                last_end_home_score=_safe_int(st.get("last_end_home_score")),
+                last_end_away_score=_safe_int(st.get("last_end_away_score")),
+                last_end_phase_key=str(st.get("last_end_phase_key") or "").strip() or None,
+            )
 
         log.info("bootstrap: synced %d subscription rows (no notifications)", len(rows))
     except Exception:
