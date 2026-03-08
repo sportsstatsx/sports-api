@@ -8,83 +8,207 @@ from typing import Any, Dict, List, Optional, Tuple
 # ✅ 0) 네가 사용하는 지원 리그 (고정)
 # ------------------------------------------------------------
 SUPPORTED_LEAGUE_IDS: List[int] = [
+    # 기존 남자 리그
     39, 40, 140, 141, 78, 79, 135, 136, 61, 62, 88, 89, 94, 95,
     203, 204, 144, 145, 207, 208, 119, 98, 99, 292, 293, 307,
     305, 290, 188, 189, 71, 72, 253, 2, 3, 848, 17, 16, 218,
-    219, 179, 180, 345, 346, 106, 107, 169
+    219, 179, 180, 345, 346, 106, 107, 169,
+
+    # 추가 남자 리그
+    113, 114, 103, 104, 244, 271, 210, 373, 301, 296, 200, 233, 128, 265,
+
+    # 추가 국내컵
+    45, 143, 81, 137, 66,
+
+    # 추가 여자 리그
+    44, 699, 82, 1034, 64, 142, 139, 549, 725, 640, 854, 660, 254, 190,
 ]
 
 # ------------------------------------------------------------
 # ✅ 1) 리그 메타 (id -> name/country) : 네가 준 DB 출력 그대로
 # ------------------------------------------------------------
 LEAGUE_META: Dict[int, Dict[str, str]] = {
+    # Australia
     188: {"name": "A-League", "country": "Australia"},
     189: {"name": "Capital Territory NPL", "country": "Australia"},
+    190: {"name": "A-League Women", "country": "Australia"},
+
+    # Austria
     219: {"name": "2. Liga", "country": "Austria"},
     218: {"name": "Bundesliga", "country": "Austria"},
+
+    # Belgium
     145: {"name": "Challenger Pro League", "country": "Belgium"},
     144: {"name": "Jupiler Pro League", "country": "Belgium"},
+
+    # Brazil
     71:  {"name": "Serie A", "country": "Brazil"},
     72:  {"name": "Serie B", "country": "Brazil"},
+
+    # Chile
+    265: {"name": "Primera División", "country": "Chile"},
+
+    # China
     169: {"name": "Chinese Super League", "country": "China"},
+
+    # Croatia
+    210: {"name": "HNL", "country": "Croatia"},
+
+    # Czech Republic
     345: {"name": "Czech First League", "country": "Czech Republic"},
     346: {"name": "Czech National Football League", "country": "Czech Republic"},
+
+    # Denmark
     119: {"name": "Superliga", "country": "Denmark"},
+
+    # Egypt
+    233: {"name": "Premier League", "country": "Egypt"},
+
+    # England
     40:  {"name": "Championship", "country": "England"},
     39:  {"name": "Premier League", "country": "England"},
+    45:  {"name": "FA Cup", "country": "England"},
+    44:  {"name": "FA WSL", "country": "England"},
+    699: {"name": "Women's Championship", "country": "England"},
+
+    # Finland
+    244: {"name": "Veikkausliiga", "country": "Finland"},
+    640: {"name": "Kansallinen Liiga", "country": "Finland"},
+
+    # France
     61:  {"name": "Ligue 1", "country": "France"},
     62:  {"name": "Ligue 2", "country": "France"},
+    66:  {"name": "Coupe de France", "country": "France"},
+    64:  {"name": "Feminine Division 1", "country": "France"},
+
+    # Germany
     79:  {"name": "2. Bundesliga", "country": "Germany"},
     78:  {"name": "Bundesliga", "country": "Germany"},
+    81:  {"name": "DFB Pokal", "country": "Germany"},
+    82:  {"name": "Frauen Bundesliga", "country": "Germany"},
+    1034: {"name": "2. Frauen Bundesliga", "country": "Germany"},
+
+    # Hungary
+    271: {"name": "NB I", "country": "Hungary"},
+
+    # Iran
     290: {"name": "Persian Gulf Pro League", "country": "Iran"},
+
+    # Italy
     135: {"name": "Serie A", "country": "Italy"},
     136: {"name": "Serie B", "country": "Italy"},
+    137: {"name": "Coppa Italia", "country": "Italy"},
+    139: {"name": "Serie A Women", "country": "Italy"},
+
+    # Japan
     98:  {"name": "J1 League", "country": "Japan"},
     99:  {"name": "J2 League", "country": "Japan"},
+    854: {"name": "WE League", "country": "Japan"},
+
+    # Morocco
+    200: {"name": "Botola Pro", "country": "Morocco"},
+
+    # Netherlands
     89:  {"name": "Eerste Divisie", "country": "Netherlands"},
     88:  {"name": "Eredivisie", "country": "Netherlands"},
+
+    # Norway
+    103: {"name": "Eliteserien", "country": "Norway"},
+    104: {"name": "1. Division", "country": "Norway"},
+    725: {"name": "Toppserien", "country": "Norway"},
+
+    # Poland
     106: {"name": "Ekstraklasa", "country": "Poland"},
     107: {"name": "I Liga", "country": "Poland"},
+
+    # Portugal
     94:  {"name": "Primeira Liga", "country": "Portugal"},
     95:  {"name": "Segunda Liga", "country": "Portugal"},
+
+    # Qatar
     305: {"name": "Stars League", "country": "Qatar"},
+
+    # Saudi Arabia
     307: {"name": "Pro League", "country": "Saudi-Arabia"},
+
+    # Scotland
     180: {"name": "Championship", "country": "Scotland"},
     179: {"name": "Premiership", "country": "Scotland"},
+
+    # Slovenia
+    373: {"name": "1. SNL", "country": "Slovenia"},
+
+    # South Korea
     292: {"name": "K League 1", "country": "South-Korea"},
     293: {"name": "K League 2", "country": "South-Korea"},
+    660: {"name": "WK-League", "country": "South-Korea"},
+
+    # Spain
     140: {"name": "La Liga", "country": "Spain"},
     141: {"name": "Segunda División", "country": "Spain"},
+    143: {"name": "Copa del Rey", "country": "Spain"},
+    142: {"name": "Primera División Femenina", "country": "Spain"},
+
+    # Sweden
+    113: {"name": "Allsvenskan", "country": "Sweden"},
+    114: {"name": "Superettan", "country": "Sweden"},
+    549: {"name": "Damallsvenskan", "country": "Sweden"},
+
+    # Switzerland
     208: {"name": "Challenge League", "country": "Switzerland"},
     207: {"name": "Super League", "country": "Switzerland"},
+
+    # Thailand
+    296: {"name": "Thai League 1", "country": "Thailand"},
+
+    # Turkey
     204: {"name": "1. Lig", "country": "Turkey"},
     203: {"name": "Süper Lig", "country": "Turkey"},
+
+    # UAE
+    301: {"name": "Pro League", "country": "United-Arab-Emirates"},
+
+    # USA
     253: {"name": "Major League Soccer", "country": "USA"},
+    254: {"name": "NWSL Women", "country": "USA"},
+
+    # World
     17:  {"name": "AFC Champions League", "country": "World"},
     16:  {"name": "CONCACAF Champions League", "country": "World"},
     2:   {"name": "UEFA Champions League", "country": "World"},
     848: {"name": "UEFA Europa Conference League", "country": "World"},
     3:   {"name": "UEFA Europa League", "country": "World"},
+
+    # Argentina
+    128: {"name": "Liga Profesional Argentina", "country": "Argentina"},
 }
 
 # ------------------------------------------------------------
 # ✅ 2) 대륙 분류 (네 규칙 고정)
 # ------------------------------------------------------------
-CONTINENT_ORDER: List[str] = ["Europe", "Asia", "Americas"]
+CONTINENT_ORDER: List[str] = ["Europe", "Asia", "Africa", "Americas"]
 
 EUROPE_COUNTRIES = {
     "England", "Spain", "Germany", "Italy", "France",
     "Netherlands", "Portugal", "Belgium", "Austria",
     "Denmark", "Scotland", "Switzerland", "Turkey",
     "Poland", "Czech Republic",
+    "Sweden", "Norway", "Finland", "Hungary", "Croatia", "Slovenia",
 }
 
 ASIA_COUNTRIES = {
     "South-Korea", "Japan", "China", "Australia",
     "Iran", "Qatar", "Saudi-Arabia",
+    "United-Arab-Emirates", "Thailand",
 }
 
-AMERICAS_COUNTRIES = {"USA", "Brazil"}
+AFRICA_COUNTRIES = {
+    "Morocco", "Egypt",
+}
+
+AMERICAS_COUNTRIES = {
+    "USA", "Brazil", "Argentina", "Chile",
+}
 
 # ------------------------------------------------------------
 # ✅ 3) 티어(1부/2부) + 대륙컵(대륙 필터 안으로)
@@ -94,14 +218,17 @@ EUROPE_TOP5_ORDER: List[int] = [39, 140, 78, 135, 61]
 
 # 대륙컵들은 각 대륙 필터 안에 포함
 EUROPE_CONTINENTAL_CUPS: List[int] = [2, 3, 848]   # UEFA CL/EL/UECL
-ASIA_CONTINENTAL_CUPS: List[int] = [17]           # AFC CL
-AMERICAS_CONTINENTAL_CUPS: List[int] = [16]       # CONCACAF CL
+ASIA_CONTINENTAL_CUPS: List[int] = [17]            # AFC CL
+AMERICAS_CONTINENTAL_CUPS: List[int] = [16]        # CONCACAF CL
+
+# 추가: 국내컵
+EUROPE_DOMESTIC_CUPS: List[int] = [45, 143, 81, 137, 66]  # ENG/ESP/GER/ITA/FRA
 
 
 # (country, tier) 매핑: 네가 준 리그셋 기준으로 확정
 # tier: 1 or 2, cup은 tier=None + is_cup=True로 다룸
 TIER_MAP: Dict[int, int] = {
-    # Europe
+    # Europe - men
     39: 1, 40: 2,          # England
     140: 1, 141: 2,        # Spain
     78: 1, 79: 2,          # Germany
@@ -111,25 +238,57 @@ TIER_MAP: Dict[int, int] = {
     94: 1, 95: 2,          # Portugal
     144: 1, 145: 2,        # Belgium
     218: 1, 219: 2,        # Austria
-    119: 1,                # Denmark (2부 없음)
+    119: 1,                # Denmark
     179: 1, 180: 2,        # Scotland
     207: 1, 208: 2,        # Switzerland
     203: 1, 204: 2,        # Turkey
     106: 1, 107: 2,        # Poland
     345: 1, 346: 2,        # Czech Republic
+    113: 1, 114: 2,        # Sweden
+    103: 1, 104: 2,        # Norway
+    244: 1,                # Finland
+    271: 1,                # Hungary
+    210: 1,                # Croatia
+    373: 1,                # Slovenia
 
-    # Asia
+    # Europe - women
+    44: 1, 699: 2,         # England Women
+    82: 1, 1034: 2,        # Germany Women
+    64: 1,                 # France Women
+    142: 1,                # Spain Women
+    139: 1,                # Italy Women
+    549: 1,                # Sweden Women
+    725: 1,                # Norway Women
+    640: 1,                # Finland Women
+
+    # Asia - men
     292: 1, 293: 2,        # South-Korea
     98: 1, 99: 2,          # Japan
-    169: 1,                # China (2부 없음)
-    188: 1, 189: 2,        # Australia (너가 넣은 2개 기준으로 2부 취급)
+    169: 1,                # China
+    188: 1, 189: 2,        # Australia
     290: 1,                # Iran
     305: 1,                # Qatar
-    307: 1,                # Saudi
+    307: 1,                # Saudi Arabia
+    301: 1,                # UAE
+    296: 1,                # Thailand
 
-    # Americas
+    # Asia - women
+    854: 1,                # Japan Women
+    660: 1,                # South-Korea Women
+    190: 1,                # Australia Women
+
+    # Africa - men
+    200: 1,                # Morocco
+    233: 1,                # Egypt
+
+    # Americas - men
     71: 1, 72: 2,          # Brazil
-    253: 1,                # USA (2부 없음)
+    253: 1,                # USA
+    128: 1,                # Argentina
+    265: 1,                # Chile
+
+    # Americas - women
+    254: 1,                # USA Women
 }
 
 
@@ -148,6 +307,8 @@ def _continent_for_league(league_id: int) -> str:
         return "Europe"
     if country in ASIA_COUNTRIES:
         return "Asia"
+    if country in AFRICA_COUNTRIES:
+        return "Africa"
     if country in AMERICAS_COUNTRIES:
         return "Americas"
 
@@ -156,8 +317,12 @@ def _continent_for_league(league_id: int) -> str:
 
 
 def _is_cup(league_id: int) -> bool:
-    return league_id in (set(EUROPE_CONTINENTAL_CUPS) | set(ASIA_CONTINENTAL_CUPS) | set(AMERICAS_CONTINENTAL_CUPS))
-
+    return league_id in (
+        set(EUROPE_CONTINENTAL_CUPS)
+        | set(ASIA_CONTINENTAL_CUPS)
+        | set(AMERICAS_CONTINENTAL_CUPS)
+        | set(EUROPE_DOMESTIC_CUPS)
+    )
 
 def _tier_for_league(league_id: int) -> Optional[int]:
     if _is_cup(league_id):
@@ -291,6 +456,7 @@ def build_home_master_config() -> Dict[str, Any]:
             "europe_cups": EUROPE_CONTINENTAL_CUPS,
             "asia_cups": ASIA_CONTINENTAL_CUPS,
             "americas_cups": AMERICAS_CONTINENTAL_CUPS,
+            "europe_domestic_cups": EUROPE_DOMESTIC_CUPS,
         },
     }
 

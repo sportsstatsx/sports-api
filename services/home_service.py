@@ -527,6 +527,52 @@ def get_home_league_directory(
         timezone_str=timezone_str,
     )
 
+    # ✅ countries(name->flag) 맵을 만들어서, config item에 country_flag를 주입
+    try:
+        crow = fetch_all("SELECT name, flag FROM countries", tuple())
+
+        name_to_flag: Dict[str, str] = {}
+        for r in (crow or []):
+            n = ""
+            f = ""
+
+            # ✅ fetch_all 구현에 따라 dict 또는 tuple/list로 올 수 있어서 둘 다 처리
+            if isinstance(r, dict):
+                n = (r.get("name") or "").strip()
+                f = (r.get("flag") or "").strip()
+            elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                n = (str(r[0]) if r[0] is not None else "").strip()
+                f = (str(r[1]) if r[1] is not None else "").strip()
+            else:
+                continue
+
+            if n and f:
+                name_to_flag[n.lower()] = f
+
+        # ✅ full_sections에 주입
+        for sec in (full_sections or []):
+            if not isinstance(sec, dict):
+                continue
+            items = sec.get("items") or []
+            if not isinstance(items, list):
+                continue
+
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                cname = (it.get("country") or "").strip().lower()
+                flag = name_to_flag.get(cname)
+                if flag:
+                    it["country_flag"] = flag
+
+    except Exception as e:
+        # ✅ 조용히 삼키지 말고 서버 로그에 남겨서 다음에 바로 잡히게
+        try:
+            import logging
+            logging.getLogger("home_service").exception("country_flag inject failed: %s", e)
+        except Exception:
+            pass
+
     # 2) 오늘(로컬 date) 기준 UTC 범위
     utc_start, utc_end = _get_utc_range_for_local_date(date_str, timezone_str)
 
@@ -576,17 +622,30 @@ def get_home_league_directory(
         today_items: List[Dict[str, Any]] = []
         nog_items: List[Dict[str, Any]] = []
 
+        # ✅ 최종 응답에 확실히 country_flag가 남도록 "복사본"으로 넣는다.
         for it in items:
+            if not isinstance(it, dict):
+                continue
+
             lid = it.get("league_id")
             try:
                 lid_int = int(lid)
             except Exception:
                 continue
 
+            # ✅ 원본이 어떤 경로에서 재생성/딥카피돼도 상관없이
+            #    여기서 최종 응답 item을 확정한다.
+            out_it = dict(it)
+
+            cname = (out_it.get("country") or "").strip().lower()
+            flag = name_to_flag.get(cname)
+            if flag:
+                out_it["country_flag"] = flag
+
             if lid_int in today_ids:
-                today_items.append(it)
+                today_items.append(out_it)
             else:
-                nog_items.append(it)
+                nog_items.append(out_it)
 
         if today_items:
             today_out.append({"continent": continent, "count": len(today_items), "items": today_items})

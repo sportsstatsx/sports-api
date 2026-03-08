@@ -32,7 +32,10 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     }
 
     # ② 플레이오프 우승 = 챔피언
-    PLAYOFFS_CHAMPION = {188, 253}
+    PLAYOFFS_CHAMPION = {
+        188, 253,
+        190, 254,  # A-League Women, NWSL Women
+    }
 
     # ③ 정규시즌 챔프 + 플레이오프 챔프 (2개 존재)
     REGULAR_AND_PLAYOFFS = {218, 144, 345, 119, 292}
@@ -42,7 +45,14 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     PLAYOFFS_BUT_REGULAR_IS_CHAMPION = {179}
 
     # ⑤ 토너먼트 (정규시즌 개념 없음) = 최종 우승
-    KNOCKOUT_TOURNAMENT = {17, 16, 2, 848, 3}
+    KNOCKOUT_TOURNAMENT = {
+        17, 16, 2, 848, 3,
+        45,   # FA Cup
+        143,  # Copa del Rey
+        81,   # DFB Pokal
+        137,  # Coppa Italia
+        66,   # Coupe de France
+    }
 
     def _champion_mode(lid: int) -> str:
         if lid in KNOCKOUT_TOURNAMENT:

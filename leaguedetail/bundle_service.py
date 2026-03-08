@@ -129,12 +129,20 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
             m.fixture_id,
             m.date_utc,
             m.league_round,
+            m.status_group,
+            m.status,
+            m.status_short,
             CASE
               WHEN lower(coalesce(m.status_group,'')) = 'finished'
                 OR coalesce(m.status,'') IN ('FT','AET','PEN')
                 OR coalesce(m.status_short,'') IN ('FT','AET','PEN')
               THEN 1 ELSE 0
-            END AS is_finished
+            END AS is_finished,
+            CASE
+              WHEN coalesce(m.status,'') IN ('CANC','PST','ABD','AWD','WO')
+                OR coalesce(m.status_short,'') IN ('CANC','PST','ABD','AWD','WO')
+              THEN 1 ELSE 0
+            END AS is_invalid_rep
           FROM matches m
           WHERE m.league_id = %s
             AND m.season = %s
@@ -142,11 +150,13 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
         )
         SELECT fixture_id, date_utc, league_round
         FROM cand
+        WHERE is_invalid_rep = 0
         ORDER BY
-          -- ✅ 1순위: 아직 안 끝난 경기 중 "가장 가까운 예정 경기"
+          -- ✅ 0순위: 취소/연기/중단/몰수 경기는 대표 fixture 후보에서 제외
+          -- ✅ 1순위: 아직 안 끝난 "정상 경기" 중 가장 가까운 경기
           (CASE WHEN is_finished = 0 THEN 0 ELSE 1 END) ASC,
           (CASE WHEN is_finished = 0 THEN date_utc END) ASC NULLS LAST,
-          -- ✅ 2순위: 전부 끝났으면 "가장 최근 완료 경기"
+          -- ✅ 2순위: 전부 끝났으면 가장 최근 완료 경기
           (CASE WHEN is_finished = 1 THEN date_utc END) DESC NULLS LAST
         LIMIT 1
         """,

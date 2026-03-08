@@ -112,6 +112,7 @@ def hockey_subscribe_game():
     notify_score = bool(body.get("notify_score", True))
     notify_game_start = bool(body.get("notify_game_start", True))
     notify_game_end = bool(body.get("notify_game_end", True))
+    notify_periods = bool(body.get("notify_periods", True))
 
     # device 존재 확인
     dev = hockey_fetch_one("SELECT device_id FROM hockey_user_devices WHERE device_id=%s", (device_id,))
@@ -127,17 +128,18 @@ def hockey_subscribe_game():
     up = hockey_fetch_one(
         """
         INSERT INTO hockey_game_notification_subscriptions
-          (device_id, game_id, notify_score, notify_game_start, notify_game_end)
-        VALUES (%s, %s, %s, %s, %s)
+          (device_id, game_id, notify_score, notify_game_start, notify_game_end, notify_periods)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (device_id, game_id)
         DO UPDATE SET
           notify_score = EXCLUDED.notify_score,
           notify_game_start = EXCLUDED.notify_game_start,
           notify_game_end = EXCLUDED.notify_game_end,
+          notify_periods = EXCLUDED.notify_periods,
           updated_at = now()
         RETURNING (xmax = 0) AS inserted
         """,
-        (device_id, game_id_int, notify_score, notify_game_start, notify_game_end),
+        (device_id, game_id_int, notify_score, notify_game_start, notify_game_end, notify_periods),
     )
     
     inserted = bool((up or {}).get("inserted"))
@@ -277,6 +279,7 @@ def hockey_get_subscriptions():
                s.notify_score,
                s.notify_game_start,
                s.notify_game_end,
+               s.notify_periods,
                g.league_id,
                g.season,
                g.game_date,
