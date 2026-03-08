@@ -63,6 +63,11 @@ WATCHDOG_INTERVAL_SEC = int(os.environ.get("LIVE_WATCHDOG_INTERVAL_SEC", "60"))
 WATCHDOG_STALE_HOURS = float(os.environ.get("LIVE_WATCHDOG_STALE_HOURS", "2"))
 WATCHDOG_LIMIT = int(os.environ.get("LIVE_WATCHDOG_LIMIT", "50"))
 
+# ✅ 예정 경기 재검증: DB에 저장된 NS/TBD/PST/UPCOMING 경기를 순환 조회
+# - backfill 루프에서만 사용
+# - 전체를 한 번에 치지 않고, LIMIT 개수씩 커서 순환
+SCHEDULE_RECHECK_LIMIT = int(os.environ.get("SCHEDULE_RECHECK_LIMIT", "50"))
+
 
 # ✅ (C) “핵심 리그는 5초” 같은 오버라이드 목록
 # 예) "39,140,135"  (여기에 포함된 리그만 5초)
@@ -98,6 +103,9 @@ LAST_WATCHDOG_TS: float = 0.0
 
 # ✅ backfill B안: (date,lid) 조합을 run_once마다 분할 처리하기 위한 커서
 BACKFILL_CURSOR: int = 0
+
+# ✅ 예정 경기 전체 순환 재검증용 커서
+SCHEDULE_RECHECK_CURSOR: int = 0
 
 
 
@@ -389,6 +397,110 @@ def fetch_fixture_by_id(session: requests.Session, fixture_id: int) -> Optional[
     if resp and isinstance(resp, list) and isinstance(resp[0], dict):
         return resp[0]
     return None
+
+
+def recheck_scheduled_fixtures(
+    session: requests.Session,
+    fetched_at: dt.datetime,
+    limit: int = 50,
+) -> int:
+    """
+    ✅ 예정 경기 전체 순환 재검증
+    목적:
+    - 기존 date 기반 backfill만으로는 "미래로 멀리 밀린 경기"를 다시 못 잡는 문제 보완
+    - DB에 이미 저장된 예정 경기(NS/TBD/PST/UPCOMING)를 fixture_id 단건조회로 재확인
+    - 전체를 한 번에 치지 않고, LIMIT씩 커서 순환
+
+    주의:
+    - 기존 기능 변경 없음
+    - 라이브/이벤트/라인업 로직 건드리지 않음
+    - date/status/raw 정합성만 다시 맞춤
+    """
+    global SCHEDULE_RECHECK_CURSOR
+
+    page_size = max(1, int(limit or 50))
+    offset = max(0, int(SCHEDULE_RECHECK_CURSOR or 0))
+
+    def _select_page(off: int) -> List[Dict[str, Any]]:
+        return fetch_all(
+            """
+            SELECT fixture_id, league_id, season
+            FROM matches
+            WHERE
+                status_group = 'UPCOMING'
+                OR status IN ('NS', 'TBD', 'PST')
+            ORDER BY NULLIF(date_utc,'')::timestamptz ASC NULLS LAST, fixture_id ASC
+            LIMIT %s OFFSET %s
+            """,
+            (page_size, off),
+        ) or []
+
+    rows = _select_page(offset)
+
+    # 커서가 끝에 도달했으면 처음부터 다시 순환
+    if not rows and offset > 0:
+        offset = 0
+        rows = _select_page(offset)
+
+    if not rows:
+        SCHEDULE_RECHECK_CURSOR = 0
+        print("      [schedule_recheck] candidates=0")
+        return 0
+
+    processed = 0
+
+    for r in rows:
+        fid = safe_int(r.get("fixture_id"))
+        lid = safe_int(r.get("league_id"))
+        season = safe_int(r.get("season"))
+
+        if fid is None or lid is None or season is None:
+            continue
+
+        try:
+            fx_obj = fetch_fixture_by_id(session, fid)
+            if not fx_obj:
+                continue
+
+            lg = fx_obj.get("league") or {}
+            fx = fx_obj.get("fixture") or {}
+            st = fx.get("status") or {}
+
+            real_lid = safe_int(lg.get("id")) or lid
+            real_season = safe_int(lg.get("season")) or season
+            status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
+            status_group = map_status_group(status_short)
+
+            upsert_fixture_row(
+                fixture_id=fid,
+                league_id=real_lid,
+                season=real_season,
+                date_utc=safe_text(fx.get("date")),
+                status_short=status_short,
+                status_group=status_group,
+            )
+
+            upsert_match_row_from_fixture(
+                fx_obj,
+                league_id=real_lid,
+                season=real_season,
+            )
+
+            try:
+                upsert_match_fixtures_raw(fid, fx_obj, fetched_at)
+            except Exception:
+                pass
+
+            processed += 1
+
+        except Exception as e:
+            print(f"      [schedule_recheck] fixture_id={fid} err: {e}", file=sys.stderr)
+
+    next_offset = offset + len(rows)
+    SCHEDULE_RECHECK_CURSOR = next_offset
+
+    print(f"      [schedule_recheck] scanned={len(rows)} processed={processed} next_offset={SCHEDULE_RECHECK_CURSOR}")
+    return processed
 
 
 def watchdog_fix_stale_inplay(session: requests.Session, now: dt.datetime) -> int:
@@ -2967,7 +3079,20 @@ def run_once_backfill() -> int:
             except Exception as e:
                 print(f"  ! backfill fixture 처리 중 에러: {e}", file=sys.stderr)
 
-    print(f"[backfill_worker] done. total_fixtures={total_fixtures}")
+    # ✅ 추가: DB에 저장된 예정 경기 전체를 순환 재검증
+    # - date 기반 스캔으로는 "멀리 미래로 밀린 경기"를 다시 못 잡을 수 있으므로
+    # - fixture_id 단건조회로 NS/TBD/PST/UPCOMING 경기의 최신 일정/상태를 반영
+    try:
+        rechecked = recheck_scheduled_fixtures(
+            s,
+            fetched_at,
+            limit=SCHEDULE_RECHECK_LIMIT,
+        )
+    except Exception as e:
+        rechecked = 0
+        print(f"[backfill_worker] schedule_recheck err: {e}", file=sys.stderr)
+
+    print(f"[backfill_worker] done. total_fixtures={total_fixtures}, rechecked={rechecked}")
     return total_fixtures
 
 
