@@ -632,17 +632,21 @@ def upsert_game(api_item: Dict[str, Any], *, conn: psycopg.Connection) -> Option
 
 def _ingest_game_stats_live(game_id: int, *, conn: psycopg.Connection) -> None:
     """
-    bootstrap_nba.ingest_game_stats() 로직을 워커에 이식.
-    - /games/statistics?id=GAME  -> nba_game_team_stats upsert
-    - /players/statistics?game= -> nba_game_player_stats upsert
+    bootstrap_nba.ingest_game_stats() 로직 중 팀 스탯만 라이브워커에서 수집.
+    - /games/statistics?id=GAME -> nba_game_team_stats upsert
+
+    주의:
+    - 선수 스탯(/players/statistics)은 이 워커에서 수집하지 않음.
+    - nba_players / nba_game_player_stats 쓰기도 완전히 비활성화.
     """
     now_iso = _utc_now().isoformat()
 
-    # (1) 팀 스탯
+    # (1) 팀 스탯만 수집
     d = _get("/games/statistics", {"id": int(game_id)})
     for trow in (d.get("response") or []):
         if not isinstance(trow, dict):
             continue
+
         team = trow.get("team") if isinstance(trow.get("team"), dict) else {}
         tid = _safe_int(team.get("id"))
         if tid is None:
@@ -664,101 +668,6 @@ def _ingest_game_stats_live(game_id: int, *, conn: psycopg.Connection) -> None:
             )
         except Exception as e:
             log.warning("team stats row skipped: game=%s team=%s err=%s", game_id, tid, e)
-
-    # (2) 선수 스탯
-    p = _get("/players/statistics", {"game": int(game_id)})
-    for prow in (p.get("response") or []):
-        if not isinstance(prow, dict):
-            continue
-
-        player = prow.get("player") if isinstance(prow.get("player"), dict) else {}
-        pid = _safe_int(player.get("id"))
-        if pid is None:
-            continue
-
-        team = prow.get("team") if isinstance(prow.get("team"), dict) else {}
-        tid_i = _safe_int(team.get("id"))
-
-        sp_player_stub = _savepoint_name("sp_player_stub", game_id, pid)
-        try:
-            _db_execute_in_savepoint(
-                """
-                INSERT INTO nba_players (
-                  id,
-                  firstname, lastname,
-                  birth, country,
-                  height, weight,
-                  nba_start, affiliation,
-                  raw_json,
-                  updated_utc
-                )
-                VALUES (
-                  %s,
-                  %s,%s,
-                  %s,%s,
-                  %s,%s,
-                  %s,%s,
-                  %s::jsonb,
-                  %s
-                )
-                ON CONFLICT (id) DO UPDATE SET
-                  firstname = COALESCE(EXCLUDED.firstname, nba_players.firstname),
-                  lastname = COALESCE(EXCLUDED.lastname, nba_players.lastname),
-                  birth = COALESCE(EXCLUDED.birth, nba_players.birth),
-                  country = COALESCE(EXCLUDED.country, nba_players.country),
-                  height = COALESCE(EXCLUDED.height, nba_players.height),
-                  weight = COALESCE(EXCLUDED.weight, nba_players.weight),
-                  nba_start = COALESCE(EXCLUDED.nba_start, nba_players.nba_start),
-                  affiliation = COALESCE(EXCLUDED.affiliation, nba_players.affiliation),
-                  raw_json = CASE
-                    WHEN EXCLUDED.raw_json IS NOT NULL THEN EXCLUDED.raw_json
-                    ELSE nba_players.raw_json
-                  END,
-                  updated_utc = EXCLUDED.updated_utc
-                """,
-                (
-                    int(pid),
-                    _safe_text(player.get("firstname")),
-                    _safe_text(player.get("lastname")),
-                    _safe_text(player.get("birth")),
-                    _safe_text(player.get("country")),
-                    _safe_text(player.get("height")),
-                    _safe_text(player.get("weight")),
-                    _safe_int(player.get("nba")),
-                    _safe_text(player.get("affiliation")),
-                    _jdump(player),
-                    _utc_now().isoformat(),
-                ),
-                conn=conn,
-                sp_name=sp_player_stub,
-            )
-        except Exception as e:
-            log.warning("player stub row skipped: game=%s player=%s err=%s", game_id, pid, e)
-            continue
-
-        sp_name = _savepoint_name("sp_player_stats", game_id, pid)
-        try:
-            _db_execute_in_savepoint(
-                """
-                INSERT INTO nba_game_player_stats (game_id, player_id, team_id, raw_json, updated_utc)
-                VALUES (%s,%s,%s,%s::jsonb,%s)
-                ON CONFLICT (game_id, player_id) DO UPDATE SET
-                  team_id=EXCLUDED.team_id,
-                  raw_json=EXCLUDED.raw_json,
-                  updated_utc=EXCLUDED.updated_utc
-                """,
-                (
-                    int(game_id),
-                    int(pid),
-                    int(tid_i) if tid_i is not None else None,
-                    _jdump(prow),
-                    now_iso,
-                ),
-                conn=conn,
-                sp_name=sp_name,
-            )
-        except Exception as e:
-            log.warning("player stats row skipped: game=%s player=%s err=%s", game_id, pid, e)
 
 
 def _try_ingest_game_stats(game_id: int, *, conn: psycopg.Connection) -> None:
