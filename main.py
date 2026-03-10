@@ -547,12 +547,17 @@ def fixtures_by_ids():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
+            (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
+            (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
+            (rf.data_json::jsonb->'score'->'penalty'->>'away') AS away_pen,
             {home_red_sql},
             {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
@@ -583,6 +588,8 @@ def fixtures_by_ids():
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
                 "ht": r["home_ht"],
+                "et": int(r["home_et"]) if r.get("home_et") not in (None, "") else None,
+                "pen": int(r["home_pen"]) if r.get("home_pen") not in (None, "") else None,
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -591,6 +598,8 @@ def fixtures_by_ids():
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
                 "ht": r["away_ht"],
+                "et": int(r["away_et"]) if r.get("away_et") not in (None, "") else None,
+                "pen": int(r["away_pen"]) if r.get("away_pen") not in (None, "") else None,
                 "red_cards": r["away_red_cards"],
             },
         }
@@ -1878,12 +1887,17 @@ def list_fixtures():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
+            (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
+            (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
+            (rf.data_json::jsonb->'score'->'penalty'->>'away') AS away_pen,
             {home_red_sql},
             {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
@@ -1913,6 +1927,8 @@ def list_fixtures():
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
                 "ht": r["home_ht"],
+                "et": int(r["home_et"]) if r.get("home_et") not in (None, "") else None,
+                "pen": int(r["home_pen"]) if r.get("home_pen") not in (None, "") else None,
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -1921,6 +1937,8 @@ def list_fixtures():
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
                 "ht": r["away_ht"],
+                "et": int(r["away_et"]) if r.get("away_et") not in (None, "") else None,
+                "pen": int(r["away_pen"]) if r.get("away_pen") not in (None, "") else None,
                 "red_cards": r["away_red_cards"],
             },
         })
@@ -2801,21 +2819,4 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
