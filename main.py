@@ -477,28 +477,28 @@ def fixtures_by_ids():
 
     if use_mls:
         home_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
-                ELSE (
+            COALESCE(
+                mls.home_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.home_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS home_red_cards
+            ) AS home_red_cards
         """
         away_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
-                ELSE (
+            COALESCE(
+                mls.away_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.away_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS away_red_cards
+            ) AS away_red_cards
         """
         mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
     else:
@@ -547,6 +547,7 @@ def fixtures_by_ids():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            l.country_flag AS league_country_flag,
             (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
             (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
             (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
@@ -580,6 +581,7 @@ def fixtures_by_ids():
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
+            "league_country_flag": r["league_country_flag"],
             "league_round": r["league_round"],
             "venue_name": r["venue_name"],
             "home": {
@@ -1794,13 +1796,13 @@ def list_fixtures():
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_next_day_start = local_start + timedelta(days=1)
 
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end = local_end.astimezone(timezone.utc)
+    utc_end = local_next_day_start.astimezone(timezone.utc)
 
     params: List[Any] = [utc_start, utc_end]
-    where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
+    where_clauses = ["m.date_utc >= %s AND m.date_utc < %s"]
 
     if league_ids:
         placeholders = ", ".join(["%s"] * len(league_ids))
@@ -1817,28 +1819,28 @@ def list_fixtures():
 
     if use_mls:
         home_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
-                ELSE (
+            COALESCE(
+                mls.home_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.home_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS home_red_cards
+            ) AS home_red_cards
         """
         away_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
-                ELSE (
+            COALESCE(
+                mls.away_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.away_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS away_red_cards
+            ) AS away_red_cards
         """
         mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
     else:
@@ -1887,6 +1889,7 @@ def list_fixtures():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            l.country_flag AS league_country_flag,
             (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
             (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
             (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
@@ -1919,6 +1922,7 @@ def list_fixtures():
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
+            "league_country_flag": r["league_country_flag"],
             "league_round": r["league_round"],
             "venue_name": r["venue_name"],
             "home": {
@@ -2819,4 +2823,5 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
