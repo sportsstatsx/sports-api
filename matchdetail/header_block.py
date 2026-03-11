@@ -187,13 +187,10 @@ def build_header_block(
             "name": row["home_name"],
             "short_name": row["home_name"],
             "logo": row["home_logo"],
-
             "ft": home_ft,
             "ht": home_ht,
             "et": home_et,
             "pen": home_pen,
-
-            # 기존 앱 호환
             "score": home_ft,
             "red_cards": row["home_red_cards"],
         },
@@ -203,13 +200,10 @@ def build_header_block(
             "name": row["away_name"],
             "short_name": row["away_name"],
             "logo": row["away_logo"],
-
             "ft": away_ft,
             "ht": away_ht,
             "et": away_et,
             "pen": away_pen,
-
-            # 기존 앱 호환
             "score": away_ft,
             "red_cards": row["away_red_cards"],
         },
@@ -217,7 +211,5 @@ def build_header_block(
         "filters": {
             "last_n": "Last 10",
             "comp": "All",
-        },
-    }
         },
     }
