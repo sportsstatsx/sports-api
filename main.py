@@ -1804,7 +1804,7 @@ def list_fixtures():
     utc_end = local_next_day_start.astimezone(timezone.utc)
 
     params: List[Any] = [utc_start, utc_end]
-    where_clauses = ["m.date_utc >= %s AND m.date_utc < %s"]
+    where_clauses = ["m.date_utc::timestamptz >= %s AND m.date_utc::timestamptz < %s"]
 
     if league_ids:
         placeholders = ", ".join(["%s"] * len(league_ids))
@@ -1907,7 +1907,7 @@ def list_fixtures():
         LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
-        ORDER BY m.date_utc ASC
+        ORDER BY m.date_utc::timestamptz ASC
     """
 
     rows = fetch_all(sql, tuple(params))
@@ -2827,6 +2827,7 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
