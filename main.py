@@ -547,7 +547,7 @@ def fixtures_by_ids():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
-            l.country_flag AS league_country_flag,
+            c.flag AS league_country_flag,
             (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
             (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
             (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
@@ -558,6 +558,8 @@ def fixtures_by_ids():
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN countries c
+          ON LOWER(TRIM(c.name)) = LOWER(TRIM(l.country))
         LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
@@ -1889,7 +1891,7 @@ def list_fixtures():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
-            l.country_flag AS league_country_flag,
+            c.flag AS league_country_flag,
             (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
             (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
             (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
@@ -1900,6 +1902,8 @@ def list_fixtures():
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN countries c
+          ON LOWER(TRIM(c.name)) = LOWER(TRIM(l.country))
         LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
@@ -2823,5 +2827,6 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
