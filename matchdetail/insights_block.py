@@ -3971,6 +3971,25 @@ def build_insights_overall_block(
         },
     }
 
+    sections_meta = _build_insights_overall_sections_meta()
+
+    # ✅ meta_only 초기 진입:
+    #    - Competition / LastN / Game Sample / sections UI 메타만 내려준다.
+    #    - AI Predictions 전용 리그 평균 / 리그 시간대 골분포는 제외
+    if meta_only:
+        return {
+            "league_id": league_id,
+            "season": season_for_calc,
+            "last_n": last_n_for_calc,
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
+            "filters": filters_for_client,
+            "default_filters": default_filters,
+            "sections": sections_meta,
+            "home": home_ins,
+            "away": away_ins,
+        }
+
     league_avgs = _compute_league_mu_home_away(
         league_id=league_id,
         season_int=season_for_calc,
@@ -3991,11 +4010,9 @@ def build_insights_overall_block(
         "away_team_id": away_team_id,
         "filters": filters_for_client,
         "default_filters": default_filters,
-
         "league_avgs": league_avgs,
         "league_goals_by_time10_total": league_goals_by_time10_total,
-        "sections": _build_insights_overall_sections_meta(),
-
+        "sections": sections_meta,
         "home": home_ins,
         "away": away_ins,
     }
