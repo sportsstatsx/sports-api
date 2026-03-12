@@ -3193,6 +3193,131 @@ def _merge_options(*lists: List[str]) -> List[str]:
             merged.append(v)
     return merged
 
+
+def _load_league_name(league_id: int) -> Optional[str]:
+    try:
+        lid = int(league_id)
+    except Exception:
+        return None
+
+    rows = fetch_all(
+        """
+        SELECT name
+        FROM leagues
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (lid,),
+    ) or []
+
+    if not rows:
+        return None
+
+    name = (rows[0] or {}).get("name")
+    if name is None:
+        return None
+
+    s = str(name).strip()
+    return s if s else None
+
+
+def _pick_default_comp_label(
+    *,
+    league_id: int,
+    options: List[str],
+    fallback_label: Optional[str] = None,
+) -> str:
+    """
+    초기 기본 Competition 선택값.
+    우선순위:
+      1) 현재 경기 league_id 의 실제 league name 과 정확히 매칭되는 옵션
+      2) fallback_label 과 매칭되는 옵션
+      3) 첫 non-All 옵션
+      4) 첫 옵션
+      5) "All"
+    """
+    clean_options = [str(v).strip() for v in (options or []) if str(v).strip()]
+
+    if not clean_options:
+        return "All"
+
+    current_league_name = _load_league_name(league_id)
+
+    def _find_match(target: Optional[str]) -> Optional[str]:
+        if not target:
+            return None
+        t = str(target).strip()
+        if not t:
+            return None
+
+        # exact match
+        for opt in clean_options:
+            if opt.lower() == t.lower():
+                return opt
+
+        # contains match
+        tl = t.lower()
+        for opt in clean_options:
+            ol = opt.lower()
+            if tl in ol or ol in tl:
+                return opt
+
+        return None
+
+    hit = _find_match(current_league_name)
+    if hit:
+        return hit
+
+    hit = _find_match(fallback_label)
+    if hit:
+        return hit
+
+    for opt in clean_options:
+        if opt.lower() != "all":
+            return opt
+
+    return clean_options[0] if clean_options else "All"
+
+
+def _pick_default_last_n_label(
+    *,
+    season_int: int,
+    options: List[str],
+    fallback_label: Optional[str] = None,
+) -> str:
+    """
+    초기 기본 Last N 선택값.
+    우선순위:
+      1) Season {season_int}
+      2) fallback_label
+      3) 첫 번째 Season 계열 옵션
+      4) 첫 옵션
+      5) "Last 10"
+    """
+    clean_options = [str(v).strip() for v in (options or []) if str(v).strip()]
+    if not clean_options:
+        return "Last 10"
+
+    preferred = f"Season {season_int}"
+
+    for opt in clean_options:
+        if opt.lower() == preferred.lower():
+            return opt
+
+    if fallback_label:
+        fb = str(fallback_label).strip()
+        for opt in clean_options:
+            if opt.lower() == fb.lower():
+                return opt
+
+    for opt in clean_options:
+        low = opt.lower()
+        if low.startswith("season"):
+            return opt
+
+    return clean_options[0] if clean_options else "Last 10"
+
+
 def _infer_insight_desc(*, label: str, key: str, suffix: str) -> str:
     """
     Build an English, meaning-only help sentence for an Insights metric.
@@ -3599,59 +3724,33 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     # ✅ NEW: 현재 보고 있는 매치 kickoff(UTC) = 컷오프 기준
     ref_date_utc = _get_ref_date_utc_for_this_match(header)
 
-
     if None in (league_id, season_int, home_team_id, away_team_id):
         return None
 
-    # 1) 선택된 last_n (라벨 → 숫자) 파싱
-    last_n = _get_last_n_from_header(header)
-
-    # 2) 헤더의 필터 블록 (라벨 그대로, comp / last_n 문자열 등)
+    # 1) 헤더의 필터 블록(원본 라벨)
     filters_block = _get_filters_from_header(header)
-    comp_raw = filters_block.get("comp")
 
-    # 3) Season YYYY 라벨이면 시즌을 바꾸고 last_n 은 0(전체 시즌)으로 사용
-    season_for_calc = season_int
-    last_n_for_calc = last_n
-
+    # 2) 기본 Last N 라벨 결정
     raw_last_n_label = filters_block.get("last_n") or header.get("last_n")
-    if isinstance(raw_last_n_label, str):
-        s = raw_last_n_label.strip()
+    requested_last_n_label = None
+    if raw_last_n_label is not None:
+        requested_last_n_label = str(raw_last_n_label).strip() or None
+
+    # 시즌 계산은 "선택된 last_n 라벨"에 따라 달라질 수 있다.
+    season_for_calc = season_int
+
+    if requested_last_n_label:
+        s = requested_last_n_label.strip()
         lower = s.lower()
         if lower.startswith("season"):
-            # 예: "Season 2024" → 2024
             digits = "".join(ch for ch in s if ch.isdigit())
             if digits:
                 try:
-                    season_override = int(digits)
-                    season_for_calc = season_override
-                    last_n_for_calc = 0  # 전체 시즌 모드
+                    season_for_calc = int(digits)
                 except ValueError:
                     pass
 
-    # ───────── 홈 / 어웨이 인사이트 계산 ─────────
-    home_ins = _build_side_insights(
-        league_id=league_id,
-        season_int=season_for_calc,
-        team_id=home_team_id,
-        last_n=last_n_for_calc,
-        comp_raw=comp_raw,
-        header_filters=filters_block,
-        ref_date_utc=ref_date_utc,   # ✅ NEW
-    )
-    away_ins = _build_side_insights(
-        league_id=league_id,
-        season_int=season_for_calc,
-        team_id=away_team_id,
-        last_n=last_n_for_calc,
-        comp_raw=comp_raw,
-        header_filters=filters_block,
-        ref_date_utc=ref_date_utc,   # ✅ NEW
-    )
-
-
-    # ───────── UI에서 쓸 필터 옵션 리스트 구성 (동적 생성) ─────────
-    # 1) 팀별 comp 옵션  → 시즌 기준은 season_for_calc 사용
+    # 3) 필터 옵션 먼저 구성
     comp_opts_home = _build_comp_options_for_team(
         league_id=league_id,
         season_int=season_for_calc,
@@ -3663,74 +3762,122 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         team_id=away_team_id,
     )
 
-    # 두 팀 합친(옛날과 동일한) 전체 리스트
     comp_options_union = _merge_options(comp_opts_home, comp_opts_away)
     if not comp_options_union:
         comp_options_union = ["All", "League"]
 
-    # 팀별 리스트가 비어 있으면 최소 기본값은 보장
     if not comp_opts_home:
         comp_opts_home = ["All", "League"]
     if not comp_opts_away:
         comp_opts_away = ["All", "League"]
 
-    # 현재 선택된 comp 라벨
-    comp_label_raw = filters_block.get("comp") or "All"
-    comp_label = str(comp_label_raw).strip() or "All"
-
-    def _pick_selected(options: List[str]) -> str:
-        if comp_label in options:
-            return comp_label
-        return options[0] if options else "All"
-
-    comp_label_home = _pick_selected(comp_opts_home)
-    comp_label_away = _pick_selected(comp_opts_away)
-
-    # 2) last_n 옵션 (두 팀 시즌 정보를 기반으로)
     last_n_options = _build_last_n_options_for_match(
         home_team_id=home_team_id,
         away_team_id=away_team_id,
     )
 
-    last_n_label_raw = filters_block.get("last_n") or "Last 10"
-    last_n_label = str(last_n_label_raw).strip() or "Last 10"
-    if last_n_label not in last_n_options:
-        last_n_options.insert(0, last_n_label)
+    selected_last_n_label = _pick_default_last_n_label(
+        season_int=season_for_calc,
+        options=last_n_options,
+        fallback_label=requested_last_n_label,
+    )
+
+    # 선택된 last_n 라벨 기준으로 실제 계산용 숫자 last_n 결정
+    last_n_for_calc = parse_last_n(selected_last_n_label)
+
+    # 4) 기본 Competition 선택값 결정
+    requested_comp_label_raw = filters_block.get("comp")
+    requested_comp_label = None
+    if requested_comp_label_raw is not None:
+        requested_comp_label = str(requested_comp_label_raw).strip() or None
+
+    selected_comp_common = _pick_default_comp_label(
+        league_id=league_id,
+        options=comp_options_union,
+        fallback_label=requested_comp_label,
+    )
+    selected_comp_home = _pick_default_comp_label(
+        league_id=league_id,
+        options=comp_opts_home,
+        fallback_label=selected_comp_common,
+    )
+    selected_comp_away = _pick_default_comp_label(
+        league_id=league_id,
+        options=comp_opts_away,
+        fallback_label=selected_comp_common,
+    )
+    selected_comp_ai = selected_comp_common
+
+    # 5) 서버가 최종 선택값을 확정해서 side insights 계산
+    effective_filters_block: Dict[str, Any] = dict(filters_block)
+    effective_filters_block["comp"] = selected_comp_common
+    effective_filters_block["last_n"] = selected_last_n_label
+
+    # ───────── 홈 / 어웨이 인사이트 계산 ─────────
+    home_ins = _build_side_insights(
+        league_id=league_id,
+        season_int=season_for_calc,
+        team_id=home_team_id,
+        last_n=last_n_for_calc,
+        comp_raw=selected_comp_common,
+        header_filters=effective_filters_block,
+        ref_date_utc=ref_date_utc,
+    )
+    away_ins = _build_side_insights(
+        league_id=league_id,
+        season_int=season_for_calc,
+        team_id=away_team_id,
+        last_n=last_n_for_calc,
+        comp_raw=selected_comp_common,
+        header_filters=effective_filters_block,
+        ref_date_utc=ref_date_utc,
+    )
 
     filters_for_client: Dict[str, Any] = {
-        # 예전과 동일한 전체 comp 옵션 (두 팀 합친 집합)
         "comp": {
             "options": comp_options_union,
-            "selected": comp_label,
+            "selected": selected_comp_common,
         },
-        # 팀별 comp 옵션
         "comp_home": {
             "options": comp_opts_home,
-            "selected": comp_label_home,
+            "selected": selected_comp_home,
         },
         "comp_away": {
             "options": comp_opts_away,
-            "selected": comp_label_away,
+            "selected": selected_comp_away,
         },
         "last_n": {
             "options": last_n_options,
-            "selected": last_n_label,
+            "selected": selected_last_n_label,
+        },
+    }
+
+    default_filters = {
+        "home": {
+            "comp": selected_comp_home,
+            "last_n": selected_last_n_label,
+        },
+        "away": {
+            "comp": selected_comp_away,
+            "last_n": selected_last_n_label,
+        },
+        "ai": {
+            "comp": selected_comp_ai,
+            "last_n": selected_last_n_label,
         },
     }
 
     league_avgs = _compute_league_mu_home_away(
         league_id=league_id,
         season_int=season_for_calc,
-        ref_date_utc=ref_date_utc,   # ✅ NEW: 경기 kickoff 이전까지만
+        ref_date_utc=ref_date_utc,
     )
 
-    # ✅ AI Predictions 엔진용: 리그 득점 분포(10버킷, total)
     league_goals_by_time10_total = _compute_league_goals_by_time10_total(
         league_id=league_id,
         season_int=season_for_calc,
-        ref_date_utc=ref_date_utc,   # ✅ NEW: 경기 kickoff 이전까지만
+        ref_date_utc=ref_date_utc,
     )
-
 
     return {
         "league_id": league_id,
@@ -3739,14 +3886,10 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
         "home_team_id": home_team_id,
         "away_team_id": away_team_id,
         "filters": filters_for_client,
+        "default_filters": default_filters,
 
-        # ✅ AI Predictions용 리그 평균(고정)
         "league_avgs": league_avgs,
-
-        # ✅ AI Predictions 엔진이 찾는 키 (matchdetail/ai_predictions_engine.py)
         "league_goals_by_time10_total": league_goals_by_time10_total,
-
-        # ✅ NEW: 동적 렌더링용 섹션 정의
         "sections": _build_insights_overall_sections_meta(),
 
         "home": home_ins,
