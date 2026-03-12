@@ -2881,6 +2881,86 @@ def _compute_events_sample_home_away(
     out["events_sample_away"] = est_away
     return out
 
+def _build_side_insights_meta_only(
+    *,
+    league_id: int,
+    season_int: int,
+    team_id: int,
+    last_n: int,
+    comp_raw: Any,
+    header_filters: Dict[str, Any],
+    ref_date_utc: Any = None,
+) -> Dict[str, Any]:
+    """
+    초기 매치디테일 진입용 가벼운 Insights 메타만 생성.
+    - comp / last_n 기준 필터 계산
+    - Game Sample(events_sample / home / away)만 계산
+    - 무거운 세부 metrics/raw_json 은 만들지 않음
+    """
+    stats: Dict[str, Any] = {}
+
+    side_filters = _build_insights_filters_for_team(
+        league_id=league_id,
+        season_int=season_int,
+        team_id=team_id,
+        comp_raw=comp_raw,
+        last_n=last_n,
+    )
+
+    merged_filters: Dict[str, Any] = dict(header_filters)
+    merged_filters.update(side_filters)
+    stats["insights_filters"] = merged_filters
+
+    target_league_ids = build_league_ids_for_query(stats, league_id)
+    if not target_league_ids:
+        target_league_ids = [league_id]
+
+    placeholders = ",".join(["%s"] * len(target_league_ids))
+    cutoff_sql = " AND m.date_utc < %s" if ref_date_utc is not None else ""
+
+    sql = f"""
+        SELECT
+            m.home_id,
+            m.away_id,
+            m.date_utc
+        FROM matches m
+        WHERE m.league_id IN ({placeholders})
+          AND m.season = %s
+          AND (m.home_id = %s OR m.away_id = %s)
+          AND lower(m.status_group) = 'finished'
+          AND m.home_ft IS NOT NULL
+          AND m.away_ft IS NOT NULL
+          {cutoff_sql}
+        ORDER BY m.date_utc DESC
+    """
+
+    params: List[Any] = []
+    params.extend(target_league_ids)
+    params.extend([season_int, team_id, team_id])
+    if ref_date_utc is not None:
+        params.append(ref_date_utc)
+
+    rows = fetch_all(sql, tuple(params)) or []
+
+    if last_n and last_n > 0:
+        rows = rows[:last_n]
+
+    eff_tot = len(rows)
+    eff_home = 0
+    eff_away = 0
+
+    for r in rows:
+        if r.get("home_id") == team_id:
+            eff_home += 1
+        elif r.get("away_id") == team_id:
+            eff_away += 1
+
+    return {
+        "events_sample": eff_tot,
+        "events_sample_home": eff_home,
+        "events_sample_away": eff_away,
+    }
+
 
 # ─────────────────────────────────────
 #  한 팀(홈/원정) 계산
@@ -3710,7 +3790,11 @@ def _build_insights_overall_sections_meta() -> List[Dict[str, Any]]:
 # ─────────────────────────────────────
 #  전체 insights 블록 생성
 # ─────────────────────────────────────
-def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def build_insights_overall_block(
+    header: Dict[str, Any],
+    *,
+    meta_only: bool = False,
+) -> Optional[Dict[str, Any]]:
     if not header:
         return None
 
@@ -3814,24 +3898,44 @@ def build_insights_overall_block(header: Dict[str, Any]) -> Optional[Dict[str, A
     effective_filters_block["last_n"] = selected_last_n_label
 
     # ───────── 홈 / 어웨이 인사이트 계산 ─────────
-    home_ins = _build_side_insights(
-        league_id=league_id,
-        season_int=season_for_calc,
-        team_id=home_team_id,
-        last_n=last_n_for_calc,
-        comp_raw=selected_comp_common,
-        header_filters=effective_filters_block,
-        ref_date_utc=ref_date_utc,
-    )
-    away_ins = _build_side_insights(
-        league_id=league_id,
-        season_int=season_for_calc,
-        team_id=away_team_id,
-        last_n=last_n_for_calc,
-        comp_raw=selected_comp_common,
-        header_filters=effective_filters_block,
-        ref_date_utc=ref_date_utc,
-    )
+    if meta_only:
+        home_ins = _build_side_insights_meta_only(
+            league_id=league_id,
+            season_int=season_for_calc,
+            team_id=home_team_id,
+            last_n=last_n_for_calc,
+            comp_raw=selected_comp_common,
+            header_filters=effective_filters_block,
+            ref_date_utc=ref_date_utc,
+        )
+        away_ins = _build_side_insights_meta_only(
+            league_id=league_id,
+            season_int=season_for_calc,
+            team_id=away_team_id,
+            last_n=last_n_for_calc,
+            comp_raw=selected_comp_common,
+            header_filters=effective_filters_block,
+            ref_date_utc=ref_date_utc,
+        )
+    else:
+        home_ins = _build_side_insights(
+            league_id=league_id,
+            season_int=season_for_calc,
+            team_id=home_team_id,
+            last_n=last_n_for_calc,
+            comp_raw=selected_comp_common,
+            header_filters=effective_filters_block,
+            ref_date_utc=ref_date_utc,
+        )
+        away_ins = _build_side_insights(
+            league_id=league_id,
+            season_int=season_for_calc,
+            team_id=away_team_id,
+            last_n=last_n_for_calc,
+            comp_raw=selected_comp_common,
+            header_filters=effective_filters_block,
+            ref_date_utc=ref_date_utc,
+        )
 
     filters_for_client: Dict[str, Any] = {
         "comp": {
