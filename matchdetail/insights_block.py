@@ -3308,10 +3308,10 @@ def _pick_default_comp_label(
     fallback_label: Optional[str] = None,
 ) -> str:
     """
-    초기 기본 Competition 선택값.
+    Competition 선택값 확정.
     우선순위:
-      1) 현재 경기 league_id 의 실제 league name 과 정확히 매칭되는 옵션
-      2) fallback_label 과 매칭되는 옵션
+      1) 사용자가 요청한 fallback_label
+      2) 현재 경기 league_id 의 실제 league name
       3) 첫 non-All 옵션
       4) 첫 옵션
       5) "All"
@@ -3330,12 +3330,10 @@ def _pick_default_comp_label(
         if not t:
             return None
 
-        # exact match
         for opt in clean_options:
             if opt.lower() == t.lower():
                 return opt
 
-        # contains match
         tl = t.lower()
         for opt in clean_options:
             ol = opt.lower()
@@ -3344,11 +3342,12 @@ def _pick_default_comp_label(
 
         return None
 
-    hit = _find_match(current_league_name)
+    # ✅ 사용자가 고른 comp가 최우선
+    hit = _find_match(fallback_label)
     if hit:
         return hit
 
-    hit = _find_match(fallback_label)
+    hit = _find_match(current_league_name)
     if hit:
         return hit
 
@@ -3366,10 +3365,10 @@ def _pick_default_last_n_label(
     fallback_label: Optional[str] = None,
 ) -> str:
     """
-    초기 기본 Last N 선택값.
+    Last N 선택값 확정.
     우선순위:
-      1) Season {season_int}
-      2) fallback_label
+      1) 사용자가 요청한 fallback_label
+      2) Season {season_int}
       3) 첫 번째 Season 계열 옵션
       4) 첫 옵션
       5) "Last 10"
@@ -3378,17 +3377,17 @@ def _pick_default_last_n_label(
     if not clean_options:
         return "Last 10"
 
-    preferred = f"Season {season_int}"
-
-    for opt in clean_options:
-        if opt.lower() == preferred.lower():
-            return opt
-
     if fallback_label:
         fb = str(fallback_label).strip()
         for opt in clean_options:
             if opt.lower() == fb.lower():
                 return opt
+
+    preferred = f"Season {season_int}"
+
+    for opt in clean_options:
+        if opt.lower() == preferred.lower():
+            return opt
 
     for opt in clean_options:
         low = opt.lower()
