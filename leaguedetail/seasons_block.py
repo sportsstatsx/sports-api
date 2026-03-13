@@ -11,12 +11,9 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
 
     정책:
     - 기본은 standings(rank=1) 우승팀
-    - 단, 플레이오프/브라켓 리그의 경우 tournament_ties의 "최종 라운드 winner"를 우선 우승팀으로 사용
-      (round_name 표기 변형이 많으므로, canonical 정규화로 Final을 안정적으로 인식)
-    - ✅ 최신 시즌(latest_season)은 "진행중인 경우에만" 우승팀 목록에서 제외
-      (다음 시즌이 아직 시작 전이면 latest_season=직전 종료시즌이 될 수 있으므로, 종료시즌은 제외하면 안 됨)
+    - tournament_ties / 브라켓 기반 우승팀 결정은 더 이상 사용하지 않음
+    - 컵/토너먼트 대회는 standings 우승 정보가 없을 수 있으므로 시즌 박스는 유지하되 챔피언 정보는 비워서 내려줌
     """
-    import re  # ✅ 누락 방지: 이 함수 안에서 re 사용하므로 내부 import로 안전 고정
 
     seasons: List[int] = []
     season_champions: List[Dict[str, Any]] = []
@@ -68,105 +65,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         # 안전 폴백: 기본은 정규시즌(standings) 우선
         return "regular"
 
-
-    # ─────────────────────────────────────────────
-    # local helpers
-    # ─────────────────────────────────────────────
-    def _norm_round_name(raw: Any) -> str:
-        s = (raw or "").strip()
-        if not s:
-            return ""
-        s = s.lower()
-        s = s.replace("–", "-").replace("—", "-")
-        s = re.sub(r"\s+", " ", s)
-        s = s.replace("-", " ")
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
-        s = _norm_round_name(raw_round_name)
-        if not s:
-            return None
-
-        # ✅ Qualifying/Preliminary Final 은 "진짜 우승 결승"이 아니므로 분리
-        if "qualifying" in s and "final" in s:
-            return "qualifying_final"
-        if "preliminary" in s and "final" in s:
-            return "preliminary_final"
-
-        # Final 계열 (✅ 진짜 Final만)
-        if re.fullmatch(r"finals?", s) or re.fullmatch(r"grand final(s)?", s):
-            return "final"
-
-
-        # Semi / Quarter
-        if re.fullmatch(r"semi finals?", s) or re.fullmatch(r"semifinals?", s):
-            return "semi"
-        if re.fullmatch(r"quarter finals?", s) or re.fullmatch(r"quarterfinals?", s):
-            return "quarter"
-
-        # Last N / Round of N / 1/8 Finals
-        m = re.fullmatch(r"last (\d+)", s)
-        if m:
-            return f"r{int(m.group(1))}"
-
-        m = re.fullmatch(r"round of (\d+)", s)
-        if m:
-            return f"r{int(m.group(1))}"
-
-        m = re.fullmatch(r"1\s*/\s*(\d+)\s*finals?", s)
-        if m:
-            return f"r{int(m.group(1)) * 2}"
-
-        # 1st/2nd/3rd/4th Round
-        m = re.fullmatch(r"(\d+)(st|nd|rd|th) round", s)
-        if m:
-            return f"round_{m.group(1)}"
-
-        # Play-in / Playoffs
-        if "play in" in s or "playin" in s or "wild card" in s or "wildcard" in s:
-            return "play_in"
-        if "knockout round" in s and ("playoff" in s or "play off" in s):
-            return "knockout_playoffs"
-        if "playoff" in s or "play off" in s or "playoffs" in s or "play offs" in s:
-            return "playoffs"
-
-        # elimination / preliminary / qualifying
-        if "elimination" in s:
-            if "final" in s:
-                return "elimination_final"
-            return "elimination"
-        if "preliminary" in s:
-            return "preliminary"
-        if "qualifying" in s or "qualifier" in s:
-            return "qualifying"
-
-        return None
-
-    CANON_ORDER: List[str] = [
-        "preliminary",
-        "qualifying",
-        "preliminary_final",
-        "qualifying_final",
-        "round_1",
-        "round_2",
-        "round_3",
-        "round_4",
-        "play_in",
-        "elimination",
-        "elimination_final",
-        "playoffs",
-        "knockout_playoffs",
-        "r256",
-        "r128",
-        "r64",
-        "r32",
-        "r16",
-        "quarter",
-        "semi",
-        "final",
-    ]
-    CANON_ORDER_INDEX = {k: i for i, k in enumerate(CANON_ORDER)}
 
     def _is_season_in_progress(season_value: int) -> bool:
         """
@@ -245,97 +143,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         print(f"[build_seasons_block] ERROR league_id={league_id}: {e}")
         seasons = []
 
-    # 2-A) tournament_ties 기반 우승팀 후보(있으면 우선)
     final_winner_map: Dict[int, Dict[str, Any]] = {}
-    try:
-        tie_rows = fetch_all(
-            """
-            SELECT
-                tt.season,
-                tt.round_name,
-                tt.winner_team_id AS team_id,
-                COALESCE(t.name, '') AS team_name,
-                t.logo AS team_logo,
-                COALESCE(tt.leg2_date_utc, tt.leg1_date_utc) AS tie_date_utc
-            FROM tournament_ties AS tt
-            LEFT JOIN teams AS t
-              ON t.id = tt.winner_team_id
-            WHERE tt.league_id = %s
-              AND tt.winner_team_id IS NOT NULL
-            ORDER BY
-              tt.season DESC,
-              COALESCE(tt.leg2_date_utc, tt.leg1_date_utc) DESC NULLS LAST
-            """,
-            (league_id,),
-        )
-
-        candidates_by_season: Dict[int, List[Dict[str, Any]]] = {}
-        for r in tie_rows:
-            sv = r.get("season")
-            if sv is None:
-                continue
-            s_int = int(sv)
-
-            canon = _canonical_round_key(r.get("round_name"))
-            candidates_by_season.setdefault(s_int, []).append(
-                {
-                    "season": s_int,
-                    "canon": canon,
-                    "canon_idx": CANON_ORDER_INDEX.get(canon) if canon else None,
-                    "team_id": r.get("team_id"),
-                    "team_name": r.get("team_name") or "",
-                    "team_logo": r.get("team_logo"),
-                    "tie_date_utc": r.get("tie_date_utc"),
-                }
-            )
-
-        for s_int, items in candidates_by_season.items():
-            pick: Optional[Dict[str, Any]] = None
-
-            finals = [x for x in items if x.get("canon") == "final"]
-            if finals:
-                finals.sort(
-                    key=lambda x: (
-                        x.get("tie_date_utc") is not None,
-                        x.get("tie_date_utc"),
-                    ),
-                    reverse=True,
-                )
-                pick = finals[0]
-            else:
-                # ✅ 챔스/유로파 같은 순수 토너먼트는 "Final" 없으면 우승 확정으로 보지 않는다
-                if league_id in KNOCKOUT_TOURNAMENT:
-                    pick = None
-                else:
-                    # (기타 리그는 기존 폴백 유지)
-                    known = [x for x in items if isinstance(x.get("canon_idx"), int)]
-                    if known:
-                        known.sort(
-                            key=lambda x: (
-                                x["canon_idx"],
-                                x.get("tie_date_utc") is not None,
-                                x.get("tie_date_utc"),
-                            ),
-                            reverse=True,
-                        )
-                        pick = known[0]
-                    else:
-                        pick = items[0] if items else None
-
-            if pick:
-                final_winner_map[s_int] = {
-                    "season": s_int,
-                    "team_id": pick.get("team_id"),
-                    "team_name": pick.get("team_name") or "",
-                    "team_logo": pick.get("team_logo"),
-                    "points": None,
-                    "_source": "tournament_winner",
-                }
-
-
-    except Exception as e:
-        print(f"[build_seasons_block] TOURNAMENT WINNER ERROR league_id={league_id}: {e}")
-        final_winner_map = {}
 
     # 2-B) standings(rank=1) fallback
     # ✅ split 리그(Champ Rnd / Releg Rnd 등)에서 rank=1 후보가 여러 개 생기므로
