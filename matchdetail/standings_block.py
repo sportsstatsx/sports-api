@@ -20,163 +20,7 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     rows = fetch_all(query, params)
     return rows[0] if rows else None
 
-def _safe_int_or_none(v: Any) -> Optional[int]:
-    try:
-        if v is None:
-            return None
-        return int(v)
-    except (TypeError, ValueError):
-        return None
 
-
-def _safe_text_or_none(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s else None
-
-
-def _parse_json_text(v: Any) -> Dict[str, Any]:
-    if isinstance(v, dict):
-        return v
-    if not isinstance(v, str):
-        return {}
-    try:
-        import json
-        parsed = json.loads(v)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def _read_fixture_score_from_raw(fixture_id: Optional[int]) -> Dict[str, Optional[int]]:
-    """
-    match_fixtures_raw.data_json 에서 score/fulltime/extratime/penalty를 읽는다.
-    반환:
-      {
-        "ft_home": ...,
-        "ft_away": ...,
-        "et_home": ...,
-        "et_away": ...,
-        "pen_home": ...,
-        "pen_away": ...,
-      }
-    """
-    if fixture_id is None:
-        return {
-            "ft_home": None,
-            "ft_away": None,
-            "et_home": None,
-            "et_away": None,
-            "pen_home": None,
-            "pen_away": None,
-        }
-
-    row = _fetch_one(
-        """
-        SELECT data_json
-        FROM match_fixtures_raw
-        WHERE fixture_id = %s
-        LIMIT 1
-        """,
-        (fixture_id,),
-    )
-    if not row:
-        return {
-            "ft_home": None,
-            "ft_away": None,
-            "et_home": None,
-            "et_away": None,
-            "pen_home": None,
-            "pen_away": None,
-        }
-
-    root = _parse_json_text(row.get("data_json"))
-    score = root.get("score") if isinstance(root.get("score"), dict) else {}
-
-    ft = score.get("fulltime") if isinstance(score.get("fulltime"), dict) else {}
-    et = score.get("extratime") if isinstance(score.get("extratime"), dict) else {}
-    pen = score.get("penalty") if isinstance(score.get("penalty"), dict) else {}
-
-    return {
-        "ft_home": _safe_int_or_none(ft.get("home")),
-        "ft_away": _safe_int_or_none(ft.get("away")),
-        "et_home": _safe_int_or_none(et.get("home")),
-        "et_away": _safe_int_or_none(et.get("away")),
-        "pen_home": _safe_int_or_none(pen.get("home")),
-        "pen_away": _safe_int_or_none(pen.get("away")),
-    }
-
-
-def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    """
-    브라켓 표시에 쓸 스코어를 결정한다.
-
-    우선순위:
-    - PEN  -> raw.score.penalty
-    - AET  -> raw.score.extratime
-    - 그 외 -> raw.score.fulltime
-    - raw 없으면 matches.home_ft / away_ft fallback
-    """
-    fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
-    status = str(match_row.get("status") or "").strip().upper()
-    status_group = str(match_row.get("status_group") or "").strip().upper()
-
-    raw_score = _read_fixture_score_from_raw(fixture_id)
-
-    match_home_ft = _safe_int_or_none(match_row.get("home_ft"))
-    match_away_ft = _safe_int_or_none(match_row.get("away_ft"))
-
-    disp_home: Optional[int] = None
-    disp_away: Optional[int] = None
-    score_source = "matches_ft"
-
-    if status == "PEN":
-        if raw_score["pen_home"] is not None and raw_score["pen_away"] is not None:
-            disp_home = raw_score["pen_home"]
-            disp_away = raw_score["pen_away"]
-            score_source = "raw_penalty"
-        elif raw_score["et_home"] is not None and raw_score["et_away"] is not None:
-            disp_home = raw_score["et_home"]
-            disp_away = raw_score["et_away"]
-            score_source = "raw_extratime"
-        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
-            score_source = "raw_fulltime"
-
-    elif status == "AET":
-        if raw_score["et_home"] is not None and raw_score["et_away"] is not None:
-            disp_home = raw_score["et_home"]
-            disp_away = raw_score["et_away"]
-            score_source = "raw_extratime"
-        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
-            score_source = "raw_fulltime"
-
-    elif status_group == "FINISHED" or status in {"FT", "NS", "PST", "CANC", "ABD"}:
-        if raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
-            score_source = "raw_fulltime"
-
-    if disp_home is None or disp_away is None:
-        disp_home = match_home_ft
-        disp_away = match_away_ft
-        score_source = "matches_ft"
-
-    return {
-        "home": disp_home,
-        "away": disp_away,
-        "ft_home": raw_score["ft_home"],
-        "ft_away": raw_score["ft_away"],
-        "et_home": raw_score["et_home"],
-        "et_away": raw_score["et_away"],
-        "pen_home": raw_score["pen_home"],
-        "pen_away": raw_score["pen_away"],
-        "score_source": score_source,
-    }
 
 
 def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
@@ -804,7 +648,6 @@ Match Detail용 Standings 블록 (TABLE 전용)
                     return tuple(sorted((h, a)))
 
                 def _leg_payload(m: Dict[str, Any], leg_index: Optional[int]) -> Dict[str, Any]:
-                    resolved = _resolve_bracket_display_scores(m)
                     return {
                         "fixture_id": _safe_int_or_none(m.get("fixture_id")),
                         "leg_index": leg_index,
@@ -815,36 +658,11 @@ Match Detail용 Standings 블록 (TABLE 전용)
                         "away_id": _coalesce_int(m.get("away_id"), 0),
                         "away_name": _safe_text_or_none(m.get("away_name")),
                         "away_logo": _safe_text_or_none(m.get("away_logo")),
-                        "home_ft": resolved.get("home"),
-                        "away_ft": resolved.get("away"),
+                        "home_ft": _safe_int_or_none(m.get("home_ft")),
+                        "away_ft": _safe_int_or_none(m.get("away_ft")),
                     }
 
-                def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-                    """
-                    aggregate 계산용 점수:
-                    - AET면 extratime 우선
-                    - FT면 fulltime 우선
-                    - PEN이면 연장점수 있으면 extratime, 없으면 fulltime, 그것도 없으면 display score
-                    """
-                    resolved = _resolve_bracket_display_scores(original_match)
-                    status = str(original_match.get("status") or "").strip().upper()
 
-                    if status == "AET":
-                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
-                            return resolved.get("et_home"), resolved.get("et_away")
-                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                            return resolved.get("ft_home"), resolved.get("ft_away")
-
-                    if status == "PEN":
-                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
-                            return resolved.get("et_home"), resolved.get("et_away")
-                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                            return resolved.get("ft_home"), resolved.get("ft_away")
-
-                    if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                        return resolved.get("ft_home"), resolved.get("ft_away")
-
-                    return leg.get("home_ft"), leg.get("away_ft")
 
                 def _build_round_ties(round_label: str, round_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     if not round_matches:
@@ -889,8 +707,10 @@ Match Detail용 Standings 블록 (TABLE 전용)
                             agg_away: Optional[int] = None
 
                             if _match_is_finished(m1) and _match_is_finished(m2):
-                                s1h, s1a = _agg_score_for_leg(leg1, m1)
-                                s2h, s2a = _agg_score_for_leg(leg2, m2)
+                                s1h = leg1.get("home_ft")
+                                s1a = leg1.get("away_ft")
+                                s2h = leg2.get("home_ft")
+                                s2a = leg2.get("away_ft")
 
                                 if None not in (s1h, s1a, s2h, s2a):
                                     h_sum = 0
