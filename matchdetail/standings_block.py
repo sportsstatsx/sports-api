@@ -112,10 +112,12 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
     """
     브라켓 표시에 쓸 스코어를 결정한다.
 
-    우선순위:
-    - PEN  -> raw.score.penalty
-    - AET  -> raw.score.extratime
-    - 그 외 -> raw.score.fulltime
+    규칙:
+    - 메인 스코어(home/away)는 항상 경기 스코어 기준
+      * PEN  -> ET 있으면 ET, 없으면 FT
+      * AET  -> ET 우선, 없으면 FT
+      * FT   -> FT
+    - 승부차기 점수는 pen_home / pen_away 로 별도 전달
     - raw 없으면 matches.home_ft / away_ft fallback
     """
     fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
@@ -132,11 +134,7 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
     score_source = "matches_ft"
 
     if status == "PEN":
-        if raw_score["pen_home"] is not None and raw_score["pen_away"] is not None:
-            disp_home = raw_score["pen_home"]
-            disp_away = raw_score["pen_away"]
-            score_source = "raw_penalty"
-        elif raw_score["et_home"] is not None and raw_score["et_away"] is not None:
+        if raw_score["et_home"] is not None and raw_score["et_away"] is not None:
             disp_home = raw_score["et_home"]
             disp_away = raw_score["et_away"]
             score_source = "raw_extratime"
@@ -176,6 +174,7 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
         "pen_home": raw_score["pen_home"],
         "pen_away": raw_score["pen_away"],
         "score_source": score_source,
+        "status": status,
     }
 
 
@@ -751,7 +750,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 WHERE league_id = %s
                   AND season = %s
                   AND is_knockout = 1
-                ORDER BY round_order ASC, round_name ASC
+                ORDER BY round_order DESC, round_name DESC
                 """,
                 (league_id_int, season_resolved),
             )
@@ -786,7 +785,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                       AND m.season = %s
                       AND m.league_round = ANY(%s)
                     ORDER BY
-                        m.league_round ASC,
+                        m.league_round DESC,
                         m.date_utc ASC,
                         m.fixture_id ASC
                     """,
@@ -817,6 +816,11 @@ Match Detail용 Standings 블록 (TABLE 전용)
                         "away_logo": _safe_text_or_none(m.get("away_logo")),
                         "home_ft": resolved.get("home"),
                         "away_ft": resolved.get("away"),
+                        "home_pen": resolved.get("pen_home"),
+                        "away_pen": resolved.get("pen_away"),
+                        "home_et": resolved.get("et_home"),
+                        "away_et": resolved.get("et_away"),
+                        "score_status": resolved.get("status"),
                     }
 
                 def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
