@@ -488,149 +488,6 @@ _CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
 
 
 
-    def _team_name_logo(tid: Any) -> Tuple[Optional[str], Optional[str]]:
-        try:
-            tid_i = int(tid) if tid is not None else 0
-        except (TypeError, ValueError):
-            tid_i = 0
-        if tid_i <= 0:
-            return (None, None)
-        info = team_map.get(tid_i) or {}
-        name = info.get("name")
-        logo = info.get("logo")
-        return (
-            name if isinstance(name, str) and name.strip() else None,
-            logo if isinstance(logo, str) and logo.strip() else None,
-        )
-
-    # canonical round별로 모으기
-    by_canon: Dict[str, List[Dict[str, Any]]] = {}
-    for r in ties_rows:
-        raw_rn = (r.get("round_name") or "").strip()
-
-        # 기존 정책 유지: "넉아웃으로 판단되는 라운드만 브라켓 포함"
-        if not _is_knockout_round_for_bracket(league_id, raw_rn):
-            continue
-
-        canon = _canonical_round_key(raw_rn)
-        if not canon:
-            # 기존과 동일 정책: 우리가 분류 못하는 round_name은 제외
-            continue
-
-        idx = _CANON_ORDER_INDEX.get(canon)
-        if idx is None:
-            continue
-
-        # ✅ 범위 필터: start ~ end
-        if start_idx is not None and idx < start_idx:
-            continue
-        if end_idx is not None and idx > end_idx:
-            continue
-
-        by_canon.setdefault(canon, []).append(r)
-
-    # 정렬 및 출력 변환
-    bracket: List[Dict[str, Any]] = []
-
-    for canon in _CANON_ORDER:
-        if canon not in by_canon:
-            continue
-
-        ties_sorted = sorted(by_canon[canon], key=lambda x: str(x.get("tie_key") or ""))
-
-        ties_out: List[Dict[str, Any]] = []
-        for i, tr in enumerate(ties_sorted, start=1):
-            legs: List[Dict[str, Any]] = []
-
-            # leg1
-            if tr.get("leg1_fixture_id") is not None:
-                h_id = _coalesce_int(tr.get("leg1_home_id"), 0) or None
-                a_id = _coalesce_int(tr.get("leg1_away_id"), 0) or None
-
-                h_name, h_logo = _team_name_logo(h_id)
-                a_name, a_logo = _team_name_logo(a_id)
-
-                legs.append(
-                    {
-                        "leg_index": 1,
-                        "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
-                        "date_utc": tr.get("leg1_date_utc"),
-                        "home_id": h_id,
-                        "away_id": a_id,
-                        "home_ft": tr.get("leg1_home_ft"),
-                        "away_ft": tr.get("leg1_away_ft"),
-                        "home_name": h_name,
-                        "home_logo": h_logo,
-                        "away_name": a_name,
-                        "away_logo": a_logo,
-                    }
-                )
-
-            # leg2
-            if tr.get("leg2_fixture_id") is not None:
-                h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
-                a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
-
-                h_name, h_logo = _team_name_logo(h_id)
-                a_name, a_logo = _team_name_logo(a_id)
-
-                legs.append(
-                    {
-                        "leg_index": 2,
-                        "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
-                        "date_utc": tr.get("leg2_date_utc"),
-                        "home_id": h_id,
-                        "away_id": a_id,
-                        "home_ft": tr.get("leg2_home_ft"),
-                        "away_ft": tr.get("leg2_away_ft"),
-                        "home_name": h_name,
-                        "home_logo": h_logo,
-                        "away_name": a_name,
-                        "away_logo": a_logo,
-                    }
-                )
-
-            a_id = tr.get("team_a_id")
-            b_id = tr.get("team_b_id")
-            a_name, a_logo = _team_name_logo(a_id)
-            b_name, b_logo = _team_name_logo(b_id)
-
-            ties_out.append(
-                {
-                    "tie_key": tr.get("tie_key"),
-                    "order_hint": i,
-                    "team_a_id": a_id,
-                    "team_b_id": b_id,
-                    "team_a_name": a_name,
-                    "team_a_logo": a_logo,
-                    "team_b_name": b_name,
-                    "team_b_logo": b_logo,
-                    "agg_a": tr.get("agg_a"),
-                    "agg_b": tr.get("agg_b"),
-                    "winner_team_id": tr.get("winner_team_id"),
-                    "legs": legs,
-                }
-            )
-
-        round_label = _canonical_round_label(canon)
-        round_key = round_label.upper().replace(" ", "_").replace("-", "_")
-
-        bracket.append(
-            {
-                "round_key": round_key,
-                "round_label": round_label,
-                "ties": ties_out,
-            }
-        )
-
-    return bracket
-
-
-
-
-
-
-
 def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Match Detail용 Standings 블록 (TABLE + BRACKET 하이브리드)
@@ -680,6 +537,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     season_resolved = _resolve_season(league_id_int, season if isinstance(season, int) else None)
+    fixture_id = _extract_fixture_id_from_header(header)
 
     # 시즌 자체를 못 찾으면: 빈 블록 + 안내
     if season_resolved is None:
@@ -738,11 +596,10 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
     # ─────────────────────────────────────────────────────────────
     if rows_raw:
-        fixture_id_for_guard = fixture_id if "fixture_id" in locals() else _extract_fixture_id_from_header(header)
         if _should_hide_standings_early_season(
             league_id=league_id_int,
             season=season_resolved,
-            fixture_id=fixture_id_for_guard,
+            fixture_id=fixture_id,
             rows_raw=rows_raw,
             window_days=14,
             played_threshold=15,
