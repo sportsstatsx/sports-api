@@ -63,6 +63,51 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
     return None
 
 
+def _detect_league_cup_like(league_id: int) -> bool:
+    try:
+        cols = fetch_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'leagues'
+            """
+        )
+        colset = {str(r.get("column_name") or "") for r in cols if r.get("column_name")}
+    except Exception:
+        return False
+
+    select_cols: List[str] = []
+    for c in ("type", "cup", "is_cup"):
+        if c in colset:
+            select_cols.append(c)
+
+    if not select_cols:
+        return False
+
+    row = _fetch_one(
+        f"SELECT {', '.join(select_cols)} FROM leagues WHERE id = %s",
+        (league_id,),
+    )
+    if row is None:
+        return False
+
+    v_type = row.get("type")
+    if isinstance(v_type, str) and v_type.strip().lower() == "cup":
+        return True
+
+    for key in ("cup", "is_cup"):
+        v = row.get(key)
+        if v is True:
+            return True
+        if isinstance(v, (int, float)) and int(v) == 1:
+            return True
+        if isinstance(v, str) and v.strip().lower() in ("1", "true", "t", "yes", "y"):
+            return True
+
+    return False
+
+
 def _effective_group_name(
     *,
     raw_group_name: Any,
@@ -248,6 +293,8 @@ def build_standings_block(
     except Exception as e:
         print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
 
+    is_cup_like = _detect_league_cup_like(league_id)
+
     
     def _cols_of(table_name: str) -> set[str]:
         try:
@@ -305,7 +352,21 @@ def build_standings_block(
         print(f"[build_standings_block] ERROR standings query league_id={league_id}, season={season_resolved}: {e}")
         rows_raw = []
 
-    # 2) standings가 비어 있으면 → matches에서 즉시 계산
+    # 2) standings가 비어 있고 cup 성격 리그면
+    #    computed_from_matches fallback 을 막는다.
+    if not rows_raw and is_cup_like:
+        return {
+            "league_id": league_id,
+            "season": season_resolved,
+            "league_name": league_name,
+            "rows": [],
+            "context_options": {"conferences": [], "groups": []},
+            "mode": "TABLE",
+            "bracket": None,
+            "message": "Standings are not available for this competition stage.\nPlease check back later.",
+        }
+
+    # 3) standings가 비어 있으면 → matches에서 즉시 계산
     if not rows_raw:
         # 2-1) matches 컬럼 자동 탐지(환경/스키마 흔들림 방어)
         mcols = _cols_of("matches")
