@@ -11,7 +11,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
 
     정책:
     - 기본은 standings(rank=1) 우승팀
-    - tournament_ties / 브라켓 기반 우승팀 결정은 더 이상 사용하지 않음
+    - 토너먼트 타이 / 브라켓 기반 우승팀 결정은 더 이상 사용하지 않음
     - 컵/토너먼트 대회는 standings 우승 정보가 없을 수 있으므로 시즌 박스는 유지하되 챔피언 정보는 비워서 내려줌
     """
 
@@ -90,7 +90,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                   AND NOT (
                     lower(coalesce(status_group,'')) = 'finished'
                     OR coalesce(status,'') IN ('FT','AET','PEN')
-                    OR coalesce(status_short,'') IN ('FT','AET','PEN')
                   )
                 """,
                 (league_id, season_value),
@@ -325,7 +324,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     #   (즉, 시즌 확정되면 그때부터 팀명이 표시됨)
     # ---------------------------------------------------------
 
-    # merged_rows 는 "결과 후보" (standings/tournament_ties 기반) 목록
+    # merged_rows 는 "결과 후보" (standings 기반) 목록
     # → 이를 season/champion_type 기준으로 빠르게 찾을 수 있게 맵으로 만든다.
     merged_by_key: Dict[tuple, Dict[str, Any]] = {}
     for r in merged_rows:
