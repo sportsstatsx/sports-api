@@ -424,109 +424,6 @@ def _is_knockout_round_name(round_name: Any) -> bool:
 
     return False
 
-def _round_stage_size(round_name: Any) -> Optional[int]:
-    """
-    라운드 이름을 '스테이지 크기'로 정규화.
-    값이 작을수록 더 후반(최신) 라운드.
-
-    예:
-      Final              -> 1
-      Semi-finals        -> 2
-      Quarter-finals     -> 4
-      Round of 16        -> 16
-      Round of 32        -> 32
-      Round of 64        -> 64
-      Round of 128       -> 128
-      1/128-finals       -> 256   # Round of 128 직전 단계로 강제
-    """
-    if not isinstance(round_name, str):
-        return None
-
-    rn = round_name.strip().lower()
-    if not rn:
-        return None
-
-    if rn == "final":
-        return 1
-    if "semi" in rn:
-        return 2
-    if "quarter" in rn:
-        return 4
-
-    # 1/N-finals 는 Round of N 보다 '한 단계 이전'으로 취급
-    # 예: 1/128-finals -> 256
-    m = re.search(r"1\s*/\s*(\d+)\s*-\s*finals", rn)
-    if m:
-        try:
-            return int(m.group(1)) * 2
-        except Exception:
-            return None
-
-    m = re.search(r"1/(\d+)-finals", rn)
-    if m:
-        try:
-            return int(m.group(1)) * 2
-        except Exception:
-            return None
-
-    m = re.search(r"round of\s+(\d+)", rn)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-
-    return None
-
-
-def _round_display_sort_key(col: Dict[str, Any]) -> Tuple[int, int, str]:
-    """
-    MatchDetail 브라켓 탭 표시용 정렬 키.
-    목표: 최신 -> 과거 순
-
-    1) 메인 토너먼트 라운드
-       Final -> Semi -> Quarter -> Round of 16 -> Round of 32 -> Round of 64 -> Round of 128 -> 1/128-finals
-    2) 그 다음 qualifying / preliminary
-       더 늦은 라운드가 먼저 오도록 정렬
-    """
-    label = str(col.get("round_label") or "").strip()
-    label_l = label.lower()
-
-    stage_size = _round_stage_size(label)
-    if stage_size is not None:
-        return (0, stage_size, label_l)
-
-    # qualifying / preliminary 최신 -> 과거 순
-    # 4th Q > 3rd Q > 2nd Q > 1st Q > Preliminary > Extra Preliminary
-    q_rank = 999999
-
-    if "4th round qualifying replays" in label_l:
-        q_rank = 401
-    elif "4th round qualifying" in label_l:
-        q_rank = 400
-    elif "3rd round qualifying replays" in label_l:
-        q_rank = 301
-    elif "3rd round qualifying" in label_l:
-        q_rank = 300
-    elif "2nd round qualifying replays" in label_l:
-        q_rank = 201
-    elif "2nd round qualifying" in label_l:
-        q_rank = 200
-    elif "1st round qualifying replays" in label_l:
-        q_rank = 101
-    elif "1st round qualifying" in label_l:
-        q_rank = 100
-    elif "preliminary round replays" in label_l:
-        q_rank = 21
-    elif label_l == "preliminary round":
-        q_rank = 20
-    elif "extra preliminary round replays" in label_l:
-        q_rank = 11
-    elif label_l == "extra preliminary round":
-        q_rank = 10
-
-    # 최신 -> 과거 로 가려면 큰 rank가 먼저 와야 하므로 음수화
-    return (1, -q_rank, label_l)
 
 
 def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
@@ -1105,7 +1002,29 @@ Match Detail용 Standings 블록 (TABLE 전용)
                         }
                     )
                 if bracket_columns:
-                    bracket_columns.sort(key=_round_display_sort_key)
+                    # ✅ FA Cup 2025 한정 예외 보정:
+                    # 1/128-finals 가 Round of 128 바로 이전 단계로 오도록만 위치 조정
+                    if league_id_int == 45 and season_resolved == 2025:
+                        idx_1128 = next(
+                            (i for i, c in enumerate(bracket_columns)
+                             if str(c.get("round_label") or "").strip() == "1/128-finals"),
+                            None,
+                        )
+                        idx_r128 = next(
+                            (i for i, c in enumerate(bracket_columns)
+                             if str(c.get("round_label") or "").strip() == "Round of 128"),
+                            None,
+                        )
+
+                        if idx_1128 is not None and idx_r128 is not None and idx_1128 > idx_r128:
+                            col_1128 = bracket_columns.pop(idx_1128)
+                            idx_r128 = next(
+                                (i for i, c in enumerate(bracket_columns)
+                                 if str(c.get("round_label") or "").strip() == "Round of 128"),
+                                None,
+                            )
+                            if idx_r128 is not None:
+                                bracket_columns.insert(idx_r128 + 1, col_1128)
 
                     for col in bracket_columns:
                         col.pop("_round_order", None)
