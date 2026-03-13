@@ -146,6 +146,92 @@ def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _is_knockout_round_name(round_name: Any) -> bool:
+    if not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    lo = rn.lower()
+
+    if (
+        "league stage" in lo
+        or "regular season" in lo
+        or lo.startswith("group ")
+        or "group stage" in lo
+        or lo.startswith("stage ")
+        or re.match(r"^(apertura|clausura)\s*-\s*\d+$", lo)
+    ):
+        return False
+
+    include_tokens = (
+        "final",
+        "semi",
+        "quarter",
+        "round of",
+        "knockout",
+        "playoff",
+        "play-off",
+        "play in",
+        "play-in",
+        "elimination",
+        "preliminary",
+        "qualifying",
+        "qualifier",
+        "reclasificacion",
+        "reclasificación",
+    )
+    if any(t in lo for t in include_tokens):
+        return True
+
+    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
+        return True
+    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+        return True
+
+    return False
+
+
+def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
+    league = header.get("league") or {}
+    fixture = header.get("fixture") or {}
+    match = header.get("match") or {}
+
+    if isinstance(league, dict):
+        league_type = league.get("type")
+        if isinstance(league_type, str) and league_type.strip().lower() == "cup":
+            return True
+
+        league_cup = league.get("cup")
+        if league_cup is True:
+            return True
+        if isinstance(league_cup, (int, float)) and int(league_cup) == 1:
+            return True
+        if isinstance(league_cup, str) and league_cup.strip().lower() in ("1", "true", "t", "yes", "y"):
+            return True
+
+    round_candidates: List[Any] = [
+        header.get("league_round"),
+    ]
+
+    if isinstance(league, dict):
+        round_candidates.append(league.get("round"))
+    if isinstance(fixture, dict):
+        round_candidates.append(fixture.get("league_round"))
+        round_candidates.append(fixture.get("round"))
+    if isinstance(match, dict):
+        round_candidates.append(match.get("league_round"))
+        round_candidates.append(match.get("round"))
+
+    for rn in round_candidates:
+        if _is_knockout_round_name(rn):
+            return True
+
+    return False
+
+
 def _should_hide_standings_early_season(
     *,
     league_id: int,
@@ -256,6 +342,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
     season_resolved = _resolve_season(league_id_int, season if isinstance(season, int) else None)
     fixture_id = _extract_fixture_id_from_header(header)
+    is_knockout_context = _is_header_knockout_context(header)
 
     # 시즌 자체를 못 찾으면: 빈 블록 + 안내
     if season_resolved is None:
@@ -338,7 +425,26 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
 
     # ─────────────────────────────────────────────────────────────
-    # 2) standings 비어 있으면 → matches에서 계산 (기존 로직 유지)
+    # 2) standings 비어 있고 현재 컨텍스트가 컵/넉아웃이면
+    #    computed_from_matches fallback 을 막는다.
+    # ─────────────────────────────────────────────────────────────
+    if not rows_raw and is_knockout_context:
+        return {
+            "league": {
+                "league_id": league_id_int,
+                "season": season_resolved,
+                "name": league_name,
+            },
+            "mode": "TABLE",
+            "rows": [],
+            "bracket": None,
+            "context_options": {"conferences": [], "groups": []},
+            "message": "Standings are not available for this knockout round.\nPlease check back later.",
+            "source": "knockout_no_standings",
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # 3) standings 비어 있으면 → matches에서 계산 (리그/조별/리그페이즈만)
     # ─────────────────────────────────────────────────────────────
     if not rows_raw:
         mcols = _cols_of("matches")
