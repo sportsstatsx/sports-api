@@ -382,7 +382,7 @@ def build_standings_block(
         rows_raw = []
 
     # 2) standings가 비어 있고 cup 성격 리그면
-    #    computed_from_matches fallback 을 막는다.
+    #    matches 기반 standings fallback 을 막는다.
     if not rows_raw and is_cup_like:
         return {
             "league_id": league_id,
