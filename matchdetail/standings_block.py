@@ -6,7 +6,7 @@ import re
 import datetime as dt
 
 
-from db import fetch_all
+from db import fetch_all, fetch_one
 
 
 def _coalesce_int(v: Any, default: int = 0) -> int:
@@ -19,6 +19,164 @@ def _coalesce_int(v: Any, default: int = 0) -> int:
 def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     rows = fetch_all(query, params)
     return rows[0] if rows else None
+
+def _safe_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_text_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _parse_json_text(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return v
+    if not isinstance(v, str):
+        return {}
+    try:
+        import json
+        parsed = json.loads(v)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_fixture_score_from_raw(fixture_id: Optional[int]) -> Dict[str, Optional[int]]:
+    """
+    match_fixtures_raw.data_json 에서 score/fulltime/extratime/penalty를 읽는다.
+    반환:
+      {
+        "ft_home": ...,
+        "ft_away": ...,
+        "et_home": ...,
+        "et_away": ...,
+        "pen_home": ...,
+        "pen_away": ...,
+      }
+    """
+    if fixture_id is None:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    row = fetch_one(
+        """
+        SELECT data_json
+        FROM match_fixtures_raw
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if not row:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    root = _parse_json_text(row.get("data_json"))
+    score = root.get("score") if isinstance(root.get("score"), dict) else {}
+
+    ft = score.get("fulltime") if isinstance(score.get("fulltime"), dict) else {}
+    et = score.get("extratime") if isinstance(score.get("extratime"), dict) else {}
+    pen = score.get("penalty") if isinstance(score.get("penalty"), dict) else {}
+
+    return {
+        "ft_home": _safe_int_or_none(ft.get("home")),
+        "ft_away": _safe_int_or_none(ft.get("away")),
+        "et_home": _safe_int_or_none(et.get("home")),
+        "et_away": _safe_int_or_none(et.get("away")),
+        "pen_home": _safe_int_or_none(pen.get("home")),
+        "pen_away": _safe_int_or_none(pen.get("away")),
+    }
+
+
+def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """
+    브라켓 표시에 쓸 스코어를 결정한다.
+
+    우선순위:
+    - PEN  -> raw.score.penalty
+    - AET  -> raw.score.extratime
+    - 그 외 -> raw.score.fulltime
+    - raw 없으면 matches.home_ft / away_ft fallback
+    """
+    fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
+    status = str(match_row.get("status") or "").strip().upper()
+    status_group = str(match_row.get("status_group") or "").strip().upper()
+
+    raw_score = _read_fixture_score_from_raw(fixture_id)
+
+    match_home_ft = _safe_int_or_none(match_row.get("home_ft"))
+    match_away_ft = _safe_int_or_none(match_row.get("away_ft"))
+
+    disp_home: Optional[int] = None
+    disp_away: Optional[int] = None
+    score_source = "matches_ft"
+
+    if status == "PEN":
+        if raw_score["pen_home"] is not None and raw_score["pen_away"] is not None:
+            disp_home = raw_score["pen_home"]
+            disp_away = raw_score["pen_away"]
+            score_source = "raw_penalty"
+        elif raw_score["et_home"] is not None and raw_score["et_away"] is not None:
+            disp_home = raw_score["et_home"]
+            disp_away = raw_score["et_away"]
+            score_source = "raw_extratime"
+        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
+            disp_home = raw_score["ft_home"]
+            disp_away = raw_score["ft_away"]
+            score_source = "raw_fulltime"
+
+    elif status == "AET":
+        if raw_score["et_home"] is not None and raw_score["et_away"] is not None:
+            disp_home = raw_score["et_home"]
+            disp_away = raw_score["et_away"]
+            score_source = "raw_extratime"
+        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
+            disp_home = raw_score["ft_home"]
+            disp_away = raw_score["ft_away"]
+            score_source = "raw_fulltime"
+
+    elif status_group == "FINISHED" or status in {"FT", "NS", "PST", "CANC", "ABD"}:
+        if raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
+            disp_home = raw_score["ft_home"]
+            disp_away = raw_score["ft_away"]
+            score_source = "raw_fulltime"
+
+    if disp_home is None or disp_away is None:
+        disp_home = match_home_ft
+        disp_away = match_away_ft
+        score_source = "matches_ft"
+
+    return {
+        "home": disp_home,
+        "away": disp_away,
+        "ft_home": raw_score["ft_home"],
+        "ft_away": raw_score["ft_away"],
+        "et_home": raw_score["et_home"],
+        "et_away": raw_score["et_away"],
+        "pen_home": raw_score["pen_home"],
+        "pen_away": raw_score["pen_away"],
+        "score_source": score_source,
+    }
 
 
 def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
@@ -558,6 +716,302 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
     comp_meta = _get_competition_meta(league_id_int, season_resolved)
     source = "standings_table" if rows_raw else "computed_from_matches"
+
+    # ─────────────────────────────────────────────────────────────
+    # BRACKET 우선 시도 (컵 / 플레이오프 / 넉아웃 대회)
+    # - 앱 MatchDetailJsonParser.parseBracketColumns() 구조와 100% 호환
+    # - penalty / extra time 점수 반영
+    # - single-leg / two-leg tie 모두 처리
+    # ─────────────────────────────────────────────────────────────
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    is_bracket_candidate = False
+
+    if format_hint == "knockout_only":
+        is_bracket_candidate = True
+
+    elif format_hint in {
+        "single_table_league_plus_playoff",
+        "league_phase_plus_knockout",
+        "multi_group_league_plus_playoff",
+    }:
+        if _is_header_knockout_context(header):
+            is_bracket_candidate = True
+
+    if is_bracket_candidate:
+        try:
+            knockout_rounds = fetch_all(
+                """
+                SELECT
+                    round_name,
+                    round_order,
+                    round_kind,
+                    is_knockout
+                FROM competition_rounds_meta
+                WHERE league_id = %s
+                  AND season = %s
+                  AND is_knockout = 1
+                ORDER BY round_order ASC, round_name ASC
+                """,
+                (league_id_int, season_resolved),
+            )
+
+            if knockout_rounds:
+                round_names = [
+                    str(r.get("round_name")).strip()
+                    for r in knockout_rounds
+                    if r.get("round_name")
+                ]
+
+                matches = fetch_all(
+                    """
+                    SELECT
+                        m.fixture_id,
+                        m.league_round,
+                        m.date_utc,
+                        m.home_id,
+                        m.away_id,
+                        m.home_ft,
+                        m.away_ft,
+                        m.status,
+                        m.status_group,
+                        th.name AS home_name,
+                        ta.name AS away_name,
+                        th.logo AS home_logo,
+                        ta.logo AS away_logo
+                    FROM matches m
+                    LEFT JOIN teams th ON th.id = m.home_id
+                    LEFT JOIN teams ta ON ta.id = m.away_id
+                    WHERE m.league_id = %s
+                      AND m.season = %s
+                      AND m.league_round = ANY(%s)
+                    ORDER BY
+                        m.league_round ASC,
+                        m.date_utc ASC,
+                        m.fixture_id ASC
+                    """,
+                    (league_id_int, season_resolved, round_names),
+                )
+
+                def _match_is_finished(m: Dict[str, Any]) -> bool:
+                    sg = str(m.get("status_group") or "").strip().upper()
+                    st = str(m.get("status") or "").strip().upper()
+                    return sg == "FINISHED" or st in {"FT", "AET", "PEN"}
+
+                def _unordered_pair_key(m: Dict[str, Any]) -> Tuple[int, int]:
+                    h = _coalesce_int(m.get("home_id"), 0)
+                    a = _coalesce_int(m.get("away_id"), 0)
+                    return tuple(sorted((h, a)))
+
+                def _leg_payload(m: Dict[str, Any], leg_index: Optional[int]) -> Dict[str, Any]:
+                    resolved = _resolve_bracket_display_scores(m)
+                    return {
+                        "fixture_id": _safe_int_or_none(m.get("fixture_id")),
+                        "leg_index": leg_index,
+                        "date_utc": _safe_text_or_none(m.get("date_utc")),
+                        "home_id": _coalesce_int(m.get("home_id"), 0),
+                        "home_name": _safe_text_or_none(m.get("home_name")),
+                        "home_logo": _safe_text_or_none(m.get("home_logo")),
+                        "away_id": _coalesce_int(m.get("away_id"), 0),
+                        "away_name": _safe_text_or_none(m.get("away_name")),
+                        "away_logo": _safe_text_or_none(m.get("away_logo")),
+                        "home_ft": resolved.get("home"),
+                        "away_ft": resolved.get("away"),
+                    }
+
+                def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+                    """
+                    aggregate 계산용 점수:
+                    - AET면 extratime 우선
+                    - FT면 fulltime 우선
+                    - PEN이면 연장점수 있으면 extratime, 없으면 fulltime, 그것도 없으면 display score
+                    """
+                    resolved = _resolve_bracket_display_scores(original_match)
+                    status = str(original_match.get("status") or "").strip().upper()
+
+                    if status == "AET":
+                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
+                            return resolved.get("et_home"), resolved.get("et_away")
+                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
+                            return resolved.get("ft_home"), resolved.get("ft_away")
+
+                    if status == "PEN":
+                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
+                            return resolved.get("et_home"), resolved.get("et_away")
+                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
+                            return resolved.get("ft_home"), resolved.get("ft_away")
+
+                    if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
+                        return resolved.get("ft_home"), resolved.get("ft_away")
+
+                    return leg.get("home_ft"), leg.get("away_ft")
+
+                def _build_round_ties(round_label: str, round_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                    if not round_matches:
+                        return []
+
+                    grouped: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+
+                    for m in round_matches:
+                        h = _coalesce_int(m.get("home_id"), 0)
+                        a = _coalesce_int(m.get("away_id"), 0)
+                        if h > 0 and a > 0:
+                            grouped.setdefault(_unordered_pair_key(m), []).append(m)
+
+                    ties: List[Dict[str, Any]] = []
+                    used_fixture_ids: set[int] = set()
+                    order_hint = 1
+
+                    for _, pair_matches in grouped.items():
+                        pair_matches = sorted(
+                            pair_matches,
+                            key=lambda x: (
+                                str(x.get("date_utc") or ""),
+                                _coalesce_int(x.get("fixture_id"), 0),
+                            ),
+                        )
+
+                        # 왕복전 묶음: 동일 두 팀이 정확히 2경기일 때 우선 2leg tie 처리
+                        if len(pair_matches) == 2:
+                            m1 = pair_matches[0]
+                            m2 = pair_matches[1]
+
+                            used_fixture_ids.add(_coalesce_int(m1.get("fixture_id"), 0))
+                            used_fixture_ids.add(_coalesce_int(m2.get("fixture_id"), 0))
+
+                            leg1 = _leg_payload(m1, 1)
+                            leg2 = _leg_payload(m2, 2)
+
+                            home_anchor_id = leg1["home_id"]
+                            away_anchor_id = leg1["away_id"]
+
+                            agg_home: Optional[int] = None
+                            agg_away: Optional[int] = None
+
+                            if _match_is_finished(m1) and _match_is_finished(m2):
+                                s1h, s1a = _agg_score_for_leg(leg1, m1)
+                                s2h, s2a = _agg_score_for_leg(leg2, m2)
+
+                                if None not in (s1h, s1a, s2h, s2a):
+                                    h_sum = 0
+                                    a_sum = 0
+
+                                    # leg1
+                                    if leg1["home_id"] == home_anchor_id:
+                                        h_sum += int(s1h)
+                                    elif leg1["home_id"] == away_anchor_id:
+                                        a_sum += int(s1h)
+
+                                    if leg1["away_id"] == home_anchor_id:
+                                        h_sum += int(s1a)
+                                    elif leg1["away_id"] == away_anchor_id:
+                                        a_sum += int(s1a)
+
+                                    # leg2
+                                    if leg2["home_id"] == home_anchor_id:
+                                        h_sum += int(s2h)
+                                    elif leg2["home_id"] == away_anchor_id:
+                                        a_sum += int(s2h)
+
+                                    if leg2["away_id"] == home_anchor_id:
+                                        h_sum += int(s2a)
+                                    elif leg2["away_id"] == away_anchor_id:
+                                        a_sum += int(s2a)
+
+                                    agg_home = h_sum
+                                    agg_away = a_sum
+
+                            ties.append(
+                                {
+                                    "round_label": round_label,
+                                    "order_hint": order_hint,
+                                    "agg_home": agg_home,
+                                    "agg_away": agg_away,
+                                    "legs": [leg1, leg2],
+                                }
+                            )
+                            order_hint += 1
+
+                    # 나머지 단판 경기
+                    remaining_matches = [
+                        m for m in round_matches
+                        if _coalesce_int(m.get("fixture_id"), 0) not in used_fixture_ids
+                    ]
+
+                    remaining_matches = sorted(
+                        remaining_matches,
+                        key=lambda x: (
+                            str(x.get("date_utc") or ""),
+                            _coalesce_int(x.get("fixture_id"), 0),
+                        ),
+                    )
+
+                    for m in remaining_matches:
+                        used_fixture_ids.add(_coalesce_int(m.get("fixture_id"), 0))
+                        ties.append(
+                            {
+                                "round_label": round_label,
+                                "order_hint": order_hint,
+                                "agg_home": None,
+                                "agg_away": None,
+                                "legs": [_leg_payload(m, None)],
+                            }
+                        )
+                        order_hint += 1
+
+                    ties.sort(
+                        key=lambda t: (
+                            _coalesce_int(t.get("order_hint"), 999999),
+                            str(
+                                (
+                                    (t.get("legs") or [{}])[0].get("date_utc")
+                                    if (t.get("legs") or [])
+                                    else ""
+                                ) or ""
+                            ),
+                        )
+                    )
+                    return ties
+
+                bracket_columns: List[Dict[str, Any]] = []
+
+                for rnd in knockout_rounds:
+                    round_label = _safe_text_or_none(rnd.get("round_name"))
+                    if not round_label:
+                        continue
+
+                    round_matches = [
+                        m for m in matches
+                        if _safe_text_or_none(m.get("league_round")) == round_label
+                    ]
+
+                    ties = _build_round_ties(round_label, round_matches)
+                    if not ties:
+                        continue
+
+                    bracket_columns.append(
+                        {
+                            "round_label": round_label,
+                            "ties": ties,
+                        }
+                    )
+
+                if bracket_columns:
+                    return {
+                        "league": {
+                            "league_id": league_id_int,
+                            "season": season_resolved,
+                            "name": league_name,
+                        },
+                        "mode": "BRACKET",
+                        "rows": [],
+                        "bracket": bracket_columns,
+                        "context_options": {"conferences": [], "groups": []},
+                        "source": "computed_bracket",
+                    }
+
+        except Exception:
+            pass
 
     # ✅ competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
     if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
