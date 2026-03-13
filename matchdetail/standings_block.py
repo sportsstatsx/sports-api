@@ -216,22 +216,14 @@ def _should_hide_standings_early_season(
 
 def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Match Detail용 Standings 블록 (TABLE + BRACKET 하이브리드)
+Match Detail용 Standings 블록 (TABLE 전용)
 
-    ✅ 규칙:
-    - 넉아웃(브라켓) 대상 fixture면: mode="BRACKET" + bracket 채워서 반환 (rows는 [])
-    - 그 외 TABLE:
-      1) standings 테이블 우선
-      2) 비어있으면 matches로 계산
-      3) finished=0이면 rows=[] + message
-
-    ✅ A 방식(서버가 필터용 context_options 제공) 강화:
-    - MLS(East/West)는 기존처럼 "전체 rows 유지 + 필터" (컷팅 없음)
-    - Split Round(Championship/Relegation)도 "전체 rows 유지 + 필터"
-    - Group A/B(예: Argentina)도 "전체 rows 유지 + 필터"
-    - 따라서 "홈/원정 팀이 속한 group만 남기는 컷팅"은 제거
-    - 중복 제거는 team_id 단독이 아니라 (team_id + group_name) 기준으로만 안전하게 수행
-    """
+✅ 규칙:
+1) standings 테이블 우선
+2) 비어있으면 matches로 계산
+3) finished=0이면 rows=[] + message
+4) 현재는 브라켓 비활성화 상태이므로 mode="TABLE", bracket=None 고정
+"""
 
     league_id = header.get("league_id")
     season = header.get("season")
