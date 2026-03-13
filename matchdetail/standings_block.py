@@ -488,105 +488,6 @@ _CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
 
 
 
-def _build_bracket_from_tournament_ties(
-    league_id: int,
-    season: int,
-    *,
-    start_round_name: Optional[str] = None,
-    end_round_name: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    tournament_ties 기반 bracket 생성.
-
-    - start_round_name: 이 라운드부터(포함) 보여줌
-    - end_round_name: 이 라운드까지(포함) 보여줌
-
-    ✅ 변경 포인트(원샷 안정화):
-    - DB round_name 표기가 제각각이어도 canonical key로 정규화해서 정렬/표시
-    - 매번 order 리스트에 문자열을 계속 추가하는 패치 반복을 제거
-    - 기존 legs/팀매핑/knockout 필터 정책은 그대로 유지
-    """
-
-    # start/end도 canonical로 변환해서 범위 필터를 안정화
-    start_canon = _canonical_round_key(start_round_name) if start_round_name else None
-    end_canon = _canonical_round_key(end_round_name) if end_round_name else None
-
-    start_idx = _CANON_ORDER_INDEX.get(start_canon) if start_canon else None
-    end_idx = _CANON_ORDER_INDEX.get(end_canon) if end_canon else None
-
-    # 해당 리그/시즌 ties 전부 가져오기(필터는 파이썬에서)
-    ties_rows: List[Dict[str, Any]] = fetch_all(
-        """
-        SELECT
-            round_name,
-            tie_key,
-            team_a_id,
-            team_b_id,
-            leg1_fixture_id,
-            leg2_fixture_id,
-            leg1_home_id,
-            leg1_away_id,
-            leg1_home_ft,
-            leg1_away_ft,
-            leg1_date_utc,
-            leg2_home_id,
-            leg2_away_id,
-            leg2_home_ft,
-            leg2_away_ft,
-            leg2_date_utc,
-            agg_a,
-            agg_b,
-            winner_team_id
-        FROM tournament_ties
-        WHERE league_id = %s
-          AND season = %s
-        """,
-        (league_id, season),
-    )
-
-    # 브라켓에 등장하는 모든 팀 id를 한 번에 모아서 teams에서 이름/로고 매핑
-    team_ids: set[int] = set()
-    for tr in ties_rows:
-        for k in (
-            "team_a_id",
-            "team_b_id",
-            "leg1_home_id",
-            "leg1_away_id",
-            "leg2_home_id",
-            "leg2_away_id",
-            "winner_team_id",
-        ):
-            v = tr.get(k)
-            try:
-                if v is None:
-                    continue
-                iv = int(v)
-                if iv > 0:
-                    team_ids.add(iv)
-            except (TypeError, ValueError):
-                continue
-
-    team_map: Dict[int, Dict[str, Any]] = {}
-    if team_ids:
-        team_rows = fetch_all(
-            """
-            SELECT id, name, logo
-            FROM teams
-            WHERE id = ANY(%s)
-            """,
-            (list(team_ids),),
-        )
-        for r in team_rows:
-            try:
-                tid = int(r.get("id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if tid > 0:
-                team_map[tid] = {
-                    "name": r.get("name"),
-                    "logo": r.get("logo"),
-                }
-
     def _team_name_logo(tid: Any) -> Tuple[Optional[str], Optional[str]]:
         try:
             tid_i = int(tid) if tid is not None else 0
@@ -796,69 +697,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "source": "standings_table",
         }
 
-    # ─────────────────────────────────────────────────────────────
-    # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
-    # ─────────────────────────────────────────────────────────────
-    fixture_id = _extract_fixture_id_from_header(header)
-
-    # ✅ league_round 추출 보강: header 구조가 달라도 안정적으로 라운드 문자열 확보
-    league_round = None
-    if isinstance(header.get("league_round"), str):
-        league_round = header.get("league_round")
-
-    if league_round is None and isinstance(header.get("round"), str):
-        league_round = header.get("round")
-
-    league_info2 = header.get("league")
-    if league_round is None and isinstance(league_info2, dict):
-        if isinstance(league_info2.get("round"), str):
-            league_round = league_info2.get("round")
-        elif isinstance(league_info2.get("league_round"), str):
-            league_round = league_info2.get("league_round")
-
-    league_round_str = league_round.strip() if isinstance(league_round, str) else None
-
-
-    if fixture_id is not None and _is_knockout_round_for_bracket(league_id_int, league_round_str):
-        tie_row = _fetch_one(
-            """
-            SELECT round_name
-            FROM tournament_ties
-            WHERE league_id = %s
-              AND season = %s
-              AND (%s = leg1_fixture_id OR %s = leg2_fixture_id)
-            LIMIT 1
-            """,
-            (league_id_int, season_resolved, fixture_id, fixture_id),
-        )
-
-        tie_round_name = (tie_row or {}).get("round_name")
-        tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
-
-        current_round = (
-            tie_round_name
-            if _is_knockout_round_for_bracket(league_id_int, tie_round_name)
-            else league_round_str
-        )
-
-        bracket = _build_bracket_from_tournament_ties(
-            league_id_int,
-            season_resolved,
-            start_round_name=None,
-            end_round_name=current_round,
-        )
-
-        if bracket:
-            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
-            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
-            bracket_mode = "BRACKET"
-            bracket_data = bracket
-            bracket_source = "tournament_ties"
-        else:
-            bracket_mode = None
-            bracket_data = None
-            bracket_source = None
-        # bracket이 비면 기존 TABLE로 fallback (기존 로직 그대로)
 
 
     # ─────────────────────────────────────────────────────────────
@@ -1228,24 +1066,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "context_options": context_options,
         "source": source,
     }
-
-    # ✅ BRACKET이 있었으면: bracket을 추가로 포함 + chips에 Play-offs 추가
-    if "bracket_data" in locals() and bracket_data:
-        out["mode"] = "BRACKET"
-        out["bracket"] = bracket_data
-        out["source"] = bracket_source or out.get("source")
-
-        # UX-2: 기존 그룹칩 + Play-offs 혼합
-        try:
-            co = out.get("context_options") or {}
-            groups = list(co.get("groups") or [])
-            # case-insensitive 중복 방지
-            if not any((g or "").strip().lower() == "play-offs" for g in groups):
-                groups.append("Play-offs")
-            co["groups"] = groups
-            out["context_options"] = co
-        except Exception:
-            pass
 
 
     if not table:
