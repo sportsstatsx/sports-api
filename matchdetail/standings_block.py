@@ -6,7 +6,7 @@ import re
 import datetime as dt
 
 
-from db import fetch_all, fetch_one
+from db import fetch_all
 
 
 def _coalesce_int(v: Any, default: int = 0) -> int:
@@ -72,7 +72,7 @@ def _read_fixture_score_from_raw(fixture_id: Optional[int]) -> Dict[str, Optiona
             "pen_away": None,
         }
 
-    row = fetch_one(
+    row = _fetch_one(
         """
         SELECT data_json
         FROM match_fixtures_raw
