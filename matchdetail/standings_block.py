@@ -21,21 +21,6 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def _safe_int_or_none(v: Any) -> Optional[int]:
-    try:
-        return int(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_text_or_none(v: Any) -> Optional[str]:
-    if v is None:
-        return None
-    s = str(v).strip()
-    return s if s else None
-
-
-
 def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
     if fixture_id is None:
         return None
@@ -573,14 +558,6 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
     comp_meta = _get_competition_meta(league_id_int, season_resolved)
     source = "standings_table" if rows_raw else "computed_from_matches"
-
-    # ─────────────────────────────────────────────────────────────
-    # BRACKET 우선 시도 (임시 비활성화)
-    # - 이번 재배포 무한 로딩 원인 분리용
-    # - 기존 TABLE 흐름만 유지
-    # ─────────────────────────────────────────────────────────────
-    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
-    is_bracket_candidate = False
 
     # ✅ competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
     if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
