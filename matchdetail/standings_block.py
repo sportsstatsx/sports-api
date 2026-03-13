@@ -424,6 +424,79 @@ def _is_knockout_round_name(round_name: Any) -> bool:
 
     return False
 
+def _round_stage_size(round_name: Any) -> Optional[int]:
+    """
+    라운드 이름을 '스테이지 크기'로 정규화.
+    값이 작을수록 더 후반 라운드.
+    예:
+      Final            -> 1
+      Semi-finals      -> 2
+      Quarter-finals   -> 4
+      Round of 16      -> 16
+      Round of 32      -> 32
+      1/128-finals     -> 128
+    """
+    if not isinstance(round_name, str):
+        return None
+
+    rn = round_name.strip().lower()
+    if not rn:
+        return None
+
+    if rn == "final":
+        return 1
+    if "semi" in rn:
+        return 2
+    if "quarter" in rn:
+        return 4
+
+    m = re.search(r"round of\s+(\d+)", rn)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    m = re.search(r"1\s*/\s*(\d+)\s*-\s*finals", rn)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    m = re.search(r"1/(\d+)-finals", rn)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    return None
+
+
+def _round_display_sort_key(col: Dict[str, Any]) -> Tuple[int, int, str]:
+    """
+    MatchDetail 브라켓 탭 표시용 정렬 키.
+    우선순위:
+    1) 메인 토너먼트 라운드(Final / Semi / Quarter / Round of N / 1/N-finals)
+       -> stage_size 오름차순 (작을수록 후반 라운드)
+    2) 그 외(qualifying / preliminary 등)는 뒤로 보냄
+    3) tie-breaker로 기존 round_order 사용
+    """
+    label = str(col.get("round_label") or "").strip()
+    stage_size = _round_stage_size(label)
+
+    order_hint = col.get("_round_order")
+    try:
+        order_hint_int = int(order_hint) if order_hint is not None else 999999
+    except Exception:
+        order_hint_int = 999999
+
+    if stage_size is not None:
+        return (0, stage_size, label.lower())
+
+    return (1, order_hint_int, label.lower())
+
 
 def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
     league = header.get("league") or {}
@@ -750,7 +823,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 WHERE league_id = %s
                   AND season = %s
                   AND is_knockout = 1
-                ORDER BY round_order DESC, round_name DESC
+                ORDER BY round_order ASC, round_name ASC
                 """,
                 (league_id_int, season_resolved),
             )
@@ -785,7 +858,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                       AND m.season = %s
                       AND m.league_round = ANY(%s)
                     ORDER BY
-                        m.league_round DESC,
+                        m.league_round ASC,
                         m.date_utc ASC,
                         m.fixture_id ASC
                     """,
@@ -997,10 +1070,15 @@ Match Detail용 Standings 블록 (TABLE 전용)
                         {
                             "round_label": round_label,
                             "ties": ties,
+                            "_round_order": rnd.get("round_order"),
                         }
                     )
-
                 if bracket_columns:
+                    bracket_columns.sort(key=_round_display_sort_key)
+
+                    for col in bracket_columns:
+                        col.pop("_round_order", None)
+
                     return {
                         "league": {
                             "league_id": league_id_int,
