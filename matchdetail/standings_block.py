@@ -816,29 +816,114 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
                     """
                     aggregate 계산용 점수:
-                    - AET면 extratime 우선
-                    - FT면 fulltime 우선
-                    - PEN이면 연장점수 있으면 extratime, 없으면 fulltime, 그것도 없으면 display score
+                    - FT  종료: FT
+                    - AET 종료: FT + ET
+                    - PEN 종료: FT + ET
                     """
                     resolved = _resolve_bracket_display_scores(original_match)
+
+                    ft_home = resolved.get("ft_home")
+                    ft_away = resolved.get("ft_away")
+                    et_home = resolved.get("et_home")
+                    et_away = resolved.get("et_away")
                     status = str(original_match.get("status") or "").strip().upper()
 
-                    if status == "AET":
-                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
-                            return resolved.get("et_home"), resolved.get("et_away")
-                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                            return resolved.get("ft_home"), resolved.get("ft_away")
+                    if status in {"AET", "PEN"}:
+                        if ft_home is not None and ft_away is not None:
+                            return ft_home + (et_home or 0), ft_away + (et_away or 0)
 
-                    if status == "PEN":
-                        if resolved.get("et_home") is not None and resolved.get("et_away") is not None:
-                            return resolved.get("et_home"), resolved.get("et_away")
-                        if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                            return resolved.get("ft_home"), resolved.get("ft_away")
-
-                    if resolved.get("ft_home") is not None and resolved.get("ft_away") is not None:
-                        return resolved.get("ft_home"), resolved.get("ft_away")
+                    if ft_home is not None and ft_away is not None:
+                        return ft_home, ft_away
 
                     return leg.get("home_ft"), leg.get("away_ft")
+
+                def _winner_from_single_match(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+                    """
+                    단판 경기의 최종 승자를 서버에서 확정한다.
+                    우선순위:
+                    1) 메인 스코어(home/away)
+                    2) PEN이면 승부차기 스코어
+                    """
+                    resolved = _resolve_bracket_display_scores(m)
+
+                    home_id = _safe_int_or_none(m.get("home_id"))
+                    away_id = _safe_int_or_none(m.get("away_id"))
+                    if home_id is None or away_id is None:
+                        return None, None
+
+                    home_score = resolved.get("home")
+                    away_score = resolved.get("away")
+                    if home_score is not None and away_score is not None:
+                        if home_score > away_score:
+                            return home_id, "score"
+                        if away_score > home_score:
+                            return away_id, "score"
+
+                    status = str(m.get("status") or "").strip().upper()
+                    if status == "PEN":
+                        pen_home = resolved.get("pen_home")
+                        pen_away = resolved.get("pen_away")
+                        if pen_home is not None and pen_away is not None:
+                            if pen_home > pen_away:
+                                return home_id, "penalty"
+                            if pen_away > pen_home:
+                                return away_id, "penalty"
+
+                    return None, None
+
+                def _winner_from_two_leg_tie(
+                    *,
+                    leg1: Dict[str, Any],
+                    leg2: Dict[str, Any],
+                    m2: Dict[str, Any],
+                    agg_home: Optional[int],
+                    agg_away: Optional[int],
+                ) -> Tuple[Optional[int], Optional[str]]:
+                    """
+                    왕복전 tie의 최종 승자를 서버에서 확정한다.
+                    우선순위:
+                    1) aggregate
+                    2) 2차전 PEN이면 승부차기
+                    """
+                    home_anchor_id = _safe_int_or_none(leg1.get("home_id"))
+                    away_anchor_id = _safe_int_or_none(leg1.get("away_id"))
+                    if home_anchor_id is None or away_anchor_id is None:
+                        return None, None
+
+                    if agg_home is not None and agg_away is not None:
+                        if agg_home > agg_away:
+                            return home_anchor_id, "aggregate"
+                        if agg_away > agg_home:
+                            return away_anchor_id, "aggregate"
+
+                    status2 = str(m2.get("status") or "").strip().upper()
+                    if status2 == "PEN":
+                        resolved2 = _resolve_bracket_display_scores(m2)
+                        pen_home2 = resolved2.get("pen_home")
+                        pen_away2 = resolved2.get("pen_away")
+                        if pen_home2 is None or pen_away2 is None:
+                            return None, None
+
+                        anchor_home_pen: Optional[int] = None
+                        anchor_away_pen: Optional[int] = None
+
+                        if _safe_int_or_none(leg2.get("home_id")) == home_anchor_id:
+                            anchor_home_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == home_anchor_id:
+                            anchor_home_pen = pen_away2
+
+                        if _safe_int_or_none(leg2.get("home_id")) == away_anchor_id:
+                            anchor_away_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == away_anchor_id:
+                            anchor_away_pen = pen_away2
+
+                        if anchor_home_pen is not None and anchor_away_pen is not None:
+                            if anchor_home_pen > anchor_away_pen:
+                                return home_anchor_id, "penalty"
+                            if anchor_away_pen > anchor_home_pen:
+                                return away_anchor_id, "penalty"
+
+                    return None, None
 
                 def _build_round_ties(round_label: str, round_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     if not round_matches:
@@ -915,12 +1000,22 @@ Match Detail용 Standings 블록 (TABLE 전용)
                                     agg_home = h_sum
                                     agg_away = a_sum
 
+                            winner_team_id, winner_reason = _winner_from_two_leg_tie(
+                                leg1=leg1,
+                                leg2=leg2,
+                                m2=m2,
+                                agg_home=agg_home,
+                                agg_away=agg_away,
+                            )
+
                             ties.append(
                                 {
                                     "round_label": round_label,
                                     "order_hint": order_hint,
                                     "agg_home": agg_home,
                                     "agg_away": agg_away,
+                                    "winner_team_id": winner_team_id,
+                                    "winner_reason": winner_reason,
                                     "legs": [leg1, leg2],
                                 }
                             )
@@ -942,13 +1037,19 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
                     for m in remaining_matches:
                         used_fixture_ids.add(_coalesce_int(m.get("fixture_id"), 0))
+
+                        leg = _leg_payload(m, None)
+                        winner_team_id, winner_reason = _winner_from_single_match(m)
+
                         ties.append(
                             {
                                 "round_label": round_label,
                                 "order_hint": order_hint,
                                 "agg_home": None,
                                 "agg_away": None,
-                                "legs": [_leg_payload(m, None)],
+                                "winner_team_id": winner_team_id,
+                                "winner_reason": winner_reason,
+                                "legs": [leg],
                             }
                         )
                         order_hint += 1
