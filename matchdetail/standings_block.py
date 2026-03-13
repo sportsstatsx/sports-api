@@ -21,19 +21,93 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
+def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
+    if fixture_id is None:
+        return None
+
+    row = _fetch_one(
+        """
+        SELECT season
+        FROM matches
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    row = _fetch_one(
+        """
+        SELECT season
+        FROM fixtures
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    return None
+
+
+def _resolve_season(
+    league_id: int,
+    season: Optional[int],
+    fixture_id: Optional[int] = None,
+) -> Optional[int]:
     """
-    matchdetail header에서 season이 비어오는 경우 방어:
-      1) standings에서 MAX(season)
-      2) 없으면 fixtures에서 MAX(season)
+    matchdetail header에서 season이 비어오는 경우 방어 우선순위:
+      1) header season
+      2) fixture_id 기준 matches.season
+      3) fixture_id 기준 fixtures.season
+      4) competition_season_meta MAX(season)
+      5) standings MAX(season)
+      6) matches MAX(season)
+      7) fixtures MAX(season)
     """
     if season is not None:
         return season
+
+    s = _resolve_season_from_fixture_id(fixture_id)
+    if s is not None:
+        return s
+
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM competition_season_meta
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
 
     row = _fetch_one(
         """
         SELECT MAX(season) AS season
         FROM standings
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
         WHERE league_id = %s
         """,
         (league_id,),
@@ -271,6 +345,49 @@ def _get_group_meta_names(league_id: int, season: int) -> List[str]:
                 out.append(name)
     return out
 
+def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
+    """
+    matches 기반 standings 계산을 막아야 하는 시즌/대회 포맷 판별.
+
+    계산 fallback은 '순수 단일 리그 테이블(single_table_league)' 에서만 허용.
+    아래는 모두 fallback 금지:
+    - has_standings = 0
+    - 컵/넉아웃 전용
+    - league phase + knockout
+    - multi group league
+    - playoff 포함 리그
+    """
+    if comp_meta is None:
+        return False
+
+    has_standings_meta = _coalesce_int(comp_meta.get("has_standings"), 0)
+    groups_count = _coalesce_int(comp_meta.get("groups_count"), 0)
+    has_knockout_rounds = _coalesce_int(comp_meta.get("has_knockout_rounds"), 0)
+    format_hint = str(comp_meta.get("format_hint") or "").strip().lower()
+
+    if has_standings_meta == 0:
+        return True
+
+    if groups_count > 1:
+        return True
+
+    if has_knockout_rounds == 1 and format_hint != "single_table_league":
+        return True
+
+    blocked_hints = {
+        "knockout_only",
+        "league_phase_plus_knockout",
+        "cup_with_standings",
+        "cup_other",
+        "multi_group_league",
+        "multi_group_league_plus_playoff",
+        "single_table_league_plus_playoff",
+    }
+    if format_hint in blocked_hints:
+        return True
+
+    return False
+
 
 def _should_hide_standings_early_season(
     *,
@@ -380,8 +497,12 @@ Match Detail용 Standings 블록 (TABLE 전용)
     except (TypeError, ValueError):
         return None
 
-    season_resolved = _resolve_season(league_id_int, season if isinstance(season, int) else None)
     fixture_id = _extract_fixture_id_from_header(header)
+    season_resolved = _resolve_season(
+        league_id_int,
+        season if isinstance(season, int) else None,
+        fixture_id=fixture_id,
+    )
     is_knockout_context = _is_header_knockout_context(header)
 
     # 시즌 자체를 못 찾으면: 빈 블록 + 안내
@@ -438,24 +559,46 @@ Match Detail용 Standings 블록 (TABLE 전용)
     comp_meta = _get_competition_meta(league_id_int, season_resolved)
     source = "standings_table" if rows_raw else "computed_from_matches"
 
-    # ✅ competition meta가 "이 시즌은 standings 없음"이라고 말하면
-    #    matches 기반 계산 fallback 자체를 막는다.
-    if not rows_raw and comp_meta is not None:
-        has_standings_meta = _coalesce_int(comp_meta.get("has_standings"), 0)
-        if has_standings_meta == 0:
-            return {
-                "league": {
-                    "league_id": league_id_int,
-                    "season": season_resolved,
-                    "name": league_name,
-                },
-                "mode": "TABLE",
-                "rows": [],
-                "bracket": None,
-                "context_options": {"conferences": [], "groups": []},
-                "message": "Standings are not available for this competition.",
-                "source": "competition_meta_no_standings",
-            }
+    # ✅ competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
+    if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
+        format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+        has_standings_meta = _coalesce_int((comp_meta or {}).get("has_standings"), 0)
+
+        message = "Standings are not available for this competition."
+        source_name = "competition_meta_no_standings"
+
+        if format_hint in {
+            "knockout_only",
+            "league_phase_plus_knockout",
+            "cup_with_standings",
+            "cup_other",
+        }:
+            message = "Standings are not available for this competition stage.\nPlease check back later."
+            source_name = "competition_meta_complex_format"
+        elif format_hint in {
+            "multi_group_league",
+            "multi_group_league_plus_playoff",
+            "single_table_league_plus_playoff",
+        }:
+            message = "Standings are not available yet.\nPlease check back later."
+            source_name = "competition_meta_grouped_or_playoff_format"
+        elif has_standings_meta == 0:
+            message = "Standings are not available for this competition."
+            source_name = "competition_meta_no_standings"
+
+        return {
+            "league": {
+                "league_id": league_id_int,
+                "season": season_resolved,
+                "name": league_name,
+            },
+            "mode": "TABLE",
+            "rows": [],
+            "bracket": None,
+            "context_options": {"conferences": [], "groups": []},
+            "message": message,
+            "source": source_name,
+        }
 
     # ─────────────────────────────────────────────────────────────
     # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
