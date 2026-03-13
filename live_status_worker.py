@@ -746,9 +746,7 @@ def ensure_match_postmatch_timeline_state_table() -> None:
 FT_TRIGGER_TTL_DAYS = int(os.environ.get("FT_TRIGGER_TTL_DAYS", "90"))
 
 STANDINGS_LOOP_SEC = int(os.environ.get("STANDINGS_LOOP_SEC", "1800"))  # 30분
-BRACKET_LOOP_SEC   = int(os.environ.get("BRACKET_LOOP_SEC", "3600"))    # 60분
-
-TRIGGER_POLL_SEC   = int(os.environ.get("FT_TRIGGER_POLL_SEC", "10"))   # standings/bracket에서 트리거 폴링 간격(짧게)
+TRIGGER_POLL_SEC   = int(os.environ.get("FT_TRIGGER_POLL_SEC", "10"))   # standings 트리거 폴링 간격(짧게)
 
 
 def ensure_ft_triggers_table() -> None:
@@ -760,60 +758,15 @@ def ensure_ft_triggers_table() -> None:
             season                   integer NOT NULL,
             finished_utc             text,
             standings_consumed_utc   text,
-            bracket_consumed_utc     text,
             created_utc              text,
             updated_utc              text
         )
         """
     )
-    # 조회/정리 성능을 위한 인덱스(있으면 좋고 없어도 동작은 동일)
     execute("CREATE INDEX IF NOT EXISTS idx_ft_triggers_created_utc ON ft_triggers (created_utc)")
     execute("CREATE INDEX IF NOT EXISTS idx_ft_triggers_league_season ON ft_triggers (league_id, season)")
 
 
-def ensure_tournament_ties_table() -> None:
-    """
-    브라켓/플레이오프(녹아웃) 표시용 '가공 결과' 테이블
-    - 앱에서 그리기 쉬운 형태로 저장(B안)
-    - raw를 다 때려박는 게 아니라, tie 단위로 leg/agg/winner를 서버에서 정리
-    """
-    execute(
-        """
-        CREATE TABLE IF NOT EXISTS tournament_ties (
-            league_id        integer NOT NULL,
-            season           integer NOT NULL,
-            round_name       text    NOT NULL,
-            tie_key          text    NOT NULL,
-
-            team_a_id        integer,
-            team_b_id        integer,
-
-            leg1_fixture_id  integer,
-            leg2_fixture_id  integer,
-
-            leg1_home_id     integer,
-            leg1_away_id     integer,
-            leg1_home_ft     integer,
-            leg1_away_ft     integer,
-            leg1_date_utc    text,
-
-            leg2_home_id     integer,
-            leg2_away_id     integer,
-            leg2_home_ft     integer,
-            leg2_away_ft     integer,
-            leg2_date_utc    text,
-
-            agg_a            integer,
-            agg_b            integer,
-            winner_team_id   integer,
-
-            updated_utc      text,
-
-            PRIMARY KEY (league_id, season, round_name, tie_key)
-        )
-        """
-    )
-    execute("CREATE INDEX IF NOT EXISTS idx_tournament_ties_round ON tournament_ties (league_id, season, round_name)")
 
 
 def _now_iso_utc() -> str:
@@ -834,10 +787,10 @@ def enqueue_ft_trigger(fixture_id: int, league_id: int, season: int, finished_is
         INSERT INTO ft_triggers (
             fixture_id, league_id, season,
             finished_utc,
-            standings_consumed_utc, bracket_consumed_utc,
+            standings_consumed_utc,
             created_utc, updated_utc
         )
-        VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s)
+        VALUES (%s,%s,%s,%s,NULL,%s,%s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id    = EXCLUDED.league_id,
             season       = EXCLUDED.season,
@@ -863,18 +816,7 @@ def cleanup_old_rows() -> None:
             (str(days),),
         )
     except Exception:
-        pass
-
-    try:
-        execute(
-            """
-            DELETE FROM tournament_ties
-            WHERE NULLIF(updated_utc,'')::timestamptz < (NOW() - (%s || ' days')::interval)
-            """,
-            (str(days),),
-        )
-    except Exception:
-        pass
+        passpass
 
 
 def _resolve_season_for_league_from_db(league_id: int) -> Optional[int]:
@@ -1041,13 +983,12 @@ def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]
 
 
 
-def _select_unconsumed_triggers(which: str, limit: int = 50) -> List[Dict[str, Any]]:
-    col = "standings_consumed_utc" if which == "standings" else "bracket_consumed_utc"
+def _select_unconsumed_triggers(limit: int = 50) -> List[Dict[str, Any]]:
     rows = fetch_all(
-        f"""
+        """
         SELECT fixture_id, league_id, season, finished_utc
         FROM ft_triggers
-        WHERE {col} IS NULL
+        WHERE standings_consumed_utc IS NULL
         ORDER BY NULLIF(finished_utc,'')::timestamptz ASC NULLS LAST, fixture_id ASC
         LIMIT %s
         """,
@@ -1056,83 +997,22 @@ def _select_unconsumed_triggers(which: str, limit: int = 50) -> List[Dict[str, A
     return rows or []
 
 
-def _mark_triggers_consumed(which: str, fixture_ids: List[int]) -> None:
+def _mark_triggers_consumed(fixture_ids: List[int]) -> None:
     if not fixture_ids:
         return
-    col = "standings_consumed_utc" if which == "standings" else "bracket_consumed_utc"
     nowi = _now_iso_utc()
-    # IN (...) 안전하게 array로 처리
     execute(
-        f"""
+        """
         UPDATE ft_triggers
-        SET {col} = %s, updated_utc = %s
+        SET standings_consumed_utc = %s, updated_utc = %s
         WHERE fixture_id = ANY(%s)
-          AND {col} IS NULL
+          AND standings_consumed_utc IS NULL
         """,
         (nowi, nowi, fixture_ids),
     )
 
 
-def _bracket_round_names() -> Set[str]:
-    """
-    ✅ '정확 일치' 기반 필터용 라운드명 세트(백업/호환용)
 
-    - 기존에 잘 되던 라운드명은 그대로 유지
-    - 우리가 DB에서 확인한 "예선/플레이오프/플레이-인/엘리미네이션" 계열을 추가
-    - 실제 판정은 build_and_upsert_bracket_for_league_season에서
-      _is_knockout_round_name() 규칙 기반으로 수행한다.
-      (이 세트는 혹시 모를 보수적 fallback/참고용)
-    """
-    return {
-        # 핵심 녹아웃
-        "Final", "Finals",
-        "Semi-finals", "Semi Final", "Semi Finals", "Semifinals",
-        "Quarter-finals", "Quarter Final", "Quarter Finals", "Quarterfinals",
-        "Round of 16", "Round of 32", "Round of 64", "Round of 128",
-
-        # UEFA/대륙컵 컨벤션
-        "Knockout Round Play-offs", "Knockout Round Playoffs",
-        "Play-offs", "Playoffs", "Play-off", "Playoff",
-
-        # 예선/초기 라운드(녹아웃일 수 있음)
-        "Preliminary Round",
-        "1st Preliminary Round", "2nd Preliminary Round", "3rd Preliminary Round",
-        "Qualifying Round",
-        "1st Qualifying Round", "2nd Qualifying Round", "3rd Qualifying Round", "4th Qualifying Round",
-        "1st Round", "2nd Round", "3rd Round", "4th Round",
-
-        # 리그/컵에서 자주 나오는 녹아웃 표기
-        "Elimination Finals", "Elimination Final",
-        "Play-In", "Play-In Final", "Play In", "Play In Final",
-    }
-
-
-
-
-def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> int:
-    """
-    DB의 matches(이미 저장된 경기)에서 round 기반으로 tie를 만들고 tournament_ties에 upsert.
-    - 두 팀 조합(순서 무관) + round_name 기준으로 tie_key 생성
-    - 2leg면 date_utc로 leg1/leg2 정렬
-
-    ✅ 변경(핵심):
-    - 기존: round_name 정확 일치(set)만 포함 → 누락 발생 가능
-    - 개선: "넉아웃 라운드인지"를 규칙(포함/제외 패턴)으로 판정
-      * 예선이라도 Knockout이면 포함(Preliminary/Qualifying/Round/Playoff/Final 등)
-      * League Stage / Regular Season / Apertura / Clausura / Group 등 '승점/스테이지'는 제외
-    - 기존 기능(2leg/agg/winner 계산, PK, upsert)은 그대로 유지
-    """
-    import re
-
-    def _norm(s: Any) -> str:
-        if s is None:
-            return ""
-        try:
-            x = str(s).strip()
-            x = re.sub(r"\s+", " ", x)
-            return x
-        except Exception:
-            return ""
 
     def _is_knockout_round_name(round_name: str) -> bool:
         rn = _norm(round_name)
@@ -1350,57 +1230,6 @@ def build_and_upsert_bracket_for_league_season(league_id: int, season: int) -> i
 
 
 
-def bracket_fill_missing_rounds(session: requests.Session, league_id: int, season: int, limit: int = 50) -> int:
-    """
-    ✅ /fixtures로 league.round / raw 채우기 담당(우리가 합의한 'round/raw 채우기')
-    - DB matches에서 league_round 빈 finished 경기들을 일부(limit) 골라서
-      /fixtures?id= 로 단건 보충 → upsert_match_row_from_fixture가 league_round 채움
-      + match_fixtures_raw 저장(best-effort)
-    호출수 폭발 방지: LIMIT
-    """
-    rows = fetch_all(
-        """
-        SELECT fixture_id
-        FROM matches
-        WHERE league_id = %s
-          AND season = %s
-          AND status_group = 'FINISHED'
-          AND (league_round IS NULL OR league_round = '')
-        ORDER BY NULLIF(date_utc,'')::timestamptz ASC NULLS LAST
-        LIMIT %s
-        """,
-        (int(league_id), int(season), int(limit)),
-    ) or []
-
-    if not rows:
-        return 0
-
-    done = 0
-    nowu = now_utc()
-
-    for r in rows:
-        fid = safe_int(r.get("fixture_id"))
-        if fid is None:
-            continue
-        try:
-            fx_obj = fetch_fixture_by_id(session, fid)
-            if not fx_obj:
-                continue
-
-            # upsert_match_row_from_fixture 안에서 league_round 채움
-            upsert_match_row_from_fixture(fx_obj, league_id=int(league_id), season=int(season))
-
-            try:
-                upsert_match_fixtures_raw(fid, fx_obj, nowu)
-            except Exception:
-                pass
-
-            done += 1
-        except Exception:
-            pass
-
-    return done
-
 
 def run_once_standings(do_periodic: bool = True) -> int:
     """
@@ -1428,8 +1257,8 @@ def run_once_standings(do_periodic: bool = True) -> int:
 
     s = _session()
 
-    # 1) 트리거 우선 처리(미소비)
-    triggers = _select_unconsumed_triggers("standings", limit=60)
+   
+    triggers = _select_unconsumed_triggers(limit=60)
 
     # fixture_id -> (lid, season)
     trig_map: Dict[int, Tuple[int, int]] = {}
@@ -1476,7 +1305,7 @@ def run_once_standings(do_periodic: bool = True) -> int:
 
         if ok_fids:
             try:
-                _mark_triggers_consumed("standings", ok_fids)
+                _mark_triggers_consumed(ok_fids)
             except Exception:
                 pass
 
@@ -1513,124 +1342,6 @@ def run_once_standings(do_periodic: bool = True) -> int:
         pass
 
     return total_rows
-
-
-
-
-def run_once_bracket(do_periodic: bool = True) -> int:
-    """
-    ✅ Round/Bracket 워커:
-    - FT 트리거 즉시 1회(폴링): do_periodic=False 로 호출
-    - 60분 주기 실행: do_periodic=True 로 호출
-    - 역할:
-      1) /fixtures?id= 로 league.round 및 raw 채우기(빈 것만, limit)
-      2) DB matches 기반으로 tournament_ties 생성/갱신
-    - 트리거 소비 방식: B(bracket_consumed_utc)
-
-    ✅ FIX(중요):
-    - trigger 처리에서 "실제로 의미 있는 작업(라운드 채움 or ties upsert)이 1개라도 성공"한
-      (league_id, season) 페어에 속한 fixture_id만 consumed 처리한다.
-      (실패/무변경이면 트리거 유지 → 다음 poll에서 재시도 가능)
-    """
-    if not API_KEY:
-        print("[bracket_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
-        return 0
-
-    league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
-    if not league_ids:
-        print("[bracket_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
-        return 0
-
-    if not hasattr(run_once_bracket, "_ddl_done"):
-        ensure_ft_triggers_table()
-        ensure_tournament_ties_table()
-        run_once_bracket._ddl_done = True  # type: ignore[attr-defined]
-
-    s = _session()
-
-    # 1) 트리거 우선 처리(미소비)
-    triggers = _select_unconsumed_triggers("bracket", limit=60)
-
-    # fixture_id -> (lid, season)
-    trig_map: Dict[int, Tuple[int, int]] = {}
-    processed_pairs: Set[Tuple[int, int]] = set()
-
-    for t in triggers or []:
-        fid = safe_int(t.get("fixture_id"))
-        lid = safe_int(t.get("league_id"))
-        season = safe_int(t.get("season"))
-        if fid is None or lid is None or season is None:
-            continue
-        trig_map[int(fid)] = (int(lid), int(season))
-        processed_pairs.add((int(lid), int(season)))
-
-    total = 0
-
-    # ✅ 성공한 pair만 모아서 그 pair에 속한 trigger만 consumed 처리
-    succeeded_pairs: Set[Tuple[int, int]] = set()
-
-    for (lid, season) in sorted(processed_pairs):
-        try:
-            filled = bracket_fill_missing_rounds(s, lid, season, limit=60)
-            up = build_and_upsert_bracket_for_league_season(lid, season)
-
-            total += (filled + up)
-
-            # ✅ 의미있는 작업이 1개라도 있으면 성공으로 간주(= 소비 가능)
-            if (filled + up) > 0:
-                succeeded_pairs.add((lid, season))
-                print(f"[bracket_worker] trigger_run league={lid} season={season} filled_round={filled} upserted_ties={up}")
-            else:
-                # 아무 것도 안 했으면 트리거 유지(다음 poll에서 재시도/나중에 DB가 채워질 수 있음)
-                print(f"[bracket_worker] trigger_run league={lid} season={season} no-op (filled=0, up=0) -> keep triggers (retry)")
-
-        except Exception as e:
-            # ✅ 에러면 트리거 유지(재시도)
-            print(f"[bracket_worker] trigger_run league={lid} season={season} err: {e} -> keep triggers", file=sys.stderr)
-
-    # ✅ 성공한 pair에 속한 fixture_id만 consumed 처리
-    if triggers and succeeded_pairs:
-        ok_fids: List[int] = []
-        for fid, pair in trig_map.items():
-            if pair in succeeded_pairs:
-                ok_fids.append(int(fid))
-
-        if ok_fids:
-            try:
-                _mark_triggers_consumed("bracket", ok_fids)
-            except Exception:
-                pass
-
-    # ✅ 폴링 모드(do_periodic=False)면 여기서 종료
-    if not do_periodic:
-        try:
-            cleanup_old_rows()
-        except Exception:
-            pass
-        return total
-
-    # 2) 정기(60분): 시즌 추정 후 실행(트리거로 "성공 처리"한 것 제외)
-    for lid in league_ids:
-        season = _resolve_season_for_league_from_db(lid)
-        if season is None:
-            continue
-        if (lid, season) in succeeded_pairs:
-            continue
-        try:
-            filled = bracket_fill_missing_rounds(s, lid, season, limit=40)
-            up = build_and_upsert_bracket_for_league_season(lid, season)
-            total += (filled + up)
-            print(f"[bracket_worker] periodic_run league={lid} season={season} filled_round={filled} upserted_ties={up}")
-        except Exception as e:
-            print(f"[bracket_worker] periodic_run league={lid} season={season} err: {e}", file=sys.stderr)
-
-    # 3) TTL 정리
-    try:
-        cleanup_old_rows()
-    except Exception:
-        pass
-
-    return total
 
 
 
@@ -2599,9 +2310,7 @@ def run_once() -> int:
         ensure_match_live_state_table()
         ensure_match_postmatch_timeline_state_table()
 
-        # ✅ FT 트리거/브라켓 스키마 자동 추가(기존 기능 영향 없음)
         ensure_ft_triggers_table()
-        ensure_tournament_ties_table()
 
         run_once._ddl_done = True  # type: ignore[attr-defined]
 
@@ -2696,7 +2405,6 @@ def run_once() -> int:
             except Exception:
                 pass
 
-            # ✅ FT 트리거 기록(B안): 어디서 FT가 감지되든 standings/bracket 워커가 소비
             if sg2 == "FINISHED":
                 try:
                     enqueue_ft_trigger(fixture_id, lid, season, finished_iso_utc=iso_utc(now))
@@ -2933,9 +2641,7 @@ def run_once_backfill() -> int:
         ensure_match_live_state_table()
         ensure_match_postmatch_timeline_state_table()
 
-        # ✅ FT 트리거/브라켓 스키마 자동 추가(기존 기능 영향 없음)
         ensure_ft_triggers_table()
-        ensure_tournament_ties_table()
 
         run_once_backfill._ddl_done = True  # type: ignore[attr-defined]
 
@@ -3115,9 +2821,7 @@ def run_once_watchdog() -> int:
         ensure_match_live_state_table()
         ensure_match_postmatch_timeline_state_table()
 
-        # ✅ FT 트리거/브라켓 스키마 자동 추가(기존 기능 영향 없음)
         ensure_ft_triggers_table()
-        ensure_tournament_ties_table()
 
         run_once_watchdog._ddl_done = True  # type: ignore[attr-defined]
 
@@ -3197,25 +2901,6 @@ def loop() -> None:
 
             time.sleep(max(5, int(TRIGGER_POLL_SEC)))
 
-    elif role == "bracket":
-        print(f"[live_status_worker] start role=bracket (periodic={BRACKET_LOOP_SEC}s, poll={TRIGGER_POLL_SEC}s)")
-        last_periodic = 0.0
-        while True:
-            try:
-                now_ts = time.time()
-
-                # 1) 트리거 폴링: 트리거만 처리 (즉시성)
-                run_once_bracket(do_periodic=False)
-
-                # 2) 주기적 전체 갱신: 60분에 1번만
-                if (now_ts - last_periodic) >= float(BRACKET_LOOP_SEC):
-                    last_periodic = now_ts
-                    run_once_bracket(do_periodic=True)
-
-            except Exception:
-                traceback.print_exc()
-
-            time.sleep(max(5, int(TRIGGER_POLL_SEC)))
 
     else:
         # default = live
