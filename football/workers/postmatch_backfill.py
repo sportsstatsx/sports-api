@@ -2,18 +2,17 @@
 #
 # 역할:
 # - 특정 날짜(date=YYYY-MM-DD)의 FINISHED 경기들에 대해 "한 번만" 무거운 데이터 전체 백필
-#   * /fixtures          → fixtures/matches upsert + match_fixtures_raw 저장
-#   * /fixtures/events   → match_events / match_events_raw
-#   * /fixtures/lineups  → match_lineups
+#   * /fixtures            → fixtures/matches upsert + match_fixtures_raw 저장
+#   * /fixtures/events     → match_events / match_events_raw
+#   * /fixtures/lineups    → match_lineups
 #   * /fixtures/statistics → match_team_stats
-#   * /fixtures/players  → match_player_stats
-#   * /standings         → standings (league+season)
+#   * /fixtures/players    → match_player_stats
+#   * /standings           → standings (league+season)
 #
 # 특징:
-
 # - 이미 백필된 경기(match_events에 row 존재)는 스킵
 # - LIVE_LEAGUES env 에 포함된 리그만 대상
-# - 스키마 변경 없음
+# - 축구 bracket/tournament_ties 처리는 하지 않음
 
 import os
 import sys
@@ -837,7 +836,6 @@ def ensure_ft_triggers_table() -> None:
             season                   integer NOT NULL,
             finished_utc             text,
             standings_consumed_utc   text,
-            bracket_consumed_utc     text,
             created_utc              text,
             updated_utc              text
         )
@@ -857,10 +855,10 @@ def enqueue_ft_trigger(fixture_id: int, league_id: int, season: int, finished_is
         INSERT INTO ft_triggers (
             fixture_id, league_id, season,
             finished_utc,
-            standings_consumed_utc, bracket_consumed_utc,
+            standings_consumed_utc,
             created_utc, updated_utc
         )
-        VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s)
+        VALUES (%s,%s,%s,%s,NULL,%s,%s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id    = EXCLUDED.league_id,
             season       = EXCLUDED.season,
@@ -1851,7 +1849,7 @@ def main() -> None:
                     if sg != "FINISHED":
                         continue
 
-                    # ✅ 브라켓/스탠딩 워커 동일화용: FT 트리거 기록
+                    # ✅ standings 후속 처리용: FT 트리거 기록
                     try:
                         enqueue_ft_trigger(fixture_id, int(lid), int(season))
                     except Exception:
@@ -2027,7 +2025,7 @@ def main() -> None:
                     if sg != "FINISHED":
                         continue
 
-                    # ✅ 브라켓/스탠딩 워커 동일화용: FT 트리거 기록
+                    # ✅ standings 후속 처리용: FT 트리거 기록
                     try:
                         enqueue_ft_trigger(fixture_id, int(lid), int(season))
                     except Exception:
