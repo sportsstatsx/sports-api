@@ -21,6 +21,19 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+def _safe_int_or_none(v: Any) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_text_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
 
 
 def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
@@ -831,7 +844,19 @@ Match Detail용 Standings 블록 (TABLE 전용)
                     }
 
         except Exception:
-            pass
+            return {
+                "league": {
+                    "league_id": league_id_int,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "mode": "TABLE",
+                "rows": [],
+                "bracket": None,
+                "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available for this competition stage.\nPlease check back later.",
+                "source": "computed_bracket_error",
+            }
 
     # ✅ competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
     if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
