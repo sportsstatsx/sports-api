@@ -25,14 +25,28 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
 def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
     """
     season 이 None 이면:
-      1) standings 에서 해당 리그의 MAX(season)
-      2) 없으면 fixtures 에서 MAX(season)
+      1) competition_season_meta MAX(season)
+      2) standings MAX(season)
+      3) matches MAX(season)
+      4) fixtures MAX(season)
     순서대로 시도해서 하나라도 찾으면 그 값 리턴.
     """
     if season is not None:
         return season
 
-    # 1) standings 기준
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM competition_season_meta
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
     row = _fetch_one(
         """
         SELECT MAX(season) AS season
@@ -46,7 +60,19 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
         if s > 0:
             return s
 
-    # 2) fixtures 기준
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
     row = _fetch_one(
         """
         SELECT MAX(season) AS season
@@ -133,6 +159,84 @@ def _detect_league_cup_like(league_id: int) -> bool:
             return True
         if isinstance(v, str) and v.strip().lower() in ("1", "true", "t", "yes", "y"):
             return True
+
+    return False
+
+def _get_competition_meta(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    return _fetch_one(
+        """
+        SELECT
+            league_id,
+            season,
+            has_standings,
+            groups_count,
+            has_rounds,
+            has_knockout_rounds,
+            format_hint
+        FROM competition_season_meta
+        WHERE league_id = %s
+          AND season = %s
+        LIMIT 1
+        """,
+        (league_id, season),
+    )
+
+
+def _get_group_meta_names(league_id: int, season: int) -> List[str]:
+    rows = fetch_all(
+        """
+        SELECT group_name
+        FROM standings_group_meta
+        WHERE league_id = %s
+          AND season = %s
+        ORDER BY group_order ASC, group_name ASC
+        """,
+        (league_id, season),
+    )
+    out: List[str] = []
+    for r in rows or []:
+        name = r.get("group_name")
+        if isinstance(name, str):
+            name = re.sub(r"\s+", " ", name).strip()
+            if name:
+                out.append(name)
+    return out
+
+
+def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
+    """
+    matches 기반 standings 계산을 막아야 하는 시즌/대회 포맷 판별.
+
+    계산 fallback은 '순수 단일 리그 테이블(single_table_league)' 에서만 허용.
+    """
+    if comp_meta is None:
+        return False
+
+    has_standings_meta = _coalesce_int(comp_meta.get("has_standings"), 0)
+    groups_count = _coalesce_int(comp_meta.get("groups_count"), 0)
+    has_knockout_rounds = _coalesce_int(comp_meta.get("has_knockout_rounds"), 0)
+    format_hint = str(comp_meta.get("format_hint") or "").strip().lower()
+
+    if has_standings_meta == 0:
+        return True
+
+    if groups_count > 1:
+        return True
+
+    if has_knockout_rounds == 1 and format_hint != "single_table_league":
+        return True
+
+    blocked_hints = {
+        "knockout_only",
+        "league_phase_plus_knockout",
+        "cup_with_standings",
+        "cup_other",
+        "multi_group_league",
+        "multi_group_league_plus_playoff",
+        "single_table_league_plus_playoff",
+    }
+    if format_hint in blocked_hints:
+        return True
 
     return False
 
@@ -323,7 +427,7 @@ def build_standings_block(
         print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
 
     is_cup_like = _detect_league_cup_like(league_id)
-
+    comp_meta = _get_competition_meta(league_id, season_resolved)
     
     def _cols_of(table_name: str) -> set[str]:
         try:
@@ -381,8 +485,46 @@ def build_standings_block(
         print(f"[build_standings_block] ERROR standings query league_id={league_id}, season={season_resolved}: {e}")
         rows_raw = []
 
-    # 2) standings가 비어 있고 cup 성격 리그면
-    #    matches 기반 standings fallback 을 막는다.
+    # 2) competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
+    if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
+        format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+        has_standings_meta = _coalesce_int((comp_meta or {}).get("has_standings"), 0)
+
+        message = "Standings are not available for this competition."
+        source_name = "competition_meta_no_standings"
+
+        if format_hint in {
+            "knockout_only",
+            "league_phase_plus_knockout",
+            "cup_with_standings",
+            "cup_other",
+        }:
+            message = "Standings are not available for this competition stage.\nPlease check back later."
+            source_name = "competition_meta_complex_format"
+        elif format_hint in {
+            "multi_group_league",
+            "multi_group_league_plus_playoff",
+            "single_table_league_plus_playoff",
+        }:
+            message = "Standings are not available yet.\nPlease check back later."
+            source_name = "competition_meta_grouped_or_playoff_format"
+        elif has_standings_meta == 0:
+            message = "Standings are not available for this competition."
+            source_name = "competition_meta_no_standings"
+
+        return {
+            "league_id": league_id,
+            "season": season_resolved,
+            "league_name": league_name,
+            "rows": [],
+            "context_options": {"conferences": [], "groups": []},
+            "mode": "TABLE",
+            "bracket": None,
+            "message": message,
+            "source": source_name,
+        }
+
+    # 3) competition meta가 없을 때만 cup heuristic으로 보조 차단
     if not rows_raw and is_cup_like:
         return {
             "league_id": league_id,
@@ -393,6 +535,7 @@ def build_standings_block(
             "mode": "TABLE",
             "bracket": None,
             "message": "Standings are not available for this competition stage.\nPlease check back later.",
+            "source": "league_cup_heuristic_block",
         }
 
     # 3) standings가 비어 있으면 → matches에서 즉시 계산
@@ -683,6 +826,41 @@ def build_standings_block(
 
     context_options = _build_context_options_from_rows(context_rows)
 
+    # ✅ 서버에서 저장한 standings_group_meta가 있으면 그 값을 우선 사용
+    try:
+        meta_group_names = _get_group_meta_names(league_id, season_resolved)
+        if meta_group_names:
+            conferences: List[str] = []
+            groups: List[str] = []
+
+            for name in meta_group_names:
+                nl = name.lower()
+                if "east" in nl:
+                    conferences.append("East")
+                    continue
+                if "west" in nl:
+                    conferences.append("West")
+                    continue
+                groups.append(name)
+
+            def _dedup_keep_order(items: List[str]) -> List[str]:
+                seen = set()
+                out: List[str] = []
+                for x in items:
+                    k = x.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(x)
+                return out
+
+            context_options = {
+                "conferences": _dedup_keep_order(conferences),
+                "groups": _dedup_keep_order(groups),
+            }
+    except Exception:
+        pass
+
 
     out = {
         "league_id": league_id,
@@ -692,7 +870,11 @@ def build_standings_block(
         "context_options": context_options,
         "mode": "TABLE",
         "bracket": None,
+        "source": "standings_table" if rows_raw else "computed_from_matches",
     }
+
+    if not out_rows:
+        out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
 
