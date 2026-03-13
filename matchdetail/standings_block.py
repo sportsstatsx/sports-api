@@ -427,14 +427,17 @@ def _is_knockout_round_name(round_name: Any) -> bool:
 def _round_stage_size(round_name: Any) -> Optional[int]:
     """
     라운드 이름을 '스테이지 크기'로 정규화.
-    값이 작을수록 더 후반 라운드.
+    값이 작을수록 더 후반(최신) 라운드.
+
     예:
-      Final            -> 1
-      Semi-finals      -> 2
-      Quarter-finals   -> 4
-      Round of 16      -> 16
-      Round of 32      -> 32
-      1/128-finals     -> 128
+      Final              -> 1
+      Semi-finals        -> 2
+      Quarter-finals     -> 4
+      Round of 16        -> 16
+      Round of 32        -> 32
+      Round of 64        -> 64
+      Round of 128       -> 128
+      1/128-finals       -> 256   # Round of 128 직전 단계로 강제
     """
     if not isinstance(round_name, str):
         return None
@@ -450,21 +453,23 @@ def _round_stage_size(round_name: Any) -> Optional[int]:
     if "quarter" in rn:
         return 4
 
-    m = re.search(r"round of\s+(\d+)", rn)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-
+    # 1/N-finals 는 Round of N 보다 '한 단계 이전'으로 취급
+    # 예: 1/128-finals -> 256
     m = re.search(r"1\s*/\s*(\d+)\s*-\s*finals", rn)
     if m:
         try:
-            return int(m.group(1))
+            return int(m.group(1)) * 2
         except Exception:
             return None
 
     m = re.search(r"1/(\d+)-finals", rn)
+    if m:
+        try:
+            return int(m.group(1)) * 2
+        except Exception:
+            return None
+
+    m = re.search(r"round of\s+(\d+)", rn)
     if m:
         try:
             return int(m.group(1))
@@ -477,25 +482,51 @@ def _round_stage_size(round_name: Any) -> Optional[int]:
 def _round_display_sort_key(col: Dict[str, Any]) -> Tuple[int, int, str]:
     """
     MatchDetail 브라켓 탭 표시용 정렬 키.
-    우선순위:
-    1) 메인 토너먼트 라운드(Final / Semi / Quarter / Round of N / 1/N-finals)
-       -> stage_size 오름차순 (작을수록 후반 라운드)
-    2) 그 외(qualifying / preliminary 등)는 뒤로 보냄
-    3) tie-breaker로 기존 round_order 사용
+    목표: 최신 -> 과거 순
+
+    1) 메인 토너먼트 라운드
+       Final -> Semi -> Quarter -> Round of 16 -> Round of 32 -> Round of 64 -> Round of 128 -> 1/128-finals
+    2) 그 다음 qualifying / preliminary
+       더 늦은 라운드가 먼저 오도록 정렬
     """
     label = str(col.get("round_label") or "").strip()
+    label_l = label.lower()
+
     stage_size = _round_stage_size(label)
-
-    order_hint = col.get("_round_order")
-    try:
-        order_hint_int = int(order_hint) if order_hint is not None else 999999
-    except Exception:
-        order_hint_int = 999999
-
     if stage_size is not None:
-        return (0, stage_size, label.lower())
+        return (0, stage_size, label_l)
 
-    return (1, order_hint_int, label.lower())
+    # qualifying / preliminary 최신 -> 과거 순
+    # 4th Q > 3rd Q > 2nd Q > 1st Q > Preliminary > Extra Preliminary
+    q_rank = 999999
+
+    if "4th round qualifying replays" in label_l:
+        q_rank = 401
+    elif "4th round qualifying" in label_l:
+        q_rank = 400
+    elif "3rd round qualifying replays" in label_l:
+        q_rank = 301
+    elif "3rd round qualifying" in label_l:
+        q_rank = 300
+    elif "2nd round qualifying replays" in label_l:
+        q_rank = 201
+    elif "2nd round qualifying" in label_l:
+        q_rank = 200
+    elif "1st round qualifying replays" in label_l:
+        q_rank = 101
+    elif "1st round qualifying" in label_l:
+        q_rank = 100
+    elif "preliminary round replays" in label_l:
+        q_rank = 21
+    elif label_l == "preliminary round":
+        q_rank = 20
+    elif "extra preliminary round replays" in label_l:
+        q_rank = 11
+    elif label_l == "extra preliminary round":
+        q_rank = 10
+
+    # 최신 -> 과거 로 가려면 큰 rank가 먼저 와야 하므로 음수화
+    return (1, -q_rank, label_l)
 
 
 def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
