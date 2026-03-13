@@ -64,6 +64,8 @@ def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
 
 
 def _detect_league_cup_like(league_id: int) -> bool:
+    league_name = None
+
     try:
         cols = fetch_all(
             """
@@ -75,22 +77,49 @@ def _detect_league_cup_like(league_id: int) -> bool:
         )
         colset = {str(r.get("column_name") or "") for r in cols if r.get("column_name")}
     except Exception:
-        return False
+        colset = set()
 
     select_cols: List[str] = []
-    for c in ("type", "cup", "is_cup"):
+    for c in ("name", "type", "cup", "is_cup"):
         if c in colset:
             select_cols.append(c)
 
-    if not select_cols:
-        return False
+    if select_cols:
+        row = _fetch_one(
+            f"SELECT {', '.join(select_cols)} FROM leagues WHERE id = %s",
+            (league_id,),
+        )
+    else:
+        row = _fetch_one(
+            "SELECT name FROM leagues WHERE id = %s",
+            (league_id,),
+        )
 
-    row = _fetch_one(
-        f"SELECT {', '.join(select_cols)} FROM leagues WHERE id = %s",
-        (league_id,),
-    )
     if row is None:
         return False
+
+    league_name = row.get("name")
+    if isinstance(league_name, str):
+        ln = league_name.strip().lower()
+        if ln:
+            cup_tokens = (
+                "cup",
+                "copa",
+                "coppa",
+                "pokal",
+                "taça",
+                "taca",
+                "coupe",
+                "dfb-pokal",
+                "fa cup",
+                "league cup",
+                "super cup",
+                "supercoppa",
+                "supercopa",
+                "trophy",
+            )
+            if any(tok in ln for tok in cup_tokens):
+                return True
 
     v_type = row.get("type")
     if isinstance(v_type, str) and v_type.strip().lower() == "cup":
