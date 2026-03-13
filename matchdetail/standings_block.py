@@ -231,6 +231,46 @@ def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
 
     return False
 
+def _get_competition_meta(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    return _fetch_one(
+        """
+        SELECT
+            league_id,
+            season,
+            has_standings,
+            groups_count,
+            has_rounds,
+            has_knockout_rounds,
+            format_hint
+        FROM competition_season_meta
+        WHERE league_id = %s
+          AND season = %s
+        LIMIT 1
+        """,
+        (league_id, season),
+    )
+
+
+def _get_group_meta_names(league_id: int, season: int) -> List[str]:
+    rows = fetch_all(
+        """
+        SELECT group_name
+        FROM standings_group_meta
+        WHERE league_id = %s
+          AND season = %s
+        ORDER BY group_order ASC, group_name ASC
+        """,
+        (league_id, season),
+    )
+    out: List[str] = []
+    for r in rows or []:
+        name = r.get("group_name")
+        if isinstance(name, str):
+            name = re.sub(r"\s+", " ", name).strip()
+            if name:
+                out.append(name)
+    return out
+
 
 def _should_hide_standings_early_season(
     *,
@@ -395,7 +435,27 @@ Match Detail용 Standings 블록 (TABLE 전용)
     except Exception:
         rows_raw = []
 
+    comp_meta = _get_competition_meta(league_id_int, season_resolved)
     source = "standings_table" if rows_raw else "computed_from_matches"
+
+    # ✅ competition meta가 "이 시즌은 standings 없음"이라고 말하면
+    #    matches 기반 계산 fallback 자체를 막는다.
+    if not rows_raw and comp_meta is not None:
+        has_standings_meta = _coalesce_int(comp_meta.get("has_standings"), 0)
+        if has_standings_meta == 0:
+            return {
+                "league": {
+                    "league_id": league_id_int,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "mode": "TABLE",
+                "rows": [],
+                "bracket": None,
+                "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available for this competition.",
+                "source": "competition_meta_no_standings",
+            }
 
     # ─────────────────────────────────────────────────────────────
     # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
@@ -733,6 +793,41 @@ Match Detail용 Standings 블록 (TABLE 전용)
         )
 
     context_options = _build_context_options_from_rows(dedup_rows)
+
+    # ✅ 서버에서 저장한 standings_group_meta가 있으면 그 값을 우선 사용
+    try:
+        meta_group_names = _get_group_meta_names(league_id_int, season_resolved)
+        if meta_group_names:
+            conferences: List[str] = []
+            groups: List[str] = []
+
+            for name in meta_group_names:
+                nl = name.lower()
+                if "east" in nl:
+                    conferences.append("East")
+                    continue
+                if "west" in nl:
+                    conferences.append("West")
+                    continue
+                groups.append(name)
+
+            def _dedup_keep_order(items: List[str]) -> List[str]:
+                seen = set()
+                out: List[str] = []
+                for x in items:
+                    k = x.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(x)
+                return out
+
+            context_options = {
+                "conferences": _dedup_keep_order(conferences),
+                "groups": _dedup_keep_order(groups),
+            }
+    except Exception:
+        pass
 
     out: Dict[str, Any] = {
         "league": {
