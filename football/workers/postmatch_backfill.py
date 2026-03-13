@@ -20,6 +20,7 @@ import json
 import time
 import datetime as dt
 from typing import Any, Dict, List, Optional
+import re
 
 import requests
 
@@ -1063,6 +1064,76 @@ def _infer_round_is_knockout(round_name: Optional[str]) -> int:
         "final",
     } else 0
 
+def _extract_round_number(round_name: Optional[str]) -> Optional[int]:
+    if not isinstance(round_name, str):
+        return None
+    text = round_name.strip()
+    if not text:
+        return None
+
+    m = re.search(r"(\d+)\s*$", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    m = re.search(r"regular season\s*-\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    return None
+
+
+def _round_sort_key(round_name: Optional[str]) -> tuple[int, int, str]:
+    rn = safe_text(round_name) or ""
+    kind = _infer_round_kind(rn)
+    num = _extract_round_number(rn)
+
+    priority_map = {
+        "qualifying_round": 10,
+        "phase_round": 20,
+        "regular_round": 30,
+        "league_phase": 40,
+        "other_round": 50,
+        "play_in": 60,
+        "playoff": 70,
+        "round_of_64": 80,
+        "round_of_32": 90,
+        "round_of_16": 100,
+        "quarter_final": 110,
+        "semi_final": 120,
+        "final": 130,
+        "unknown": 999,
+    }
+
+    pri = priority_map.get(kind, 999)
+
+    if num is None:
+        num = 999999
+
+    return (pri, num, rn.lower())
+
+
+def _sort_rounds(rounds: List[str]) -> List[str]:
+    uniq: List[str] = []
+    seen = set()
+
+    for r in rounds or []:
+        name = (safe_text(r) or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(name)
+
+    return sorted(uniq, key=_round_sort_key)
+
 
 def upsert_competition_api_raw(
     league_id: int,
@@ -1096,7 +1167,8 @@ def replace_rounds_for_league_season(league_id: int, season: int, rounds: List[s
         (int(league_id), int(season)),
     )
     n = 0
-    for round_name in rounds or []:
+    sorted_rounds = _sort_rounds(rounds or [])
+    for round_name in sorted_rounds:
         execute(
             "INSERT INTO rounds (league_id, round, season) VALUES (%s, %s, %s)",
             (int(league_id), str(round_name), int(season)),
@@ -1196,7 +1268,9 @@ def replace_competition_rounds_meta(
 
     updated_utc = _iso_utc_from_dt(updated_at)
     n = 0
-    for idx, round_name in enumerate(rounds or [], start=1):
+    sorted_rounds = _sort_rounds(rounds or [])
+
+    for idx, round_name in enumerate(sorted_rounds, start=1):
         round_kind = _infer_round_kind(round_name)
         is_knockout = _infer_round_is_knockout(round_name)
         execute(
@@ -1265,10 +1339,15 @@ def upsert_competition_season_meta(
             format_hint = "knockout_only"
         else:
             format_hint = "cup_other"
-    elif has_groups:
-        format_hint = "multi_group_league"
     else:
-        format_hint = "single_table_league"
+        if has_groups and has_knockout_rounds:
+            format_hint = "multi_group_league_plus_playoff"
+        elif has_groups:
+            format_hint = "multi_group_league"
+        elif has_knockout_rounds:
+            format_hint = "single_table_league_plus_playoff"
+        else:
+            format_hint = "single_table_league"
 
     updated_utc = _iso_utc_from_dt(updated_at)
 
