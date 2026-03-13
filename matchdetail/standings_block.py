@@ -308,7 +308,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
 1) standings 테이블 우선
 2) 비어있으면 matches로 계산
 3) finished=0이면 rows=[] + message
-4) 현재는 브라켓 비활성화 상태이므로 mode="TABLE", bracket=None 고정
+4) mode="TABLE" 고정
 """
 
     league_id = header.get("league_id")
@@ -425,8 +425,8 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
 
     # ─────────────────────────────────────────────────────────────
-    # 2) standings 비어 있고 현재 컨텍스트가 컵/넉아웃이면
-    #    computed_from_matches fallback 을 막는다.
+    # 2) standings가 비어 있고 현재 컨텍스트가 컵/넉아웃이면
+    #    matches 기반 standings fallback 을 막는다.
     # ─────────────────────────────────────────────────────────────
     if not rows_raw and is_knockout_context:
         return {
@@ -740,7 +740,6 @@ Match Detail용 Standings 블록 (TABLE 전용)
             "season": season_resolved,
             "name": league_name,
         },
-        # ✅ 기본은 TABLE, bracket이 있으면 BRACKET으로만 바꿔 끼움
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
