@@ -107,7 +107,6 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                   AND season = %s
                   AND NOT (
                     coalesce(status,'') IN ('FT','AET','PEN')
-                    OR coalesce(status_short,'') IN ('FT','AET','PEN')
                   )
                 """,
                 (league_id, season_value),
