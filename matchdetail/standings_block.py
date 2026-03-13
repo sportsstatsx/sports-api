@@ -113,12 +113,10 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
     브라켓 표시에 쓸 스코어를 결정한다.
 
     규칙:
-    - 메인 스코어(home/away)는 항상 경기 스코어 기준
-      * PEN  -> ET 있으면 ET, 없으면 FT
-      * AET  -> ET 우선, 없으면 FT
-      * FT   -> FT
-    - 승부차기 점수는 pen_home / pen_away 로 별도 전달
-    - raw 없으면 matches.home_ft / away_ft fallback
+    - FT 종료  -> FT 사용
+    - AET 종료 -> FT + ET 사용
+    - PEN 종료 -> FT + ET 사용, penalty는 별도 전달
+    - raw 점수가 부족하면 matches.home_ft / away_ft fallback
     """
     fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
     status = str(match_row.get("status") or "").strip().upper()
@@ -129,34 +127,25 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
     match_home_ft = _safe_int_or_none(match_row.get("home_ft"))
     match_away_ft = _safe_int_or_none(match_row.get("away_ft"))
 
+    ft_home = raw_score["ft_home"]
+    ft_away = raw_score["ft_away"]
+    et_home = raw_score["et_home"]
+    et_away = raw_score["et_away"]
+
     disp_home: Optional[int] = None
     disp_away: Optional[int] = None
     score_source = "matches_ft"
 
-    if status == "PEN":
-        if raw_score["et_home"] is not None and raw_score["et_away"] is not None:
-            disp_home = raw_score["et_home"]
-            disp_away = raw_score["et_away"]
-            score_source = "raw_extratime"
-        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
-            score_source = "raw_fulltime"
-
-    elif status == "AET":
-        if raw_score["et_home"] is not None and raw_score["et_away"] is not None:
-            disp_home = raw_score["et_home"]
-            disp_away = raw_score["et_away"]
-            score_source = "raw_extratime"
-        elif raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
-            score_source = "raw_fulltime"
+    if status in {"AET", "PEN"}:
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home + (et_home or 0)
+            disp_away = ft_away + (et_away or 0)
+            score_source = "raw_fulltime_plus_extratime"
 
     elif status_group == "FINISHED" or status in {"FT", "NS", "PST", "CANC", "ABD"}:
-        if raw_score["ft_home"] is not None and raw_score["ft_away"] is not None:
-            disp_home = raw_score["ft_home"]
-            disp_away = raw_score["ft_away"]
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home
+            disp_away = ft_away
             score_source = "raw_fulltime"
 
     if disp_home is None or disp_away is None:
@@ -167,10 +156,10 @@ def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Opti
     return {
         "home": disp_home,
         "away": disp_away,
-        "ft_home": raw_score["ft_home"],
-        "ft_away": raw_score["ft_away"],
-        "et_home": raw_score["et_home"],
-        "et_away": raw_score["et_away"],
+        "ft_home": ft_home,
+        "ft_away": ft_away,
+        "et_home": et_home,
+        "et_away": et_away,
         "pen_home": raw_score["pen_home"],
         "pen_away": raw_score["pen_away"],
         "score_source": score_source,
