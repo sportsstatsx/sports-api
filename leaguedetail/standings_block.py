@@ -668,8 +668,33 @@ def _derive_table_stage_label(
     return None
 
 
+def _should_pin_table_stage_first(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    table_stage_label: Optional[str],
+    table_stage_has_data: bool,
+) -> bool:
+    """
+    Table + 부가 플레이오프(진출권/분류전/컨퍼런스 플레이오프 등) 구조에서는
+    stage 칩 순서를 "Table 우선"으로 보정한다.
+
+    반대로 진짜 메인 녹아웃(예: league_phase_plus_knockout, knockout_only)은
+    기존처럼 최신 라운드 우선 정책을 유지한다.
+    """
+    if not table_stage_label or not table_stage_has_data:
+        return False
+
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    return format_hint in {
+        "single_table_league_plus_playoff",
+        "multi_group_league_plus_playoff",
+    }
+
+
 def _build_stage_round_options(
     *,
+    comp_meta: Optional[Dict[str, Any]],
     all_round_rows: List[Dict[str, Any]],
     table_stage_label: Optional[str],
     table_stage_has_data: bool,
@@ -692,9 +717,9 @@ def _build_stage_round_options(
             continue
 
         is_knockout = _is_knockout_round_name(
-                    row.get("round_name"),
-                    meta_is_knockout=row.get("is_knockout"),
-                )
+            row.get("round_name"),
+            meta_is_knockout=row.get("is_knockout"),
+        )
 
         if is_knockout:
             if _coalesce_int(round_count_map.get(round_name), 0) > 0:
@@ -705,7 +730,28 @@ def _build_stage_round_options(
             visible_asc.append(table_stage_label)
             added_table_stage = True
 
-    return list(reversed(visible_asc))
+    visible_desc = list(reversed(visible_asc))
+
+    if _should_pin_table_stage_first(
+        comp_meta=comp_meta,
+        table_stage_label=table_stage_label,
+        table_stage_has_data=table_stage_has_data,
+    ):
+        pinned: List[str] = []
+        if table_stage_label:
+            pinned.append(table_stage_label)
+
+        for label in visible_desc:
+            if (
+                table_stage_label
+                and label.strip().lower() == table_stage_label.strip().lower()
+            ):
+                continue
+            pinned.append(label)
+
+        return pinned
+
+    return visible_desc
 
 
 def _should_hide_standings_early_season(
@@ -957,6 +1003,7 @@ def build_standings_block(
             table_stage_has_data = bool(table_stage_label and rows_raw)
 
             stage_round_options = _build_stage_round_options(
+                comp_meta=comp_meta,
                 all_round_rows=all_round_rows or [],
                 table_stage_label=table_stage_label,
                 table_stage_has_data=table_stage_has_data,
