@@ -1,8 +1,9 @@
-# leaguedetail/standings_block.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import re
+import datetime as dt
+import json
 
 from db import fetch_all
 
@@ -15,22 +16,39 @@ def _coalesce_int(v: Any, default: int = 0) -> int:
 
 
 def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
-    """
-    fetch_all 래핑해서 첫 번째 row만 돌려주는 헬퍼.
-    """
     rows = fetch_all(query, params)
     return rows[0] if rows else None
 
 
+def _safe_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_text_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def _parse_json_text(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return v
+    if not isinstance(v, str):
+        return {}
+    try:
+        parsed = json.loads(v)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
-    """
-    season 이 None 이면:
-      1) competition_season_meta MAX(season)
-      2) standings MAX(season)
-      3) matches MAX(season)
-      4) fixtures MAX(season)
-    순서대로 시도해서 하나라도 찾으면 그 값 리턴.
-    """
     if season is not None:
         return season
 
@@ -162,6 +180,7 @@ def _detect_league_cup_like(league_id: int) -> bool:
 
     return False
 
+
 def _get_competition_meta(league_id: int, season: int) -> Optional[Dict[str, Any]]:
     return _fetch_one(
         """
@@ -204,11 +223,6 @@ def _get_group_meta_names(league_id: int, season: int) -> List[str]:
 
 
 def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
-    """
-    matches 기반 standings 계산을 막아야 하는 시즌/대회 포맷 판별.
-
-    계산 fallback은 '순수 단일 리그 테이블(single_table_league)' 에서만 허용.
-    """
     if comp_meta is None:
         return False
 
@@ -246,17 +260,9 @@ def _effective_group_name(
     raw_group_name: Any,
     description: Any,
 ) -> Optional[str]:
-    """
-    rows의 group_name이 리그명/기본값으로만 채워지고,
-    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
-
-    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
-    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
-    """
     g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
     d = description.strip().lower() if isinstance(description, str) else ""
 
-    # group_name 자체가 의미있으면 그대로 둠
     gl = g.lower()
     if gl:
         if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
@@ -266,31 +272,17 @@ def _effective_group_name(
         if "east" in gl or "west" in gl:
             return g
 
-    # description 기반 split round 보정
     if "champ" in d and "round" in d:
         return "Championship Round"
     if "releg" in d and "round" in d:
         return "Relegation Round"
 
-    # 그 외는 기존 group_name 유지(빈 값이면 None)
     return g if g else None
 
-
-
-
-# ────────────────────────────────────────────────────────────
-#  컨퍼런스 / 그룹 / 스플릿 정보 추출 (context_options)
-# ────────────────────────────────────────────────────────────
 
 def _build_context_options_from_rows(
     rows: List[Dict[str, Any]]
 ) -> Dict[str, List[str]]:
-    """
-    matchdetail과 동일한 컨퍼런스/그룹 인식 로직.
-
-    - conferences: ["East", "West"] 등
-    - groups: ["Group A", "Group B", "Championship Round", "Relegation Round"] 등
-    """
     if not rows:
         return {"conferences": [], "groups": []}
 
@@ -306,7 +298,7 @@ def _build_context_options_from_rows(
         if isinstance(d, str):
             desc_raw.append(d.lower())
 
-    group_raw = list(dict.fromkeys(group_raw))  # distinct, 순서 유지
+    group_raw = list(dict.fromkeys(group_raw))
 
     rx_has_split_round = re.compile(
         r"(champ(ion)?ship\s+.*(round|rnd))|(releg(ation)?\s+.*(round|rnd))",
@@ -375,60 +367,501 @@ def _build_context_options_from_rows(
     return {"conferences": conferences, "groups": groups}
 
 
+def _read_fixture_score_from_raw(fixture_id: Optional[int]) -> Dict[str, Optional[int]]:
+    if fixture_id is None:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    row = _fetch_one(
+        """
+        SELECT data_json
+        FROM match_fixtures_raw
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if not row:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    root = _parse_json_text(row.get("data_json"))
+    score = root.get("score") if isinstance(root.get("score"), dict) else {}
+
+    ft = score.get("fulltime") if isinstance(score.get("fulltime"), dict) else {}
+    et = score.get("extratime") if isinstance(score.get("extratime"), dict) else {}
+    pen = score.get("penalty") if isinstance(score.get("penalty"), dict) else {}
+
+    return {
+        "ft_home": _safe_int_or_none(ft.get("home")),
+        "ft_away": _safe_int_or_none(ft.get("away")),
+        "et_home": _safe_int_or_none(et.get("home")),
+        "et_away": _safe_int_or_none(et.get("away")),
+        "pen_home": _safe_int_or_none(pen.get("home")),
+        "pen_away": _safe_int_or_none(pen.get("away")),
+    }
+
+
+def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
+    status = str(match_row.get("status") or "").strip().upper()
+    status_group = str(match_row.get("status_group") or "").strip().upper()
+
+    raw_score = _read_fixture_score_from_raw(fixture_id)
+
+    match_home_ft = _safe_int_or_none(match_row.get("home_ft"))
+    match_away_ft = _safe_int_or_none(match_row.get("away_ft"))
+
+    ft_home = raw_score["ft_home"]
+    ft_away = raw_score["ft_away"]
+    et_home = raw_score["et_home"]
+    et_away = raw_score["et_away"]
+
+    disp_home: Optional[int] = None
+    disp_away: Optional[int] = None
+    score_source = "matches_ft"
+
+    if status in {"AET", "PEN"}:
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home + (et_home or 0)
+            disp_away = ft_away + (et_away or 0)
+            score_source = "raw_fulltime_plus_extratime"
+
+    elif status_group == "FINISHED" or status in {"FT", "NS", "PST", "CANC", "ABD"}:
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home
+            disp_away = ft_away
+            score_source = "raw_fulltime"
+
+    if disp_home is None or disp_away is None:
+        disp_home = match_home_ft
+        disp_away = match_away_ft
+        score_source = "matches_ft"
+
+    return {
+        "home": disp_home,
+        "away": disp_away,
+        "ft_home": ft_home,
+        "ft_away": ft_away,
+        "et_home": et_home,
+        "et_away": et_away,
+        "pen_home": raw_score["pen_home"],
+        "pen_away": raw_score["pen_away"],
+        "score_source": score_source,
+        "status": status,
+    }
+
+
+def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
+    if not isinstance(s, str):
+        return None
+    txt = s.strip()
+    if not txt:
+        return None
+
+    try:
+        iso = txt.replace(" ", "T")
+        d = dt.datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc)
+    except Exception:
+        pass
+
+    try:
+        head = txt.replace("T", " ").split("+", 1)[0].strip()[:19]
+        d = dt.datetime.strptime(head, "%Y-%m-%d %H:%M:%S")
+        return d.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _fetch_pair_round_matches(
+    *,
+    league_id: int,
+    season: int,
+    round_label: str,
+    team_a_id: int,
+    team_b_id: int,
+) -> List[Dict[str, Any]]:
+    if not round_label or team_a_id <= 0 or team_b_id <= 0:
+        return []
+
+    try:
+        rows = fetch_all(
+            """
+            SELECT
+                m.fixture_id,
+                m.league_round,
+                m.date_utc,
+                m.home_id,
+                m.away_id,
+                m.home_ft,
+                m.away_ft,
+                m.status,
+                m.status_group,
+                th.name AS home_name,
+                ta.name AS away_name,
+                th.logo AS home_logo,
+                ta.logo AS away_logo
+            FROM matches m
+            LEFT JOIN teams th ON th.id = m.home_id
+            LEFT JOIN teams ta ON ta.id = m.away_id
+            WHERE m.league_id = %s
+              AND m.season = %s
+              AND m.league_round = %s
+              AND (
+                    (m.home_id = %s AND m.away_id = %s)
+                 OR (m.home_id = %s AND m.away_id = %s)
+              )
+            ORDER BY
+                m.date_utc ASC,
+                m.fixture_id ASC
+            """,
+            (league_id, season, round_label, team_a_id, team_b_id, team_b_id, team_a_id),
+        )
+        return rows or []
+    except Exception:
+        return []
+
+
+def _is_knockout_round_name(round_name: Any) -> bool:
+    if not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    lo = rn.lower()
+
+    if (
+        "league stage" in lo
+        or "regular season" in lo
+        or lo.startswith("group ")
+        or "group stage" in lo
+        or lo.startswith("stage ")
+        or re.match(r"^(apertura|clausura)\s*-\s*\d+$", lo)
+    ):
+        return False
+
+    include_tokens = (
+        "final",
+        "semi",
+        "quarter",
+        "round of",
+        "knockout",
+        "playoff",
+        "play-off",
+        "play in",
+        "play-in",
+        "elimination",
+        "preliminary",
+        "qualifying",
+        "qualifier",
+        "reclasificacion",
+        "reclasificación",
+    )
+    if any(t in lo for t in include_tokens):
+        return True
+
+    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
+        return True
+    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+        return True
+
+    return False
+
+
+def _normalize_knockout_round_rows_for_display(
+    league_id: int,
+    season: int,
+    knockout_rounds: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not knockout_rounds:
+        knockout_rounds = []
+
+    normalized: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for row in knockout_rounds:
+        rn = _safe_text_or_none(row.get("round_name"))
+        if not rn:
+            continue
+        if rn in seen_names:
+            continue
+        seen_names.add(rn)
+        normalized.append(dict(row))
+
+    if league_id == 45 and season == 2025:
+        fa_2025_order = [
+            "Extra Preliminary Round",
+            "Extra Preliminary Round Replays",
+            "Preliminary Round",
+            "Preliminary Round Replays",
+            "1st Round Qualifying",
+            "1st Round Qualifying Replays",
+            "2nd Round Qualifying",
+            "2nd Round Qualifying Replays",
+            "3rd Round Qualifying",
+            "1/128-finals",
+            "Round of 128",
+            "Round of 64",
+            "Round of 32",
+            "Round of 16",
+            "Quarter-finals",
+            "Semi-finals",
+            "Final",
+        ]
+
+        order_map = {name: idx + 1 for idx, name in enumerate(fa_2025_order)}
+
+        existing_names = {
+            _safe_text_or_none(r.get("round_name"))
+            for r in normalized
+            if _safe_text_or_none(r.get("round_name"))
+        }
+
+        if "Round of 128" not in existing_names:
+            normalized.append(
+                {
+                    "round_name": "Round of 128",
+                    "round_order": order_map["Round of 128"],
+                    "round_kind": "round_of_128",
+                    "is_knockout": 1,
+                }
+            )
+
+        fixed_rows: List[Dict[str, Any]] = []
+        seen_names = set()
+
+        for row in normalized:
+            rn = _safe_text_or_none(row.get("round_name"))
+            if not rn or rn in seen_names:
+                continue
+            seen_names.add(rn)
+
+            fixed = dict(row)
+
+            if rn in order_map:
+                fixed["round_order"] = order_map[rn]
+                fixed["is_knockout"] = 1
+
+                if rn == "1/128-finals":
+                    fixed["round_kind"] = "round_of_256_playin"
+                elif rn == "Round of 128":
+                    fixed["round_kind"] = "round_of_128"
+
+            fixed_rows.append(fixed)
+
+        fixed_rows.sort(
+            key=lambda r: (
+                _coalesce_int(r.get("round_order"), 999999),
+                str(r.get("round_name") or ""),
+            )
+        )
+        return fixed_rows
+
+    normalized.sort(
+        key=lambda r: (
+            _coalesce_int(r.get("round_order"), 999999),
+            str(r.get("round_name") or ""),
+        )
+    )
+    return normalized
+
+
+def _derive_table_stage_label(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    round_rows: List[Dict[str, Any]],
+    rows_raw: List[Dict[str, Any]],
+) -> Optional[str]:
+    if not rows_raw:
+        return None
+
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+    has_knockout_rounds = _coalesce_int((comp_meta or {}).get("has_knockout_rounds"), 0)
+
+    if has_knockout_rounds != 1:
+        return None
+
+    round_names = [
+        _safe_text_or_none(r.get("round_name"))
+        for r in (round_rows or [])
+    ]
+    round_names = [r for r in round_names if r]
+
+    lower_names = [r.lower() for r in round_names]
+
+    if any("league stage" in r for r in lower_names):
+        return "League Stage"
+
+    if any(("group stage" in r) or r.startswith("group ") for r in lower_names):
+        return "Group Stage"
+
+    if format_hint in {
+        "league_phase_plus_knockout",
+        "single_table_league_plus_playoff",
+        "multi_group_league_plus_playoff",
+        "cup_with_standings",
+    }:
+        return "Table"
+
+    return None
+
+
+def _build_stage_round_options(
+    *,
+    all_round_rows: List[Dict[str, Any]],
+    table_stage_label: Optional[str],
+    table_stage_has_data: bool,
+    round_count_map: Dict[str, int],
+) -> List[str]:
+    visible_asc: List[str] = []
+    added_table_stage = False
+
+    sorted_rows = sorted(
+        all_round_rows or [],
+        key=lambda r: (
+            _coalesce_int(r.get("round_order"), 999999),
+            str(r.get("round_name") or ""),
+        )
+    )
+
+    for row in sorted_rows:
+        round_name = _safe_text_or_none(row.get("round_name"))
+        if not round_name:
+            continue
+
+        is_knockout = _coalesce_int(row.get("is_knockout"), 0) == 1
+
+        if is_knockout:
+            if _coalesce_int(round_count_map.get(round_name), 0) > 0:
+                visible_asc.append(round_name)
+            continue
+
+        if table_stage_label and table_stage_has_data and not added_table_stage:
+            visible_asc.append(table_stage_label)
+            added_table_stage = True
+
+    return list(reversed(visible_asc))
+
+
+def _should_hide_standings_early_season(
+    *,
+    league_id: int,
+    season: int,
+    rows_raw: List[Dict[str, Any]],
+    window_days: int = 14,
+    played_threshold: int = 15,
+) -> bool:
+    if not rows_raw:
+        return False
+
+    max_played = 0
+    for r in rows_raw:
+        p = _coalesce_int(r.get("played"), 0)
+        if p > max_played:
+            max_played = p
+
+    if max_played < played_threshold:
+        return False
+
+    min_row = _fetch_one(
+        """
+        SELECT MIN(date_utc) AS min_date_utc
+        FROM fixtures
+        WHERE league_id = %s
+          AND season = %s
+        """,
+        (league_id, season),
+    )
+    season_start_dt = _parse_utc_dt((min_row or {}).get("min_date_utc"))
+    if season_start_dt is None:
+        return False
+
+    ref_dt = dt.datetime.now(dt.timezone.utc)
+    delta_days = (ref_dt - season_start_dt).total_seconds() / 86400.0
+    if delta_days <= window_days:
+        return True
+
+    return False
+
 
 def build_standings_block(
     league_id: int,
     season: Optional[int],
+    bracket_round: Optional[str] = None,
 ) -> Dict[str, Any]:
-
-
-    """
-    League Detail 화면의 'Standings' 탭 데이터.
-
-    ✅ 완전무결(절대 흔들리지 않게):
-    1) standings 테이블에 (league_id, season) rows가 있으면 그걸 우선 사용
-    2) standings가 비어 있어도,
-       - 해당 시즌에 "완료된 경기"가 1개라도 있으면(matches 기준)
-       - 즉시 standings를 계산해서 내려준다 (현재 시즌 Standings 보장)
-    3) 완료된 경기 자체가 0이면 rows=[] (아직 시즌 시작 전)
-    """
-
     if not league_id:
         return {
-            "league_id": None,
-            "season": None,
+            "league": {
+                "league_id": None,
+                "season": None,
+                "name": None,
+            },
+            "mode": "TABLE",
             "rows": [],
+            "bracket": None,
+            "bracket_round_options": [],
+            "selected_bracket_round": None,
             "context_options": {"conferences": [], "groups": []},
+            "message": "Standings are not available yet.\nPlease check back later.",
+            "source": "invalid_league",
         }
 
     season_resolved = _resolve_season(league_id, season)
     if season_resolved is None:
-        print(f"[build_standings_block] WARN: no season found for league_id={league_id}")
         return {
-            "league_id": league_id,
-            "season": None,
+            "league": {
+                "league_id": league_id,
+                "season": None,
+                "name": None,
+            },
+            "mode": "TABLE",
             "rows": [],
+            "bracket": None,
+            "bracket_round_options": [],
+            "selected_bracket_round": None,
             "context_options": {"conferences": [], "groups": []},
+            "message": "Standings are not available yet.\nPlease check back later.",
+            "source": "season_not_found",
         }
 
     league_name: Optional[str] = None
+    league_logo: Optional[str] = None
     try:
         league_row = _fetch_one(
             """
-            SELECT name
+            SELECT name, logo
             FROM leagues
             WHERE id = %s
+            LIMIT 1
             """,
             (league_id,),
         )
         if league_row is not None:
             league_name = (league_row.get("name") or "").strip() or None
-    except Exception as e:
-        print(f"[build_standings_block] WARN: failed to load league name league_id={league_id}: {e}")
+            league_logo = (league_row.get("logo") or "").strip() or None
+    except Exception:
+        pass
 
     is_cup_like = _detect_league_cup_like(league_id)
     comp_meta = _get_competition_meta(league_id, season_resolved)
-    
+
     def _cols_of(table_name: str) -> set[str]:
         try:
             cols = fetch_all(
@@ -444,13 +877,12 @@ def build_standings_block(
         except Exception:
             return set()
 
-    def _pick_pair(cols: set[str], pairs: List[tuple[str, str]]) -> Optional[tuple[str, str]]:
+    def _pick_pair(cols: set[str], pairs: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
         for a, b in pairs:
             if a in cols and b in cols:
                 return (a, b)
         return None
 
-    # 1) standings 테이블 우선
     try:
         rows_raw: List[Dict[str, Any]] = fetch_all(
             """
@@ -481,11 +913,523 @@ def build_standings_block(
             """,
             (league_id, season_resolved),
         )
-    except Exception as e:
-        print(f"[build_standings_block] ERROR standings query league_id={league_id}, season={season_resolved}: {e}")
+    except Exception:
         rows_raw = []
 
-    # 2) competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
+    source = "standings_table" if rows_raw else "computed_from_matches"
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    try:
+        all_round_rows = fetch_all(
+            """
+            SELECT
+                round_name,
+                round_order,
+                round_kind,
+                is_knockout
+            FROM competition_rounds_meta
+            WHERE league_id = %s
+              AND season = %s
+            ORDER BY round_order ASC, round_name ASC
+            """,
+            (league_id, season_resolved),
+        )
+    except Exception:
+        all_round_rows = []
+
+    table_stage_label = _derive_table_stage_label(
+        comp_meta=comp_meta,
+        round_rows=all_round_rows or [],
+        rows_raw=rows_raw or [],
+    )
+
+    stage_round_options: List[str] = []
+
+    is_bracket_candidate = format_hint in {
+        "knockout_only",
+        "single_table_league_plus_playoff",
+        "league_phase_plus_knockout",
+        "multi_group_league_plus_playoff",
+    }
+
+    if is_bracket_candidate or table_stage_label:
+        try:
+            knockout_rounds = fetch_all(
+                """
+                SELECT
+                    round_name,
+                    round_order,
+                    round_kind,
+                    is_knockout
+                FROM competition_rounds_meta
+                WHERE league_id = %s
+                  AND season = %s
+                  AND is_knockout = 1
+                ORDER BY round_order ASC, round_name ASC
+                """,
+                (league_id, season_resolved),
+            )
+
+            knockout_rounds = _normalize_knockout_round_rows_for_display(
+                league_id=league_id,
+                season=season_resolved,
+                knockout_rounds=knockout_rounds or [],
+            )
+
+            knockout_round_names_asc = [
+                str(r.get("round_name")).strip()
+                for r in knockout_rounds
+                if r.get("round_name")
+            ]
+
+            round_count_rows = []
+            if knockout_round_names_asc:
+                round_count_rows = fetch_all(
+                    """
+                    SELECT
+                        m.league_round,
+                        COUNT(*) AS cnt
+                    FROM matches m
+                    WHERE m.league_id = %s
+                      AND m.season = %s
+                      AND m.league_round = ANY(%s)
+                    GROUP BY m.league_round
+                    """,
+                    (league_id, season_resolved, knockout_round_names_asc),
+                )
+
+            round_count_map: Dict[str, int] = {}
+            for rr in round_count_rows or []:
+                rn = _safe_text_or_none(rr.get("league_round"))
+                if not rn:
+                    continue
+                round_count_map[rn] = _coalesce_int(rr.get("cnt"), 0)
+
+            table_stage_has_data = bool(table_stage_label and rows_raw)
+
+            stage_round_options = _build_stage_round_options(
+                all_round_rows=all_round_rows or [],
+                table_stage_label=table_stage_label,
+                table_stage_has_data=table_stage_has_data,
+                round_count_map=round_count_map,
+            )
+
+            selected_round_label: Optional[str] = None
+            selected_is_table_stage = False
+            requested_round = _safe_text_or_none(bracket_round)
+
+            if (
+                requested_round
+                and table_stage_label
+                and requested_round.strip().lower() == table_stage_label.strip().lower()
+            ):
+                selected_round_label = table_stage_label
+                selected_is_table_stage = True
+
+            elif (
+                requested_round
+                and requested_round in knockout_round_names_asc
+                and _coalesce_int(round_count_map.get(requested_round), 0) > 0
+            ):
+                selected_round_label = requested_round
+
+            elif stage_round_options:
+                selected_round_label = stage_round_options[0]
+                if table_stage_label and selected_round_label.strip().lower() == table_stage_label.strip().lower():
+                    selected_is_table_stage = True
+
+            if not selected_is_table_stage and selected_round_label:
+                def _match_is_finished(m: Dict[str, Any]) -> bool:
+                    sg = str(m.get("status_group") or "").strip().upper()
+                    st = str(m.get("status") or "").strip().upper()
+                    return sg == "FINISHED" or st in {"FT", "AET", "PEN"}
+
+                def _unordered_pair_key(m: Dict[str, Any]) -> Tuple[int, int]:
+                    h = _coalesce_int(m.get("home_id"), 0)
+                    a = _coalesce_int(m.get("away_id"), 0)
+                    return tuple(sorted((h, a)))
+
+                def _leg_payload(m: Dict[str, Any], leg_index: Optional[int]) -> Dict[str, Any]:
+                    resolved = _resolve_bracket_display_scores(m)
+                    return {
+                        "fixture_id": _safe_int_or_none(m.get("fixture_id")),
+                        "leg_index": leg_index,
+                        "date_utc": _safe_text_or_none(m.get("date_utc")),
+                        "home_id": _coalesce_int(m.get("home_id"), 0),
+                        "home_name": _safe_text_or_none(m.get("home_name")),
+                        "home_logo": _safe_text_or_none(m.get("home_logo")),
+                        "away_id": _coalesce_int(m.get("away_id"), 0),
+                        "away_name": _safe_text_or_none(m.get("away_name")),
+                        "away_logo": _safe_text_or_none(m.get("away_logo")),
+                        "home_ft": resolved.get("home"),
+                        "away_ft": resolved.get("away"),
+                        "home_pen": resolved.get("pen_home"),
+                        "away_pen": resolved.get("pen_away"),
+                        "score_status": resolved.get("status"),
+                    }
+
+                def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+                    resolved = _resolve_bracket_display_scores(original_match)
+
+                    ft_home = resolved.get("ft_home")
+                    ft_away = resolved.get("ft_away")
+                    et_home = resolved.get("et_home")
+                    et_away = resolved.get("et_away")
+                    status = str(original_match.get("status") or "").strip().upper()
+
+                    if status in {"AET", "PEN"}:
+                        if ft_home is not None and ft_away is not None:
+                            return ft_home + (et_home or 0), ft_away + (et_away or 0)
+
+                    if ft_home is not None and ft_away is not None:
+                        return ft_home, ft_away
+
+                    return leg.get("home_ft"), leg.get("away_ft")
+
+                def _winner_from_single_match(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+                    resolved = _resolve_bracket_display_scores(m)
+
+                    home_id = _safe_int_or_none(m.get("home_id"))
+                    away_id = _safe_int_or_none(m.get("away_id"))
+                    if home_id is None or away_id is None:
+                        return None, None
+
+                    home_score = resolved.get("home")
+                    away_score = resolved.get("away")
+                    if home_score is not None and away_score is not None:
+                        if home_score > away_score:
+                            return home_id, "score"
+                        if away_score > home_score:
+                            return away_id, "score"
+
+                    status = str(m.get("status") or "").strip().upper()
+                    if status == "PEN":
+                        pen_home = resolved.get("pen_home")
+                        pen_away = resolved.get("pen_away")
+                        if pen_home is not None and pen_away is not None:
+                            if pen_home > pen_away:
+                                return home_id, "penalty"
+                            if pen_away > pen_home:
+                                return away_id, "penalty"
+
+                    return None, None
+
+                def _winner_from_two_leg_tie(
+                    *,
+                    leg1: Dict[str, Any],
+                    leg2: Dict[str, Any],
+                    m2: Dict[str, Any],
+                    agg_home: Optional[int],
+                    agg_away: Optional[int],
+                ) -> Tuple[Optional[int], Optional[str]]:
+                    home_anchor_id = _safe_int_or_none(leg1.get("home_id"))
+                    away_anchor_id = _safe_int_or_none(leg1.get("away_id"))
+                    if home_anchor_id is None or away_anchor_id is None:
+                        return None, None
+
+                    if agg_home is not None and agg_away is not None:
+                        if agg_home > agg_away:
+                            return home_anchor_id, "aggregate"
+                        if agg_away > agg_home:
+                            return away_anchor_id, "aggregate"
+
+                    status2 = str(m2.get("status") or "").strip().upper()
+                    if status2 == "PEN":
+                        resolved2 = _resolve_bracket_display_scores(m2)
+                        pen_home2 = resolved2.get("pen_home")
+                        pen_away2 = resolved2.get("pen_away")
+                        if pen_home2 is None or pen_away2 is None:
+                            return None, None
+
+                        anchor_home_pen: Optional[int] = None
+                        anchor_away_pen: Optional[int] = None
+
+                        if _safe_int_or_none(leg2.get("home_id")) == home_anchor_id:
+                            anchor_home_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == home_anchor_id:
+                            anchor_home_pen = pen_away2
+
+                        if _safe_int_or_none(leg2.get("home_id")) == away_anchor_id:
+                            anchor_away_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == away_anchor_id:
+                            anchor_away_pen = pen_away2
+
+                        if anchor_home_pen is not None and anchor_away_pen is not None:
+                            if anchor_home_pen > anchor_away_pen:
+                                return home_anchor_id, "penalty"
+                            if anchor_away_pen > anchor_home_pen:
+                                return away_anchor_id, "penalty"
+
+                    return None, None
+
+                def _build_round_ties(round_label: str, round_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                    if not round_matches:
+                        return []
+
+                    grouped: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+
+                    for m in round_matches:
+                        h = _coalesce_int(m.get("home_id"), 0)
+                        a = _coalesce_int(m.get("away_id"), 0)
+                        if h > 0 and a > 0:
+                            grouped.setdefault(_unordered_pair_key(m), []).append(m)
+
+                    def _sort_matches(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                        return sorted(
+                            items,
+                            key=lambda x: (
+                                str(x.get("date_utc") or ""),
+                                _coalesce_int(x.get("fixture_id"), 0),
+                            ),
+                        )
+
+                    def _build_two_leg_tie_from_matches(
+                        pair_items: List[Dict[str, Any]],
+                        order_value: int,
+                    ) -> Optional[Dict[str, Any]]:
+                        pair_items = _sort_matches(pair_items)
+                        if len(pair_items) < 2:
+                            return None
+
+                        m1 = pair_items[0]
+                        m2 = pair_items[1]
+
+                        leg1 = _leg_payload(m1, 1)
+                        leg2 = _leg_payload(m2, 2)
+
+                        home_anchor_id = leg1["home_id"]
+                        away_anchor_id = leg1["away_id"]
+
+                        agg_home: Optional[int] = None
+                        agg_away: Optional[int] = None
+
+                        if _match_is_finished(m1) and _match_is_finished(m2):
+                            s1h, s1a = _agg_score_for_leg(leg1, m1)
+                            s2h, s2a = _agg_score_for_leg(leg2, m2)
+
+                            if None not in (s1h, s1a, s2h, s2a):
+                                h_sum = 0
+                                a_sum = 0
+
+                                if leg1["home_id"] == home_anchor_id:
+                                    h_sum += int(s1h)
+                                elif leg1["home_id"] == away_anchor_id:
+                                    a_sum += int(s1h)
+
+                                if leg1["away_id"] == home_anchor_id:
+                                    h_sum += int(s1a)
+                                elif leg1["away_id"] == away_anchor_id:
+                                    a_sum += int(s1a)
+
+                                if leg2["home_id"] == home_anchor_id:
+                                    h_sum += int(s2h)
+                                elif leg2["home_id"] == away_anchor_id:
+                                    a_sum += int(s2h)
+
+                                if leg2["away_id"] == home_anchor_id:
+                                    h_sum += int(s2a)
+                                elif leg2["away_id"] == away_anchor_id:
+                                    a_sum += int(s2a)
+
+                                agg_home = h_sum
+                                agg_away = a_sum
+
+                        winner_team_id, winner_reason = _winner_from_two_leg_tie(
+                            leg1=leg1,
+                            leg2=leg2,
+                            m2=m2,
+                            agg_home=agg_home,
+                            agg_away=agg_away,
+                        )
+
+                        legs_completed = 0
+                        if _match_is_finished(m1):
+                            legs_completed += 1
+                        if _match_is_finished(m2):
+                            legs_completed += 1
+
+                        return {
+                            "round_label": round_label,
+                            "order_hint": order_value,
+                            "tie_format": "two_leg",
+                            "legs_expected": 2,
+                            "legs_scheduled": max(2, len(pair_items)),
+                            "legs_completed": legs_completed,
+                            "agg_home": agg_home,
+                            "agg_away": agg_away,
+                            "winner_team_id": winner_team_id,
+                            "winner_reason": winner_reason,
+                            "legs": [leg1, leg2],
+                        }
+
+                    ties: List[Dict[str, Any]] = []
+                    used_fixture_ids: set[int] = set()
+                    order_hint = 1
+
+                    for _, pair_matches in grouped.items():
+                        pair_matches = _sort_matches(pair_matches)
+
+                        sample = pair_matches[0]
+                        team_a_id = _coalesce_int(sample.get("home_id"), 0)
+                        team_b_id = _coalesce_int(sample.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches) if scheduled_pair_matches else pair_matches
+
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+
+                    remaining_matches = [
+                        m for m in round_matches
+                        if _coalesce_int(m.get("fixture_id"), 0) not in used_fixture_ids
+                    ]
+
+                    remaining_matches = _sort_matches(remaining_matches)
+
+                    for m in remaining_matches:
+                        fixture_id_int = _coalesce_int(m.get("fixture_id"), 0)
+                        if fixture_id_int in used_fixture_ids:
+                            continue
+
+                        team_a_id = _coalesce_int(m.get("home_id"), 0)
+                        team_b_id = _coalesce_int(m.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches)
+
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+                            continue
+
+                        used_fixture_ids.add(fixture_id_int)
+
+                        leg = _leg_payload(m, None)
+
+                        winner_team_id: Optional[int] = None
+                        winner_reason: Optional[str] = None
+                        if _match_is_finished(m):
+                            winner_team_id, winner_reason = _winner_from_single_match(m)
+
+                        ties.append(
+                            {
+                                "round_label": round_label,
+                                "order_hint": order_hint,
+                                "tie_format": "single_leg",
+                                "legs_expected": 1,
+                                "legs_scheduled": 1,
+                                "legs_completed": 1 if _match_is_finished(m) else 0,
+                                "agg_home": None,
+                                "agg_away": None,
+                                "winner_team_id": winner_team_id,
+                                "winner_reason": winner_reason,
+                                "legs": [leg],
+                            }
+                        )
+                        order_hint += 1
+
+                    ties.sort(
+                        key=lambda t: (
+                            _coalesce_int(t.get("order_hint"), 999999),
+                            str(
+                                (
+                                    (t.get("legs") or [{}])[0].get("date_utc")
+                                    if (t.get("legs") or [])
+                                    else ""
+                                ) or ""
+                            ),
+                        )
+                    )
+                    return ties
+
+                selected_round_matches: List[Dict[str, Any]] = []
+                if selected_round_label:
+                    selected_round_matches = fetch_all(
+                        """
+                        SELECT
+                            m.fixture_id,
+                            m.league_round,
+                            m.date_utc,
+                            m.home_id,
+                            m.away_id,
+                            m.home_ft,
+                            m.away_ft,
+                            m.status,
+                            m.status_group,
+                            th.name AS home_name,
+                            ta.name AS away_name,
+                            th.logo AS home_logo,
+                            ta.logo AS away_logo
+                        FROM matches m
+                        LEFT JOIN teams th ON th.id = m.home_id
+                        LEFT JOIN teams ta ON ta.id = m.away_id
+                        WHERE m.league_id = %s
+                          AND m.season = %s
+                          AND m.league_round = %s
+                        ORDER BY
+                            m.date_utc ASC,
+                            m.fixture_id ASC
+                        """,
+                        (league_id, season_resolved, selected_round_label),
+                    )
+
+                selected_ties = _build_round_ties(
+                    selected_round_label or "",
+                    selected_round_matches or [],
+                ) if selected_round_label else []
+
+                bracket_columns: List[Dict[str, Any]] = []
+                if selected_round_label:
+                    bracket_columns.append(
+                        {
+                            "round_label": selected_round_label,
+                            "ties": selected_ties,
+                        }
+                    )
+
+                return {
+                    "league": {
+                        "league_id": league_id,
+                        "season": season_resolved,
+                        "name": league_name,
+                    },
+                    "league_id": league_id,
+                    "season": season_resolved,
+                    "league_name": league_name,
+                    "league_logo": league_logo,
+                    "mode": "BRACKET",
+                    "rows": [],
+                    "bracket": bracket_columns,
+                    "bracket_round_options": stage_round_options,
+                    "selected_bracket_round": selected_round_label,
+                    "context_options": {"conferences": [], "groups": []},
+                    "source": "computed_bracket",
+                }
+
+        except Exception:
+            pass
+
     if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
         format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
         has_standings_meta = _coalesce_int((comp_meta or {}).get("has_standings"), 0)
@@ -513,34 +1457,47 @@ def build_standings_block(
             source_name = "competition_meta_no_standings"
 
         return {
+            "league": {
+                "league_id": league_id,
+                "season": season_resolved,
+                "name": league_name,
+            },
             "league_id": league_id,
             "season": season_resolved,
             "league_name": league_name,
-            "rows": [],
-            "context_options": {"conferences": [], "groups": []},
+            "league_logo": league_logo,
             "mode": "TABLE",
+            "rows": [],
             "bracket": None,
+            "bracket_round_options": stage_round_options,
+            "selected_bracket_round": table_stage_label if stage_round_options else None,
+            "context_options": {"conferences": [], "groups": []},
             "message": message,
             "source": source_name,
         }
 
-    # 3) competition meta가 없을 때만 cup heuristic으로 보조 차단
     if not rows_raw and is_cup_like:
         return {
+            "league": {
+                "league_id": league_id,
+                "season": season_resolved,
+                "name": league_name,
+            },
             "league_id": league_id,
             "season": season_resolved,
             "league_name": league_name,
-            "rows": [],
-            "context_options": {"conferences": [], "groups": []},
+            "league_logo": league_logo,
             "mode": "TABLE",
+            "rows": [],
             "bracket": None,
+            "bracket_round_options": stage_round_options,
+            "selected_bracket_round": table_stage_label if stage_round_options else None,
+            "context_options": {"conferences": [], "groups": []},
             "message": "Standings are not available for this competition stage.\nPlease check back later.",
             "source": "league_cup_heuristic_block",
         }
 
-    # 3) standings가 비어 있으면 → matches에서 즉시 계산
     if not rows_raw:
-        # 2-1) matches 컬럼 자동 탐지(환경/스키마 흔들림 방어)
         mcols = _cols_of("matches")
 
         team_pair = _pick_pair(
@@ -561,19 +1518,29 @@ def build_standings_block(
         )
 
         if not team_pair or not goal_pair:
-            # matches로도 계산 불가 → 그냥 빈 값
             return {
+                "league": {
+                    "league_id": league_id,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
                 "league_id": league_id,
                 "season": season_resolved,
                 "league_name": league_name,
+                "league_logo": league_logo,
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
+                "bracket_round_options": stage_round_options,
+                "selected_bracket_round": table_stage_label if stage_round_options else None,
                 "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
         ht, at = team_pair
         hg, ag = goal_pair
 
-        # 2-2) 완료된 경기 수 확인 (0이면 시즌 시작 전)
         try:
             cnt_row = _fetch_one(
                 f"""
@@ -597,14 +1564,25 @@ def build_standings_block(
 
         if finished_cnt <= 0:
             return {
+                "league": {
+                    "league_id": league_id,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
                 "league_id": league_id,
                 "season": season_resolved,
                 "league_name": league_name,
+                "league_logo": league_logo,
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
+                "bracket_round_options": stage_round_options,
+                "selected_bracket_round": table_stage_label if stage_round_options else None,
                 "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
-        # 2-3) matches 기반 standings 계산 (기본 포인트/득실/다득점 정렬)
         try:
             rows_raw = fetch_all(
                 f"""
@@ -696,38 +1674,65 @@ def build_standings_block(
                 """,
                 (league_id, season_resolved),
             )
-        except Exception as e:
-            print(f"[build_standings_block] ERROR computed standings league_id={league_id}, season={season_resolved}: {e}")
+            source = "computed_from_matches"
+        except Exception:
             rows_raw = []
 
         if not rows_raw:
             return {
+                "league": {
+                    "league_id": league_id,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
                 "league_id": league_id,
                 "season": season_resolved,
                 "league_name": league_name,
+                "league_logo": league_logo,
+                "mode": "TABLE",
                 "rows": [],
+                "bracket": None,
+                "bracket_round_options": stage_round_options,
+                "selected_bracket_round": table_stage_label if stage_round_options else None,
                 "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": source,
             }
 
-    # ─────────────────────────────────────────────────────────────
-    # 공통 후처리 (matchdetail과 동일):
-    # - (team_id) 단독 디듀프 제거
-    # - (team_id + group_name) 기준으로만 "진짜 중복" 정리
-    # - 정렬: group_name -> rank -> team_name
-    # - group_name은 _effective_group_name()으로 보정(오스트리아 split 등)
-    # ─────────────────────────────────────────────────────────────
+    if rows_raw:
+        if _should_hide_standings_early_season(
+            league_id=league_id,
+            season=season_resolved,
+            rows_raw=rows_raw,
+            window_days=14,
+            played_threshold=15,
+        ):
+            return {
+                "league": {
+                    "league_id": league_id,
+                    "season": season_resolved,
+                    "name": league_name,
+                },
+                "league_id": league_id,
+                "season": season_resolved,
+                "league_name": league_name,
+                "league_logo": league_logo,
+                "mode": "TABLE",
+                "rows": [],
+                "bracket": None,
+                "bracket_round_options": stage_round_options,
+                "selected_bracket_round": table_stage_label if stage_round_options else None,
+                "context_options": {"conferences": [], "groups": []},
+                "message": "Standings are not available yet.\nPlease check back later.",
+                "source": "standings_table",
+            }
+
     def _norm_group(v: Any) -> str:
         if not isinstance(v, str):
             return ""
         return re.sub(r"\s+", " ", v).strip()
 
     def _better_row(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        같은 (team_id, group_name) 키에 대해 어떤 row를 남길지 결정.
-        - played 큰 것 우선
-        - points, goals_diff, goals_for 큰 것 우선
-        - rank는 작은 것 우선 (있으면)
-        """
         a_played = _coalesce_int(a.get("played"), 0)
         b_played = _coalesce_int(b.get("played"), 0)
         if b_played != a_played:
@@ -813,8 +1818,6 @@ def build_standings_block(
             }
         )
 
-    # context_options는 "보정된 group_name" 기준으로 만들어야
-    # description에만 split 정보가 있는 리그(예: Austria)도 chips가 안정적이다.
     context_rows: List[Dict[str, Any]] = []
     for r in dedup_rows:
         rr = dict(r)
@@ -826,7 +1829,6 @@ def build_standings_block(
 
     context_options = _build_context_options_from_rows(context_rows)
 
-    # ✅ 서버에서 저장한 standings_group_meta가 있으면 그 값을 우선 사용
     try:
         meta_group_names = _get_group_meta_names(league_id, season_resolved)
         if meta_group_names:
@@ -861,22 +1863,37 @@ def build_standings_block(
     except Exception:
         pass
 
+    if stage_round_options:
+        groups_now = context_options.get("groups") or []
+        if len(groups_now) == 1:
+            only_group = str(groups_now[0] or "").strip().lower()
+            league_name_norm = str(league_name or "").strip().lower()
+            if only_group and league_name_norm and only_group == league_name_norm:
+                context_options = {
+                    "conferences": context_options.get("conferences") or [],
+                    "groups": [],
+                }
 
     out = {
+        "league": {
+            "league_id": league_id,
+            "season": season_resolved,
+            "name": league_name,
+        },
         "league_id": league_id,
         "season": season_resolved,
         "league_name": league_name,
+        "league_logo": league_logo,
         "rows": out_rows,
         "context_options": context_options,
         "mode": "TABLE",
         "bracket": None,
-        "source": "standings_table" if rows_raw else "computed_from_matches",
+        "bracket_round_options": stage_round_options,
+        "selected_bracket_round": table_stage_label if stage_round_options else None,
+        "source": source,
     }
 
     if not out_rows:
         out["message"] = "Standings are not available yet.\nPlease check back later."
 
     return out
-
-
-
