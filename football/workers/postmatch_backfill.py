@@ -386,6 +386,27 @@ def get_only_standings() -> bool:
     return "--only-standings" in sys.argv
 
 
+def get_only_fixtures() -> bool:
+    """
+    C안: fixtures/matches/raw 만 채우는 가벼운 모드.
+      - 목적: league_round 같은 fixture 레벨 정보만 다시 채우기
+      - 수행:
+          * /fixtures            → fixtures/matches upsert + match_fixtures_raw 저장
+      - 미수행:
+          * /fixtures/events
+          * /fixtures/lineups
+          * /fixtures/statistics
+          * /fixtures/players
+          * /standings
+      - ENV ONLY_FIXTURES=1/true/yes/y
+      - 또는 CLI: --only-fixtures
+    """
+    env_flag = (os.environ.get("ONLY_FIXTURES") or "").strip().lower()
+    if env_flag in ("1", "true", "yes", "y"):
+        return True
+    return "--only-fixtures" in sys.argv
+
+
 def get_standings_from_db_source() -> Optional[str]:
     """
     B안: DB에 "이미 존재하는 league_id+season 쌍"만 대상으로 standings 채우기.
@@ -2215,12 +2236,20 @@ def main() -> None:
     target_dates = get_target_dates()  # 시즌 모드가 아니면 기존대로 날짜 모드 사용
 
     only_standings = get_only_standings()  # A안
+    only_fixtures = get_only_fixtures()  # C안
     standings_from_db = get_standings_from_db_source()  # B안: fixtures|matches|ft_triggers|standings
 
     live_leagues = parse_live_leagues(os.environ.get("LIVE_LEAGUES", ""))
 
     force = (os.environ.get("FORCE_BACKFILL") or "").strip().lower() in ("1", "true", "yes", "y")
     today_str = now_utc().strftime("%Y-%m-%d")
+
+    if only_fixtures and only_standings:
+        print(
+            "[WARN] ONLY_FIXTURES 와 ONLY_STANDINGS 가 동시에 설정되었습니다. "
+            "ONLY_FIXTURES 모드를 우선 적용합니다.",
+            file=sys.stderr,
+        )
 
     # ✅ B안이면 LIVE_LEAGUES 없어도 실행 가능(DB 기준으로 대상 만들기)
     #    단, LIVE_LEAGUES가 있으면 "지원 리그 필터"로 교집합 적용.
@@ -2229,13 +2258,130 @@ def main() -> None:
     if target_season is not None:
         print(
             f"[postmatch_backfill] season_mode season={target_season}, today={today_str}, "
-            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, standings_from_db={standings_from_db}"
+            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, "
+            f"only_fixtures={only_fixtures}, standings_from_db={standings_from_db}"
         )
     else:
         print(
             f"[postmatch_backfill] dates={target_dates}, today={today_str}, "
-            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, standings_from_db={standings_from_db}"
+            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, "
+            f"only_fixtures={only_fixtures}, standings_from_db={standings_from_db}"
         )
+
+    # ─────────────────────────────────────
+    #  ✅ C안: fixtures/matches/raw 만 채우는 가벼운 모드
+    #  - 목적: league_round 같은 fixture 레벨 정보만 다시 채우기
+    #  - /fixtures 응답만 사용
+    #  - events/lineups/stats/players/standings 는 건드리지 않음
+    # ─────────────────────────────────────
+    if only_fixtures:
+        if not live_leagues:
+            print(
+                "[postmatch_backfill] ONLY_FIXTURES 모드인데 LIVE_LEAGUES가 비어있습니다. 종료.",
+                file=sys.stderr,
+            )
+            return
+
+        total_synced = 0
+        seen_team_ids: set[int] = set()
+        seen_league_ids: set[int] = set()
+
+        # ✅ 시즌 모드: league + season 전체 fixtures만 재동기화
+        if target_season is not None:
+            for lid in live_leagues:
+                try:
+                    fixtures = fetch_fixtures_for_season(int(lid), int(target_season))
+                    print(f"  - only_fixtures season={target_season} league {lid}: fixtures={len(fixtures)}")
+
+                    for fx in fixtures:
+                        basic = _extract_fixture_basic(fx)
+                        if basic is None:
+                            continue
+
+                        fixture_id = basic["fixture_id"]
+                        season = basic.get("season") or int(target_season)
+                        if season is None:
+                            continue
+
+                        if basic.get("league_id") is not None:
+                            seen_league_ids.add(int(basic["league_id"]))
+                        else:
+                            seen_league_ids.add(int(lid))
+
+                        if basic.get("home_id") is not None:
+                            seen_team_ids.add(int(basic["home_id"]))
+                        if basic.get("away_id") is not None:
+                            seen_team_ids.add(int(basic["away_id"]))
+
+                        try:
+                            upsert_match_fixtures_raw(fixture_id, fx, now_utc())
+                        except Exception as raw_e:
+                            print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+
+                        upsert_fixture_row(fx, int(lid), int(season))
+                        upsert_match_row(fx, int(lid), int(season))
+                        total_synced += 1
+
+                except Exception as e:
+                    print(f"  ! only_fixtures season={target_season} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+        # ✅ 날짜 모드: 기존 날짜 범위의 fixtures만 재동기화
+        else:
+            for target_date in target_dates:
+                for lid in live_leagues:
+                    try:
+                        season_guess = pick_season_for_date(int(lid), target_date)
+                        fixtures = fetch_fixtures_from_api(int(lid), target_date, season_guess)
+
+                        print(
+                            f"  - only_fixtures date={target_date} league {lid}: "
+                            f"season_guess={season_guess} fixtures={len(fixtures)}"
+                        )
+
+                        for fx in fixtures:
+                            basic = _extract_fixture_basic(fx)
+                            if basic is None:
+                                continue
+
+                            fixture_id = basic["fixture_id"]
+                            season = basic.get("season") or season_guess
+                            if season is None:
+                                continue
+
+                            if basic.get("league_id") is not None:
+                                seen_league_ids.add(int(basic["league_id"]))
+                            else:
+                                seen_league_ids.add(int(lid))
+
+                            if basic.get("home_id") is not None:
+                                seen_team_ids.add(int(basic["home_id"]))
+                            if basic.get("away_id") is not None:
+                                seen_team_ids.add(int(basic["away_id"]))
+
+                            try:
+                                upsert_match_fixtures_raw(fixture_id, fx, now_utc())
+                            except Exception as raw_e:
+                                print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+
+                            upsert_fixture_row(fx, int(lid), int(season))
+                            upsert_match_row(fx, int(lid), int(season))
+                            total_synced += 1
+
+                    except Exception as e:
+                        print(f"  ! only_fixtures date={target_date} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+        # ✅ meta backfill (teams/leagues)
+        try:
+            if seen_league_ids:
+                backfill_leagues_meta(sorted(seen_league_ids))
+            if seen_team_ids:
+                backfill_teams_meta(sorted(seen_team_ids))
+                backfill_teams_meta_single(sorted(seen_team_ids))
+        except Exception as me:
+            print(f"[meta] backfill failed: {me}", file=sys.stderr)
+
+        print(f"[postmatch_backfill] ONLY_FIXTURES 완료. synced={total_synced}")
+        return
 
     # ─────────────────────────────────────
     #  ✅ A안: standings만 채우기 (fixtures/events/... DB 오염 방지)
