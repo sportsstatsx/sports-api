@@ -161,22 +161,36 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         if "releg" in x:
             return "relegation"
 
-        # ✅ group_name 기반 split/final stage
-        # 예: Championship Round, Championship Group, Playoff Round
+        # ✅ 상위 스플릿/챔피언십 단계
+        # - 벨기에 Champ Rnd
+        # - 오스트리아 Championship Round
+        # - 덴마크 Championship Round
+        # - 체코 Championship Group
+        # 이건 "playoff champion"이 아니라
+        # "최종 리그 테이블이 확정되는 상위 단계"로 별도 분리한다.
         if (
             "championship round" in g
             or "championship group" in g
-            or "playoff" in g
-            or "play-off" in g
+            or "champ rnd" in g
+            or "champ round" in g
+            or "championship stage" in g
         ):
-            return "playoff"
+            return "championship_stage"
 
-        # ✅ description 은 "Champions League" 같은 진출권 문구가 많아서
-        #    generic "champ" 매칭을 하면 EPL 1위 같은 것도 잘못 playoff로 분류됨
-        #    따라서 round/stage 성격이 명확할 때만 playoff 취급
         if (
             "championship round" in d
             or "championship group" in d
+            or "champ rnd" in d
+            or "champ round" in d
+            or "championship stage" in d
+        ):
+            return "championship_stage"
+
+        # ✅ 진짜 playoff/group 이름이 명확한 경우만 playoff
+        # (MLS, A-League 같은 "플레이오프 우승 = 챔피언" 리그용)
+        if (
+            "playoff" in g
+            or "play-off" in g
             or "playoff" in d
             or "play-off" in d
         ):
@@ -493,7 +507,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             # - Relegation 은 제외
             regular_best = _pick_best_candidate(
                 items,
-                ["playoff", "regular", "general"],
+                ["championship_stage", "regular", "general", "playoff"],
             )
             if regular_best:
                 standings_regular_map[s_int] = {
