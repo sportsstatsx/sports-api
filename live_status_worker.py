@@ -979,19 +979,21 @@ def _round_sort_key(round_name: Optional[str]) -> Tuple[int, int, str]:
 
 def _sort_rounds(rounds: List[str]) -> List[str]:
     uniq: List[str] = []
-    seen: Set[str] = set()
+    seen = set()
 
     for r in rounds or []:
         name = (safe_text(r) or "").strip()
         if not name:
             continue
+
         key = name.lower()
         if key in seen:
             continue
+
         seen.add(key)
         uniq.append(name)
 
-    return sorted(uniq, key=_round_sort_key)
+    return uniq
 
 
 def upsert_competition_api_raw(
