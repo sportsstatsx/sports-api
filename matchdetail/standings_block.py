@@ -2008,8 +2008,8 @@ Match Detail용 Standings 블록 (TABLE 전용)
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
-        "bracket_round_options": stage_round_options,
-        "selected_bracket_round": table_stage_label if stage_round_options else None,
+        "bracket_round_options": [],
+        "selected_bracket_round": None,
         "context_options": context_options,
         "source": source,
     }
