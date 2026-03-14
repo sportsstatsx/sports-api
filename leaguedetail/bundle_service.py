@@ -13,7 +13,11 @@ from leaguedetail.seasons_block import (
 
 
 
-def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str, Any]:
+def get_league_detail_bundle(
+    league_id: int,
+    season: Optional[int],
+    bracket_round: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     ✅ 완전무결 시즌 처리:
     - resolved_season: resolve_season_for_league()가 검증/보정까지 책임
@@ -67,6 +71,7 @@ def get_league_detail_bundle(league_id: int, season: Optional[int]) -> Dict[str,
     standings_block = build_standings_block(
         league_id=league_id,
         season=resolved_season,
+        bracket_round=bracket_round,
     )
 
 
