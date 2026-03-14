@@ -18,6 +18,7 @@ def match_detail_bundle():
 
         comp = request.args.get("comp")
         last_n = request.args.get("last_n")
+        bracket_round = request.args.get("bracket_round")
 
         # ✅ optional: 부분 로딩용 parts
         # 예) parts=header,form  /  parts=timeline  /  parts=stats,h2h
@@ -80,8 +81,9 @@ def match_detail_bundle():
             season=season,
             comp=comp,
             last_n=last_n,
+            bracket_round=bracket_round,
             apply_override=apply_override,
-            parts=parts,  # ✅ 추가
+            parts=parts,
         )
 
 
