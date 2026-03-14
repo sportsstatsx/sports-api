@@ -263,6 +263,213 @@ def safe_text(x: Any) -> Optional[str]:
         return None
 
 
+def _read_match_score_state(fixture_id: int) -> Optional[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT
+            fixture_id,
+            status,
+            status_group,
+            status_short,
+            elapsed,
+            home_ft,
+            away_ft,
+            home_ht,
+            away_ht
+        FROM matches
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (int(fixture_id),),
+    )
+    if not rows:
+        return None
+
+    r = rows[0]
+    return {
+        "fixture_id": int(fixture_id),
+        "status": safe_text(r.get("status")) or "",
+        "status_group": (safe_text(r.get("status_group")) or "").upper(),
+        "status_short": safe_text(r.get("status_short")) or "",
+        "elapsed": safe_int(r.get("elapsed")),
+        "home_ft": safe_int(r.get("home_ft")),
+        "away_ft": safe_int(r.get("away_ft")),
+        "home_ht": safe_int(r.get("home_ht")),
+        "away_ht": safe_int(r.get("away_ht")),
+    }
+
+
+def _extract_incoming_match_score_state(fixture_obj: Dict[str, Any]) -> Dict[str, Any]:
+    fx = fixture_obj.get("fixture") or {}
+    goals = fixture_obj.get("goals") or {}
+    score = fixture_obj.get("score") or {}
+
+    st = fx.get("status") or {}
+    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
+    status_group = map_status_group(status_short)
+
+    ht = (score.get("halftime") or {}) if isinstance(score, dict) else {}
+
+    return {
+        "fixture_id": safe_int(fx.get("id")),
+        "status": (status_short or "").strip() or "UNK",
+        "status_group": status_group,
+        "status_short": status_short,
+        "elapsed": safe_int(st.get("elapsed")),
+        "home_ft": safe_int(goals.get("home")) if isinstance(goals, dict) else None,
+        "away_ft": safe_int(goals.get("away")) if isinstance(goals, dict) else None,
+        "home_ht": safe_int(ht.get("home")) if isinstance(ht, dict) else None,
+        "away_ht": safe_int(ht.get("away")) if isinstance(ht, dict) else None,
+    }
+
+
+def _fmt_match_score_state(state: Optional[Dict[str, Any]]) -> str:
+    if not state:
+        return "none"
+
+    return (
+        f"sg={state.get('status_group') or ''} "
+        f"st={state.get('status_short') or state.get('status') or ''} "
+        f"el={state.get('elapsed')} "
+        f"ft={state.get('home_ft')}:{state.get('away_ft')} "
+        f"ht={state.get('home_ht')}:{state.get('away_ht')}"
+    )
+
+
+def _is_meaningful_match_state_change(
+    before_state: Optional[Dict[str, Any]],
+    incoming_state: Optional[Dict[str, Any]],
+) -> bool:
+    if before_state is None and incoming_state is None:
+        return False
+    if before_state is None or incoming_state is None:
+        return True
+
+    keys = [
+        "status_group",
+        "status_short",
+        "elapsed",
+        "home_ft",
+        "away_ft",
+        "home_ht",
+        "away_ht",
+    ]
+    for k in keys:
+        if before_state.get(k) != incoming_state.get(k):
+            return True
+    return False
+
+
+def _log_match_score_decision(
+    source: str,
+    fixture_id: int,
+    action: str,
+    before_state: Optional[Dict[str, Any]],
+    incoming_state: Optional[Dict[str, Any]],
+    reason: str = "",
+) -> None:
+    msg = (
+        f"[score_flow] source={source} fixture_id={fixture_id} action={action} "
+        f"before=({_fmt_match_score_state(before_state)}) "
+        f"incoming=({_fmt_match_score_state(incoming_state)})"
+    )
+    if reason:
+        msg += f" reason={reason}"
+    print(msg, flush=True)
+
+
+def _should_skip_fixtures_scan_nonlive_overwrite(
+    fixture_id: int,
+    incoming_state: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """
+    fixtures_worker의 league/date 스캔 응답이 stale일 때
+    이미 더 앞서간 DB 상태를 덮어쓰지 않도록 방어.
+
+    현재 방어 정책:
+    1) DB가 이미 INPLAY인데 incoming 이 non-INPLAY면 skip
+    2) DB가 이미 FINISHED인데 incoming 이 UPCOMING/OTHER면 skip
+    3) DB score 합계가 incoming 보다 크고, incoming 이 FINISHED가 아니면 skip
+    4) DB elapsed가 incoming 보다 많이 앞서 있고, incoming 이 UPCOMING/OTHER면 skip
+    """
+    current_state = _read_match_score_state(fixture_id)
+    if not current_state:
+        return False, ""
+
+    db_sg = (current_state.get("status_group") or "").upper()
+    in_sg = (incoming_state.get("status_group") or "").upper()
+
+    db_elapsed = safe_int(current_state.get("elapsed"))
+    in_elapsed = safe_int(incoming_state.get("elapsed"))
+
+    db_home = safe_int(current_state.get("home_ft"))
+    db_away = safe_int(current_state.get("away_ft"))
+    in_home = safe_int(incoming_state.get("home_ft"))
+    in_away = safe_int(incoming_state.get("away_ft"))
+
+    if db_sg == "INPLAY" and in_sg in ("UPCOMING", "OTHER"):
+        return True, "db_inplay_but_incoming_regressed_nonlive"
+
+
+    if db_sg == "FINISHED" and in_sg in ("UPCOMING", "OTHER"):
+        return True, "db_finished_but_incoming_regressed"
+
+    if (
+        db_home is not None and db_away is not None
+        and in_home is not None and in_away is not None
+    ):
+        db_total = db_home + db_away
+        in_total = in_home + in_away
+
+        if db_total > in_total and in_sg != "FINISHED":
+            return True, "db_score_more_advanced_than_incoming"
+
+    if (
+        db_elapsed is not None
+        and in_elapsed is not None
+        and db_elapsed >= 1
+        and (db_elapsed - in_elapsed) >= 10
+        and in_sg in ("UPCOMING", "OTHER")
+    ):
+        return True, "db_elapsed_more_advanced_than_incoming"
+
+    return False, ""
+
+
+def upsert_match_row_from_fixture_logged(
+    fixture_obj: Dict[str, Any],
+    league_id: Optional[int],
+    season: Optional[int],
+    *,
+    source: str,
+) -> Tuple[int, int, int, str, str]:
+    incoming_state = _extract_incoming_match_score_state(fixture_obj)
+    fixture_id = safe_int(incoming_state.get("fixture_id"))
+
+    before_state: Optional[Dict[str, Any]] = None
+    if fixture_id is not None:
+        try:
+            before_state = _read_match_score_state(fixture_id)
+        except Exception:
+            before_state = None
+
+    if fixture_id is not None and _is_meaningful_match_state_change(before_state, incoming_state):
+        _log_match_score_decision(
+            source=source,
+            fixture_id=fixture_id,
+            action="apply",
+            before_state=before_state,
+            incoming_state=incoming_state,
+        )
+
+    return upsert_match_row_from_fixture(
+        fixture_obj,
+        league_id=league_id,
+        season=season,
+    )
+
+
+
 # ─────────────────────────────────────
 # HTTP (API-Sports)
 # ─────────────────────────────────────
@@ -498,11 +705,13 @@ def recheck_scheduled_fixtures(
                 status_group=status_group,
             )
 
-            upsert_match_row_from_fixture(
+            upsert_match_row_from_fixture_logged(
                 fx_obj,
                 league_id=real_lid,
                 season=real_season,
+                source="schedule_recheck",
             )
+
 
             try:
                 upsert_match_fixtures_raw(fid, fx_obj, fetched_at)
@@ -598,9 +807,13 @@ def watchdog_fix_stale_inplay(session: requests.Session, now: dt.datetime) -> in
             )
 
             # matches 테이블 보정(FT/home_ft/away_ft/elapsed 포함)
-            fixture_id, home_id, away_id, sg2, date_utc = upsert_match_row_from_fixture(
-                fx_obj, league_id=lid, season=season
+            fixture_id, home_id, away_id, sg2, date_utc = upsert_match_row_from_fixture_logged(
+                fx_obj,
+                league_id=lid,
+                season=season,
+                source="watchdog",
             )
+
 
             # raw도 best-effort
             try:
@@ -2948,9 +3161,13 @@ def run_once() -> int:
                 status_group=sg,
             )
 
-            fixture_id, home_id, away_id, sg2, date_utc = upsert_match_row_from_fixture(
-                item, league_id=lid, season=season
+            fixture_id, home_id, away_id, sg2, date_utc = upsert_match_row_from_fixture_logged(
+                item,
+                league_id=lid,
+                season=season,
+                source="live_all",
             )
+
 
             try:
                 upsert_match_fixtures_raw(fixture_id, item, fetched_at)
@@ -3211,8 +3428,31 @@ def run_once_fixtures_worker() -> int:
                 status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
                 status_group = map_status_group(status_short)
 
+                incoming_state = _extract_incoming_match_score_state(item)
+
                 # INPLAY는 live worker가 전담
                 if status_group == "INPLAY":
+                    continue
+
+                skip_overwrite, skip_reason = _should_skip_fixtures_scan_nonlive_overwrite(
+                    fid,
+                    incoming_state,
+                )
+                if skip_overwrite:
+                    current_state = None
+                    try:
+                        current_state = _read_match_score_state(fid)
+                    except Exception:
+                        current_state = None
+
+                    _log_match_score_decision(
+                        source=f"fixtures_scan:{lid}:{date_str}",
+                        fixture_id=fid,
+                        action="skip",
+                        before_state=current_state,
+                        incoming_state=incoming_state,
+                        reason=skip_reason,
+                    )
                     continue
 
                 upsert_fixture_row(
@@ -3224,8 +3464,11 @@ def run_once_fixtures_worker() -> int:
                     status_group=status_group,
                 )
 
-                fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
-                    item, league_id=lid, season=used_season
+                fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture_logged(
+                    item,
+                    league_id=lid,
+                    season=used_season,
+                    source=f"fixtures_scan:{lid}:{date_str}",
                 )
 
                 try:
@@ -3244,6 +3487,7 @@ def run_once_fixtures_worker() -> int:
                         enqueue_ft_trigger(fixture_id, lid, used_season, finished_iso_utc=iso_utc(now))
                     except Exception:
                         pass
+
 
             except Exception as e:
                 print(f"  ! fixtures_worker fixture 처리 중 에러: {e}", file=sys.stderr)
