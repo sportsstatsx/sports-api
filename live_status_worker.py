@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import json
+import re
 import traceback
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -85,9 +86,12 @@ INTERVAL_SEC = int(os.environ.get("LIVE_WORKER_INTERVAL_SEC", str(DETECT_INTERVA
 BASE = "https://v3.football.api-sports.io"
 UA = "SportsStatsX-LiveWorker/1.0"
 
-STATS_INTERVAL_SEC = 60   # stats 쿨다운은 유지
-REQ_TIMEOUT = 12
-REQ_RETRIES = 2
+STATS_INTERVAL_SEC = int(os.environ.get("LIVE_STATS_INTERVAL_SEC", "60"))   # stats 쿨다운
+EVENTS_INTERVAL_SEC = int(os.environ.get("LIVE_EVENTS_INTERVAL_SEC", "15"))  # events 쿨다운
+LIVE_HOTPATH_BUDGET_SEC = float(os.environ.get("LIVE_HOTPATH_BUDGET_SEC", "6.0"))  # live hot path 예산
+LIVE_SLOW_API_LOG_SEC = float(os.environ.get("LIVE_SLOW_API_LOG_SEC", "2.0"))       # slow api log threshold
+REQ_TIMEOUT = int(os.environ.get("LIVE_REQ_TIMEOUT_SEC", "12"))
+REQ_RETRIES = int(os.environ.get("LIVE_REQ_RETRIES", "2"))
 
 
 
@@ -97,6 +101,7 @@ REQ_RETRIES = 2
 # ─────────────────────────────────────
 
 LAST_STATS_SYNC: Dict[int, float] = {}   # fixture_id -> last ts
+LAST_EVENTS_SYNC: Dict[int, float] = {}  # fixture_id -> last ts
 LINEUPS_STATE: Dict[int, Dict[str, Any]] = {}  # fixture_id -> {"slot60":bool,"slot10":bool,"success":bool}
 
 # ✅ 리그별 스캔 모드에서 /fixtures(league/date) 호출 간격 제어
@@ -282,12 +287,11 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
     - ENV 기반 레이트리밋(RATE_LIMIT_PER_MIN / RATE_LIMIT_BURST) 적용 (토큰버킷)
     - 429(Too Many Requests) 대응: Retry-After 헤더 존중
     - 기존 재시도(REQ_RETRIES) 유지
+    - ✅ 느린 API 호출 slow log 추가
     """
     url = f"{BASE}{path}"
 
-    # --- rate limiter (token bucket) ---
     if not hasattr(api_get, "_rl"):
-        # ENV가 없으면 기본값(기존 동작과 유사하게 너무 느리게 막지 않도록 넉넉히)
         try:
             per_min = float(os.environ.get("RATE_LIMIT_PER_MIN", "0") or "0")
         except Exception:
@@ -297,7 +301,6 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
         except Exception:
             burst = 0.0
 
-        # 값이 0이면 '제한 없음'으로 취급(기존 동작 유지)
         rate_per_sec = (per_min / 60.0) if per_min > 0 else 0.0
         max_tokens = burst if burst > 0 else (max(1.0, rate_per_sec * 5) if rate_per_sec > 0 else 0.0)
 
@@ -314,12 +317,12 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
         rate = float(rl.get("rate") or 0.0)
         max_t = float(rl.get("max") or 0.0)
         if rate <= 0 or max_t <= 0:
-            return  # 제한 없음
+            return
 
         now_ts = time.time()
         last_ts = float(rl.get("ts") or now_ts)
         elapsed = max(0.0, now_ts - last_ts)
-        # refill
+
         tokens = float(rl.get("tokens") or 0.0) + elapsed * rate
         if tokens > max_t:
             tokens = max_t
@@ -330,13 +333,11 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
             rl["tokens"] = tokens - 1.0
             return
 
-        # 부족하면 필요한 시간만큼 sleep
         need = 1.0 - tokens
         wait_sec = need / rate if rate > 0 else 0.25
         if wait_sec > 0:
             time.sleep(wait_sec)
 
-        # 재획득(한 번 더 refill 후 1개 사용)
         now_ts2 = time.time()
         elapsed2 = max(0.0, now_ts2 - float(rl.get("ts") or now_ts2))
         tokens2 = float(rl.get("tokens") or 0.0) + elapsed2 * rate
@@ -346,12 +347,19 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
         rl["ts"] = now_ts2
 
     last_err: Optional[Exception] = None
-    for _ in range(REQ_RETRIES + 1):
+    for attempt in range(REQ_RETRIES + 1):
+        started = time.time()
         try:
             _acquire_token()
             r = session.get(url, params=params, timeout=REQ_TIMEOUT)
+            elapsed = time.time() - started
 
-            # 429 대응
+            if elapsed >= LIVE_SLOW_API_LOG_SEC:
+                print(
+                    f"[slow_api] path={path} elapsed={elapsed:.2f}s status={r.status_code} params={params}",
+                    flush=True,
+                )
+
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 try:
@@ -365,7 +373,13 @@ def api_get(session: requests.Session, path: str, params: Dict[str, Any]) -> Dic
             data = r.json()
             return data
         except Exception as e:
+            elapsed = time.time() - started
             last_err = e
+            print(
+                f"[api_err] path={path} attempt={attempt + 1}/{REQ_RETRIES + 1} elapsed={elapsed:.2f}s params={params} err={e}",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(0.4)
 
     raise last_err  # type: ignore
@@ -1992,19 +2006,16 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
     - ✅ 레이스 차단: DB의 matches.status_group 이 아직 'INPLAY'면
       postmatch/backfill/watchdog 경로에서 match_events를 건드리지 않는다.
       (라이브중 이벤트는 live=all 경로가 전담)
+    - ✅ DELETE + INSERT를 하나의 트랜잭션으로 묶는다.
     반환: insert된 row 수
     """
     cols = set(_get_table_columns("match_events"))
     if not cols:
         return 0
 
-    # ✅ 빈 배열이면 "기다림"(기존 DB 유지)
     if not events:
         return 0
 
-    # ✅ 레이스 차단: "live 역할이 아닐 때만" INPLAY면 스킵
-    # - live role에서는 INPLAY 타임라인을 정상적으로 써야 함
-    # - backfill/watchdog/postmatch 경로에서만 INPLAY 건드리지 않도록 보호
     try:
         role = (os.environ.get("LIVE_WORKER_ROLE") or "live").strip().lower()
 
@@ -2022,88 +2033,97 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
             if (role != "live") and (sg == "INPLAY"):
                 return 0
     except Exception:
-        # 상태 조회 실패 시에는 안전하게 기존 동작(쓰기) 유지
         pass
 
-
-    # 최소 필수(있을 때만 사용)
     def has(c: str) -> bool:
         return c.lower() in cols
 
-    # 컬럼명 호환(둘 중 하나 존재)
     col_extra = "extra" if has("extra") else ("time_extra" if has("time_extra") else None)
 
     inserted = 0
+    tx_started = False
 
-    # ✅ events가 있을 때만 기존 fixture 이벤트 삭제(스냅샷 교체)
-    execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
+    try:
+        execute("BEGIN")
+        tx_started = True
 
-    for ev in events:
-        time_obj = ev.get("time") or {}
-        team_obj = ev.get("team") or {}
-        player_obj = ev.get("player") or {}
-        assist_obj = ev.get("assist") or {}
+        execute("DELETE FROM match_events WHERE fixture_id = %s", (fixture_id,))
 
-        minute = safe_int(time_obj.get("elapsed")) or 0
-        extra = safe_int(time_obj.get("extra"))
-        type_raw = safe_text(ev.get("type"))
-        detail_raw = safe_text(ev.get("detail"))
-        comments_raw = safe_text(ev.get("comments"))
+        for ev in events:
+            time_obj = ev.get("time") or {}
+            team_obj = ev.get("team") or {}
+            player_obj = ev.get("player") or {}
+            assist_obj = ev.get("assist") or {}
 
-        team_id = safe_int(team_obj.get("id"))
-        player_id = safe_int(player_obj.get("id"))
-        player_name = safe_text(player_obj.get("name"))
+            minute = safe_int(time_obj.get("elapsed")) or 0
+            extra = safe_int(time_obj.get("extra"))
+            type_raw = safe_text(ev.get("type"))
+            detail_raw = safe_text(ev.get("detail"))
+            comments_raw = safe_text(ev.get("comments"))
 
-        assist_id = safe_int(assist_obj.get("id"))
-        assist_name = safe_text(assist_obj.get("name"))
+            team_id = safe_int(team_obj.get("id"))
+            player_id = safe_int(player_obj.get("id"))
+            player_name = safe_text(player_obj.get("name"))
 
-        # SUB의 경우: API-Sports는 보통 player=OUT, assist=IN 으로 옴
-        player_in_id = assist_id
-        player_in_name = assist_name
+            assist_id = safe_int(assist_obj.get("id"))
+            assist_name = safe_text(assist_obj.get("name"))
 
-        ins_cols: List[str] = []
-        ins_vals: List[Any] = []
+            player_in_id = assist_id
+            player_in_name = assist_name
 
-        def add(c: str, v: Any) -> None:
-            if has(c):
-                ins_cols.append(c)
-                ins_vals.append(v)
+            ins_cols: List[str] = []
+            ins_vals: List[Any] = []
 
-        add("fixture_id", fixture_id)
-        add("minute", minute)
+            def add(c: str, v: Any) -> None:
+                if has(c):
+                    ins_cols.append(c)
+                    ins_vals.append(v)
 
-        if col_extra:
-            ins_cols.append(col_extra)
-            ins_vals.append(extra)
+            add("fixture_id", fixture_id)
+            add("minute", minute)
 
-        add("type", type_raw)
-        add("detail", detail_raw)
-        add("comments", comments_raw)
+            if col_extra:
+                ins_cols.append(col_extra)
+                ins_vals.append(extra)
 
-        add("team_id", team_id)
+            add("type", type_raw)
+            add("detail", detail_raw)
+            add("comments", comments_raw)
 
-        add("player_id", player_id)
-        add("player_name", player_name)
+            add("team_id", team_id)
 
-        add("assist_player_id", assist_id)
-        add("assist_name", assist_name)
+            add("player_id", player_id)
+            add("player_name", player_name)
 
-        add("player_in_id", player_in_id)
-        add("player_in_name", player_in_name)
+            add("assist_player_id", assist_id)
+            add("assist_name", assist_name)
 
-        if not ins_cols:
-            continue
+            add("player_in_id", player_in_id)
+            add("player_in_name", player_in_name)
 
-        col_sql = ", ".join(ins_cols)
-        ph_sql = ", ".join(["%s"] * len(ins_cols))
+            if not ins_cols:
+                continue
 
-        execute(
-            f"INSERT INTO match_events ({col_sql}) VALUES ({ph_sql})",
-            tuple(ins_vals),
-        )
-        inserted += 1
+            col_sql = ", ".join(ins_cols)
+            ph_sql = ", ".join(["%s"] * len(ins_cols))
 
-    return inserted
+            execute(
+                f"INSERT INTO match_events ({col_sql}) VALUES ({ph_sql})",
+                tuple(ins_vals),
+            )
+            inserted += 1
+
+        execute("COMMIT")
+        tx_started = False
+        return inserted
+
+    except Exception:
+        if tx_started:
+            try:
+                execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
 
 
 
@@ -2799,6 +2819,7 @@ def run_once() -> int:
     now = now_utc()
     fetched_at = now
     s = _session()
+    run_started_ts = time.time()
 
     total_fixtures = 0
     total_inplay = 0
@@ -2897,26 +2918,34 @@ def run_once() -> int:
                 total_inplay += 1
 
                 try:
-                    events = fetch_events(s, fixture_id)
+                    now_ts_events = time.time()
+                    last_events_ts = LAST_EVENTS_SYNC.get(fixture_id)
 
-                    try:
-                        upsert_match_events_raw(fixture_id, events, now)
-                    except Exception:
-                        pass
+                    if (last_events_ts is None) or ((now_ts_events - last_events_ts) >= EVENTS_INTERVAL_SEC):
+                        events = fetch_events(s, fixture_id)
 
-                    inserted = 0
-                    try:
-                        inserted = replace_match_events_for_fixture(fixture_id, events)
-                    except Exception:
+                        try:
+                            upsert_match_events_raw(fixture_id, events, now)
+                        except Exception:
+                            pass
+
                         inserted = 0
+                        try:
+                            inserted = replace_match_events_for_fixture(fixture_id, events)
+                        except Exception:
+                            inserted = 0
 
-                    try:
-                        h_red, a_red = calc_red_cards_from_events(events, home_id, away_id)
-                        upsert_match_live_state(fixture_id, h_red, a_red, now)
-                    except Exception:
-                        pass
+                        try:
+                            h_red, a_red = calc_red_cards_from_events(events, home_id, away_id)
+                            upsert_match_live_state(fixture_id, h_red, a_red, now)
+                        except Exception:
+                            pass
 
-                    print(f"      [live_all_events] fixture_id={fixture_id} events={len(events)} inserted={inserted}")
+                        LAST_EVENTS_SYNC[fixture_id] = now_ts_events
+                        print(f"      [live_all_events] fixture_id={fixture_id} events={len(events)} inserted={inserted} interval={EVENTS_INTERVAL_SEC}s")
+                    else:
+                        remain = EVENTS_INTERVAL_SEC - (now_ts_events - last_events_ts)
+                        print(f"      [live_events_skip] fixture_id={fixture_id} remain={remain:.1f}s")
                 except Exception as e:
                     print(f"      [live_all_events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
@@ -3080,7 +3109,12 @@ def run_once() -> int:
                     print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
 
     # ✅ LIVE 스캔만 수행 (backfill은 별도 워커로 분리)
-    _scan_fixtures_for_dates(live_dates, mode_tag="live", forced_interval=None)
+    #    단, 라이브 핫패스가 이미 오래 걸렸으면 이번 틱의 date scan은 건너뛴다.
+    hotpath_elapsed = time.time() - run_started_ts
+    if (total_inplay > 0) and (hotpath_elapsed >= LIVE_HOTPATH_BUDGET_SEC):
+        print(f"[live_scan_skip] hotpath_elapsed={hotpath_elapsed:.2f}s inplay={total_inplay} budget={LIVE_HOTPATH_BUDGET_SEC}s")
+    else:
+        _scan_fixtures_for_dates(live_dates, mode_tag="live", forced_interval=None)
 
     # ─────────────────────────────────────
     # (6) 런타임 캐시 prune (메모리 누적 방지)
@@ -3089,6 +3123,7 @@ def run_once() -> int:
         for fid, g in list(fixture_groups.items()):
             if g in ("FINISHED", "OTHER"):
                 LAST_STATS_SYNC.pop(fid, None)
+                LAST_EVENTS_SYNC.pop(fid, None)
                 LINEUPS_STATE.pop(fid, None)
 
         if len(LINEUPS_STATE) > 3000:
@@ -3097,7 +3132,8 @@ def run_once() -> int:
     except Exception:
         pass
 
-    print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}")
+    run_sec = time.time() - run_started_ts
+    print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}, run_sec={run_sec:.2f}")
     return total_inplay
 
 
