@@ -35,6 +35,21 @@ def _safe_text_or_none(v: Any) -> Optional[str]:
     s = str(v).strip()
     return s if s else None
 
+def _normalize_round_name(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+
+    s = v.strip()
+
+    s = re.sub(r"\s+", " ", s)
+
+    # API 특이 케이스 보정
+    s = s.replace("Round Of", "Round of")
+    s = s.replace("Quarter Finals", "Quarter-finals")
+    s = s.replace("Semi Finals", "Semi-finals")
+
+    return s if s else None
+
 
 def _parse_json_text(v: Any) -> Dict[str, Any]:
     if isinstance(v, dict):
@@ -453,7 +468,22 @@ def _fetch_pair_round_matches(
         return []
 
 
-def _is_knockout_round_name(round_name: Any) -> bool:
+def _is_knockout_round_name(
+    round_name: Any,
+    *,
+    meta_is_knockout: Optional[int] = None,
+) -> bool:
+    """
+    round_kind 판별 안정판
+
+    우선순위
+    1️⃣ competition_rounds_meta.is_knockout
+    2️⃣ 이름 기반 fallback
+    """
+
+    if meta_is_knockout is not None:
+        return int(meta_is_knockout) == 1
+
     if not isinstance(round_name, str):
         return False
 
@@ -469,7 +499,6 @@ def _is_knockout_round_name(round_name: Any) -> bool:
         or lo.startswith("group ")
         or "group stage" in lo
         or lo.startswith("stage ")
-        or re.match(r"^(apertura|clausura)\s*-\s*\d+$", lo)
     ):
         return False
 
@@ -481,21 +510,11 @@ def _is_knockout_round_name(round_name: Any) -> bool:
         "knockout",
         "playoff",
         "play-off",
-        "play in",
-        "play-in",
-        "elimination",
         "preliminary",
         "qualifying",
-        "qualifier",
-        "reclasificacion",
-        "reclasificación",
     )
-    if any(t in lo for t in include_tokens):
-        return True
 
-    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
-        return True
-    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+    if any(t in lo for t in include_tokens):
         return True
 
     return False
@@ -579,115 +598,6 @@ def _get_group_meta_names(league_id: int, season: int) -> List[str]:
                 out.append(name)
     return out
 
-
-def _normalize_knockout_round_rows_for_display(
-    league_id: int,
-    season: int,
-    knockout_rounds: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    competition_rounds_meta 오염 보정용.
-
-    현재 하드코딩 대상:
-    - FA Cup 2025 (league_id=45, season=2025)
-
-    보정 내용:
-    - 1/128-finals 가 final 로 잘못 저장된 메타를 무시하고
-    - Round of 128 이 is_knockout=0 이어도 브라켓 라운드 후보에 포함
-    - 표시/정렬 순서를 실제 FA Cup 진행 순서에 맞게 강제
-    """
-    if not knockout_rounds:
-        knockout_rounds = []
-
-    normalized: List[Dict[str, Any]] = []
-    seen_names: set[str] = set()
-
-    for row in knockout_rounds:
-        rn = _safe_text_or_none(row.get("round_name"))
-        if not rn:
-            continue
-        if rn in seen_names:
-            continue
-        seen_names.add(rn)
-        normalized.append(dict(row))
-
-    if league_id == 45 and season == 2025:
-        fa_2025_order = [
-            "Extra Preliminary Round",
-            "Extra Preliminary Round Replays",
-            "Preliminary Round",
-            "Preliminary Round Replays",
-            "1st Round Qualifying",
-            "1st Round Qualifying Replays",
-            "2nd Round Qualifying",
-            "2nd Round Qualifying Replays",
-            "3rd Round Qualifying",
-            "1/128-finals",
-            "Round of 128",
-            "Round of 64",
-            "Round of 32",
-            "Round of 16",
-            "Quarter-finals",
-            "Semi-finals",
-            "Final",
-        ]
-
-        order_map = {name: idx + 1 for idx, name in enumerate(fa_2025_order)}
-
-        existing_names = {
-            _safe_text_or_none(r.get("round_name"))
-            for r in normalized
-            if _safe_text_or_none(r.get("round_name"))
-        }
-
-        # competition_rounds_meta 에 is_knockout=0 로 빠진 Round of 128 강제 추가
-        if "Round of 128" not in existing_names:
-            normalized.append(
-                {
-                    "round_name": "Round of 128",
-                    "round_order": order_map["Round of 128"],
-                    "round_kind": "round_of_128",
-                    "is_knockout": 1,
-                }
-            )
-
-        fixed_rows: List[Dict[str, Any]] = []
-        seen_names = set()
-
-        for row in normalized:
-            rn = _safe_text_or_none(row.get("round_name"))
-            if not rn or rn in seen_names:
-                continue
-            seen_names.add(rn)
-
-            fixed = dict(row)
-
-            if rn in order_map:
-                fixed["round_order"] = order_map[rn]
-                fixed["is_knockout"] = 1
-
-                if rn == "1/128-finals":
-                    fixed["round_kind"] = "round_of_256_playin"
-                elif rn == "Round of 128":
-                    fixed["round_kind"] = "round_of_128"
-
-            fixed_rows.append(fixed)
-
-        fixed_rows.sort(
-            key=lambda r: (
-                _coalesce_int(r.get("round_order"), 999999),
-                str(r.get("round_name") or ""),
-            )
-        )
-        return fixed_rows
-
-    normalized.sort(
-        key=lambda r: (
-            _coalesce_int(r.get("round_order"), 999999),
-            str(r.get("round_name") or ""),
-        )
-    )
-    return normalized
 
 
 def _filter_bracket_round_options_to_played_rounds(
@@ -789,7 +699,10 @@ def _build_stage_round_options(
         if not round_name:
             continue
 
-        is_knockout = _coalesce_int(row.get("is_knockout"), 0) == 1
+        is_knockout = _is_knockout_round_name(
+            row.get("round_name"),
+            meta_is_knockout=row.get("is_knockout"),
+        )
 
         if is_knockout:
             if _coalesce_int(round_count_map.get(round_name), 0) > 0:
@@ -1055,7 +968,10 @@ Match Detail용 Standings 블록 (TABLE 전용)
     non_knockout_round_names = [
         _safe_text_or_none(r.get("round_name"))
         for r in (all_round_rows or [])
-        if _coalesce_int(r.get("is_knockout"), 0) != 1
+        if not _is_knockout_round_name(
+            r.get("round_name"),
+            meta_is_knockout=r.get("is_knockout"),
+        )
     ]
     non_knockout_round_names = [r for r in non_knockout_round_names if r]
 
@@ -1099,11 +1015,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 (league_id_int, season_resolved),
             )
 
-            knockout_rounds = _normalize_knockout_round_rows_for_display(
-                league_id=league_id_int,
-                season=season_resolved,
-                knockout_rounds=knockout_rounds or [],
-            )
+            knockout_rounds = knockout_rounds or []
 
             knockout_round_names_asc = [
                 str(r.get("round_name")).strip()
@@ -1129,7 +1041,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
             round_count_map: Dict[str, int] = {}
             for rr in round_count_rows or []:
-                rn = _safe_text_or_none(rr.get("league_round"))
+                rn = _normalize_round_name(rr.get("league_round"))
                 if not rn:
                     continue
                 round_count_map[rn] = _coalesce_int(rr.get("cnt"), 0)
@@ -1162,7 +1074,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 and requested_round in knockout_round_names_asc
                 and _coalesce_int(round_count_map.get(requested_round), 0) > 0
             ):
-                selected_round_label = requested_round
+                selected_round_label = _normalize_round_name(requested_round)
 
             elif (
                 table_stage_label
@@ -1177,7 +1089,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 and header_round in knockout_round_names_asc
                 and _coalesce_int(round_count_map.get(header_round), 0) > 0
             ):
-                selected_round_label = header_round
+                selected_round_label = _normalize_round_name(header_round)
 
             elif stage_round_options:
                 selected_round_label = stage_round_options[0]
@@ -1916,7 +1828,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
             raw_group_name=r.get("group_name"),
             description=r.get("description"),
         )
-        g = _norm_group(eff_g)
+        g = _norm_group(eff_g) or ""
         rk = _coalesce_int(r.get("rank"), 0) or 999999
         tn = str(r.get("team_name") or "")
         return (g.lower(), rk, tn.lower())
