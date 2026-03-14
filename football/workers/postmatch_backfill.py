@@ -1124,6 +1124,10 @@ def _round_sort_key(round_name: Optional[str]) -> tuple[int, int, str]:
 
 
 def _sort_rounds(rounds: List[str]) -> List[str]:
+    """
+    API 원본 순서를 그대로 유지한다.
+    (FA Cup 같은 컵대회에서 round 이름 패턴으로 정렬하면 순서가 깨짐)
+    """
     uniq: List[str] = []
     seen = set()
 
@@ -1131,13 +1135,15 @@ def _sort_rounds(rounds: List[str]) -> List[str]:
         name = (safe_text(r) or "").strip()
         if not name:
             continue
+
         key = name.lower()
         if key in seen:
             continue
+
         seen.add(key)
         uniq.append(name)
 
-    return sorted(uniq, key=_round_sort_key)
+    return uniq
 
 
 def upsert_competition_api_raw(
