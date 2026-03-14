@@ -2027,33 +2027,28 @@ def _effective_group_name(
     description: Any,
 ) -> Optional[str]:
     """
-    rows의 group_name이 리그명/기본값으로만 채워지고,
-    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
+    rows의 raw group_name을 최대한 그대로 유지한다.
 
-    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
-    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
+    원칙:
+    - DB에 이미 의미 있는 group_name이 있으면 그대로 사용
+      예: Group A, East/West, Championship Round, Relegation Round,
+          Bundesliga: Regular Season
+    - group_name이 비어 있거나 정말 의미 없는 경우에만
+      description 기반으로 Championship/Relegation 보정
     """
     g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
     d = description.strip().lower() if isinstance(description, str) else ""
 
-    # group_name 자체가 의미있으면 그대로 둠
     gl = g.lower()
     if gl:
-        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
-            return g
-        if gl.startswith("group "):
-            return g
-        if "east" in gl or "west" in gl:
-            return g
+        return g
 
-    # description 기반 split round 보정
     if "champ" in d and "round" in d:
         return "Championship Round"
     if "releg" in d and "round" in d:
         return "Relegation Round"
 
-    # 그 외는 기존 group_name 유지(빈 값이면 None)
-    return g if g else None
+    return None
 
 
 
