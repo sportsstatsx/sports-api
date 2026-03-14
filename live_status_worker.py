@@ -2879,6 +2879,12 @@ def run_once() -> int:
 
     total_inplay = 0
 
+    print(
+        f"[live_worker] tick start detect_interval={DETECT_INTERVAL_SEC}s "
+        f"watched_leagues={len(league_ids)}",
+        flush=True,
+    )
+
     # ─────────────────────────────────────
     # (0) live=all 감지
     # ─────────────────────────────────────
@@ -2888,6 +2894,8 @@ def run_once() -> int:
     except Exception as e:
         print(f"[live_detect] err: {e}", file=sys.stderr)
         live_items = []
+
+    print(f"[live_worker] live_all fetched={len(live_items)}", flush=True)
 
     watched = set(league_ids)
 
@@ -2991,6 +2999,11 @@ def run_once_events_worker() -> int:
     now = now_utc()
 
     rows = _select_inplay_matches(limit=EVENTS_BATCH_LIMIT)
+    print(
+        f"[events_worker] tick candidates={len(rows)} batch_limit={EVENTS_BATCH_LIMIT} "
+        f"cooldown={EVENTS_INTERVAL_SEC}s",
+        flush=True,
+    )
     if not rows:
         print("[events_worker] inplay=0")
         return 0
@@ -3053,6 +3066,11 @@ def run_once_stats_worker() -> int:
 
     s = _session()
     rows = _select_inplay_matches(limit=STATS_BATCH_LIMIT)
+    print(
+        f"[stats_worker] tick candidates={len(rows)} batch_limit={STATS_BATCH_LIMIT} "
+        f"cooldown={STATS_INTERVAL_SEC}s",
+        flush=True,
+    )
     if not rows:
         print("[stats_worker] inplay=0")
         return 0
