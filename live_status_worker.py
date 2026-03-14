@@ -1535,11 +1535,6 @@ def _resolve_season_for_league_from_db(league_id: int) -> Optional[int]:
     return None
 
 
-def fetch_standings(session: requests.Session, league_id: int, season: int) -> List[Dict[str, Any]]:
-    bundle = fetch_standings_bundle(session, league_id, season)
-    return bundle.get("rows") or []
-
-
 def upsert_standings_rows(league_id: int, season: int, rows: List[Dict[str, Any]]) -> int:
     """
     ✅ standings 테이블(네 스키마)에 맞춰 REPLACE (league_id+season 단위 싹 교체)
@@ -1676,6 +1671,65 @@ def _mark_triggers_consumed(fixture_ids: List[int]) -> None:
         """,
         (nowi, nowi, fixture_ids),
     )
+
+def _select_inplay_matches(limit: int = 100) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT fixture_id, league_id, season, home_id, away_id, date_utc, elapsed
+        FROM matches
+        WHERE status_group = 'INPLAY'
+        ORDER BY
+            CASE
+                WHEN elapsed IS NULL THEN 9999
+                ELSE elapsed
+            END ASC,
+            fixture_id ASC
+        LIMIT %s
+        """,
+        (int(limit),),
+    )
+    return rows or []
+
+
+def _select_recent_finished_for_postmatch(limit: int = 60) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT fixture_id, league_id, season, date_utc, status_group
+        FROM matches
+        WHERE status_group = 'FINISHED'
+        ORDER BY NULLIF(date_utc,'')::timestamptz DESC NULLS LAST, fixture_id DESC
+        LIMIT %s
+        """,
+        (int(limit),),
+    )
+    return rows or []
+
+
+def process_due_postmatch_fixtures(
+    session: requests.Session,
+    now: dt.datetime,
+    limit: int = 60,
+) -> int:
+    """
+    FT 이후 postmatch timeline(60초/30분) 대상만 별도 처리.
+    live worker가 아니라 fixtures worker가 담당한다.
+    """
+    rows = _select_recent_finished_for_postmatch(limit=limit)
+    if not rows:
+        return 0
+
+    processed = 0
+    for r in rows:
+        fid = safe_int(r.get("fixture_id"))
+        if fid is None:
+            continue
+        try:
+            maybe_sync_postmatch_timeline(session, fid, "FINISHED", now)
+            processed += 1
+        except Exception as e:
+            print(f"[postmatch_worker] fixture_id={fid} err: {e}", file=sys.stderr)
+
+    return processed
 
 
 
@@ -2030,7 +2084,7 @@ def replace_match_events_for_fixture(fixture_id: int, events: List[Dict[str, Any
         )
         if rows:
             sg = (rows[0].get("status_group") or "").strip().upper()
-            if (role != "live") and (sg == "INPLAY"):
+            if (role not in ("live", "events")) and (sg == "INPLAY"):
                 return 0
     except Exception:
         pass
@@ -2793,8 +2847,10 @@ def run_once() -> int:
     """
     ✅ LIVE 전용(핫패스):
     - live=all 감지/즉시 처리
-    - live_dates(오늘, 필요 시 어제) 스캔만 수행
-    - backfill / watchdog 는 별도 워커(run_once_backfill / run_once_watchdog)가 담당
+    - fixtures / matches / raw 반영
+    - lineup 정책 수행
+    - FT 트리거 enqueue
+    - events / stats / fixtures-scan / watchdog / postmatch 는 다른 워커가 담당
     """
     if not API_KEY:
         print("[live_status_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
@@ -2821,7 +2877,6 @@ def run_once() -> int:
     s = _session()
     run_started_ts = time.time()
 
-    total_fixtures = 0
     total_inplay = 0
 
     # ─────────────────────────────────────
@@ -2846,11 +2901,10 @@ def run_once() -> int:
         if lid in watched:
             live_lids.add(lid)
 
-    idle_mode = (len(live_lids) == 0)
-    if idle_mode:
-        print(f"[live_detect] watched_live=0 (live_all={len(live_items)}) → all leagues slow scan mode")
+    if len(live_lids) == 0:
+        print(f"[live_detect] watched_live=0 (live_all={len(live_items)})")
     else:
-        print(f"[live_detect] watched_live={len(live_lids)} (live_all={len(live_items)}) → mixed scan (live fast / non-live slow)")
+        print(f"[live_detect] watched_live={len(live_lids)} (live_all={len(live_items)})")
 
     # ─────────────────────────────────────
     # (0-1) ✅ LIVE 아이템 즉시 처리
@@ -2870,7 +2924,6 @@ def run_once() -> int:
             season = safe_int(lg.get("season"))
             if season is None:
                 season = safe_int((item.get("league") or {}).get("season"))
-
             if season is None:
                 continue
 
@@ -2902,10 +2955,7 @@ def run_once() -> int:
             except Exception:
                 pass
 
-            try:
-                maybe_sync_postmatch_timeline(s, fixture_id, sg2, now)
-            except Exception:
-                pass
+            # postmatch timeline 처리는 fixtures worker가 담당
 
             if sg2 == "FINISHED":
                 try:
@@ -2913,256 +2963,149 @@ def run_once() -> int:
                 except Exception:
                     pass
 
-
             if sg2 == "INPLAY":
                 total_inplay += 1
-
-                try:
-                    now_ts_events = time.time()
-                    last_events_ts = LAST_EVENTS_SYNC.get(fixture_id)
-
-                    if (last_events_ts is None) or ((now_ts_events - last_events_ts) >= EVENTS_INTERVAL_SEC):
-                        events = fetch_events(s, fixture_id)
-
-                        try:
-                            upsert_match_events_raw(fixture_id, events, now)
-                        except Exception:
-                            pass
-
-                        inserted = 0
-                        try:
-                            inserted = replace_match_events_for_fixture(fixture_id, events)
-                        except Exception:
-                            inserted = 0
-
-                        try:
-                            h_red, a_red = calc_red_cards_from_events(events, home_id, away_id)
-                            upsert_match_live_state(fixture_id, h_red, a_red, now)
-                        except Exception:
-                            pass
-
-                        LAST_EVENTS_SYNC[fixture_id] = now_ts_events
-                        print(f"      [live_all_events] fixture_id={fixture_id} events={len(events)} inserted={inserted} interval={EVENTS_INTERVAL_SEC}s")
-                    else:
-                        remain = EVENTS_INTERVAL_SEC - (now_ts_events - last_events_ts)
-                        print(f"      [live_events_skip] fixture_id={fixture_id} remain={remain:.1f}s")
-                except Exception as e:
-                    print(f"      [live_all_events] fixture_id={fixture_id} err: {e}", file=sys.stderr)
-
-                try:
-                    now_ts3 = time.time()
-                    last_ts = LAST_STATS_SYNC.get(fixture_id)
-                    if (last_ts is None) or ((now_ts3 - last_ts) >= STATS_INTERVAL_SEC):
-                        stats = fetch_team_stats(s, fixture_id)
-                        upsert_match_team_stats(fixture_id, stats)
-                        LAST_STATS_SYNC[fixture_id] = now_ts3
-                        print(f"      [live_all_stats] fixture_id={fixture_id} updated")
-                except Exception as e:
-                    print(f"      [live_all_stats] fixture_id={fixture_id} err: {e}", file=sys.stderr)
 
         except Exception as e:
             print(f"  ! live_all item 처리 중 에러: {e}", file=sys.stderr)
 
-    # ─────────────────────────────────────
-    # (1) league/date 시즌 & 무경기 캐시 (API 낭비 감소)
-    # ─────────────────────────────────────
-    if not hasattr(run_once, "_fixtures_cache"):
-        run_once._fixtures_cache = {}  # type: ignore[attr-defined]
-    fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once._fixtures_cache  # type: ignore[attr-defined]
-
-    SEASON_TTL = 60 * 60
-    NOFIX_TTL = 60 * 10
-
-    now_ts = time.time()
-    for k, v in list(fc.items()):
-        if float(v.get("exp") or 0) < now_ts:
-            del fc[k]
-
-    fast_leagues = set(parse_fast_leagues(FAST_LEAGUES_ENV))
-    fixture_groups: Dict[int, str] = {}
-
-    live_dates = target_dates_for_live()
-
-    def _pick_scan_interval(lid: int) -> int:
-        if lid in fast_leagues:
-            return int(DETECT_INTERVAL_SEC)
-        if lid in live_lids:
-            return int(DEFAULT_SCAN_INTERVAL_SEC)
-        return int(IDLE_SCAN_INTERVAL_SEC)
-
-    def _scan_fixtures_for_dates(date_list: List[str], mode_tag: str, forced_interval: Optional[int] = None) -> None:
-        nonlocal total_fixtures, fixture_groups
-
-        combos: List[Tuple[str, int]] = []
-        for date_str in date_list:
-            for lid in league_ids:
-                combos.append((date_str, lid))
-        if not combos:
-            return
-
-        for date_str, lid in combos:
-            scan_interval = int(forced_interval) if forced_interval is not None else _pick_scan_interval(lid)
-
-            k_scan = (lid, f"{date_str}|{mode_tag}")
-            last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
-            if scan_interval > 0 and (now_ts - last_scan) < scan_interval:
-                continue
-            LAST_FIXTURES_SCAN_TS[k_scan] = now_ts
-
-            fixtures: List[Dict[str, Any]] = []
-            used_season: Optional[int] = None
-
-            cache_key = (lid, date_str)
-            cached = fc.get(cache_key)
-
-            if cached and float(cached.get("exp") or 0) >= now_ts:
-                if cached.get("no") is True:
-                    continue
-
-                cached_season = cached.get("season")
-                if isinstance(cached_season, int):
-                    try:
-                        rows = fetch_fixtures(s, lid, date_str, cached_season)
-                        if rows:
-                            fixtures = rows
-                            used_season = cached_season
-                        else:
-                            fc.pop(cache_key, None)
-                    except Exception as e:
-                        fc.pop(cache_key, None)
-                        print(f"  [fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
-
-            if used_season is None:
-                for season in infer_season_candidates(date_str):
-                    try:
-                        rows = fetch_fixtures(s, lid, date_str, season)
-                        if rows:
-                            fixtures = rows
-                            used_season = season
-                            fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
-                            break
-                    except Exception as e:
-                        print(f"  [fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
-
-            if used_season is None:
-                fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
-                continue
-
-            total_fixtures += len(fixtures)
-            print(f"[fixtures:{mode_tag}] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={scan_interval}s")
-
-            for item in fixtures:
-                try:
-                    fx = item.get("fixture") or {}
-                    fid = safe_int(fx.get("id"))
-                    if fid is None:
-                        continue
-
-                    st = fx.get("status") or {}
-                    status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
-                    status_group = map_status_group(status_short)
-
-                    # ✅ INPLAY(라이브중)은 live=all이 전담 → 여기서는 스킵
-                    if status_group == "INPLAY":
-                        continue
-
-                    fixture_groups[fid] = status_group
-
-                    upsert_fixture_row(
-                        fixture_id=fid,
-                        league_id=lid,
-                        season=used_season,
-                        date_utc=safe_text(fx.get("date")),
-                        status_short=status_short,
-                        status_group=status_group,
-                    )
-
-                    fixture_id, home_id, away_id, sg, date_utc = upsert_match_row_from_fixture(
-                        item, league_id=lid, season=used_season
-                    )
-
-                    try:
-                        upsert_match_fixtures_raw(fixture_id, item, fetched_at)
-                    except Exception as raw_err:
-                        print(f"      [match_fixtures_raw] fixture_id={fixture_id} err: {raw_err}", file=sys.stderr)
-
-                    try:
-                        elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
-                        maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
-                    except Exception as lu_err:
-                        print(f"      [lineups] fixture_id={fixture_id} policy err: {lu_err}", file=sys.stderr)
-
-                    try:
-                        maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
-                    except Exception as pm_err:
-                        print(f"      [postmatch_timeline] fixture_id={fixture_id} err: {pm_err}", file=sys.stderr)
-
-                    # ✅ FT 트리거 기록(B안)
-                    if sg == "FINISHED":
-                        try:
-                            enqueue_ft_trigger(fixture_id, lid, used_season, finished_iso_utc=iso_utc(now))
-                        except Exception:
-                            pass
-
-
-                except Exception as e:
-                    print(f"  ! fixture 처리 중 에러: {e}", file=sys.stderr)
-
-    # ✅ LIVE 스캔만 수행 (backfill은 별도 워커로 분리)
-    #    단, 라이브 핫패스가 이미 오래 걸렸으면 이번 틱의 date scan은 건너뛴다.
-    hotpath_elapsed = time.time() - run_started_ts
-    if (total_inplay > 0) and (hotpath_elapsed >= LIVE_HOTPATH_BUDGET_SEC):
-        print(f"[live_scan_skip] hotpath_elapsed={hotpath_elapsed:.2f}s inplay={total_inplay} budget={LIVE_HOTPATH_BUDGET_SEC}s")
-    else:
-        _scan_fixtures_for_dates(live_dates, mode_tag="live", forced_interval=None)
-
-    # ─────────────────────────────────────
-    # (6) 런타임 캐시 prune (메모리 누적 방지)
-    # ─────────────────────────────────────
-    try:
-        for fid, g in list(fixture_groups.items()):
-            if g in ("FINISHED", "OTHER"):
-                LAST_STATS_SYNC.pop(fid, None)
-                LAST_EVENTS_SYNC.pop(fid, None)
-                LINEUPS_STATE.pop(fid, None)
-
-        if len(LINEUPS_STATE) > 3000:
-            for fid in list(LINEUPS_STATE.keys())[: len(LINEUPS_STATE) - 2000]:
-                LINEUPS_STATE.pop(fid, None)
-    except Exception:
-        pass
-
     run_sec = time.time() - run_started_ts
-    print(f"[live_status_worker] done. total_fixtures={total_fixtures}, inplay={total_inplay}, run_sec={run_sec:.2f}")
+    print(f"[live_status_worker] done. inplay={total_inplay}, run_sec={run_sec:.2f}")
     return total_inplay
 
-
-
-def run_once_backfill() -> int:
+def run_once_events_worker() -> int:
     """
-    ✅ BACKFILL 전용(슬로우패스):
-    - 어제/오늘/내일 backfill_dates 스캔만 수행
-    - INPLAY는 스킵(이미 scan 로직에서 status_group==INPLAY continue)
+    ✅ EVENTS 전용:
+    - DB의 INPLAY 경기만 조회
+    - /fixtures/events + red summary 갱신
     """
     if not API_KEY:
-        print("[backfill_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        print("[events_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    if not hasattr(run_once_events_worker, "_ddl_done"):
+        ensure_match_live_state_table()
+        run_once_events_worker._ddl_done = True  # type: ignore[attr-defined]
+
+    s = _session()
+    now = now_utc()
+
+    rows = _select_inplay_matches(limit=EVENTS_BATCH_LIMIT)
+    if not rows:
+        print("[events_worker] inplay=0")
+        return 0
+
+    processed = 0
+
+    for r in rows:
+        fixture_id = safe_int(r.get("fixture_id"))
+        home_id = safe_int(r.get("home_id"))
+        away_id = safe_int(r.get("away_id"))
+
+        if fixture_id is None or home_id is None or away_id is None:
+            continue
+
+        try:
+            now_ts_events = time.time()
+            last_events_ts = LAST_EVENTS_SYNC.get(fixture_id)
+
+            if (last_events_ts is not None) and ((now_ts_events - last_events_ts) < EVENTS_INTERVAL_SEC):
+                continue
+
+            events = fetch_events(s, fixture_id)
+
+            try:
+                upsert_match_events_raw(fixture_id, events, now)
+            except Exception:
+                pass
+
+            inserted = 0
+            try:
+                inserted = replace_match_events_for_fixture(fixture_id, events)
+            except Exception:
+                inserted = 0
+
+            try:
+                h_red, a_red = calc_red_cards_from_events(events, home_id, away_id)
+                upsert_match_live_state(fixture_id, h_red, a_red, now)
+            except Exception:
+                pass
+
+            LAST_EVENTS_SYNC[fixture_id] = now_ts_events
+            processed += 1
+            print(f"[events_worker] fixture_id={fixture_id} events={len(events)} inserted={inserted}")
+
+        except Exception as e:
+            print(f"[events_worker] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+
+    print(f"[events_worker] done. processed={processed}")
+    return processed
+
+def run_once_stats_worker() -> int:
+    """
+    ✅ STATS 전용:
+    - DB의 INPLAY 경기만 조회
+    - /fixtures/statistics 갱신
+    """
+    if not API_KEY:
+        print("[stats_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
+        return 0
+
+    s = _session()
+    rows = _select_inplay_matches(limit=STATS_BATCH_LIMIT)
+    if not rows:
+        print("[stats_worker] inplay=0")
+        return 0
+
+    processed = 0
+
+    for r in rows:
+        fixture_id = safe_int(r.get("fixture_id"))
+        if fixture_id is None:
+            continue
+
+        try:
+            now_ts_stats = time.time()
+            last_ts = LAST_STATS_SYNC.get(fixture_id)
+            if (last_ts is not None) and ((now_ts_stats - last_ts) < STATS_INTERVAL_SEC):
+                continue
+
+            stats = fetch_team_stats(s, fixture_id)
+            upsert_match_team_stats(fixture_id, stats)
+            LAST_STATS_SYNC[fixture_id] = now_ts_stats
+
+            processed += 1
+            print(f"[stats_worker] fixture_id={fixture_id} updated")
+
+        except Exception as e:
+            print(f"[stats_worker] fixture_id={fixture_id} err: {e}", file=sys.stderr)
+
+    print(f"[stats_worker] done. processed={processed}")
+    return processed
+
+def run_once_fixtures_worker() -> int:
+    """
+    ✅ FIXTURES + POSTMATCH 전용:
+    - 어제/오늘/내일 fixtures scan
+    - 예정경기 재검증
+    - stale inplay watchdog
+    - FT 이후 postmatch timeline 60초/30분 처리
+    """
+    if not API_KEY:
+        print("[fixtures_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
         return 0
 
     league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
     if not league_ids:
-        print("[backfill_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
+        print("[fixtures_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
         return 0
 
-    # ✅ DDL은 워커 시작 시 1회만(FT postmatch state / red state 공용)
-    if not hasattr(run_once_backfill, "_ddl_done"):
+    if not hasattr(run_once_fixtures_worker, "_ddl_done"):
         ensure_match_live_state_table()
         ensure_match_postmatch_timeline_state_table()
-
         ensure_ft_triggers_table()
         ensure_competition_structure_tables()
-
-        run_once_backfill._ddl_done = True  # type: ignore[attr-defined]
-
+        run_once_fixtures_worker._ddl_done = True  # type: ignore[attr-defined]
 
     now = now_utc()
     fetched_at = now
@@ -3170,10 +3113,9 @@ def run_once_backfill() -> int:
 
     total_fixtures = 0
 
-    # fixtures cache는 live와 공유하지 않아도 됨(프로세스가 분리되면 자연 분리)
-    if not hasattr(run_once_backfill, "_fixtures_cache"):
-        run_once_backfill._fixtures_cache = {}  # type: ignore[attr-defined]
-    fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once_backfill._fixtures_cache  # type: ignore[attr-defined]
+    if not hasattr(run_once_fixtures_worker, "_fixtures_cache"):
+        run_once_fixtures_worker._fixtures_cache = {}  # type: ignore[attr-defined]
+    fc: Dict[Tuple[int, str], Dict[str, Any]] = run_once_fixtures_worker._fixtures_cache  # type: ignore[attr-defined]
 
     SEASON_TTL = 60 * 60
     NOFIX_TTL = 60 * 10
@@ -3184,21 +3126,15 @@ def run_once_backfill() -> int:
             del fc[k]
 
     backfill_dates = target_dates_for_scan()
-
-    # backfill은 “주기 고정”이므로 forced_interval로 DATE_SCAN_INTERVAL_SEC를 사용
     forced_interval = int(DATE_SCAN_INTERVAL_SEC)
 
-    # (date,lid) 조합 만들기
     combos: List[Tuple[str, int]] = []
     for date_str in backfill_dates:
         for lid in league_ids:
             combos.append((date_str, lid))
 
-    if not combos:
-        return 0
-
     for date_str, lid in combos:
-        k_scan = (lid, f"{date_str}|backfill")
+        k_scan = (lid, f"{date_str}|fixtures")
         last_scan = float(LAST_FIXTURES_SCAN_TS.get(k_scan) or 0.0)
         if forced_interval > 0 and (now_ts - last_scan) < forced_interval:
             continue
@@ -3225,7 +3161,7 @@ def run_once_backfill() -> int:
                         fc.pop(cache_key, None)
                 except Exception as e:
                     fc.pop(cache_key, None)
-                    print(f"  [backfill:fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
+                    print(f"  [fixtures_worker:fixtures] league={lid} date={date_str} season={cached_season} err: {e}", file=sys.stderr)
 
         if used_season is None:
             for season in infer_season_candidates(date_str):
@@ -3237,14 +3173,14 @@ def run_once_backfill() -> int:
                         fc[cache_key] = {"season": season, "no": False, "exp": now_ts + SEASON_TTL}
                         break
                 except Exception as e:
-                    print(f"  [backfill:fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
+                    print(f"  [fixtures_worker:fixtures] league={lid} date={date_str} season={season} err: {e}", file=sys.stderr)
 
         if used_season is None:
             fc[cache_key] = {"season": None, "no": True, "exp": now_ts + NOFIX_TTL}
             continue
 
         total_fixtures += len(fixtures)
-        print(f"[fixtures:backfill] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={forced_interval}s")
+        print(f"[fixtures_worker:scan] league={lid} date={date_str} season={used_season} count={len(fixtures)} interval={forced_interval}s")
 
         for item in fixtures:
             try:
@@ -3257,7 +3193,7 @@ def run_once_backfill() -> int:
                 status_short = safe_text(st.get("short")) or safe_text(st.get("code")) or ""
                 status_group = map_status_group(status_short)
 
-                # ✅ INPLAY는 backfill이 절대 건드리지 않음
+                # INPLAY는 live worker가 전담
                 if status_group == "INPLAY":
                     continue
 
@@ -3279,33 +3215,21 @@ def run_once_backfill() -> int:
                 except Exception:
                     pass
 
-                # 라인업 슬롯/정책은 backfill에서도 “프리매치/초반” 케이스에 도움 됨(그대로 유지)
                 try:
                     elapsed = safe_int((item.get("fixture") or {}).get("status", {}).get("elapsed"))
                     maybe_sync_lineups(s, fixture_id, date_utc, sg, elapsed, now)
                 except Exception:
                     pass
 
-                # FT 이후 2회 덮어쓰기 정책 유지
-                try:
-                    maybe_sync_postmatch_timeline(s, fixture_id, sg, now)
-                except Exception:
-                    pass
-
-                # ✅ FT 트리거 기록(B안)
                 if sg == "FINISHED":
                     try:
                         enqueue_ft_trigger(fixture_id, lid, used_season, finished_iso_utc=iso_utc(now))
                     except Exception:
                         pass
 
-
             except Exception as e:
-                print(f"  ! backfill fixture 처리 중 에러: {e}", file=sys.stderr)
+                print(f"  ! fixtures_worker fixture 처리 중 에러: {e}", file=sys.stderr)
 
-    # ✅ 추가: DB에 저장된 예정 경기 전체를 순환 재검증
-    # - date 기반 스캔으로는 "멀리 미래로 밀린 경기"를 다시 못 잡을 수 있으므로
-    # - fixture_id 단건조회로 NS/TBD/PST/UPCOMING 경기의 최신 일정/상태를 반영
     try:
         rechecked = recheck_scheduled_fixtures(
             s,
@@ -3314,49 +3238,30 @@ def run_once_backfill() -> int:
         )
     except Exception as e:
         rechecked = 0
-        print(f"[backfill_worker] schedule_recheck err: {e}", file=sys.stderr)
-
-    print(f"[backfill_worker] done. total_fixtures={total_fixtures}, rechecked={rechecked}")
-    return total_fixtures
-
-
-def run_once_watchdog() -> int:
-    """
-    ✅ WATCHDOG 전용:
-    - DB에 오래 남은 INPLAY 후보를 뽑아서 단건 /fixtures?id= 로 상태 보정
-    - WATCHDOG_INTERVAL_SEC 주기는 watchdog_fix_stale_inplay 내부에서도 한 번 더 막음
-    """
-    if not API_KEY:
-        print("[watchdog_worker] APIFOOTBALL_KEY(env) 가 비어있습니다. 종료.", file=sys.stderr)
-        return 0
-
-    league_ids = parse_live_leagues(LIVE_LEAGUES_ENV)
-    if not league_ids:
-        print("[watchdog_worker] LIVE_LEAGUES env 가 비어있습니다. 종료.", file=sys.stderr)
-        return 0
-
-    if not hasattr(run_once_watchdog, "_ddl_done"):
-        ensure_match_live_state_table()
-        ensure_match_postmatch_timeline_state_table()
-
-        ensure_ft_triggers_table()
-        ensure_competition_structure_tables()
-
-        run_once_watchdog._ddl_done = True  # type: ignore[attr-defined]
-
-
-    now = now_utc()
-    s = _session()
+        print(f"[fixtures_worker] schedule_recheck err: {e}", file=sys.stderr)
 
     try:
-        tried = watchdog_fix_stale_inplay(s, now)
-        print(f"[watchdog_worker] done. tried={tried}")
-        return tried
+        watchdog_tried = watchdog_fix_stale_inplay(s, now)
     except Exception as e:
-        print(f"[watchdog_worker] err: {e}", file=sys.stderr)
-        return 0
+        watchdog_tried = 0
+        print(f"[fixtures_worker] watchdog err: {e}", file=sys.stderr)
 
+    try:
+        postmatch_processed = process_due_postmatch_fixtures(
+            s,
+            now,
+            limit=POSTMATCH_BATCH_LIMIT,
+        )
+    except Exception as e:
+        postmatch_processed = 0
+        print(f"[fixtures_worker] postmatch err: {e}", file=sys.stderr)
 
+    print(
+        f"[fixtures_worker] done. total_fixtures={total_fixtures}, "
+        f"rechecked={rechecked}, watchdog_tried={watchdog_tried}, "
+        f"postmatch_processed={postmatch_processed}"
+    )
+    return total_fixtures
 
 
 
@@ -3365,40 +3270,54 @@ def run_once_watchdog() -> int:
 # 루프
 # ─────────────────────────────────────
 
-# 역할 분기(파일 1개로 워커 3개 실행할 때 사용)
+# 역할 분기(파일 1개로 워커 여러 개 실행)
 LIVE_WORKER_ROLE = (os.environ.get("LIVE_WORKER_ROLE") or "live").strip().lower()
-# live | backfill | watchdog
+# live | events | stats | fixtures | standings
 
+EVENTS_LOOP_SEC = int(os.environ.get("LIVE_EVENTS_LOOP_SEC", "5"))
+STATS_LOOP_SEC = int(os.environ.get("LIVE_STATS_LOOP_SEC", "10"))
+FIXTURES_LOOP_SEC = int(os.environ.get("LIVE_FIXTURES_LOOP_SEC", "30"))
+
+EVENTS_BATCH_LIMIT = int(os.environ.get("LIVE_EVENTS_BATCH_LIMIT", "80"))
+STATS_BATCH_LIMIT = int(os.environ.get("LIVE_STATS_BATCH_LIMIT", "80"))
+POSTMATCH_BATCH_LIMIT = int(os.environ.get("LIVE_POSTMATCH_BATCH_LIMIT", "60"))
 def loop() -> None:
     """
-    ✅ 단일 파일에서 역할별로 루프를 분기한다.
-
-    핵심 수정:
-    - standings는 TRIGGER_POLL_SEC마다 "트리거만" 처리(do_periodic=False)
-    - STANDINGS_LOOP_SEC마다 "정기 작업" 1회(do_periodic=True)
-    - 이렇게 해야 호출수 폭발 없이 'FT 즉시 1회 + 주기적 갱신'이 정확히 성립함
+    역할별 워커 루프
+    - live       : live=all 감지 + fixtures/matches/raw + lineup
+    - events     : INPLAY events
+    - stats      : INPLAY stats
+    - fixtures   : fixtures scan + schedule recheck + watchdog + postmatch
+    - standings  : FT trigger + periodic standings/bracket sync
     """
     role = LIVE_WORKER_ROLE
 
-    if role == "backfill":
-        sleep_sec = int(os.environ.get("LIVE_BACKFILL_LOOP_SEC", str(DATE_SCAN_INTERVAL_SEC)))
-        print(f"[live_status_worker] start role=backfill (loop_sec={sleep_sec}s)")
+    if role == "events":
+        print(f"[live_status_worker] start role=events (loop_sec={EVENTS_LOOP_SEC}s)")
         while True:
             try:
-                run_once_backfill()
+                run_once_events_worker()
             except Exception:
                 traceback.print_exc()
-            time.sleep(max(30, sleep_sec))
+            time.sleep(max(3, EVENTS_LOOP_SEC))
 
-    elif role == "watchdog":
-        sleep_sec = int(os.environ.get("LIVE_WATCHDOG_LOOP_SEC", str(WATCHDOG_INTERVAL_SEC)))
-        print(f"[live_status_worker] start role=watchdog (loop_sec={sleep_sec}s)")
+    elif role == "stats":
+        print(f"[live_status_worker] start role=stats (loop_sec={STATS_LOOP_SEC}s)")
         while True:
             try:
-                run_once_watchdog()
+                run_once_stats_worker()
             except Exception:
                 traceback.print_exc()
-            time.sleep(max(10, sleep_sec))
+            time.sleep(max(5, STATS_LOOP_SEC))
+
+    elif role == "fixtures":
+        print(f"[live_status_worker] start role=fixtures (loop_sec={FIXTURES_LOOP_SEC}s)")
+        while True:
+            try:
+                run_once_fixtures_worker()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(max(10, FIXTURES_LOOP_SEC))
 
     elif role == "standings":
         print(f"[live_status_worker] start role=standings (periodic={STANDINGS_LOOP_SEC}s, poll={TRIGGER_POLL_SEC}s)")
@@ -3406,25 +3325,18 @@ def loop() -> None:
         while True:
             try:
                 now_ts = time.time()
-
-                # 1) 트리거 폴링: 트리거만 처리 (즉시성)
                 run_once_standings(do_periodic=False)
-
-                # 2) 주기적 전체 갱신: 30분에 1번만
                 if (now_ts - last_periodic) >= float(STANDINGS_LOOP_SEC):
                     last_periodic = now_ts
                     run_once_standings(do_periodic=True)
-
             except Exception:
                 traceback.print_exc()
-
             time.sleep(max(5, int(TRIGGER_POLL_SEC)))
 
-
     else:
-        # default = live
         print(
-            f"[live_status_worker] start role=live (detect_interval={DETECT_INTERVAL_SEC}s, default_scan={DEFAULT_SCAN_INTERVAL_SEC}s, fast_leagues_env='{FAST_LEAGUES_ENV}')"
+            f"[live_status_worker] start role=live "
+            f"(detect_interval={DETECT_INTERVAL_SEC}s, fast_leagues_env='{FAST_LEAGUES_ENV}')"
         )
         while True:
             try:
