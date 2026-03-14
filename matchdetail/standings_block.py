@@ -705,6 +705,104 @@ def _filter_bracket_round_options_to_played_rounds(
     ]
     return list(reversed(visible_asc))
 
+def _derive_table_stage_label(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    round_rows: List[Dict[str, Any]],
+    rows_raw: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    혼합형 대회에서 TABLE 쪽 stage 칩 라벨을 결정한다.
+
+    예:
+    - League Stage - 1..8 이 있으면 -> "League Stage"
+    - Group Stage / Group A/B 류가 있으면 -> "Group Stage"
+
+    주의:
+    - 순수 리그(single_table_league)는 굳이 stage 칩을 만들지 않음
+    - 실제 standings rows가 있어야 TABLE stage 칩을 노출
+    """
+    if not rows_raw:
+        return None
+
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+    has_knockout_rounds = _coalesce_int((comp_meta or {}).get("has_knockout_rounds"), 0)
+
+    if has_knockout_rounds != 1:
+        return None
+
+    round_names = [
+        _safe_text_or_none(r.get("round_name"))
+        for r in (round_rows or [])
+    ]
+    round_names = [r for r in round_names if r]
+
+    lower_names = [r.lower() for r in round_names]
+
+    if any("league stage" in r for r in lower_names):
+        return "League Stage"
+
+    if any(("group stage" in r) or r.startswith("group ") for r in lower_names):
+        return "Group Stage"
+
+    if format_hint in {
+        "league_phase_plus_knockout",
+        "single_table_league_plus_playoff",
+        "multi_group_league_plus_playoff",
+        "cup_with_standings",
+    }:
+        return "Table"
+
+    return None
+
+
+def _build_stage_round_options(
+    *,
+    all_round_rows: List[Dict[str, Any]],
+    table_stage_label: Optional[str],
+    table_stage_has_data: bool,
+    round_count_map: Dict[str, int],
+) -> List[str]:
+    """
+    스탠딩 탭 상단 통합 stage 칩 목록 생성.
+
+    핵심:
+    - competition_rounds_meta.round_order 순서를 그대로 따른다.
+    - League Stage - 1..8 같은 non-knockout 라운드는
+      하나의 대표 칩(예: League Stage)으로 묶되,
+      실제 삽입 위치는 그 non-knockout 구간의 round_order 위치를 따른다.
+    - 최종 반환은 최신 단계가 왼쪽에 오도록 reversed(desc).
+    """
+    visible_asc: List[str] = []
+    added_table_stage = False
+
+    sorted_rows = sorted(
+        all_round_rows or [],
+        key=lambda r: (
+            _coalesce_int(r.get("round_order"), 999999),
+            str(r.get("round_name") or ""),
+        )
+    )
+
+    for row in sorted_rows:
+        round_name = _safe_text_or_none(row.get("round_name"))
+        if not round_name:
+            continue
+
+        is_knockout = _coalesce_int(row.get("is_knockout"), 0) == 1
+
+        if is_knockout:
+            if _coalesce_int(round_count_map.get(round_name), 0) > 0:
+                visible_asc.append(round_name)
+            continue
+
+        # non-knockout 구간은 대표 칩 1개만 삽입
+        if table_stage_label and table_stage_has_data and not added_table_stage:
+            visible_asc.append(table_stage_label)
+            added_table_stage = True
+
+    return list(reversed(visible_asc))
+
 
 def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
     """
@@ -924,13 +1022,49 @@ Match Detail용 Standings 블록 (TABLE 전용)
     source = "standings_table" if rows_raw else "computed_from_matches"
 
     # ─────────────────────────────────────────────────────────────
+    # 통합 stage 선택 준비
+    # - 혼합형 대회에서는 TABLE stage + BRACKET stage 칩을 함께 내려준다.
+    # - 기존 bracket_round 파라미터를 "선택된 stage 라벨"로 재사용한다.
+    # ─────────────────────────────────────────────────────────────
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    try:
+        all_round_rows = fetch_all(
+            """
+            SELECT
+                round_name,
+                round_order,
+                round_kind,
+                is_knockout
+            FROM competition_rounds_meta
+            WHERE league_id = %s
+              AND season = %s
+            ORDER BY round_order ASC, round_name ASC
+            """,
+            (league_id_int, season_resolved),
+        )
+    except Exception:
+        all_round_rows = []
+
+    table_stage_label = _derive_table_stage_label(
+        comp_meta=comp_meta,
+        round_rows=all_round_rows or [],
+        rows_raw=rows_raw or [],
+    )
+
+    non_knockout_round_names = [
+        _safe_text_or_none(r.get("round_name"))
+        for r in (all_round_rows or [])
+        if _coalesce_int(r.get("is_knockout"), 0) != 1
+    ]
+    non_knockout_round_names = [r for r in non_knockout_round_names if r]
+
+    # ─────────────────────────────────────────────────────────────
     # BRACKET 우선 시도 (컵 / 플레이오프 / 넉아웃 대회)
     # - 앱 MatchDetailJsonParser.parseBracketColumns() 구조와 100% 호환
     # - penalty / extra time 점수 반영
     # - single-leg / two-leg tie 모두 처리
     # ─────────────────────────────────────────────────────────────
-    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
-
     is_bracket_candidate = False
 
     if format_hint == "knockout_only":
@@ -944,7 +1078,9 @@ Match Detail용 Standings 블록 (TABLE 전용)
         if _is_header_knockout_context(header):
             is_bracket_candidate = True
 
-    if is_bracket_candidate:
+    stage_round_options: List[str] = []
+
+    if is_bracket_candidate or table_stage_label:
         try:
             knockout_rounds = fetch_all(
                 """
@@ -968,13 +1104,14 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 knockout_rounds=knockout_rounds or [],
             )
 
-            if knockout_rounds:
-                round_names_asc = [
-                    str(r.get("round_name")).strip()
-                    for r in knockout_rounds
-                    if r.get("round_name")
-                ]
+            knockout_round_names_asc = [
+                str(r.get("round_name")).strip()
+                for r in knockout_rounds
+                if r.get("round_name")
+            ]
 
+            round_count_rows = []
+            if knockout_round_names_asc:
                 round_count_rows = fetch_all(
                     """
                     SELECT
@@ -986,47 +1123,67 @@ Match Detail용 Standings 블록 (TABLE 전용)
                       AND m.league_round = ANY(%s)
                     GROUP BY m.league_round
                     """,
-                    (league_id_int, season_resolved, round_names_asc),
+                    (league_id_int, season_resolved, knockout_round_names_asc),
                 )
 
-                round_count_map: Dict[str, int] = {}
-                for rr in round_count_rows or []:
-                    rn = _safe_text_or_none(rr.get("league_round"))
-                    if not rn:
-                        continue
-                    round_count_map[rn] = _coalesce_int(rr.get("cnt"), 0)
+            round_count_map: Dict[str, int] = {}
+            for rr in round_count_rows or []:
+                rn = _safe_text_or_none(rr.get("league_round"))
+                if not rn:
+                    continue
+                round_count_map[rn] = _coalesce_int(rr.get("cnt"), 0)
 
-                requested_round = _safe_text_or_none(bracket_round)
-                header_round = _extract_round_label_from_header(header)
+            table_stage_has_data = bool(table_stage_label and rows_raw)
 
-                selected_round_label: Optional[str] = None
+            stage_round_options = _build_stage_round_options(
+                all_round_rows=all_round_rows or [],
+                table_stage_label=table_stage_label,
+                table_stage_has_data=table_stage_has_data,
+                round_count_map=round_count_map,
+            )
 
-                if (
-                    requested_round
-                    and requested_round in round_names_asc
-                    and _coalesce_int(round_count_map.get(requested_round), 0) > 0
-                ):
-                    selected_round_label = requested_round
-                elif (
-                    header_round
-                    and header_round in round_names_asc
-                    and _coalesce_int(round_count_map.get(header_round), 0) > 0
-                ):
-                    selected_round_label = header_round
-                else:
-                    for rn in reversed(round_names_asc):
-                        if _coalesce_int(round_count_map.get(rn), 0) > 0:
-                            selected_round_label = rn
-                            break
+            requested_round = _safe_text_or_none(bracket_round)
+            header_round = _extract_round_label_from_header(header)
 
-                if selected_round_label is None and round_names_asc:
-                    selected_round_label = round_names_asc[-1]
+            selected_round_label: Optional[str] = None
+            selected_is_table_stage = False
 
-                bracket_round_options = _filter_bracket_round_options_to_played_rounds(
-                    round_names_asc=round_names_asc,
-                    round_count_map=round_count_map,
-                )
+            if (
+                requested_round
+                and table_stage_label
+                and requested_round.strip().lower() == table_stage_label.strip().lower()
+            ):
+                selected_round_label = table_stage_label
+                selected_is_table_stage = True
 
+            elif (
+                requested_round
+                and requested_round in knockout_round_names_asc
+                and _coalesce_int(round_count_map.get(requested_round), 0) > 0
+            ):
+                selected_round_label = requested_round
+
+            elif (
+                table_stage_label
+                and header_round
+                and header_round in non_knockout_round_names
+            ):
+                selected_round_label = table_stage_label
+                selected_is_table_stage = True
+
+            elif (
+                header_round
+                and header_round in knockout_round_names_asc
+                and _coalesce_int(round_count_map.get(header_round), 0) > 0
+            ):
+                selected_round_label = header_round
+
+            elif stage_round_options:
+                selected_round_label = stage_round_options[0]
+                if table_stage_label and selected_round_label.strip().lower() == table_stage_label.strip().lower():
+                    selected_is_table_stage = True
+
+            if not selected_is_table_stage and selected_round_label:
                 def _match_is_finished(m: Dict[str, Any]) -> bool:
                     sg = str(m.get("status_group") or "").strip().upper()
                     st = str(m.get("status") or "").strip().upper()
@@ -1407,7 +1564,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
                     "mode": "BRACKET",
                     "rows": [],
                     "bracket": bracket_columns,
-                    "bracket_round_options": bracket_round_options,
+                    "bracket_round_options": stage_round_options,
                     "selected_bracket_round": selected_round_label,
                     "context_options": {"conferences": [], "groups": []},
                     "source": "computed_bracket",
@@ -1829,6 +1986,19 @@ Match Detail용 Standings 블록 (TABLE 전용)
     except Exception:
         pass
 
+    # 혼합형 대회 + 단일 테이블(리그명만 group으로 저장된 경우)은
+    # 별도 그룹 칩이 중복/노이즈가 되므로 숨긴다.
+    if stage_round_options:
+        groups_now = context_options.get("groups") or []
+        if len(groups_now) == 1:
+            only_group = str(groups_now[0] or "").strip().lower()
+            league_name_norm = str(league_name or "").strip().lower()
+            if only_group and league_name_norm and only_group == league_name_norm:
+                context_options = {
+                    "conferences": context_options.get("conferences") or [],
+                    "groups": [],
+                }
+
     out: Dict[str, Any] = {
         "league": {
             "league_id": league_id_int,
@@ -1838,8 +2008,8 @@ Match Detail용 Standings 블록 (TABLE 전용)
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
-        "bracket_round_options": [],
-        "selected_bracket_round": None,
+        "bracket_round_options": stage_round_options,
+        "selected_bracket_round": table_stage_label if stage_round_options else None,
         "context_options": context_options,
         "source": source,
     }
