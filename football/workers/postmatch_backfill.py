@@ -1020,53 +1020,103 @@ def _norm_lower(v: Any) -> str:
 
 def _infer_round_kind(round_name: Optional[str]) -> str:
     r = _norm_lower(round_name)
+
     if not r:
         return "unknown"
+
+    # ─────────────────────────
+    # 컵 라운드 (가장 구체적인 것부터)
+    # ─────────────────────────
+
+    # Final
+    if re.search(r"\bfinal\b", r) and "semi" not in r and "quarter" not in r:
+        return "final"
+
+    # Semi Final
+    if "semi-final" in r or "semi finals" in r or "semi-final" in r:
+        return "semi_final"
+
+    # Quarter Final
+    if "quarter-final" in r or "quarter finals" in r:
+        return "quarter_final"
+
+    # Round of X
+    m = re.search(r"round of\s*(\d+)", r)
+    if m:
+        n = int(m.group(1))
+        if n == 16:
+            return "round_of_16"
+        if n == 32:
+            return "round_of_32"
+        if n == 64:
+            return "round_of_64"
+        return "knockout_round"
+
+    # 1/128-finals 같은 패턴
+    m = re.search(r"1/\s*(\d+)", r)
+    if m:
+        return "knockout_round"
+
+    # ─────────────────────────
+    # Qualifying / Preliminary
+    # ─────────────────────────
+
+    if "extra preliminary" in r:
+        return "qualifying_round"
+
+    if "preliminary" in r:
+        return "qualifying_round"
+
+    if "qualifying" in r:
+        return "qualifying_round"
+
+    # ─────────────────────────
+    # League structures
+    # ─────────────────────────
+
     if "league stage" in r:
         return "league_phase"
+
     if "regular season" in r:
         return "regular_round"
+
     if "1st phase" in r or "2nd phase" in r:
         return "phase_round"
+
     if "championship round" in r:
         return "championship_round"
+
     if "relegation round" in r:
         return "relegation_round"
-    if "conference finals" in r or "conference semi-finals" in r:
-        return "playoff"
+
+    # ─────────────────────────
+    # Playoff
+    # ─────────────────────────
+
     if "play-in" in r:
         return "play_in"
-    if "play-off" in r or "playoff" in r or "play-offs" in r:
+
+    if "playoff" in r or "play-off" in r or "play-offs" in r:
         return "playoff"
-    if "qualifying" in r or "preliminary" in r:
-        return "qualifying_round"
-    if "round of 16" in r:
-        return "round_of_16"
-    if "round of 32" in r:
-        return "round_of_32"
-    if "round of 64" in r:
-        return "round_of_64"
-    if "quarter" in r:
-        return "quarter_final"
-    if "semi" in r:
-        return "semi_final"
-    if "final" in r or "finals" in r:
-        return "final"
+
+    # fallback
     return "other_round"
 
 
 def _infer_round_is_knockout(round_name: Optional[str]) -> int:
     k = _infer_round_kind(round_name)
+
     return 1 if k in {
-        "play_in",
-        "playoff",
         "qualifying_round",
+        "knockout_round",
         "round_of_64",
         "round_of_32",
         "round_of_16",
         "quarter_final",
         "semi_final",
         "final",
+        "play_in",
+        "playoff",
     } else 0
 
 def _extract_round_number(round_name: Optional[str]) -> Optional[int]:
