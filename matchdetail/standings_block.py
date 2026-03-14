@@ -579,6 +579,133 @@ def _get_group_meta_names(league_id: int, season: int) -> List[str]:
                 out.append(name)
     return out
 
+
+def _normalize_knockout_round_rows_for_display(
+    league_id: int,
+    season: int,
+    knockout_rounds: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    competition_rounds_meta 오염 보정용.
+
+    현재 하드코딩 대상:
+    - FA Cup 2025 (league_id=45, season=2025)
+
+    보정 내용:
+    - 1/128-finals 가 final 로 잘못 저장된 메타를 무시하고
+    - Round of 128 이 is_knockout=0 이어도 브라켓 라운드 후보에 포함
+    - 표시/정렬 순서를 실제 FA Cup 진행 순서에 맞게 강제
+    """
+    if not knockout_rounds:
+        knockout_rounds = []
+
+    normalized: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for row in knockout_rounds:
+        rn = _safe_text_or_none(row.get("round_name"))
+        if not rn:
+            continue
+        if rn in seen_names:
+            continue
+        seen_names.add(rn)
+        normalized.append(dict(row))
+
+    if league_id == 45 and season == 2025:
+        fa_2025_order = [
+            "Extra Preliminary Round",
+            "Extra Preliminary Round Replays",
+            "Preliminary Round",
+            "Preliminary Round Replays",
+            "1st Round Qualifying",
+            "1st Round Qualifying Replays",
+            "2nd Round Qualifying",
+            "2nd Round Qualifying Replays",
+            "3rd Round Qualifying",
+            "1/128-finals",
+            "Round of 128",
+            "Round of 64",
+            "Round of 32",
+            "Round of 16",
+            "Quarter-finals",
+            "Semi-finals",
+            "Final",
+        ]
+
+        order_map = {name: idx + 1 for idx, name in enumerate(fa_2025_order)}
+
+        existing_names = {
+            _safe_text_or_none(r.get("round_name"))
+            for r in normalized
+            if _safe_text_or_none(r.get("round_name"))
+        }
+
+        # competition_rounds_meta 에 is_knockout=0 로 빠진 Round of 128 강제 추가
+        if "Round of 128" not in existing_names:
+            normalized.append(
+                {
+                    "round_name": "Round of 128",
+                    "round_order": order_map["Round of 128"],
+                    "round_kind": "round_of_128",
+                    "is_knockout": 1,
+                }
+            )
+
+        fixed_rows: List[Dict[str, Any]] = []
+        seen_names = set()
+
+        for row in normalized:
+            rn = _safe_text_or_none(row.get("round_name"))
+            if not rn or rn in seen_names:
+                continue
+            seen_names.add(rn)
+
+            fixed = dict(row)
+
+            if rn in order_map:
+                fixed["round_order"] = order_map[rn]
+                fixed["is_knockout"] = 1
+
+                if rn == "1/128-finals":
+                    fixed["round_kind"] = "round_of_256_playin"
+                elif rn == "Round of 128":
+                    fixed["round_kind"] = "round_of_128"
+
+            fixed_rows.append(fixed)
+
+        fixed_rows.sort(
+            key=lambda r: (
+                _coalesce_int(r.get("round_order"), 999999),
+                str(r.get("round_name") or ""),
+            )
+        )
+        return fixed_rows
+
+    normalized.sort(
+        key=lambda r: (
+            _coalesce_int(r.get("round_order"), 999999),
+            str(r.get("round_name") or ""),
+        )
+    )
+    return normalized
+
+
+def _filter_bracket_round_options_to_played_rounds(
+    round_names_asc: List[str],
+    round_count_map: Dict[str, int],
+) -> List[str]:
+    """
+    칩 노출용 라운드 목록은 실제 matches 에 존재하는 라운드까지만 노출.
+    미래 라운드(예: 아직 안 한 Quarter-finals)는 숨김.
+    """
+    visible_asc = [
+        rn
+        for rn in round_names_asc
+        if _coalesce_int(round_count_map.get(rn), 0) > 0
+    ]
+    return list(reversed(visible_asc))
+
+
 def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
     """
     matches 기반 standings 계산을 막아야 하는 시즌/대회 포맷 판별.
@@ -835,6 +962,12 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 (league_id_int, season_resolved),
             )
 
+            knockout_rounds = _normalize_knockout_round_rows_for_display(
+                league_id=league_id_int,
+                season=season_resolved,
+                knockout_rounds=knockout_rounds or [],
+            )
+
             if knockout_rounds:
                 round_names_asc = [
                     str(r.get("round_name")).strip()
@@ -868,9 +1001,17 @@ Match Detail용 Standings 블록 (TABLE 전용)
 
                 selected_round_label: Optional[str] = None
 
-                if requested_round and requested_round in round_names_asc:
+                if (
+                    requested_round
+                    and requested_round in round_names_asc
+                    and _coalesce_int(round_count_map.get(requested_round), 0) > 0
+                ):
                     selected_round_label = requested_round
-                elif header_round and header_round in round_names_asc:
+                elif (
+                    header_round
+                    and header_round in round_names_asc
+                    and _coalesce_int(round_count_map.get(header_round), 0) > 0
+                ):
                     selected_round_label = header_round
                 else:
                     for rn in reversed(round_names_asc):
@@ -881,7 +1022,10 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 if selected_round_label is None and round_names_asc:
                     selected_round_label = round_names_asc[-1]
 
-                bracket_round_options = list(reversed(round_names_asc))
+                bracket_round_options = _filter_bracket_round_options_to_played_rounds(
+                    round_names_asc=round_names_asc,
+                    round_count_map=round_count_map,
+                )
 
                 def _match_is_finished(m: Dict[str, Any]) -> bool:
                     sg = str(m.get("status_group") or "").strip().upper()
