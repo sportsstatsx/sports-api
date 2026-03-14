@@ -542,7 +542,25 @@ def _fetch_pair_round_matches(
         return []
 
 
-def _is_knockout_round_name(round_name: Any) -> bool:
+def _is_knockout_round_name(
+    round_name: Any,
+    *,
+    meta_is_knockout: Optional[int] = None,
+) -> bool:
+    """
+    round_kind 판별 안정판
+
+    우선순위
+    1️⃣ competition_rounds_meta.is_knockout
+    2️⃣ 이름 기반 fallback
+    """
+
+    if meta_is_knockout is not None:
+        try:
+            return int(meta_is_knockout) == 1
+        except Exception:
+            pass
+
     if not isinstance(round_name, str):
         return False
 
@@ -558,7 +576,6 @@ def _is_knockout_round_name(round_name: Any) -> bool:
         or lo.startswith("group ")
         or "group stage" in lo
         or lo.startswith("stage ")
-        or re.match(r"^(apertura|clausura)\s*-\s*\d+$", lo)
     ):
         return False
 
@@ -570,21 +587,11 @@ def _is_knockout_round_name(round_name: Any) -> bool:
         "knockout",
         "playoff",
         "play-off",
-        "play in",
-        "play-in",
-        "elimination",
         "preliminary",
         "qualifying",
-        "qualifier",
-        "reclasificacion",
-        "reclasificación",
     )
-    if any(t in lo for t in include_tokens):
-        return True
 
-    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
-        return True
-    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
+    if any(t in lo for t in include_tokens):
         return True
 
     return False
@@ -610,74 +617,7 @@ def _normalize_knockout_round_rows_for_display(
         seen_names.add(rn)
         normalized.append(dict(row))
 
-    if league_id == 45 and season == 2025:
-        fa_2025_order = [
-            "Extra Preliminary Round",
-            "Extra Preliminary Round Replays",
-            "Preliminary Round",
-            "Preliminary Round Replays",
-            "1st Round Qualifying",
-            "1st Round Qualifying Replays",
-            "2nd Round Qualifying",
-            "2nd Round Qualifying Replays",
-            "3rd Round Qualifying",
-            "1/128-finals",
-            "Round of 128",
-            "Round of 64",
-            "Round of 32",
-            "Round of 16",
-            "Quarter-finals",
-            "Semi-finals",
-            "Final",
-        ]
-
-        order_map = {name: idx + 1 for idx, name in enumerate(fa_2025_order)}
-
-        existing_names = {
-            _safe_text_or_none(r.get("round_name"))
-            for r in normalized
-            if _safe_text_or_none(r.get("round_name"))
-        }
-
-        if "Round of 128" not in existing_names:
-            normalized.append(
-                {
-                    "round_name": "Round of 128",
-                    "round_order": order_map["Round of 128"],
-                    "round_kind": "round_of_128",
-                    "is_knockout": 1,
-                }
-            )
-
-        fixed_rows: List[Dict[str, Any]] = []
-        seen_names = set()
-
-        for row in normalized:
-            rn = _safe_text_or_none(row.get("round_name"))
-            if not rn or rn in seen_names:
-                continue
-            seen_names.add(rn)
-
-            fixed = dict(row)
-
-            if rn in order_map:
-                fixed["round_order"] = order_map[rn]
-                fixed["is_knockout"] = 1
-
-                if rn == "1/128-finals":
-                    fixed["round_kind"] = "round_of_256_playin"
-                elif rn == "Round of 128":
-                    fixed["round_kind"] = "round_of_128"
-
-            fixed_rows.append(fixed)
-
-        fixed_rows.sort(
-            key=lambda r: (
-                _coalesce_int(r.get("round_order"), 999999),
-                str(r.get("round_name") or ""),
-            )
-        )
-        return fixed_rows
+    
 
     normalized.sort(
         key=lambda r: (
@@ -751,7 +691,10 @@ def _build_stage_round_options(
         if not round_name:
             continue
 
-        is_knockout = _coalesce_int(row.get("is_knockout"), 0) == 1
+        is_knockout = _is_knockout_round_name(
+                    row.get("round_name"),
+                    meta_is_knockout=row.get("is_knockout"),
+                )
 
         if is_knockout:
             if _coalesce_int(round_count_map.get(round_name), 0) > 0:
