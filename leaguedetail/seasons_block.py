@@ -161,13 +161,12 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         if "releg" in x:
             return "relegation"
 
-        # ✅ 상위 스플릿/챔피언십 단계
-        # - 벨기에 Champ Rnd
-        # - 오스트리아 Championship Round
-        # - 덴마크 Championship Round
-        # - 체코 Championship Group
-        # 이건 "playoff champion"이 아니라
-        # "최종 리그 테이블이 확정되는 상위 단계"로 별도 분리한다.
+        # ✅ 상위 스플릿/챔피언십 단계는 group_name 기준으로만 판정
+        # - Belgium: Championship Round / Champ Rnd
+        # - Austria/Denmark: Championship Round
+        # - Czech: Championship Group
+        # description 은 "Championship round", "Champions League" 같은
+        # 진출권/설명 문구가 섞여 오판별될 수 있으므로 여기서는 사용하지 않는다.
         if (
             "championship round" in g
             or "championship group" in g
@@ -177,23 +176,13 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         ):
             return "championship_stage"
 
-        if (
-            "championship round" in d
-            or "championship group" in d
-            or "champ rnd" in d
-            or "champ round" in d
-            or "championship stage" in d
-        ):
-            return "championship_stage"
-
         # ✅ 진짜 playoff/group 이름이 명확한 경우만 playoff
-        # (MLS, A-League 같은 "플레이오프 우승 = 챔피언" 리그용)
-        if (
-            "playoff" in g
-            or "play-off" in g
-            or "playoff" in d
-            or "play-off" in d
-        ):
+        # 이것도 우선 group_name 기준으로 보고,
+        # description 은 보조적으로만 사용한다.
+        if "playoff" in g or "play-off" in g:
+            return "playoff"
+
+        if "playoff" in d or "play-off" in d:
             return "playoff"
 
         if "regular" in x or "table" in x or "overall" in x:
@@ -677,25 +666,32 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 season_champions_final.append(merged_by_key.get(key) or _blank_row(s_int, "regular_season"))
 
         elif mode == "playoffs":
-            # ✅ 토너먼트/PO는 "남은 경기"로 판단 금지
-            # ✅ 우승 확정 = merged 결과에 team_id가 존재하는가
             key = (s_int, "playoffs")
-            picked = merged_by_key.get(key)
-            winner_confirmed = bool(picked and picked.get("team_id"))
-            if winner_confirmed:
-                season_champions_final.append(picked)
-            else:
+
+            # ✅ 진행중 시즌이면 무조건 비움
+            if in_progress:
                 season_champions_final.append(_blank_row(s_int, "playoffs"))
+            else:
+                picked = merged_by_key.get(key)
+                winner_confirmed = bool(picked and picked.get("team_id"))
+                if winner_confirmed:
+                    season_champions_final.append(picked)
+                else:
+                    season_champions_final.append(_blank_row(s_int, "playoffs"))
 
         elif mode == "knockout":
-            # ✅ 챔스/유로파 등: 우승 확정 = tournament winner(team_id) 존재
             key = (s_int, "tournament")
-            picked = merged_by_key.get(key)
-            winner_confirmed = bool(picked and picked.get("team_id"))
-            if winner_confirmed:
-                season_champions_final.append(picked)
-            else:
+
+            # ✅ 진행중 시즌이면 무조건 비움
+            if in_progress:
                 season_champions_final.append(_blank_row(s_int, "tournament"))
+            else:
+                picked = merged_by_key.get(key)
+                winner_confirmed = bool(picked and picked.get("team_id"))
+                if winner_confirmed:
+                    season_champions_final.append(picked)
+                else:
+                    season_champions_final.append(_blank_row(s_int, "tournament"))
 
         elif mode == "regular+playoffs":
             key_reg = (s_int, "regular_season")
@@ -707,13 +703,16 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             else:
                 season_champions_final.append(merged_by_key.get(key_reg) or _blank_row(s_int, "regular_season"))
 
-            # ✅ playoffs는 "winner 확정 여부"로만 블랭크
-            picked_po = merged_by_key.get(key_po)
-            po_winner_confirmed = bool(picked_po and picked_po.get("team_id"))
-            if po_winner_confirmed:
-                season_champions_final.append(picked_po)
-            else:
+            # ✅ playoffs도 진행중이면 무조건 비움
+            if in_progress:
                 season_champions_final.append(_blank_row(s_int, "playoffs"))
+            else:
+                picked_po = merged_by_key.get(key_po)
+                po_winner_confirmed = bool(picked_po and picked_po.get("team_id"))
+                if po_winner_confirmed:
+                    season_champions_final.append(picked_po)
+                else:
+                    season_champions_final.append(_blank_row(s_int, "playoffs"))
 
         else:
             key = (s_int, "regular_season")
