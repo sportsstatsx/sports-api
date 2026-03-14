@@ -88,6 +88,107 @@ def load_match_elapsed(match_id: int) -> int | None:
     except Exception:
         return None
 
+def _format_minute_with_extra(minute: Any, extra: Any) -> str | None:
+    try:
+        if minute is None:
+            return None
+
+        m = int(minute)
+
+        if extra is None:
+            return f"{m}'"
+
+        e = int(extra)
+        if e > 0:
+            return f"{m}+{e}'"
+
+        return f"{m}'"
+    except Exception:
+        return None
+
+
+def _detect_scoring_team_id(
+    old_home: int,
+    old_away: int,
+    new_home: int,
+    new_away: int,
+    home_id: int | None,
+    away_id: int | None,
+) -> int | None:
+    if (new_home > old_home) and (new_away == old_away):
+        return home_id
+    if (new_away > old_away) and (new_home == old_home):
+        return away_id
+    return None
+
+
+def _detect_red_team_id(
+    old_home_red: int,
+    old_away_red: int,
+    new_home_red: int,
+    new_away_red: int,
+    home_id: int | None,
+    away_id: int | None,
+) -> int | None:
+    if (new_home_red > old_home_red) and (new_away_red == old_away_red):
+        return home_id
+    if (new_away_red > old_away_red) and (new_home_red == old_home_red):
+        return away_id
+    return None
+
+
+def load_latest_goal_minute_str(match_id: int, team_id: int | None = None) -> str | None:
+    """
+    방금 반영된 득점 알림용 minute 문자열을 match_events에서 찾는다.
+    - 추가시간은 minute + extra 조합으로 만든다. (예: 45+3')
+    - team_id가 주어지면 그 팀의 가장 최근 Goal 이벤트를 우선 사용
+    """
+    row = fetch_one(
+        """
+        SELECT
+            minute,
+            extra
+        FROM match_events
+        WHERE fixture_id = %s
+          AND LOWER(COALESCE(type, '')) = 'goal'
+          AND (%s IS NULL OR team_id = %s)
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (match_id, team_id, team_id),
+    )
+    if not row:
+        return None
+    return _format_minute_with_extra(row.get("minute"), row.get("extra"))
+
+
+def load_latest_red_minute_str(match_id: int, team_id: int | None = None) -> str | None:
+    """
+    방금 반영된 레드카드 알림용 minute 문자열을 match_events에서 찾는다.
+    - detail 이 'Red Card' 이거나 VAR 'Card upgrade' 인 이벤트를 레드 후보로 본다.
+    - 추가시간은 minute + extra 조합으로 만든다. (예: 90+1')
+    """
+    row = fetch_one(
+        """
+        SELECT
+            minute,
+            extra
+        FROM match_events
+        WHERE fixture_id = %s
+          AND (%s IS NULL OR team_id = %s)
+          AND (
+                POSITION('red card' IN LOWER(COALESCE(detail, ''))) > 0
+                OR POSITION('card upgrade' IN LOWER(COALESCE(detail, ''))) > 0
+              )
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (match_id, team_id, team_id),
+    )
+    if not row:
+        return None
+    return _format_minute_with_extra(row.get("minute"), row.get("extra"))
+
 
 
 def get_subscribed_matches() -> List[int]:
@@ -899,12 +1000,45 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
     for event_type, extra in events:
         extra = dict(extra)
 
-        # ✅ score/redcard는 fixtures elapsed로만 분 표시
-        if event_type in ("score", "score_correction"):
-            if elapsed is not None and elapsed > 0:
+        # ✅ score/redcard는 match_events.minute + extra 기준으로 분 표시
+        if event_type == "score":
+            old_home = int(extra.get("old_home", current.home_goals))
+            old_away = int(extra.get("old_away", current.away_goals))
+
+            scoring_team_id = _detect_scoring_team_id(
+                old_home=old_home,
+                old_away=old_away,
+                new_home=current.home_goals,
+                new_away=current.away_goals,
+                home_id=labels.get("home_id"),
+                away_id=labels.get("away_id"),
+            )
+
+            goal_minute_str = load_latest_goal_minute_str(match_id, scoring_team_id)
+
+            if goal_minute_str:
+                extra["goal_minute_str"] = goal_minute_str
+            elif elapsed is not None and elapsed > 0:
                 extra["goal_minute_str"] = f"{int(elapsed)}'"
+
         if event_type == "redcard":
-            if elapsed is not None and elapsed > 0:
+            old_home_red = int(extra.get("old_home", current.home_red))
+            old_away_red = int(extra.get("old_away", current.away_red))
+
+            red_team_id = _detect_red_team_id(
+                old_home_red=old_home_red,
+                old_away_red=old_away_red,
+                new_home_red=current.home_red,
+                new_away_red=current.away_red,
+                home_id=labels.get("home_id"),
+                away_id=labels.get("away_id"),
+            )
+
+            red_minute_str = load_latest_red_minute_str(match_id, red_team_id)
+
+            if red_minute_str:
+                extra["red_minute_str"] = red_minute_str
+            elif elapsed is not None and elapsed > 0:
                 extra["red_minute_str"] = f"{int(elapsed)}'"
 
         # ✅ 단계성 이벤트만 플래그 잠금(스코어/정정/레드는 플래그 없음)

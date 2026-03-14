@@ -12,12 +12,14 @@ def league_detail_bundle():
     League Detail 화면 번들 엔드포인트.
 
     Query:
-      - league_id (int, 필수)
-      - season    (int, 선택)  → 없으면 서버에서 기본 시즌 선택
+      - league_id      (int, 필수)
+      - season         (int, 선택)
+      - bracket_round  (str, 선택)
     """
     try:
         league_id = request.args.get("league_id", type=int)
-        season = request.args.get("season", type=int)  # optional
+        season = request.args.get("season", type=int)
+        bracket_round = request.args.get("bracket_round")
 
         if not league_id:
             return (
@@ -30,12 +32,15 @@ def league_detail_bundle():
                 400,
             )
 
-        bundle = get_league_detail_bundle(league_id=league_id, season=season)
+        bundle = get_league_detail_bundle(
+            league_id=league_id,
+            season=season,
+            bracket_round=bracket_round,
+        )
 
         return jsonify({"ok": True, "data": bundle})
 
     except Exception as e:
-        # 필요하면 logger로 바꿔도 됨
         print(f"[league_detail_bundle] ERROR: {e}")
         return (
             jsonify(

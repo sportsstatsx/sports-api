@@ -477,28 +477,28 @@ def fixtures_by_ids():
 
     if use_mls:
         home_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
-                ELSE (
+            COALESCE(
+                mls.home_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.home_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS home_red_cards
+            ) AS home_red_cards
         """
         away_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
-                ELSE (
+            COALESCE(
+                mls.away_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.away_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS away_red_cards
+            ) AS away_red_cards
         """
         mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
     else:
@@ -547,12 +547,20 @@ def fixtures_by_ids():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            c.flag AS league_country_flag,
+            (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
+            (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
+            (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
+            (rf.data_json::jsonb->'score'->'penalty'->>'away') AS away_pen,
             {home_red_sql},
             {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN countries c
+          ON LOWER(TRIM(c.name)) = LOWER(TRIM(l.country))
+        LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
         ORDER BY m.date_utc ASC
@@ -575,6 +583,7 @@ def fixtures_by_ids():
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
+            "league_country_flag": r["league_country_flag"],
             "league_round": r["league_round"],
             "venue_name": r["venue_name"],
             "home": {
@@ -583,6 +592,8 @@ def fixtures_by_ids():
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
                 "ht": r["home_ht"],
+                "et": int(r["home_et"]) if r.get("home_et") not in (None, "") else None,
+                "pen": int(r["home_pen"]) if r.get("home_pen") not in (None, "") else None,
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -591,6 +602,8 @@ def fixtures_by_ids():
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
                 "ht": r["away_ht"],
+                "et": int(r["away_et"]) if r.get("away_et") not in (None, "") else None,
+                "pen": int(r["away_pen"]) if r.get("away_pen") not in (None, "") else None,
                 "red_cards": r["away_red_cards"],
             },
         }
@@ -1785,13 +1798,13 @@ def list_fixtures():
         return jsonify({"ok": False, "error": "Invalid date format YYYY-MM-DD"}), 400
 
     local_start = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
-    local_end = user_tz.localize(datetime(local_date.year, local_date.month, local_date.day, 23, 59, 59))
+    local_next_day_start = local_start + timedelta(days=1)
 
     utc_start = local_start.astimezone(timezone.utc)
-    utc_end = local_end.astimezone(timezone.utc)
+    utc_end = local_next_day_start.astimezone(timezone.utc)
 
     params: List[Any] = [utc_start, utc_end]
-    where_clauses = ["(m.date_utc::timestamptz BETWEEN %s AND %s)"]
+    where_clauses = ["m.date_utc::timestamptz >= %s AND m.date_utc::timestamptz < %s"]
 
     if league_ids:
         placeholders = ", ".join(["%s"] * len(league_ids))
@@ -1808,28 +1821,28 @@ def list_fixtures():
 
     if use_mls:
         home_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.home_red, 0)
-                ELSE (
+            COALESCE(
+                mls.home_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.home_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS home_red_cards
+            ) AS home_red_cards
         """
         away_red_sql = f"""
-            CASE
-                WHEN m.status_group = 'INPLAY' THEN COALESCE(mls.away_red, 0)
-                ELSE (
+            COALESCE(
+                mls.away_red,
+                (
                     SELECT COUNT(*) FROM match_events e
                     WHERE e.fixture_id = m.fixture_id
                       AND e.team_id = m.away_id
                       AND e.type = 'Card'
                       AND e.detail IN {red_detail_sql}
                 )
-            END AS away_red_cards
+            ) AS away_red_cards
         """
         mls_join = "LEFT JOIN match_live_state mls ON mls.fixture_id = m.fixture_id"
     else:
@@ -1878,15 +1891,23 @@ def list_fixtures():
             l.name AS league_name,
             l.logo AS league_logo,
             l.country AS league_country,
+            c.flag AS league_country_flag,
+            (rf.data_json::jsonb->'score'->'extratime'->>'home') AS home_et,
+            (rf.data_json::jsonb->'score'->'extratime'->>'away') AS away_et,
+            (rf.data_json::jsonb->'score'->'penalty'->>'home') AS home_pen,
+            (rf.data_json::jsonb->'score'->'penalty'->>'away') AS away_pen,
             {home_red_sql},
             {away_red_sql}
         FROM matches m
         JOIN teams th ON th.id = m.home_id
         JOIN teams ta ON ta.id = m.away_id
         JOIN leagues l ON l.id = m.league_id
+        LEFT JOIN countries c
+          ON LOWER(TRIM(c.name)) = LOWER(TRIM(l.country))
+        LEFT JOIN match_fixtures_raw rf ON rf.fixture_id = m.fixture_id
         {mls_join}
         WHERE {where_sql}
-        ORDER BY m.date_utc ASC
+        ORDER BY m.date_utc::timestamptz ASC
     """
 
     rows = fetch_all(sql, tuple(params))
@@ -1905,6 +1926,7 @@ def list_fixtures():
             "league_name": r["league_name"],
             "league_logo": r["league_logo"],
             "league_country": r["league_country"],
+            "league_country_flag": r["league_country_flag"],
             "league_round": r["league_round"],
             "venue_name": r["venue_name"],
             "home": {
@@ -1913,6 +1935,8 @@ def list_fixtures():
                 "logo": r["home_logo"],
                 "ft": r["home_ft"],
                 "ht": r["home_ht"],
+                "et": int(r["home_et"]) if r.get("home_et") not in (None, "") else None,
+                "pen": int(r["home_pen"]) if r.get("home_pen") not in (None, "") else None,
                 "red_cards": r["home_red_cards"],
             },
             "away": {
@@ -1921,6 +1945,8 @@ def list_fixtures():
                 "logo": r["away_logo"],
                 "ft": r["away_ft"],
                 "ht": r["away_ht"],
+                "et": int(r["away_et"]) if r.get("away_et") not in (None, "") else None,
+                "pen": int(r["away_pen"]) if r.get("away_pen") not in (None, "") else None,
                 "red_cards": r["away_red_cards"],
             },
         })
@@ -2801,20 +2827,6 @@ def admin_board_delete_post(post_id: int):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

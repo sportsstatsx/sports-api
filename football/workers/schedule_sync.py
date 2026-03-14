@@ -12,6 +12,8 @@ import sys
 import datetime as dt
 from typing import Any, Dict, List, Optional, Set
 
+print("[schedule_sync] module import start", flush=True)
+
 # 기존 postmatch_backfill의 함수 재사용
 from football.workers.postmatch_backfill import (
     fetch_fixtures_from_api,
@@ -25,6 +27,8 @@ from football.workers.postmatch_backfill import (
     _upsert_team_from_api,
     parse_live_leagues,
 )
+
+print("[schedule_sync] module import done", flush=True)
 
 # 레이스 방지 정책 공유
 os.environ.setdefault("LIVE_WORKER_ROLE", "backfill")
@@ -81,7 +85,7 @@ def _backfill_missing_teams_single(ids: Set[int]) -> None:
     if not missing:
         return
 
-    print(f"[schedule_sync][meta] missing teams={len(missing)}")
+    print(f"[schedule_sync][meta] missing teams={len(missing)}", flush=True)
 
     ok = 0
     fail = 0
@@ -99,15 +103,19 @@ def _backfill_missing_teams_single(ids: Set[int]) -> None:
                 fail += 1
         except Exception as e:
             fail += 1
-            print(f"[schedule_sync][meta] team id={tid} failed: {e}", file=sys.stderr)
+            print(f"[schedule_sync][meta] team id={tid} failed: {e}", file=sys.stderr, flush=True)
 
-    print(f"[schedule_sync][meta] done ok={ok} fail={fail}")
+    print(f"[schedule_sync][meta] done ok={ok} fail={fail}", flush=True)
 
 
 def main() -> None:
+    print("[schedule_sync] main enter", flush=True)
+
     leagues = _get_schedule_leagues()
+    print(f"[schedule_sync] leagues parsed count={len(leagues)}", flush=True)
+
     if not leagues:
-        print("[schedule_sync] no leagues (set SCHEDULE_LEAGUES or LIVE_LEAGUES)", file=sys.stderr)
+        print("[schedule_sync] no leagues (set SCHEDULE_LEAGUES or LIVE_LEAGUES)", file=sys.stderr, flush=True)
         return
 
     # 실행 기준 시간(보통 KST 09:00 크론)
@@ -115,25 +123,39 @@ def main() -> None:
 
     # 전날 09:00 ~ +7일 09:00
     start_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) - dt.timedelta(days=1)
-    end_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) + dt.timedelta(days=7)
+    end_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) + dt.timedelta(days=30)
 
     dates = _date_range_kst(start_kst, end_kst)
-    print(f"[schedule_sync] leagues={leagues}")
-    print(f"[schedule_sync] window_kst={start_kst} ~ {end_kst} dates={dates[0]}..{dates[-1]} ({len(dates)}d)")
+    print(f"[schedule_sync] leagues={leagues}", flush=True)
+    print(
+        f"[schedule_sync] window_kst={start_kst} ~ {end_kst} "
+        f"dates={dates[0]}..{dates[-1]} ({len(dates)}d)",
+        flush=True,
+    )
 
     seen_team_ids: Set[int] = set()
     total_fixtures = 0
     total_upserts = 0
 
     for dstr in dates:
+        print(f"[schedule_sync] start date={dstr}", flush=True)
+
         for lid in leagues:
             try:
+                print(f"[schedule_sync] fetch date={dstr} league={lid}", flush=True)
+
                 # 날짜별 fixtures 수집(가벼운 호출)
                 fixtures = fetch_fixtures_from_api(int(lid), dstr, season=None)
                 if not fixtures:
+                    print(f"[schedule_sync] empty date={dstr} league={lid}", flush=True)
                     continue
 
                 total_fixtures += len(fixtures)
+                print(
+                    f"[schedule_sync] fixtures date={dstr} league={lid} count={len(fixtures)}",
+                    flush=True,
+                )
+
                 # fixture_id 목록
                 ids = []
                 for fx in fixtures:
@@ -142,19 +164,46 @@ def main() -> None:
                         continue
                     ids.append(int(b["fixture_id"]))
 
+                uniq_ids = sorted(set(ids))
+                print(
+                    f"[schedule_sync] fixture_ids date={dstr} league={lid} "
+                    f"raw={len(ids)} unique={len(uniq_ids)}",
+                    flush=True,
+                )
+
                 # fixture_id별로 full 조회 후 DB 업서트(정확도/일관성)
-                for fid in sorted(set(ids)):
+                processed = 0
+
+                for fid in uniq_ids:
+                    print(
+                        f"[schedule_sync] full_fetch start date={dstr} league={lid} fixture_id={fid}",
+                        flush=True,
+                    )
+
                     fx_full = fetch_fixture_by_id(int(fid))
                     if not fx_full:
+                        print(
+                            f"[schedule_sync] full_fetch empty date={dstr} league={lid} fixture_id={fid}",
+                            flush=True,
+                        )
                         continue
 
                     b = _extract_fixture_basic(fx_full)
                     if not b:
+                        print(
+                            f"[schedule_sync] extract_basic empty date={dstr} league={lid} fixture_id={fid}",
+                            flush=True,
+                        )
                         continue
 
                     league_id = b.get("league_id")
                     season = b.get("season")
                     if league_id is None or season is None:
+                        print(
+                            f"[schedule_sync] skip missing league/season "
+                            f"date={dstr} league={lid} fixture_id={fid}",
+                            flush=True,
+                        )
                         continue
 
                     # teams meta 후보 수집
@@ -169,18 +218,43 @@ def main() -> None:
                     upsert_fixture_row(fx_full, int(league_id), int(season))
                     upsert_match_row(fx_full, int(league_id), int(season))
                     total_upserts += 1
+                    processed += 1
+
+                    print(
+                        f"[schedule_sync] upsert ok date={dstr} league={lid} fixture_id={fid} "
+                        f"season={season} total_upserts={total_upserts}",
+                        flush=True,
+                    )
+
+                print(
+                    f"[schedule_sync] league_done date={dstr} league={lid} processed={processed}",
+                    flush=True,
+                )
 
             except Exception as e:
-                print(f"[schedule_sync] date={dstr} league={lid} failed: {e}", file=sys.stderr)
+                print(
+                    f"[schedule_sync] date={dstr} league={lid} failed: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
+
+        print(
+            f"[schedule_sync] date_done date={dstr} "
+            f"total_fixtures_seen={total_fixtures} total_upserts={total_upserts}",
+            flush=True,
+        )
 
     # 팀 메타 자동 채우기 (단건 /teams)
     try:
         _backfill_missing_teams_single(seen_team_ids)
     except Exception as e:
-        print(f"[schedule_sync][meta] failed: {e}", file=sys.stderr)
+        print(f"[schedule_sync][meta] failed: {e}", file=sys.stderr, flush=True)
 
-    print(f"[schedule_sync] done total_fixtures_seen={total_fixtures} total_upserts={total_upserts}")
+    print(
+        f"[schedule_sync] done total_fixtures_seen={total_fixtures} total_upserts={total_upserts}",
+        flush=True,
+    )
 
     # ✅ psycopg_pool 종료 경고 방지 (크론/짧은 프로세스에서 join 에러 방지)
     try:
@@ -192,4 +266,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    print("[schedule_sync] __main__ start", flush=True)
     main()

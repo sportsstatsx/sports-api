@@ -99,8 +99,9 @@ def get_match_detail_bundle(
     *,
     comp: Optional[str] = None,
     last_n: Optional[str] = None,
+    bracket_round: Optional[str] = None,
     apply_override: bool = True,
-    parts: Optional[list[str]] = None,  # ✅ 추가: 요청된 블럭만 생성
+    parts: Optional[list[str]] = None,
 ) -> Optional[Dict[str, Any]]:
 
 
@@ -247,13 +248,22 @@ def get_match_detail_bundle(
 
     if _need("standings"):
         t_stand0 = time.perf_counter()
-        standings = build_standings_block(header)
+        standings = build_standings_block(
+            header,
+            bracket_round=bracket_round,
+        )
         dt_standings = time.perf_counter() - t_stand0
 
-    # ✅ ai_predictions 의존성: ai를 원하면 insights_overall도 반드시 먼저 생성
+    # ✅ ai_predictions 의존성: ai를 원하면 full insights_overall 이 반드시 먼저 생성
     if _need("insights_overall") or _need("ai_predictions"):
         t_ins0 = time.perf_counter()
-        insights_overall = build_insights_overall_block(header)
+        insights_overall = build_insights_overall_block(header, meta_only=False)
+        dt_insights = time.perf_counter() - t_ins0
+
+    # ✅ 초기 진입용 가벼운 메타 전용
+    elif _need("insights_overall_meta"):
+        t_ins0 = time.perf_counter()
+        insights_overall = build_insights_overall_block(header, meta_only=True)
         dt_insights = time.perf_counter() - t_ins0
 
     if _need("ai_predictions"):

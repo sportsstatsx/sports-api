@@ -20,20 +20,255 @@ def _fetch_one(query: str, params: tuple) -> Optional[Dict[str, Any]]:
     rows = fetch_all(query, params)
     return rows[0] if rows else None
 
+def _safe_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
-def _resolve_season(league_id: int, season: Optional[int]) -> Optional[int]:
+
+def _safe_text_or_none(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+def _normalize_round_name(v: Any) -> Optional[str]:
+    if not isinstance(v, str):
+        return None
+
+    s = v.strip()
+
+    s = re.sub(r"\s+", " ", s)
+
+    # API 특이 케이스 보정
+    s = s.replace("Round Of", "Round of")
+    s = s.replace("Quarter Finals", "Quarter-finals")
+    s = s.replace("Semi Finals", "Semi-finals")
+
+    return s if s else None
+
+
+def _parse_json_text(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return v
+    if not isinstance(v, str):
+        return {}
+    try:
+        import json
+        parsed = json.loads(v)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _read_fixture_score_from_raw(fixture_id: Optional[int]) -> Dict[str, Optional[int]]:
     """
-    matchdetail header에서 season이 비어오는 경우 방어:
-      1) standings에서 MAX(season)
-      2) 없으면 fixtures에서 MAX(season)
+    match_fixtures_raw.data_json 에서 score/fulltime/extratime/penalty를 읽는다.
+    반환:
+      {
+        "ft_home": ...,
+        "ft_away": ...,
+        "et_home": ...,
+        "et_away": ...,
+        "pen_home": ...,
+        "pen_away": ...,
+      }
+    """
+    if fixture_id is None:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    row = _fetch_one(
+        """
+        SELECT data_json
+        FROM match_fixtures_raw
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if not row:
+        return {
+            "ft_home": None,
+            "ft_away": None,
+            "et_home": None,
+            "et_away": None,
+            "pen_home": None,
+            "pen_away": None,
+        }
+
+    root = _parse_json_text(row.get("data_json"))
+    score = root.get("score") if isinstance(root.get("score"), dict) else {}
+
+    ft = score.get("fulltime") if isinstance(score.get("fulltime"), dict) else {}
+    et = score.get("extratime") if isinstance(score.get("extratime"), dict) else {}
+    pen = score.get("penalty") if isinstance(score.get("penalty"), dict) else {}
+
+    return {
+        "ft_home": _safe_int_or_none(ft.get("home")),
+        "ft_away": _safe_int_or_none(ft.get("away")),
+        "et_home": _safe_int_or_none(et.get("home")),
+        "et_away": _safe_int_or_none(et.get("away")),
+        "pen_home": _safe_int_or_none(pen.get("home")),
+        "pen_away": _safe_int_or_none(pen.get("away")),
+    }
+
+
+def _resolve_bracket_display_scores(match_row: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    """
+    브라켓 표시에 쓸 스코어를 결정한다.
+
+    규칙:
+    - FT 종료  -> FT 사용
+    - AET 종료 -> FT + ET 사용
+    - PEN 종료 -> FT + ET 사용, penalty는 별도 전달
+    - raw 점수가 부족하면 matches.home_ft / away_ft fallback
+    """
+    fixture_id = _safe_int_or_none(match_row.get("fixture_id"))
+    status = str(match_row.get("status") or "").strip().upper()
+    status_group = str(match_row.get("status_group") or "").strip().upper()
+
+    raw_score = _read_fixture_score_from_raw(fixture_id)
+
+    match_home_ft = _safe_int_or_none(match_row.get("home_ft"))
+    match_away_ft = _safe_int_or_none(match_row.get("away_ft"))
+
+    ft_home = raw_score["ft_home"]
+    ft_away = raw_score["ft_away"]
+    et_home = raw_score["et_home"]
+    et_away = raw_score["et_away"]
+
+    disp_home: Optional[int] = None
+    disp_away: Optional[int] = None
+    score_source = "matches_ft"
+
+    if status in {"AET", "PEN"}:
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home + (et_home or 0)
+            disp_away = ft_away + (et_away or 0)
+            score_source = "raw_fulltime_plus_extratime"
+
+    elif status_group == "FINISHED" or status in {"FT", "NS", "PST", "CANC", "ABD"}:
+        if ft_home is not None and ft_away is not None:
+            disp_home = ft_home
+            disp_away = ft_away
+            score_source = "raw_fulltime"
+
+    if disp_home is None or disp_away is None:
+        disp_home = match_home_ft
+        disp_away = match_away_ft
+        score_source = "matches_ft"
+
+    return {
+        "home": disp_home,
+        "away": disp_away,
+        "ft_home": ft_home,
+        "ft_away": ft_away,
+        "et_home": et_home,
+        "et_away": et_away,
+        "pen_home": raw_score["pen_home"],
+        "pen_away": raw_score["pen_away"],
+        "score_source": score_source,
+        "status": status,
+    }
+
+
+def _resolve_season_from_fixture_id(fixture_id: Optional[int]) -> Optional[int]:
+    if fixture_id is None:
+        return None
+
+    row = _fetch_one(
+        """
+        SELECT season
+        FROM matches
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    row = _fetch_one(
+        """
+        SELECT season
+        FROM fixtures
+        WHERE fixture_id = %s
+        LIMIT 1
+        """,
+        (fixture_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    return None
+
+
+def _resolve_season(
+    league_id: int,
+    season: Optional[int],
+    fixture_id: Optional[int] = None,
+) -> Optional[int]:
+    """
+    matchdetail header에서 season이 비어오는 경우 방어 우선순위:
+      1) header season
+      2) fixture_id 기준 matches.season
+      3) fixture_id 기준 fixtures.season
+      4) competition_season_meta MAX(season)
+      5) standings MAX(season)
+      6) matches MAX(season)
+      7) fixtures MAX(season)
     """
     if season is not None:
         return season
+
+    s = _resolve_season_from_fixture_id(fixture_id)
+    if s is not None:
+        return s
+
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM competition_season_meta
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
 
     row = _fetch_one(
         """
         SELECT MAX(season) AS season
         FROM standings
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    if row is not None:
+        s = _coalesce_int(row.get("season"), 0)
+        if s > 0:
+            return s
+
+    row = _fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
         WHERE league_id = %s
         """,
         (league_id,),
@@ -112,6 +347,36 @@ def _extract_fixture_id_from_header(header: Dict[str, Any]) -> Optional[int]:
 
     return None
 
+
+def _extract_round_label_from_header(header: Dict[str, Any]) -> Optional[str]:
+    candidates: List[Any] = []
+
+    candidates.append(header.get("league_round"))
+
+    league = header.get("league")
+    if isinstance(league, dict):
+        candidates.append(league.get("round"))
+
+    fixture = header.get("fixture")
+    if isinstance(fixture, dict):
+        candidates.append(fixture.get("league_round"))
+        candidates.append(fixture.get("round"))
+
+    match = header.get("match")
+    if isinstance(match, dict):
+        candidates.append(match.get("league_round"))
+        candidates.append(match.get("round"))
+
+    for v in candidates:
+        if not isinstance(v, str):
+            continue
+        s = re.sub(r"\s+", " ", v).strip()
+        if s:
+            return s
+
+    return None
+
+
 def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
     """
     DB/헤더에서 오는 date_utc 문자열을 UTC datetime으로 파싱 (방어적)
@@ -144,6 +409,403 @@ def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
         return d.replace(tzinfo=dt.timezone.utc)
     except Exception:
         return None
+
+
+def _fetch_pair_round_matches(
+    *,
+    league_id: int,
+    season: int,
+    round_label: str,
+    team_a_id: int,
+    team_b_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    같은 league/season/round 안에서 동일 팀쌍(홈/원정 뒤바뀜 포함)의 경기들을
+    날짜순으로 다시 조회한다.
+
+    목적:
+    - 현재 round_matches 묶음 외에도 DB에 이미 들어와 있는 2차전(NS 포함)이 있으면
+      two-leg tie 로 판정하기 위함
+    """
+    if not round_label or team_a_id <= 0 or team_b_id <= 0:
+        return []
+
+    try:
+        rows = fetch_all(
+            """
+            SELECT
+                m.fixture_id,
+                m.league_round,
+                m.date_utc,
+                m.home_id,
+                m.away_id,
+                m.home_ft,
+                m.away_ft,
+                m.status,
+                m.status_group,
+                th.name AS home_name,
+                ta.name AS away_name,
+                th.logo AS home_logo,
+                ta.logo AS away_logo
+            FROM matches m
+            LEFT JOIN teams th ON th.id = m.home_id
+            LEFT JOIN teams ta ON ta.id = m.away_id
+            WHERE m.league_id = %s
+              AND m.season = %s
+              AND m.league_round = %s
+              AND (
+                    (m.home_id = %s AND m.away_id = %s)
+                 OR (m.home_id = %s AND m.away_id = %s)
+              )
+            ORDER BY
+                m.date_utc ASC,
+                m.fixture_id ASC
+            """,
+            (league_id, season, round_label, team_a_id, team_b_id, team_b_id, team_a_id),
+        )
+        return rows or []
+    except Exception:
+        return []
+
+
+def _is_knockout_round_name(
+    round_name: Any,
+    *,
+    meta_is_knockout: Optional[int] = None,
+) -> bool:
+    """
+    round_kind 판별 안정판
+
+    우선순위
+    1️⃣ competition_rounds_meta.is_knockout
+    2️⃣ 이름 기반 fallback
+    """
+
+    if meta_is_knockout is not None:
+        return int(meta_is_knockout) == 1
+
+    if not isinstance(round_name, str):
+        return False
+
+    rn = round_name.strip()
+    if not rn:
+        return False
+
+    lo = rn.lower()
+
+    if (
+        "league stage" in lo
+        or "regular season" in lo
+        or lo.startswith("group ")
+        or "group stage" in lo
+        or lo.startswith("stage ")
+    ):
+        return False
+
+    include_tokens = (
+        "final",
+        "semi",
+        "quarter",
+        "round of",
+        "knockout",
+        "playoff",
+        "play-off",
+        "preliminary",
+        "qualifying",
+    )
+
+    if any(t in lo for t in include_tokens):
+        return True
+
+    return False
+
+
+
+def _is_header_knockout_context(header: Dict[str, Any]) -> bool:
+    league = header.get("league") or {}
+    fixture = header.get("fixture") or {}
+    match = header.get("match") or {}
+
+    if isinstance(league, dict):
+        league_type = league.get("type")
+        if isinstance(league_type, str) and league_type.strip().lower() == "cup":
+            return True
+
+        league_cup = league.get("cup")
+        if league_cup is True:
+            return True
+        if isinstance(league_cup, (int, float)) and int(league_cup) == 1:
+            return True
+        if isinstance(league_cup, str) and league_cup.strip().lower() in ("1", "true", "t", "yes", "y"):
+            return True
+
+    round_candidates: List[Any] = [
+        header.get("league_round"),
+    ]
+
+    if isinstance(league, dict):
+        round_candidates.append(league.get("round"))
+    if isinstance(fixture, dict):
+        round_candidates.append(fixture.get("league_round"))
+        round_candidates.append(fixture.get("round"))
+    if isinstance(match, dict):
+        round_candidates.append(match.get("league_round"))
+        round_candidates.append(match.get("round"))
+
+    for rn in round_candidates:
+        if _is_knockout_round_name(rn):
+            return True
+
+    return False
+
+def _get_competition_meta(league_id: int, season: int) -> Optional[Dict[str, Any]]:
+    return _fetch_one(
+        """
+        SELECT
+            league_id,
+            season,
+            has_standings,
+            groups_count,
+            has_rounds,
+            has_knockout_rounds,
+            format_hint
+        FROM competition_season_meta
+        WHERE league_id = %s
+          AND season = %s
+        LIMIT 1
+        """,
+        (league_id, season),
+    )
+
+
+def _get_group_meta_names(league_id: int, season: int) -> List[str]:
+    rows = fetch_all(
+        """
+        SELECT group_name
+        FROM standings_group_meta
+        WHERE league_id = %s
+          AND season = %s
+        ORDER BY group_order ASC, group_name ASC
+        """,
+        (league_id, season),
+    )
+    out: List[str] = []
+    for r in rows or []:
+        name = r.get("group_name")
+        if isinstance(name, str):
+            name = re.sub(r"\s+", " ", name).strip()
+            if name:
+                out.append(name)
+    return out
+
+
+
+def _filter_bracket_round_options_to_played_rounds(
+    round_names_asc: List[str],
+    round_count_map: Dict[str, int],
+) -> List[str]:
+    """
+    칩 노출용 라운드 목록은 실제 matches 에 존재하는 라운드까지만 노출.
+    미래 라운드(예: 아직 안 한 Quarter-finals)는 숨김.
+    """
+    visible_asc = [
+        rn
+        for rn in round_names_asc
+        if _coalesce_int(round_count_map.get(rn), 0) > 0
+    ]
+    return list(reversed(visible_asc))
+
+def _derive_table_stage_label(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    round_rows: List[Dict[str, Any]],
+    rows_raw: List[Dict[str, Any]],
+) -> Optional[str]:
+    """
+    혼합형 대회에서 TABLE 쪽 stage 칩 라벨을 결정한다.
+
+    예:
+    - League Stage - 1..8 이 있으면 -> "League Stage"
+    - Group Stage / Group A/B 류가 있으면 -> "Group Stage"
+
+    주의:
+    - 순수 리그(single_table_league)는 굳이 stage 칩을 만들지 않음
+    - 실제 standings rows가 있어야 TABLE stage 칩을 노출
+    """
+    if not rows_raw:
+        return None
+
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+    has_knockout_rounds = _coalesce_int((comp_meta or {}).get("has_knockout_rounds"), 0)
+
+    if has_knockout_rounds != 1:
+        return None
+
+    round_names = [
+        _safe_text_or_none(r.get("round_name"))
+        for r in (round_rows or [])
+    ]
+    round_names = [r for r in round_names if r]
+
+    lower_names = [r.lower() for r in round_names]
+
+    if any("league stage" in r for r in lower_names):
+        return "League Stage"
+
+    if any(("group stage" in r) or r.startswith("group ") for r in lower_names):
+        return "Group Stage"
+
+    if format_hint in {
+        "league_phase_plus_knockout",
+        "single_table_league_plus_playoff",
+        "multi_group_league_plus_playoff",
+        "cup_with_standings",
+    }:
+        return "Table"
+
+    return None
+
+
+def _should_pin_table_stage_first(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    table_stage_label: Optional[str],
+    table_stage_has_data: bool,
+) -> bool:
+    """
+    Table + 부가 플레이오프(진출권/분류전/컨퍼런스 플레이오프 등) 구조에서는
+    stage 칩 순서를 "Table 우선"으로 보정한다.
+
+    반대로 진짜 메인 녹아웃(예: league_phase_plus_knockout, knockout_only)은
+    기존처럼 최신 라운드 우선 정책을 유지한다.
+    """
+    if not table_stage_label or not table_stage_has_data:
+        return False
+
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    return format_hint in {
+        "single_table_league_plus_playoff",
+        "multi_group_league_plus_playoff",
+    }
+
+
+def _build_stage_round_options(
+    *,
+    comp_meta: Optional[Dict[str, Any]],
+    all_round_rows: List[Dict[str, Any]],
+    table_stage_label: Optional[str],
+    table_stage_has_data: bool,
+    round_count_map: Dict[str, int],
+) -> List[str]:
+    """
+    스탠딩 탭 상단 통합 stage 칩 목록 생성.
+
+    핵심:
+    - competition_rounds_meta.round_order 순서를 그대로 따른다.
+    - League Stage - 1..8 같은 non-knockout 라운드는
+      하나의 대표 칩(예: League Stage)으로 묶되,
+      실제 삽입 위치는 그 non-knockout 구간의 round_order 위치를 따른다.
+    - 기본은 최신 단계가 왼쪽(reversed desc).
+    - 단, Table + 부가 플레이오프 구조는 Table을 맨 앞에 고정한다.
+    """
+    visible_asc: List[str] = []
+    added_table_stage = False
+
+    sorted_rows = sorted(
+        all_round_rows or [],
+        key=lambda r: (
+            _coalesce_int(r.get("round_order"), 999999),
+            str(r.get("round_name") or ""),
+        )
+    )
+
+    for row in sorted_rows:
+        round_name = _safe_text_or_none(row.get("round_name"))
+        if not round_name:
+            continue
+
+        is_knockout = _is_knockout_round_name(
+            row.get("round_name"),
+            meta_is_knockout=row.get("is_knockout"),
+        )
+
+        if is_knockout:
+            if _coalesce_int(round_count_map.get(round_name), 0) > 0:
+                visible_asc.append(round_name)
+            continue
+
+        # non-knockout 구간은 대표 칩 1개만 삽입
+        if table_stage_label and table_stage_has_data and not added_table_stage:
+            visible_asc.append(table_stage_label)
+            added_table_stage = True
+
+    visible_desc = list(reversed(visible_asc))
+
+    if _should_pin_table_stage_first(
+        comp_meta=comp_meta,
+        table_stage_label=table_stage_label,
+        table_stage_has_data=table_stage_has_data,
+    ):
+        pinned: List[str] = []
+        if table_stage_label:
+            pinned.append(table_stage_label)
+
+        for label in visible_desc:
+            if (
+                table_stage_label
+                and label.strip().lower() == table_stage_label.strip().lower()
+            ):
+                continue
+            pinned.append(label)
+
+        return pinned
+
+    return visible_desc
+
+
+def _competition_blocks_matches_fallback(comp_meta: Optional[Dict[str, Any]]) -> bool:
+    """
+    matches 기반 standings 계산을 막아야 하는 시즌/대회 포맷 판별.
+
+    계산 fallback은 '순수 단일 리그 테이블(single_table_league)' 에서만 허용.
+    아래는 모두 fallback 금지:
+    - has_standings = 0
+    - 컵/넉아웃 전용
+    - league phase + knockout
+    - multi group league
+    - playoff 포함 리그
+    """
+    if comp_meta is None:
+        return False
+
+    has_standings_meta = _coalesce_int(comp_meta.get("has_standings"), 0)
+    groups_count = _coalesce_int(comp_meta.get("groups_count"), 0)
+    has_knockout_rounds = _coalesce_int(comp_meta.get("has_knockout_rounds"), 0)
+    format_hint = str(comp_meta.get("format_hint") or "").strip().lower()
+
+    if has_standings_meta == 0:
+        return True
+
+    if groups_count > 1:
+        return True
+
+    if has_knockout_rounds == 1 and format_hint != "single_table_league":
+        return True
+
+    blocked_hints = {
+        "knockout_only",
+        "league_phase_plus_knockout",
+        "cup_with_standings",
+        "cup_other",
+        "multi_group_league",
+        "multi_group_league_plus_playoff",
+        "single_table_league_plus_playoff",
+    }
+    if format_hint in blocked_hints:
+        return True
+
+    return False
 
 
 def _should_hide_standings_early_season(
@@ -214,540 +876,19 @@ def _should_hide_standings_early_season(
 
 
 
-def _is_knockout_round_for_bracket(league_id: int, round_name: Optional[str]) -> bool:
+def build_standings_block(
+    header: Dict[str, Any],
+    bracket_round: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    BRACKET 표시 대상 라운드 판정(규칙 기반).
-
-    ✅ 우리가 합의한 정책:
-    - "예선이라도 넉아웃이면 브라켓에 포함"
-    - 단, '승점/스테이지/리그 예선'은 브라켓에서 제외
-      (League Stage - n / Regular Season - n / Apertura - n / Clausura - n / Group A 등)
-    """
-    if not round_name or not isinstance(round_name, str):
-        return False
-
-    rn = round_name.strip()
-    if not rn:
-        return False
-
-    lo = rn.lower()
-
-    # 1) ✅ 승점/스테이지/리그 방식 예선 제외
-    if (
-        "league stage" in lo
-        or "regular season" in lo
-        or "apertura" in lo
-        or "clausura" in lo
-        or lo.startswith("group ")
-        or "group stage" in lo
-        or lo.startswith("stage ")
-    ):
-        return False
-
-    # 2) ✅ 넉아웃 시사 키워드 포함이면 포함
-    include_tokens = (
-        "final",
-        "semi",
-        "quarter",
-        "round of",
-        "knockout",
-        "playoff",
-        "play-off",
-        "play in",
-        "play-in",
-        "elimination",
-        "preliminary",
-        "qualifying",
-        "qualifier",
-    )
-    if any(t in lo for t in include_tokens):
-        return True
-
-    # 3) ✅ 1st/2nd/3rd/4th Round 패턴 포함
-    if re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", lo):
-        return True
-    if re.search(r"(^|\s)(1st|2nd|3rd|4th)\s+round(\s|$)", lo):
-        return True
-
-    return False
-
-
-# ─────────────────────────────────────────
-# Bracket round name normalization (ONE-SHOT)
-# ─────────────────────────────────────────
-
-def _norm_round_name(raw: Any) -> str:
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    s = s.lower()
-    s = s.replace("–", "-").replace("—", "-")
-    s = re.sub(r"\s+", " ", s)
-    s = s.replace("-", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _canonical_round_key(raw_round_name: Any) -> Optional[str]:
-    """
-    DB round_name(표기 제각각)을 canonical key로 정규화.
-    - 흔한 변형(Last 16, 1/8 Finals, Round of Eight, Promotion/Relegation Playoffs 등)까지 흡수
-    """
-    s = _norm_round_name(raw_round_name)
-    if not s:
-        return None
-
-    # ── Elimination (Final 포함) ───────────────────────────
-    # "Elimination Final"이 먼저 final로 잡혀버리는 문제 방지
-    if "elimination" in s:
-        if re.search(r"(^|\s)elimination\s+final(s)?(\s|$)", s):
-            return "elimination_final"
-        return "elimination"
-
-    # ── Semi / Quarter / Final ─────────────────────────────
-    # ✅ Semi/Quarter를 Final보다 먼저 판정해야 "semi finals"가 final로 오염되지 않는다.
-    if re.search(r"(^|\s)semi\s*finals?(\s|$)", s) or re.search(r"(^|\s)semifinals?(\s|$)", s):
-        return "semi"
-
-    if re.search(r"(^|\s)quarter\s*finals?(\s|$)", s) or re.search(r"(^|\s)quarterfinals?(\s|$)", s):
-        return "quarter"
-
-    # Final은 가장 마지막에 판정 (semi/quarter/elimination final과 충돌 방지)
-    if re.search(r"(^|\s)grand\s+final(s)?(\s|$)", s) or re.search(r"(^|\s)finals?(\s|$)", s):
-        return "final"
-
-
-
-    # ── Last N / 1/8 Finals / 1/16 Finals / Round of words ──
-    # Last 16 / Last16 / Last-16
-    m = re.fullmatch(r"last (\d+)", s)
-    if m:
-        n = int(m.group(1))
-        if n == 8:
-            return "quarter"
-        if n == 4:
-            return "semi"
-        if n == 2:
-            return "final"
-        return f"r{n}"
-
-    # 1/8 finals, 1/16 finals, 1/32 finals ...
-    m = re.fullmatch(r"1\s*/\s*(\d+)\s*finals?", s)
-    if m:
-        denom = int(m.group(1))
-        n = denom * 2
-        if n == 8:
-            return "quarter"
-        if n == 4:
-            return "semi"
-        if n == 2:
-            return "final"
-        return f"r{n}"
-
-    # Round of N
-    m = re.fullmatch(r"round of (\d+)", s)
-    if m:
-        n = int(m.group(1))
-        if n == 8:
-            return "quarter"
-        if n == 4:
-            return "semi"
-        if n == 2:
-            return "final"
-        return f"r{n}"
-
-    # Round of sixteen / thirty two / sixty four / one hundred twenty eight / two hundred fifty six
-    word_map = {
-        "sixteen": 16,
-        "thirty two": 32,
-        "thirtytwo": 32,
-        "sixty four": 64,
-        "sixtyfour": 64,
-        "one hundred twenty eight": 128,
-        "one hundred and twenty eight": 128,
-        "one hundred twentyeight": 128,
-        "two hundred fifty six": 256,
-        "two hundred and fifty six": 256,
-        "two hundred fiftysix": 256,
-    }
-    m = re.fullmatch(r"round of (.+)", s)
-    if m:
-        w = m.group(1).strip()
-        n = word_map.get(w)
-        if n:
-            if n == 8:
-                return "quarter"
-            if n == 4:
-                return "semi"
-            if n == 2:
-                return "final"
-            return f"r{n}"
-
-    # ── Play-in / Wildcard ─────────────────────────────────
-    if "play in" in s or "playin" in s or "wild card" in s or "wildcard" in s:
-        return "play_in"
-
-    # ── Playoffs variants (promotion/relegation/championship) ──
-    # promotion playoffs / relegation playoffs / championship playoffs 등
-    if "play off" in s or "playoff" in s or "play offs" in s or "playoffs" in s:
-        if "knockout round" in s:
-            return "knockout_playoffs"
-        return "playoffs"
-
-    # ── Elimination ────────────────────────────────────────
-    if "elimination" in s:
-        if "final" in s:
-            return "elimination_final"
-        return "elimination"
-
-    # ── Preliminary / Qualifying ───────────────────────────
-    if "preliminary" in s:
-        return "preliminary"
-    if "qualifying" in s or "qualifier" in s:
-        return "qualifying"
-
-    # ── 1st/2nd/3rd/4th Round (숫자 기반) ───────────────────
-    # 기존은 fullmatch라서 "Conference League Play-offs - 1st Round" 같은 케이스가 안 잡힘
-    # → 포함 매칭으로 확장
-    m = re.search(r"(^|\s)(\d+)(st|nd|rd|th)\s+round(\s|$)", s)
-    if m:
-        return f"round_{m.group(2)}"
-
-
-    return None
-
-
-
-def _canonical_round_label(canon: str) -> str:
-    """
-    canonical key -> UI label(표기 통일)
-    """
-    if canon == "final":
-        return "Final"
-    if canon == "semi":
-        return "Semi-finals"
-    if canon == "quarter":
-        return "Quarter-finals"
-    if canon.startswith("r") and canon[1:].isdigit():
-        return f"Round of {canon[1:]}"
-    if canon == "knockout_playoffs":
-        return "Knockout Round Play-offs"
-    if canon == "playoffs":
-        return "Play-offs"
-    if canon == "play_in":
-        return "Play-In"
-    if canon == "elimination_final":
-        return "Elimination Final"
-    if canon == "elimination":
-        return "Elimination"
-    if canon == "preliminary":
-        return "Preliminary Round"
-    if canon == "qualifying":
-        return "Qualifying Round"
-
-    # round_1/2/3/4... 는 1st/2nd/3rd/4th...로 표기
-    if canon.startswith("round_"):
-        n_str = canon.split("_", 1)[1]
-        if n_str.isdigit():
-            n = int(n_str)
-            if n % 100 in (11, 12, 13):
-                suf = "th"
-            else:
-                suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-            return f"{n}{suf} Round"
-
-    return canon
-
-
-
-# canonical round 정렬 우선순위(고정)
-# - 더 큰 예선 라운드가 나와도 표시 가능하도록 r256 추가(있으면 쓰고, 없으면 그냥 무시됨)
-_CANON_ORDER: List[str] = [
-    "preliminary",
-    "qualifying",
-    "round_1",
-    "round_2",
-    "round_3",
-    "round_4",
-    "play_in",
-    "elimination",
-    "elimination_final",
-    "playoffs",
-    "knockout_playoffs",
-    "r256",
-    "r128",
-    "r64",
-    "r32",
-    "r16",
-    "quarter",
-    "semi",
-    "final",
-]
-_CANON_ORDER_INDEX = {k: i for i, k in enumerate(_CANON_ORDER)}
-
-
-
-
-def _build_bracket_from_tournament_ties(
-    league_id: int,
-    season: int,
-    *,
-    start_round_name: Optional[str] = None,
-    end_round_name: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """
-    tournament_ties 기반 bracket 생성.
-
-    - start_round_name: 이 라운드부터(포함) 보여줌
-    - end_round_name: 이 라운드까지(포함) 보여줌
-
-    ✅ 변경 포인트(원샷 안정화):
-    - DB round_name 표기가 제각각이어도 canonical key로 정규화해서 정렬/표시
-    - 매번 order 리스트에 문자열을 계속 추가하는 패치 반복을 제거
-    - 기존 legs/팀매핑/knockout 필터 정책은 그대로 유지
-    """
-
-    # start/end도 canonical로 변환해서 범위 필터를 안정화
-    start_canon = _canonical_round_key(start_round_name) if start_round_name else None
-    end_canon = _canonical_round_key(end_round_name) if end_round_name else None
-
-    start_idx = _CANON_ORDER_INDEX.get(start_canon) if start_canon else None
-    end_idx = _CANON_ORDER_INDEX.get(end_canon) if end_canon else None
-
-    # 해당 리그/시즌 ties 전부 가져오기(필터는 파이썬에서)
-    ties_rows: List[Dict[str, Any]] = fetch_all(
-        """
-        SELECT
-            round_name,
-            tie_key,
-            team_a_id,
-            team_b_id,
-            leg1_fixture_id,
-            leg2_fixture_id,
-            leg1_home_id,
-            leg1_away_id,
-            leg1_home_ft,
-            leg1_away_ft,
-            leg1_date_utc,
-            leg2_home_id,
-            leg2_away_id,
-            leg2_home_ft,
-            leg2_away_ft,
-            leg2_date_utc,
-            agg_a,
-            agg_b,
-            winner_team_id
-        FROM tournament_ties
-        WHERE league_id = %s
-          AND season = %s
-        """,
-        (league_id, season),
-    )
-
-    # 브라켓에 등장하는 모든 팀 id를 한 번에 모아서 teams에서 이름/로고 매핑
-    team_ids: set[int] = set()
-    for tr in ties_rows:
-        for k in (
-            "team_a_id",
-            "team_b_id",
-            "leg1_home_id",
-            "leg1_away_id",
-            "leg2_home_id",
-            "leg2_away_id",
-            "winner_team_id",
-        ):
-            v = tr.get(k)
-            try:
-                if v is None:
-                    continue
-                iv = int(v)
-                if iv > 0:
-                    team_ids.add(iv)
-            except (TypeError, ValueError):
-                continue
-
-    team_map: Dict[int, Dict[str, Any]] = {}
-    if team_ids:
-        team_rows = fetch_all(
-            """
-            SELECT id, name, logo
-            FROM teams
-            WHERE id = ANY(%s)
-            """,
-            (list(team_ids),),
-        )
-        for r in team_rows:
-            try:
-                tid = int(r.get("id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if tid > 0:
-                team_map[tid] = {
-                    "name": r.get("name"),
-                    "logo": r.get("logo"),
-                }
-
-    def _team_name_logo(tid: Any) -> Tuple[Optional[str], Optional[str]]:
-        try:
-            tid_i = int(tid) if tid is not None else 0
-        except (TypeError, ValueError):
-            tid_i = 0
-        if tid_i <= 0:
-            return (None, None)
-        info = team_map.get(tid_i) or {}
-        name = info.get("name")
-        logo = info.get("logo")
-        return (
-            name if isinstance(name, str) and name.strip() else None,
-            logo if isinstance(logo, str) and logo.strip() else None,
-        )
-
-    # canonical round별로 모으기
-    by_canon: Dict[str, List[Dict[str, Any]]] = {}
-    for r in ties_rows:
-        raw_rn = (r.get("round_name") or "").strip()
-
-        # 기존 정책 유지: "넉아웃으로 판단되는 라운드만 브라켓 포함"
-        if not _is_knockout_round_for_bracket(league_id, raw_rn):
-            continue
-
-        canon = _canonical_round_key(raw_rn)
-        if not canon:
-            # 기존과 동일 정책: 우리가 분류 못하는 round_name은 제외
-            continue
-
-        idx = _CANON_ORDER_INDEX.get(canon)
-        if idx is None:
-            continue
-
-        # ✅ 범위 필터: start ~ end
-        if start_idx is not None and idx < start_idx:
-            continue
-        if end_idx is not None and idx > end_idx:
-            continue
-
-        by_canon.setdefault(canon, []).append(r)
-
-    # 정렬 및 출력 변환
-    bracket: List[Dict[str, Any]] = []
-
-    for canon in _CANON_ORDER:
-        if canon not in by_canon:
-            continue
-
-        ties_sorted = sorted(by_canon[canon], key=lambda x: str(x.get("tie_key") or ""))
-
-        ties_out: List[Dict[str, Any]] = []
-        for i, tr in enumerate(ties_sorted, start=1):
-            legs: List[Dict[str, Any]] = []
-
-            # leg1
-            if tr.get("leg1_fixture_id") is not None:
-                h_id = _coalesce_int(tr.get("leg1_home_id"), 0) or None
-                a_id = _coalesce_int(tr.get("leg1_away_id"), 0) or None
-
-                h_name, h_logo = _team_name_logo(h_id)
-                a_name, a_logo = _team_name_logo(a_id)
-
-                legs.append(
-                    {
-                        "leg_index": 1,
-                        "fixture_id": _coalesce_int(tr.get("leg1_fixture_id"), 0) or None,
-                        "date_utc": tr.get("leg1_date_utc"),
-                        "home_id": h_id,
-                        "away_id": a_id,
-                        "home_ft": tr.get("leg1_home_ft"),
-                        "away_ft": tr.get("leg1_away_ft"),
-                        "home_name": h_name,
-                        "home_logo": h_logo,
-                        "away_name": a_name,
-                        "away_logo": a_logo,
-                    }
-                )
-
-            # leg2
-            if tr.get("leg2_fixture_id") is not None:
-                h_id = _coalesce_int(tr.get("leg2_home_id"), 0) or None
-                a_id = _coalesce_int(tr.get("leg2_away_id"), 0) or None
-
-                h_name, h_logo = _team_name_logo(h_id)
-                a_name, a_logo = _team_name_logo(a_id)
-
-                legs.append(
-                    {
-                        "leg_index": 2,
-                        "fixture_id": _coalesce_int(tr.get("leg2_fixture_id"), 0) or None,
-                        "date_utc": tr.get("leg2_date_utc"),
-                        "home_id": h_id,
-                        "away_id": a_id,
-                        "home_ft": tr.get("leg2_home_ft"),
-                        "away_ft": tr.get("leg2_away_ft"),
-                        "home_name": h_name,
-                        "home_logo": h_logo,
-                        "away_name": a_name,
-                        "away_logo": a_logo,
-                    }
-                )
-
-            a_id = tr.get("team_a_id")
-            b_id = tr.get("team_b_id")
-            a_name, a_logo = _team_name_logo(a_id)
-            b_name, b_logo = _team_name_logo(b_id)
-
-            ties_out.append(
-                {
-                    "tie_key": tr.get("tie_key"),
-                    "order_hint": i,
-                    "team_a_id": a_id,
-                    "team_b_id": b_id,
-                    "team_a_name": a_name,
-                    "team_a_logo": a_logo,
-                    "team_b_name": b_name,
-                    "team_b_logo": b_logo,
-                    "agg_a": tr.get("agg_a"),
-                    "agg_b": tr.get("agg_b"),
-                    "winner_team_id": tr.get("winner_team_id"),
-                    "legs": legs,
-                }
-            )
-
-        round_label = _canonical_round_label(canon)
-        round_key = round_label.upper().replace(" ", "_").replace("-", "_")
-
-        bracket.append(
-            {
-                "round_key": round_key,
-                "round_label": round_label,
-                "ties": ties_out,
-            }
-        )
-
-    return bracket
-
-
-
-
-
-
-
-def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Match Detail용 Standings 블록 (TABLE + BRACKET 하이브리드)
-
-    ✅ 규칙:
-    - 넉아웃(브라켓) 대상 fixture면: mode="BRACKET" + bracket 채워서 반환 (rows는 [])
-    - 그 외 TABLE:
-      1) standings 테이블 우선
-      2) 비어있으면 matches로 계산
-      3) finished=0이면 rows=[] + message
-
-    ✅ A 방식(서버가 필터용 context_options 제공) 강화:
-    - MLS(East/West)는 기존처럼 "전체 rows 유지 + 필터" (컷팅 없음)
-    - Split Round(Championship/Relegation)도 "전체 rows 유지 + 필터"
-    - Group A/B(예: Argentina)도 "전체 rows 유지 + 필터"
-    - 따라서 "홈/원정 팀이 속한 group만 남기는 컷팅"은 제거
-    - 중복 제거는 team_id 단독이 아니라 (team_id + group_name) 기준으로만 안전하게 수행
-    """
+Match Detail용 Standings 블록 (TABLE 전용)
+
+✅ 규칙:
+1) standings 테이블 우선
+2) 비어있으면 matches로 계산
+3) finished=0이면 rows=[] + message
+4) mode="TABLE" 고정
+"""
 
     league_id = header.get("league_id")
     season = header.get("season")
@@ -778,7 +919,13 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         return None
 
-    season_resolved = _resolve_season(league_id_int, season if isinstance(season, int) else None)
+    fixture_id = _extract_fixture_id_from_header(header)
+    season_resolved = _resolve_season(
+        league_id_int,
+        season if isinstance(season, int) else None,
+        fixture_id=fixture_id,
+    )
+    is_knockout_context = _is_header_knockout_context(header)
 
     # 시즌 자체를 못 찾으면: 빈 블록 + 안내
     if season_resolved is None:
@@ -796,69 +943,6 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "source": "standings_table",
         }
 
-    # ─────────────────────────────────────────────────────────────
-    # 0) 넉아웃(브라켓) 경기면: tournament_ties 기반 BRACKET 응답 우선
-    # ─────────────────────────────────────────────────────────────
-    fixture_id = _extract_fixture_id_from_header(header)
-
-    # ✅ league_round 추출 보강: header 구조가 달라도 안정적으로 라운드 문자열 확보
-    league_round = None
-    if isinstance(header.get("league_round"), str):
-        league_round = header.get("league_round")
-
-    if league_round is None and isinstance(header.get("round"), str):
-        league_round = header.get("round")
-
-    league_info2 = header.get("league")
-    if league_round is None and isinstance(league_info2, dict):
-        if isinstance(league_info2.get("round"), str):
-            league_round = league_info2.get("round")
-        elif isinstance(league_info2.get("league_round"), str):
-            league_round = league_info2.get("league_round")
-
-    league_round_str = league_round.strip() if isinstance(league_round, str) else None
-
-
-    if fixture_id is not None and _is_knockout_round_for_bracket(league_id_int, league_round_str):
-        tie_row = _fetch_one(
-            """
-            SELECT round_name
-            FROM tournament_ties
-            WHERE league_id = %s
-              AND season = %s
-              AND (%s = leg1_fixture_id OR %s = leg2_fixture_id)
-            LIMIT 1
-            """,
-            (league_id_int, season_resolved, fixture_id, fixture_id),
-        )
-
-        tie_round_name = (tie_row or {}).get("round_name")
-        tie_round_name = tie_round_name.strip() if isinstance(tie_round_name, str) else None
-
-        current_round = (
-            tie_round_name
-            if _is_knockout_round_for_bracket(league_id_int, tie_round_name)
-            else league_round_str
-        )
-
-        bracket = _build_bracket_from_tournament_ties(
-            league_id_int,
-            season_resolved,
-            start_round_name=None,
-            end_round_name=current_round,
-        )
-
-        if bracket:
-            # ✅ BRACKET이 있어도 TABLE rows/context_options를 같이 내려보내기 위해
-            #    여기서 return 하지 않고, 아래 TABLE 로직을 계속 탄다.
-            bracket_mode = "BRACKET"
-            bracket_data = bracket
-            bracket_source = "tournament_ties"
-        else:
-            bracket_mode = None
-            bracket_data = None
-            bracket_source = None
-        # bracket이 비면 기존 TABLE로 fallback (기존 로직 그대로)
 
 
     # ─────────────────────────────────────────────────────────────
@@ -894,17 +978,614 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception:
         rows_raw = []
 
+    comp_meta = _get_competition_meta(league_id_int, season_resolved)
     source = "standings_table" if rows_raw else "computed_from_matches"
+
+    # ─────────────────────────────────────────────────────────────
+    # 통합 stage 선택 준비
+    # - 혼합형 대회에서는 TABLE stage + BRACKET stage 칩을 함께 내려준다.
+    # - 기존 bracket_round 파라미터를 "선택된 stage 라벨"로 재사용한다.
+    # ─────────────────────────────────────────────────────────────
+    format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+
+    try:
+        all_round_rows = fetch_all(
+            """
+            SELECT
+                round_name,
+                round_order,
+                round_kind,
+                is_knockout
+            FROM competition_rounds_meta
+            WHERE league_id = %s
+              AND season = %s
+            ORDER BY round_order ASC, round_name ASC
+            """,
+            (league_id_int, season_resolved),
+        )
+    except Exception:
+        all_round_rows = []
+
+    table_stage_label = _derive_table_stage_label(
+        comp_meta=comp_meta,
+        round_rows=all_round_rows or [],
+        rows_raw=rows_raw or [],
+    )
+
+    non_knockout_round_names = [
+        _safe_text_or_none(r.get("round_name"))
+        for r in (all_round_rows or [])
+        if not _is_knockout_round_name(
+            r.get("round_name"),
+            meta_is_knockout=r.get("is_knockout"),
+        )
+    ]
+    non_knockout_round_names = [r for r in non_knockout_round_names if r]
+
+    # ─────────────────────────────────────────────────────────────
+    # BRACKET 우선 시도 (컵 / 플레이오프 / 넉아웃 대회)
+    # - 앱 MatchDetailJsonParser.parseBracketColumns() 구조와 100% 호환
+    # - penalty / extra time 점수 반영
+    # - single-leg / two-leg tie 모두 처리
+    # ─────────────────────────────────────────────────────────────
+    is_bracket_candidate = False
+
+    if format_hint == "knockout_only":
+        is_bracket_candidate = True
+
+    elif format_hint in {
+        "single_table_league_plus_playoff",
+        "league_phase_plus_knockout",
+        "multi_group_league_plus_playoff",
+    }:
+        if _is_header_knockout_context(header):
+            is_bracket_candidate = True
+
+    stage_round_options: List[str] = []
+    selected_table_stage_label: Optional[str] = None
+
+    if is_bracket_candidate or table_stage_label:
+        try:
+            knockout_rounds = fetch_all(
+                """
+                SELECT
+                    round_name,
+                    round_order,
+                    round_kind,
+                    is_knockout
+                FROM competition_rounds_meta
+                WHERE league_id = %s
+                  AND season = %s
+                  AND is_knockout = 1
+                ORDER BY round_order ASC, round_name ASC
+                """,
+                (league_id_int, season_resolved),
+            )
+
+            knockout_rounds = knockout_rounds or []
+
+            knockout_round_names_asc = [
+                str(r.get("round_name")).strip()
+                for r in knockout_rounds
+                if r.get("round_name")
+            ]
+
+            round_count_rows = []
+            if knockout_round_names_asc:
+                round_count_rows = fetch_all(
+                    """
+                    SELECT
+                        m.league_round,
+                        COUNT(*) AS cnt
+                    FROM matches m
+                    WHERE m.league_id = %s
+                      AND m.season = %s
+                      AND m.league_round = ANY(%s)
+                    GROUP BY m.league_round
+                    """,
+                    (league_id_int, season_resolved, knockout_round_names_asc),
+                )
+
+            round_count_map: Dict[str, int] = {}
+            for rr in round_count_rows or []:
+                rn = _normalize_round_name(rr.get("league_round"))
+                if not rn:
+                    continue
+                round_count_map[rn] = _coalesce_int(rr.get("cnt"), 0)
+
+            table_stage_has_data = bool(table_stage_label and rows_raw)
+
+            stage_round_options = _build_stage_round_options(
+                comp_meta=comp_meta,
+                all_round_rows=all_round_rows or [],
+                table_stage_label=table_stage_label,
+                table_stage_has_data=table_stage_has_data,
+                round_count_map=round_count_map,
+            )
+
+            requested_round = _safe_text_or_none(bracket_round)
+            header_round = _extract_round_label_from_header(header)
+
+            selected_round_label: Optional[str] = None
+            selected_is_table_stage = False
+
+            if (
+                requested_round
+                and table_stage_label
+                and requested_round.strip().lower() == table_stage_label.strip().lower()
+            ):
+                selected_round_label = table_stage_label
+                selected_is_table_stage = True
+
+            elif (
+                requested_round
+                and requested_round in knockout_round_names_asc
+                and _coalesce_int(round_count_map.get(requested_round), 0) > 0
+            ):
+                selected_round_label = _normalize_round_name(requested_round)
+
+            elif (
+                table_stage_label
+                and header_round
+                and header_round in non_knockout_round_names
+            ):
+                selected_round_label = table_stage_label
+                selected_is_table_stage = True
+
+            elif (
+                header_round
+                and header_round in knockout_round_names_asc
+                and _coalesce_int(round_count_map.get(header_round), 0) > 0
+            ):
+                selected_round_label = _normalize_round_name(header_round)
+
+            elif stage_round_options:
+                selected_round_label = stage_round_options[0]
+                if table_stage_label and selected_round_label.strip().lower() == table_stage_label.strip().lower():
+                    selected_is_table_stage = True
+
+            if selected_is_table_stage and selected_round_label:
+                selected_table_stage_label = selected_round_label
+
+            if not selected_is_table_stage and selected_round_label:
+                def _match_is_finished(m: Dict[str, Any]) -> bool:
+                    sg = str(m.get("status_group") or "").strip().upper()
+                    st = str(m.get("status") or "").strip().upper()
+                    return sg == "FINISHED" or st in {"FT", "AET", "PEN"}
+
+                def _unordered_pair_key(m: Dict[str, Any]) -> Tuple[int, int]:
+                    h = _coalesce_int(m.get("home_id"), 0)
+                    a = _coalesce_int(m.get("away_id"), 0)
+                    return tuple(sorted((h, a)))
+
+                def _leg_payload(m: Dict[str, Any], leg_index: Optional[int]) -> Dict[str, Any]:
+                    resolved = _resolve_bracket_display_scores(m)
+                    return {
+                        "fixture_id": _safe_int_or_none(m.get("fixture_id")),
+                        "leg_index": leg_index,
+                        "date_utc": _safe_text_or_none(m.get("date_utc")),
+                        "home_id": _coalesce_int(m.get("home_id"), 0),
+                        "home_name": _safe_text_or_none(m.get("home_name")),
+                        "home_logo": _safe_text_or_none(m.get("home_logo")),
+                        "away_id": _coalesce_int(m.get("away_id"), 0),
+                        "away_name": _safe_text_or_none(m.get("away_name")),
+                        "away_logo": _safe_text_or_none(m.get("away_logo")),
+                        "home_ft": resolved.get("home"),
+                        "away_ft": resolved.get("away"),
+                        "home_pen": resolved.get("pen_home"),
+                        "away_pen": resolved.get("pen_away"),
+                        "home_et": resolved.get("et_home"),
+                        "away_et": resolved.get("et_away"),
+                        "score_status": resolved.get("status"),
+                    }
+
+                def _agg_score_for_leg(leg: Dict[str, Any], original_match: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+                    resolved = _resolve_bracket_display_scores(original_match)
+
+                    ft_home = resolved.get("ft_home")
+                    ft_away = resolved.get("ft_away")
+                    et_home = resolved.get("et_home")
+                    et_away = resolved.get("et_away")
+                    status = str(original_match.get("status") or "").strip().upper()
+
+                    if status in {"AET", "PEN"}:
+                        if ft_home is not None and ft_away is not None:
+                            return ft_home + (et_home or 0), ft_away + (et_away or 0)
+
+                    if ft_home is not None and ft_away is not None:
+                        return ft_home, ft_away
+
+                    return leg.get("home_ft"), leg.get("away_ft")
+
+                def _winner_from_single_match(m: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+                    resolved = _resolve_bracket_display_scores(m)
+
+                    home_id = _safe_int_or_none(m.get("home_id"))
+                    away_id = _safe_int_or_none(m.get("away_id"))
+                    if home_id is None or away_id is None:
+                        return None, None
+
+                    home_score = resolved.get("home")
+                    away_score = resolved.get("away")
+                    if home_score is not None and away_score is not None:
+                        if home_score > away_score:
+                            return home_id, "score"
+                        if away_score > home_score:
+                            return away_id, "score"
+
+                    status = str(m.get("status") or "").strip().upper()
+                    if status == "PEN":
+                        pen_home = resolved.get("pen_home")
+                        pen_away = resolved.get("pen_away")
+                        if pen_home is not None and pen_away is not None:
+                            if pen_home > pen_away:
+                                return home_id, "penalty"
+                            if pen_away > pen_home:
+                                return away_id, "penalty"
+
+                    return None, None
+
+                def _winner_from_two_leg_tie(
+                    *,
+                    leg1: Dict[str, Any],
+                    leg2: Dict[str, Any],
+                    m2: Dict[str, Any],
+                    agg_home: Optional[int],
+                    agg_away: Optional[int],
+                ) -> Tuple[Optional[int], Optional[str]]:
+                    home_anchor_id = _safe_int_or_none(leg1.get("home_id"))
+                    away_anchor_id = _safe_int_or_none(leg1.get("away_id"))
+                    if home_anchor_id is None or away_anchor_id is None:
+                        return None, None
+
+                    if agg_home is not None and agg_away is not None:
+                        if agg_home > agg_away:
+                            return home_anchor_id, "aggregate"
+                        if agg_away > agg_home:
+                            return away_anchor_id, "aggregate"
+
+                    status2 = str(m2.get("status") or "").strip().upper()
+                    if status2 == "PEN":
+                        resolved2 = _resolve_bracket_display_scores(m2)
+                        pen_home2 = resolved2.get("pen_home")
+                        pen_away2 = resolved2.get("pen_away")
+                        if pen_home2 is None or pen_away2 is None:
+                            return None, None
+
+                        anchor_home_pen: Optional[int] = None
+                        anchor_away_pen: Optional[int] = None
+
+                        if _safe_int_or_none(leg2.get("home_id")) == home_anchor_id:
+                            anchor_home_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == home_anchor_id:
+                            anchor_home_pen = pen_away2
+
+                        if _safe_int_or_none(leg2.get("home_id")) == away_anchor_id:
+                            anchor_away_pen = pen_home2
+                        elif _safe_int_or_none(leg2.get("away_id")) == away_anchor_id:
+                            anchor_away_pen = pen_away2
+
+                        if anchor_home_pen is not None and anchor_away_pen is not None:
+                            if anchor_home_pen > anchor_away_pen:
+                                return home_anchor_id, "penalty"
+                            if anchor_away_pen > anchor_home_pen:
+                                return away_anchor_id, "penalty"
+
+                    return None, None
+
+                def _build_round_ties(round_label: str, round_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                    if not round_matches:
+                        return []
+
+                    grouped: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+
+                    for m in round_matches:
+                        h = _coalesce_int(m.get("home_id"), 0)
+                        a = _coalesce_int(m.get("away_id"), 0)
+                        if h > 0 and a > 0:
+                            grouped.setdefault(_unordered_pair_key(m), []).append(m)
+
+                    def _sort_matches(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                        return sorted(
+                            items,
+                            key=lambda x: (
+                                str(x.get("date_utc") or ""),
+                                _coalesce_int(x.get("fixture_id"), 0),
+                            ),
+                        )
+
+                    def _build_two_leg_tie_from_matches(
+                        pair_items: List[Dict[str, Any]],
+                        order_value: int,
+                    ) -> Optional[Dict[str, Any]]:
+                        pair_items = _sort_matches(pair_items)
+                        if len(pair_items) < 2:
+                            return None
+
+                        m1 = pair_items[0]
+                        m2 = pair_items[1]
+
+                        leg1 = _leg_payload(m1, 1)
+                        leg2 = _leg_payload(m2, 2)
+
+                        home_anchor_id = leg1["home_id"]
+                        away_anchor_id = leg1["away_id"]
+
+                        agg_home: Optional[int] = None
+                        agg_away: Optional[int] = None
+
+                        if _match_is_finished(m1) and _match_is_finished(m2):
+                            s1h, s1a = _agg_score_for_leg(leg1, m1)
+                            s2h, s2a = _agg_score_for_leg(leg2, m2)
+
+                            if None not in (s1h, s1a, s2h, s2a):
+                                h_sum = 0
+                                a_sum = 0
+
+                                if leg1["home_id"] == home_anchor_id:
+                                    h_sum += int(s1h)
+                                elif leg1["home_id"] == away_anchor_id:
+                                    a_sum += int(s1h)
+
+                                if leg1["away_id"] == home_anchor_id:
+                                    h_sum += int(s1a)
+                                elif leg1["away_id"] == away_anchor_id:
+                                    a_sum += int(s1a)
+
+                                if leg2["home_id"] == home_anchor_id:
+                                    h_sum += int(s2h)
+                                elif leg2["home_id"] == away_anchor_id:
+                                    a_sum += int(s2h)
+
+                                if leg2["away_id"] == home_anchor_id:
+                                    h_sum += int(s2a)
+                                elif leg2["away_id"] == away_anchor_id:
+                                    a_sum += int(s2a)
+
+                                agg_home = h_sum
+                                agg_away = a_sum
+
+                        winner_team_id, winner_reason = _winner_from_two_leg_tie(
+                            leg1=leg1,
+                            leg2=leg2,
+                            m2=m2,
+                            agg_home=agg_home,
+                            agg_away=agg_away,
+                        )
+
+                        legs_completed = 0
+                        if _match_is_finished(m1):
+                            legs_completed += 1
+                        if _match_is_finished(m2):
+                            legs_completed += 1
+
+                        return {
+                            "round_label": round_label,
+                            "order_hint": order_value,
+                            "tie_format": "two_leg",
+                            "legs_expected": 2,
+                            "legs_scheduled": max(2, len(pair_items)),
+                            "legs_completed": legs_completed,
+                            "agg_home": agg_home,
+                            "agg_away": agg_away,
+                            "winner_team_id": winner_team_id,
+                            "winner_reason": winner_reason,
+                            "legs": [leg1, leg2],
+                        }
+
+                    ties: List[Dict[str, Any]] = []
+                    used_fixture_ids: set[int] = set()
+                    order_hint = 1
+
+                    for _, pair_matches in grouped.items():
+                        pair_matches = _sort_matches(pair_matches)
+
+                        sample = pair_matches[0]
+                        team_a_id = _coalesce_int(sample.get("home_id"), 0)
+                        team_b_id = _coalesce_int(sample.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id_int,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches) if scheduled_pair_matches else pair_matches
+
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+
+                    remaining_matches = [
+                        m for m in round_matches
+                        if _coalesce_int(m.get("fixture_id"), 0) not in used_fixture_ids
+                    ]
+
+                    remaining_matches = _sort_matches(remaining_matches)
+
+                    for m in remaining_matches:
+                        fixture_id_int = _coalesce_int(m.get("fixture_id"), 0)
+                        if fixture_id_int in used_fixture_ids:
+                            continue
+
+                        team_a_id = _coalesce_int(m.get("home_id"), 0)
+                        team_b_id = _coalesce_int(m.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id_int,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches)
+
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+                            continue
+
+                        used_fixture_ids.add(fixture_id_int)
+
+                        leg = _leg_payload(m, None)
+
+                        winner_team_id: Optional[int] = None
+                        winner_reason: Optional[str] = None
+                        if _match_is_finished(m):
+                            winner_team_id, winner_reason = _winner_from_single_match(m)
+
+                        ties.append(
+                            {
+                                "round_label": round_label,
+                                "order_hint": order_hint,
+                                "tie_format": "single_leg",
+                                "legs_expected": 1,
+                                "legs_scheduled": 1,
+                                "legs_completed": 1 if _match_is_finished(m) else 0,
+                                "agg_home": None,
+                                "agg_away": None,
+                                "winner_team_id": winner_team_id,
+                                "winner_reason": winner_reason,
+                                "legs": [leg],
+                            }
+                        )
+                        order_hint += 1
+
+                    ties.sort(
+                        key=lambda t: (
+                            _coalesce_int(t.get("order_hint"), 999999),
+                            str(
+                                (
+                                    (t.get("legs") or [{}])[0].get("date_utc")
+                                    if (t.get("legs") or [])
+                                    else ""
+                                ) or ""
+                            ),
+                        )
+                    )
+                    return ties
+
+                selected_round_matches: List[Dict[str, Any]] = []
+                if selected_round_label:
+                    selected_round_matches = fetch_all(
+                        """
+                        SELECT
+                            m.fixture_id,
+                            m.league_round,
+                            m.date_utc,
+                            m.home_id,
+                            m.away_id,
+                            m.home_ft,
+                            m.away_ft,
+                            m.status,
+                            m.status_group,
+                            th.name AS home_name,
+                            ta.name AS away_name,
+                            th.logo AS home_logo,
+                            ta.logo AS away_logo
+                        FROM matches m
+                        LEFT JOIN teams th ON th.id = m.home_id
+                        LEFT JOIN teams ta ON ta.id = m.away_id
+                        WHERE m.league_id = %s
+                          AND m.season = %s
+                          AND m.league_round = %s
+                        ORDER BY
+                            m.date_utc ASC,
+                            m.fixture_id ASC
+                        """,
+                        (league_id_int, season_resolved, selected_round_label),
+                    )
+
+                selected_ties = _build_round_ties(
+                    selected_round_label or "",
+                    selected_round_matches or [],
+                ) if selected_round_label else []
+
+                bracket_columns: List[Dict[str, Any]] = []
+                if selected_round_label:
+                    bracket_columns.append(
+                        {
+                            "round_label": selected_round_label,
+                            "ties": selected_ties,
+                        }
+                    )
+
+                return {
+                    "league": {
+                        "league_id": league_id_int,
+                        "season": season_resolved,
+                        "name": league_name,
+                    },
+                    "mode": "BRACKET",
+                    "rows": [],
+                    "bracket": bracket_columns,
+                    "bracket_round_options": stage_round_options,
+                    "selected_bracket_round": selected_round_label,
+                    "context_options": {"conferences": [], "groups": []},
+                    "source": "computed_bracket",
+                }
+
+        except Exception:
+            pass
+
+    # ✅ competition meta 기준으로 matches fallback 허용/차단을 먼저 결정
+    if not rows_raw and _competition_blocks_matches_fallback(comp_meta):
+        format_hint = str((comp_meta or {}).get("format_hint") or "").strip().lower()
+        has_standings_meta = _coalesce_int((comp_meta or {}).get("has_standings"), 0)
+
+        message = "Standings are not available for this competition."
+        source_name = "competition_meta_no_standings"
+
+        if format_hint in {
+            "knockout_only",
+            "league_phase_plus_knockout",
+            "cup_with_standings",
+            "cup_other",
+        }:
+            message = "Standings are not available for this competition stage.\nPlease check back later."
+            source_name = "competition_meta_complex_format"
+        elif format_hint in {
+            "multi_group_league",
+            "multi_group_league_plus_playoff",
+            "single_table_league_plus_playoff",
+        }:
+            message = "Standings are not available yet.\nPlease check back later."
+            source_name = "competition_meta_grouped_or_playoff_format"
+        elif has_standings_meta == 0:
+            message = "Standings are not available for this competition."
+            source_name = "competition_meta_no_standings"
+
+        return {
+            "league": {
+                "league_id": league_id_int,
+                "season": season_resolved,
+                "name": league_name,
+            },
+            "mode": "TABLE",
+            "rows": [],
+            "bracket": None,
+            "context_options": {"conferences": [], "groups": []},
+            "message": message,
+            "source": source_name,
+        }
 
     # ─────────────────────────────────────────────────────────────
     # ✅ 옵션 A: 시즌 초반 + played 비정상(지난 시즌 최종 테이블로 의심) => 스탠딩 숨김
     # ─────────────────────────────────────────────────────────────
     if rows_raw:
-        fixture_id_for_guard = fixture_id if "fixture_id" in locals() else _extract_fixture_id_from_header(header)
         if _should_hide_standings_early_season(
             league_id=league_id_int,
             season=season_resolved,
-            fixture_id=fixture_id_for_guard,
+            fixture_id=fixture_id,
             rows_raw=rows_raw,
             window_days=14,
             played_threshold=15,
@@ -925,7 +1606,26 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
     # ─────────────────────────────────────────────────────────────
-    # 2) standings 비어 있으면 → matches에서 계산 (기존 로직 유지)
+    # 2) standings가 비어 있고 현재 컨텍스트가 컵/넉아웃이면
+    #    matches 기반 standings fallback 을 막는다.
+    # ─────────────────────────────────────────────────────────────
+    if not rows_raw and is_knockout_context:
+        return {
+            "league": {
+                "league_id": league_id_int,
+                "season": season_resolved,
+                "name": league_name,
+            },
+            "mode": "TABLE",
+            "rows": [],
+            "bracket": None,
+            "context_options": {"conferences": [], "groups": []},
+            "message": "Standings are not available for this knockout round.\nPlease check back later.",
+            "source": "knockout_no_standings",
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # 3) standings 비어 있으면 → matches에서 계산 (리그/조별/리그페이즈만)
     # ─────────────────────────────────────────────────────────────
     if not rows_raw:
         mcols = _cols_of("matches")
@@ -1176,7 +1876,7 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             raw_group_name=r.get("group_name"),
             description=r.get("description"),
         )
-        g = _norm_group(eff_g)
+        g = _norm_group(eff_g) or ""
         rk = _coalesce_int(r.get("rank"), 0) or 999999
         tn = str(r.get("team_name") or "")
         return (g.lower(), rk, tn.lower())
@@ -1215,37 +1915,68 @@ def build_standings_block(header: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     context_options = _build_context_options_from_rows(dedup_rows)
 
+    # ✅ 서버에서 저장한 standings_group_meta가 있으면 그 값을 우선 사용
+    try:
+        meta_group_names = _get_group_meta_names(league_id_int, season_resolved)
+        if meta_group_names:
+            conferences: List[str] = []
+            groups: List[str] = []
+
+            for name in meta_group_names:
+                nl = name.lower()
+                if "east" in nl:
+                    conferences.append("East")
+                    continue
+                if "west" in nl:
+                    conferences.append("West")
+                    continue
+                groups.append(name)
+
+            def _dedup_keep_order(items: List[str]) -> List[str]:
+                seen = set()
+                out: List[str] = []
+                for x in items:
+                    k = x.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(x)
+                return out
+
+            context_options = {
+                "conferences": _dedup_keep_order(conferences),
+                "groups": _dedup_keep_order(groups),
+            }
+    except Exception:
+        pass
+
+    # 혼합형 대회 + 단일 테이블(리그명만 group으로 저장된 경우)은
+    # 별도 그룹 칩이 중복/노이즈가 되므로 숨긴다.
+    if stage_round_options:
+        groups_now = context_options.get("groups") or []
+        if len(groups_now) == 1:
+            only_group = str(groups_now[0] or "").strip().lower()
+            league_name_norm = str(league_name or "").strip().lower()
+            if only_group and league_name_norm and only_group == league_name_norm:
+                context_options = {
+                    "conferences": context_options.get("conferences") or [],
+                    "groups": [],
+                }
+
     out: Dict[str, Any] = {
         "league": {
             "league_id": league_id_int,
             "season": season_resolved,
             "name": league_name,
         },
-        # ✅ 기본은 TABLE, bracket이 있으면 BRACKET으로만 바꿔 끼움
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
+        "bracket_round_options": stage_round_options,
+        "selected_bracket_round": selected_table_stage_label,
         "context_options": context_options,
         "source": source,
     }
-
-    # ✅ BRACKET이 있었으면: bracket을 추가로 포함 + chips에 Play-offs 추가
-    if "bracket_data" in locals() and bracket_data:
-        out["mode"] = "BRACKET"
-        out["bracket"] = bracket_data
-        out["source"] = bracket_source or out.get("source")
-
-        # UX-2: 기존 그룹칩 + Play-offs 혼합
-        try:
-            co = out.get("context_options") or {}
-            groups = list(co.get("groups") or [])
-            # case-insensitive 중복 방지
-            if not any((g or "").strip().lower() == "play-offs" for g in groups):
-                groups.append("Play-offs")
-            co["groups"] = groups
-            out["context_options"] = co
-        except Exception:
-            pass
 
 
     if not table:
@@ -1260,33 +1991,28 @@ def _effective_group_name(
     description: Any,
 ) -> Optional[str]:
     """
-    rows의 group_name이 리그명/기본값으로만 채워지고,
-    실제 구분(Championship/Relegation)이 description에만 있는 리그(Austria 등) 보정.
+    rows의 raw group_name을 최대한 그대로 유지한다.
 
-    - description에 championship/relegation 라운드가 있으면 group_name을 그 값으로 강제
-    - 이미 group_name이 Group A/B, East/West, Championship Round 등 의미 있는 값이면 유지
+    원칙:
+    - DB에 이미 의미 있는 group_name이 있으면 그대로 사용
+      예: Group A, East/West, Championship Round, Relegation Round,
+          Bundesliga: Regular Season
+    - group_name이 비어 있거나 정말 의미 없는 경우에만
+      description 기반으로 Championship/Relegation 보정
     """
     g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
     d = description.strip().lower() if isinstance(description, str) else ""
 
-    # group_name 자체가 의미있으면 그대로 둠
     gl = g.lower()
     if gl:
-        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
-            return g
-        if gl.startswith("group "):
-            return g
-        if "east" in gl or "west" in gl:
-            return g
+        return g
 
-    # description 기반 split round 보정
     if "champ" in d and "round" in d:
         return "Championship Round"
     if "releg" in d and "round" in d:
         return "Relegation Round"
 
-    # 그 외는 기존 group_name 유지(빈 값이면 None)
-    return g if g else None
+    return None
 
 
 

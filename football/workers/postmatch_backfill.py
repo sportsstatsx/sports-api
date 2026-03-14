@@ -1,19 +1,18 @@
-# postmatch_backfill.py
+# src/football/workers/postmatch_backfill.py
 #
 # 역할:
 # - 특정 날짜(date=YYYY-MM-DD)의 FINISHED 경기들에 대해 "한 번만" 무거운 데이터 전체 백필
-#   * /fixtures          → fixtures/matches upsert + match_fixtures_raw 저장
-#   * /fixtures/events   → match_events / match_events_raw
-#   * /fixtures/lineups  → match_lineups
+#   * /fixtures            → fixtures/matches upsert + match_fixtures_raw 저장
+#   * /fixtures/events     → match_events / match_events_raw
+#   * /fixtures/lineups    → match_lineups
 #   * /fixtures/statistics → match_team_stats
-#   * /fixtures/players  → match_player_stats
-#   * /standings         → standings (league+season)
+#   * /fixtures/players    → match_player_stats
+#   * /standings           → standings (league+season)
 #
 # 특징:
-
 # - 이미 백필된 경기(match_events에 row 존재)는 스킵
 # - LIVE_LEAGUES env 에 포함된 리그만 대상
-# - 스키마 변경 없음
+# - 축구 bracket/tournament_ties 처리는 하지 않음
 
 import os
 import sys
@@ -21,6 +20,7 @@ import json
 import time
 import datetime as dt
 from typing import Any, Dict, List, Optional
+import re
 
 import requests
 
@@ -281,14 +281,15 @@ def backfill_countries_meta() -> int:
 
 def _get_api_key() -> str:
     key = (
-        os.environ.get("APIFOOTBALL_KEY")
+        os.environ.get("APISPORTS_KEY")
+        or os.environ.get("APIFOOTBALL_KEY")
         or os.environ.get("API_FOOTBALL_KEY")
         or os.environ.get("API_KEY")
         or ""
     )
 
     if not key:
-        raise RuntimeError("API key missing: set APIFOOTBALL_KEY (or API_FOOTBALL_KEY / API_KEY)")
+        raise RuntimeError("API key missing: set APISPORTS_KEY (or APIFOOTBALL_KEY / API_FOOTBALL_KEY / API_KEY)")
     return key
 
 
@@ -383,6 +384,27 @@ def get_only_standings() -> bool:
     if env_flag in ("1", "true", "yes", "y"):
         return True
     return "--only-standings" in sys.argv
+
+
+def get_only_fixtures() -> bool:
+    """
+    C안: fixtures/matches/raw 만 채우는 가벼운 모드.
+      - 목적: league_round 같은 fixture 레벨 정보만 다시 채우기
+      - 수행:
+          * /fixtures            → fixtures/matches upsert + match_fixtures_raw 저장
+      - 미수행:
+          * /fixtures/events
+          * /fixtures/lineups
+          * /fixtures/statistics
+          * /fixtures/players
+          * /standings
+      - ENV ONLY_FIXTURES=1/true/yes/y
+      - 또는 CLI: --only-fixtures
+    """
+    env_flag = (os.environ.get("ONLY_FIXTURES") or "").strip().lower()
+    if env_flag in ("1", "true", "yes", "y"):
+        return True
+    return "--only-fixtures" in sys.argv
 
 
 def get_standings_from_db_source() -> Optional[str]:
@@ -748,29 +770,68 @@ def fetch_player_stats_from_api(fixture_id: int) -> List[Dict[str, Any]]:
     rows = data.get("response", []) or []
     return [r for r in rows if isinstance(r, dict)]
 
-def fetch_standings_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
-    # API-Sports standings는 보통 response[0].league.standings 가 "리스트의 리스트" 구조
-    data = _safe_get("/standings", params={"league": league_id, "season": int(season)})
+def fetch_league_season_meta_from_api(league_id: int, season: int) -> Dict[str, Any]:
+    data = _safe_get("/leagues", params={"id": int(league_id), "season": int(season)})
     resp = data.get("response") or []
-    if not resp or not isinstance(resp, list) or not isinstance(resp[0], dict):
-        return []
+    item = resp[0] if resp and isinstance(resp[0], dict) else {}
+    return {"raw": data, "item": item}
 
-    league = (resp[0].get("league") or {})
-    standings = league.get("standings") or []
-    if not isinstance(standings, list):
-        return []
 
-    out: List[Dict[str, Any]] = []
-    for group in standings:
-        # group: 보통 List[Dict] (그룹/컨퍼런스/Overall 등)
-        if isinstance(group, list):
-            for row in group:
-                if isinstance(row, dict):
-                    out.append(row)
-        elif isinstance(group, dict):
-            # 혹시 단일 dict로 오는 예외 케이스
-            out.append(group)
-    return out
+def fetch_rounds_from_api(league_id: int, season: int) -> Dict[str, Any]:
+    data = _safe_get("/fixtures/rounds", params={"league": int(league_id), "season": int(season)})
+    resp = data.get("response") or []
+    rounds = [str(x) for x in resp if isinstance(x, str) and str(x).strip()]
+    return {"raw": data, "rounds": rounds}
+
+
+def fetch_standings_bundle_from_api(league_id: int, season: int) -> Dict[str, Any]:
+    data = _safe_get("/standings", params={"league": int(league_id), "season": int(season)})
+    resp = data.get("response") or []
+
+    rows: List[Dict[str, Any]] = []
+    groups: List[Dict[str, Any]] = []
+
+    if resp and isinstance(resp, list) and isinstance(resp[0], dict):
+        league = (resp[0].get("league") or {})
+        standings = league.get("standings") or []
+
+        if isinstance(standings, list) and standings and isinstance(standings[0], list):
+            for idx, group_rows in enumerate(standings, start=1):
+                group_rows = [x for x in (group_rows or []) if isinstance(x, dict)]
+                if not group_rows:
+                    continue
+                group_name = safe_text(group_rows[0].get("group")) or f"Group {idx}"
+                rows.extend(group_rows)
+                groups.append(
+                    {
+                        "group_name": group_name,
+                        "group_order": idx,
+                        "rows": group_rows,
+                    }
+                )
+        elif isinstance(standings, list):
+            flat_rows = [x for x in standings if isinstance(x, dict)]
+            if flat_rows:
+                group_name = safe_text(flat_rows[0].get("group")) or "Overall"
+                rows.extend(flat_rows)
+                groups.append(
+                    {
+                        "group_name": group_name,
+                        "group_order": 1,
+                        "rows": flat_rows,
+                    }
+                )
+
+    return {
+        "raw": data,
+        "rows": rows,
+        "groups": groups,
+    }
+
+
+def fetch_standings_from_api(league_id: int, season: int) -> List[Dict[str, Any]]:
+    bundle = fetch_standings_bundle_from_api(league_id, season)
+    return bundle.get("rows") or []
 
 def _get_table_columns(table_name: str) -> List[str]:
     """
@@ -837,7 +898,6 @@ def ensure_ft_triggers_table() -> None:
             season                   integer NOT NULL,
             finished_utc             text,
             standings_consumed_utc   text,
-            bracket_consumed_utc     text,
             created_utc              text,
             updated_utc              text
         )
@@ -846,8 +906,616 @@ def ensure_ft_triggers_table() -> None:
     execute("CREATE INDEX IF NOT EXISTS idx_ft_triggers_created_utc ON ft_triggers (created_utc)")
     execute("CREATE INDEX IF NOT EXISTS idx_ft_triggers_league_season ON ft_triggers (league_id, season)")
 
+
+def ensure_competition_structure_tables() -> None:
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS competition_api_raw (
+            league_id   integer NOT NULL,
+            season      integer NOT NULL,
+            endpoint    text    NOT NULL,
+            data_json   text    NOT NULL,
+            fetched_at  text,
+            updated_at  text,
+            PRIMARY KEY (league_id, season, endpoint)
+        )
+        """
+    )
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS competition_season_meta (
+            league_id                         integer NOT NULL,
+            season                            integer NOT NULL,
+            league_name                       text,
+            league_type                       text,
+            country_name                      text,
+            season_start                      text,
+            season_end                        text,
+            season_current                    integer,
+            coverage_standings                integer,
+            coverage_events                   integer,
+            coverage_lineups                  integer,
+            coverage_statistics_fixtures      integer,
+            coverage_players                  integer,
+            has_standings                     integer,
+            standings_rows                    integer,
+            has_groups                        integer,
+            groups_count                      integer,
+            has_rounds                        integer,
+            rounds_count                      integer,
+            has_knockout_rounds               integer,
+            format_hint                       text,
+            updated_utc                       text,
+            PRIMARY KEY (league_id, season)
+        )
+        """
+    )
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS standings_group_meta (
+            league_id             integer NOT NULL,
+            season                integer NOT NULL,
+            group_name            text    NOT NULL,
+            group_order           integer,
+            group_kind            text,
+            is_primary            integer,
+            table_rows            integer,
+            description_summary   text,
+            raw_json              text,
+            updated_utc           text,
+            PRIMARY KEY (league_id, season, group_name)
+        )
+        """
+    )
+    execute(
+        """
+        CREATE TABLE IF NOT EXISTS competition_rounds_meta (
+            league_id     integer NOT NULL,
+            season        integer NOT NULL,
+            round_name    text    NOT NULL,
+            round_order   integer,
+            round_kind    text,
+            is_knockout   integer,
+            raw_json      text,
+            updated_utc   text,
+            PRIMARY KEY (league_id, season, round_name)
+        )
+        """
+    )
+    execute("CREATE INDEX IF NOT EXISTS idx_competition_api_raw_endpoint ON competition_api_raw (endpoint)")
+    execute("CREATE INDEX IF NOT EXISTS idx_standings_group_meta_lookup ON standings_group_meta (league_id, season, group_order)")
+    execute("CREATE INDEX IF NOT EXISTS idx_competition_rounds_meta_lookup ON competition_rounds_meta (league_id, season, round_order)")
+
+
 def _iso_utc_now() -> str:
     return now_utc().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_utc_from_dt(dtobj: dt.datetime) -> str:
+    x = dtobj.astimezone(dt.timezone.utc)
+    return x.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _json_compact(payload: Any) -> str:
+    return json.dumps(payload if payload is not None else {}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bool_to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    return 1 if bool(v) else 0
+
+
+def _norm_lower(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        return " ".join(str(v).strip().lower().split())
+    except Exception:
+        return ""
+
+
+
+
+
+def _infer_round_kind(round_name: Optional[str]) -> str:
+    r = _norm_lower(round_name)
+
+    if not r:
+        return "unknown"
+
+    # ─────────────────────────
+    # 컵 라운드 (가장 구체적인 것부터)
+    # ─────────────────────────
+
+    # Final
+    if re.search(r"\bfinal\b", r) and "semi" not in r and "quarter" not in r:
+        return "final"
+
+    # Semi Final
+    if "semi-final" in r or "semi finals" in r or "semi-final" in r:
+        return "semi_final"
+
+    # Quarter Final
+    if "quarter-final" in r or "quarter finals" in r:
+        return "quarter_final"
+
+    # Round of X
+    m = re.search(r"round of\s*(\d+)", r)
+    if m:
+        n = int(m.group(1))
+        if n == 16:
+            return "round_of_16"
+        if n == 32:
+            return "round_of_32"
+        if n == 64:
+            return "round_of_64"
+        return "knockout_round"
+
+    # 1/128-finals 같은 패턴
+    m = re.search(r"1/\s*(\d+)", r)
+    if m:
+        return "knockout_round"
+
+    # ─────────────────────────
+    # Qualifying / Preliminary
+    # ─────────────────────────
+
+    if "extra preliminary" in r:
+        return "qualifying_round"
+
+    if "preliminary" in r:
+        return "qualifying_round"
+
+    if "qualifying" in r:
+        return "qualifying_round"
+
+    # ─────────────────────────
+    # League structures
+    # ─────────────────────────
+
+    if "league stage" in r:
+        return "league_phase"
+
+    if "regular season" in r:
+        return "regular_round"
+
+    if "1st phase" in r or "2nd phase" in r:
+        return "phase_round"
+
+    if "championship round" in r:
+        return "championship_round"
+
+    if "relegation round" in r:
+        return "relegation_round"
+
+    # ─────────────────────────
+    # Playoff
+    # ─────────────────────────
+
+    if "play-in" in r:
+        return "play_in"
+
+    if "playoff" in r or "play-off" in r or "play-offs" in r:
+        return "playoff"
+
+    # fallback
+    return "other_round"
+
+
+def _infer_round_is_knockout(round_name: Optional[str]) -> int:
+    k = _infer_round_kind(round_name)
+
+    return 1 if k in {
+        "qualifying_round",
+        "knockout_round",
+        "round_of_64",
+        "round_of_32",
+        "round_of_16",
+        "quarter_final",
+        "semi_final",
+        "final",
+        "play_in",
+        "playoff",
+    } else 0
+
+def _extract_round_number(round_name: Optional[str]) -> Optional[int]:
+    if not isinstance(round_name, str):
+        return None
+    text = round_name.strip()
+    if not text:
+        return None
+
+    m = re.search(r"(\d+)\s*$", text)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    m = re.search(r"regular season\s*-\s*(\d+)", text, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    return None
+
+
+def _round_sort_key(round_name: Optional[str]) -> tuple[int, int, str]:
+    rn = safe_text(round_name) or ""
+    kind = _infer_round_kind(rn)
+    num = _extract_round_number(rn)
+
+    priority_map = {
+        "qualifying_round": 10,
+        "phase_round": 20,
+        "regular_round": 30,
+        "league_phase": 40,
+        "other_round": 50,
+        "play_in": 60,
+        "playoff": 70,
+        "round_of_64": 80,
+        "round_of_32": 90,
+        "round_of_16": 100,
+        "quarter_final": 110,
+        "semi_final": 120,
+        "final": 130,
+        "unknown": 999,
+    }
+
+    pri = priority_map.get(kind, 999)
+
+    if num is None:
+        num = 999999
+
+    return (pri, num, rn.lower())
+
+
+def _sort_rounds(rounds: List[str]) -> List[str]:
+    """
+    API 원본 순서를 그대로 유지한다.
+    (FA Cup 같은 컵대회에서 round 이름 패턴으로 정렬하면 순서가 깨짐)
+    """
+    uniq: List[str] = []
+    seen = set()
+
+    for r in rounds or []:
+        name = (safe_text(r) or "").strip()
+        if not name:
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        uniq.append(name)
+
+    return uniq
+
+
+def upsert_competition_api_raw(
+    league_id: int,
+    season: int,
+    endpoint: str,
+    payload: Any,
+    fetched_at: dt.datetime,
+) -> None:
+    ts = _iso_utc_from_dt(fetched_at)
+    raw = _json_compact(payload)
+    execute(
+        """
+        INSERT INTO competition_api_raw (
+            league_id, season, endpoint, data_json, fetched_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (league_id, season, endpoint) DO UPDATE SET
+            data_json   = EXCLUDED.data_json,
+            fetched_at  = EXCLUDED.fetched_at,
+            updated_at  = EXCLUDED.updated_at
+        WHERE
+            competition_api_raw.data_json IS DISTINCT FROM EXCLUDED.data_json
+        """,
+        (int(league_id), int(season), str(endpoint), raw, ts, ts),
+    )
+
+
+def replace_rounds_for_league_season(league_id: int, season: int, rounds: List[str]) -> int:
+    execute(
+        "DELETE FROM rounds WHERE league_id = %s AND season = %s",
+        (int(league_id), int(season)),
+    )
+    n = 0
+    sorted_rounds = _sort_rounds(rounds or [])
+    for round_name in sorted_rounds:
+        execute(
+            "INSERT INTO rounds (league_id, round, season) VALUES (%s, %s, %s)",
+            (int(league_id), str(round_name), int(season)),
+        )
+        n += 1
+    return n
+
+
+def _group_description_summary(group_rows: List[Dict[str, Any]]) -> Optional[str]:
+    vals: List[str] = []
+    seen = set()
+    for row in group_rows or []:
+        desc = safe_text(row.get("description"))
+        if not desc:
+            continue
+        desc = desc.strip()
+        if not desc or desc in seen:
+            continue
+        seen.add(desc)
+        vals.append(desc)
+    if not vals:
+        return None
+    return " | ".join(vals[:20])
+
+
+def replace_standings_group_meta(
+    league_id: int,
+    season: int,
+    groups: List[Dict[str, Any]],
+    updated_at: dt.datetime,
+) -> int:
+    execute(
+        "DELETE FROM standings_group_meta WHERE league_id = %s AND season = %s",
+        (int(league_id), int(season)),
+    )
+
+    prepared: List[Dict[str, Any]] = []
+    for idx, grp in enumerate(groups or [], start=1):
+        group_name = (safe_text(grp.get("group_name")) or f"Group {idx}").strip()
+        group_rows = grp.get("rows") or []
+        group_order = safe_int(grp.get("group_order")) or idx
+
+        prepared.append(
+            {
+                "group_name": group_name,
+                "group_order": group_order,
+                "group_kind": None,
+                "is_primary": 0,
+                "table_rows": len(group_rows),
+                "description_summary": _group_description_summary(group_rows),
+                "raw_json": _json_compact(group_rows),
+            }
+        )
+
+    updated_utc = _iso_utc_from_dt(updated_at)
+
+    n = 0
+    for item in prepared:
+        execute(
+            """
+            INSERT INTO standings_group_meta (
+                league_id, season, group_name, group_order, group_kind,
+                is_primary, table_rows, description_summary, raw_json, updated_utc
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                int(league_id),
+                int(season),
+                item["group_name"],
+                int(item["group_order"]),
+                item["group_kind"],
+                int(item["is_primary"]),
+                int(item["table_rows"]),
+                item["description_summary"],
+                item["raw_json"],
+                updated_utc,
+            ),
+        )
+        n += 1
+    return n
+
+
+def replace_competition_rounds_meta(
+    league_id: int,
+    season: int,
+    rounds: List[str],
+    updated_at: dt.datetime,
+) -> int:
+    execute(
+        "DELETE FROM competition_rounds_meta WHERE league_id = %s AND season = %s",
+        (int(league_id), int(season)),
+    )
+
+    updated_utc = _iso_utc_from_dt(updated_at)
+    n = 0
+    sorted_rounds = _sort_rounds(rounds or [])
+
+    for idx, round_name in enumerate(sorted_rounds, start=1):
+        round_kind = _infer_round_kind(round_name)
+        is_knockout = _infer_round_is_knockout(round_name)
+        execute(
+            """
+            INSERT INTO competition_rounds_meta (
+                league_id, season, round_name, round_order, round_kind,
+                is_knockout, raw_json, updated_utc
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                int(league_id),
+                int(season),
+                str(round_name),
+                int(idx),
+                round_kind,
+                int(is_knockout),
+                _json_compact({"round_name": round_name}),
+                updated_utc,
+            ),
+        )
+        n += 1
+    return n
+
+
+def upsert_competition_season_meta(
+    league_id: int,
+    season: int,
+    league_meta_bundle: Dict[str, Any],
+    standings_bundle: Dict[str, Any],
+    rounds_bundle: Dict[str, Any],
+    updated_at: dt.datetime,
+) -> Dict[str, Any]:
+    item = (league_meta_bundle or {}).get("item") or {}
+    league_obj = item.get("league") or {}
+    country_obj = item.get("country") or {}
+    seasons = item.get("seasons") or []
+
+    season_obj: Dict[str, Any] = {}
+    for s in seasons:
+        if safe_int((s or {}).get("year")) == int(season):
+            season_obj = s or {}
+            break
+
+    cov = season_obj.get("coverage") or {}
+    fixtures_cov = cov.get("fixtures") or {}
+
+    rows = (standings_bundle or {}).get("rows") or []
+    groups = (standings_bundle or {}).get("groups") or []
+    rounds = (rounds_bundle or {}).get("rounds") or []
+
+    league_type = safe_text(league_obj.get("type"))
+    league_type_l = _norm_lower(league_type)
+
+    has_standings = 1 if rows else 0
+    has_groups = 1 if len(groups) > 1 else 0
+    has_rounds = 1 if rounds else 0
+    has_knockout_rounds = 1 if any(_infer_round_is_knockout(r) for r in rounds) else 0
+
+    if league_type_l == "cup":
+        if has_standings and has_knockout_rounds:
+            format_hint = "league_phase_plus_knockout"
+        elif has_standings:
+            format_hint = "cup_with_standings"
+        elif has_rounds:
+            format_hint = "knockout_only"
+        else:
+            format_hint = "cup_other"
+    else:
+        if has_groups and has_knockout_rounds:
+            format_hint = "multi_group_league_plus_playoff"
+        elif has_groups:
+            format_hint = "multi_group_league"
+        elif has_knockout_rounds:
+            format_hint = "single_table_league_plus_playoff"
+        else:
+            format_hint = "single_table_league"
+
+    updated_utc = _iso_utc_from_dt(updated_at)
+
+    execute(
+        """
+        INSERT INTO competition_season_meta (
+            league_id, season,
+            league_name, league_type, country_name,
+            season_start, season_end, season_current,
+            coverage_standings, coverage_events, coverage_lineups,
+            coverage_statistics_fixtures, coverage_players,
+            has_standings, standings_rows, has_groups, groups_count,
+            has_rounds, rounds_count, has_knockout_rounds,
+            format_hint, updated_utc
+        )
+        VALUES (
+            %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s
+        )
+        ON CONFLICT (league_id, season) DO UPDATE SET
+            league_name                  = EXCLUDED.league_name,
+            league_type                  = EXCLUDED.league_type,
+            country_name                 = EXCLUDED.country_name,
+            season_start                 = EXCLUDED.season_start,
+            season_end                   = EXCLUDED.season_end,
+            season_current               = EXCLUDED.season_current,
+            coverage_standings           = EXCLUDED.coverage_standings,
+            coverage_events              = EXCLUDED.coverage_events,
+            coverage_lineups             = EXCLUDED.coverage_lineups,
+            coverage_statistics_fixtures = EXCLUDED.coverage_statistics_fixtures,
+            coverage_players             = EXCLUDED.coverage_players,
+            has_standings                = EXCLUDED.has_standings,
+            standings_rows               = EXCLUDED.standings_rows,
+            has_groups                   = EXCLUDED.has_groups,
+            groups_count                 = EXCLUDED.groups_count,
+            has_rounds                   = EXCLUDED.has_rounds,
+            rounds_count                 = EXCLUDED.rounds_count,
+            has_knockout_rounds          = EXCLUDED.has_knockout_rounds,
+            format_hint                  = EXCLUDED.format_hint,
+            updated_utc                  = EXCLUDED.updated_utc
+        """,
+        (
+            int(league_id),
+            int(season),
+            safe_text(league_obj.get("name")),
+            league_type,
+            safe_text(country_obj.get("name")),
+            safe_text(season_obj.get("start")),
+            safe_text(season_obj.get("end")),
+            _bool_to_int(season_obj.get("current")),
+            _bool_to_int(cov.get("standings")),
+            _bool_to_int(fixtures_cov.get("events")),
+            _bool_to_int(fixtures_cov.get("lineups")),
+            _bool_to_int(fixtures_cov.get("statistics_fixtures")),
+            _bool_to_int(cov.get("players")),
+            int(has_standings),
+            int(len(rows)),
+            int(has_groups),
+            int(len(groups)),
+            int(has_rounds),
+            int(len(rounds)),
+            int(has_knockout_rounds),
+            format_hint,
+            updated_utc,
+        ),
+    )
+
+    return {
+        "has_standings": has_standings,
+        "groups_count": len(groups),
+        "rounds_count": len(rounds),
+        "has_knockout_rounds": has_knockout_rounds,
+        "format_hint": format_hint,
+    }
+
+
+def sync_competition_reference_from_api(
+    league_id: int,
+    season: int,
+    fetched_at: dt.datetime,
+    *,
+    league_meta_bundle: Dict[str, Any],
+    standings_bundle: Dict[str, Any],
+    rounds_bundle: Dict[str, Any],
+) -> Dict[str, Any]:
+    upsert_competition_api_raw(league_id, season, "leagues", (league_meta_bundle or {}).get("raw") or {}, fetched_at)
+    upsert_competition_api_raw(league_id, season, "standings", (standings_bundle or {}).get("raw") or {}, fetched_at)
+    upsert_competition_api_raw(league_id, season, "fixtures_rounds", (rounds_bundle or {}).get("raw") or {}, fetched_at)
+
+    groups = (standings_bundle or {}).get("groups") or []
+    rounds = (rounds_bundle or {}).get("rounds") or []
+
+    replace_rounds_for_league_season(league_id, season, rounds)
+    replace_standings_group_meta(league_id, season, groups, fetched_at)
+    replace_competition_rounds_meta(league_id, season, rounds, fetched_at)
+
+    return upsert_competition_season_meta(
+        league_id,
+        season,
+        league_meta_bundle,
+        standings_bundle,
+        rounds_bundle,
+        fetched_at,
+    )
 
 def enqueue_ft_trigger(fixture_id: int, league_id: int, season: int, finished_iso_utc: Optional[str] = None) -> None:
     fin = finished_iso_utc or _iso_utc_now()
@@ -857,10 +1525,10 @@ def enqueue_ft_trigger(fixture_id: int, league_id: int, season: int, finished_is
         INSERT INTO ft_triggers (
             fixture_id, league_id, season,
             finished_utc,
-            standings_consumed_utc, bracket_consumed_utc,
+            standings_consumed_utc,
             created_utc, updated_utc
         )
-        VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s)
+        VALUES (%s,%s,%s,%s,NULL,%s,%s)
         ON CONFLICT (fixture_id) DO UPDATE SET
             league_id    = EXCLUDED.league_id,
             season       = EXCLUDED.season,
@@ -1604,6 +2272,7 @@ def main() -> None:
     # ✅ live 워커 구조와 동일하게 FT 트리거 테이블 보장
     try:
         ensure_ft_triggers_table()
+        ensure_competition_structure_tables()
     except Exception:
         pass
 
@@ -1623,12 +2292,20 @@ def main() -> None:
     target_dates = get_target_dates()  # 시즌 모드가 아니면 기존대로 날짜 모드 사용
 
     only_standings = get_only_standings()  # A안
+    only_fixtures = get_only_fixtures()  # C안
     standings_from_db = get_standings_from_db_source()  # B안: fixtures|matches|ft_triggers|standings
 
     live_leagues = parse_live_leagues(os.environ.get("LIVE_LEAGUES", ""))
 
     force = (os.environ.get("FORCE_BACKFILL") or "").strip().lower() in ("1", "true", "yes", "y")
     today_str = now_utc().strftime("%Y-%m-%d")
+
+    if only_fixtures and only_standings:
+        print(
+            "[WARN] ONLY_FIXTURES 와 ONLY_STANDINGS 가 동시에 설정되었습니다. "
+            "ONLY_FIXTURES 모드를 우선 적용합니다.",
+            file=sys.stderr,
+        )
 
     # ✅ B안이면 LIVE_LEAGUES 없어도 실행 가능(DB 기준으로 대상 만들기)
     #    단, LIVE_LEAGUES가 있으면 "지원 리그 필터"로 교집합 적용.
@@ -1637,13 +2314,130 @@ def main() -> None:
     if target_season is not None:
         print(
             f"[postmatch_backfill] season_mode season={target_season}, today={today_str}, "
-            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, standings_from_db={standings_from_db}"
+            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, "
+            f"only_fixtures={only_fixtures}, standings_from_db={standings_from_db}"
         )
     else:
         print(
             f"[postmatch_backfill] dates={target_dates}, today={today_str}, "
-            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, standings_from_db={standings_from_db}"
+            f"leagues={live_leagues}, force={force}, only_standings={only_standings}, "
+            f"only_fixtures={only_fixtures}, standings_from_db={standings_from_db}"
         )
+
+    # ─────────────────────────────────────
+    #  ✅ C안: fixtures/matches/raw 만 채우는 가벼운 모드
+    #  - 목적: league_round 같은 fixture 레벨 정보만 다시 채우기
+    #  - /fixtures 응답만 사용
+    #  - events/lineups/stats/players/standings 는 건드리지 않음
+    # ─────────────────────────────────────
+    if only_fixtures:
+        if not live_leagues:
+            print(
+                "[postmatch_backfill] ONLY_FIXTURES 모드인데 LIVE_LEAGUES가 비어있습니다. 종료.",
+                file=sys.stderr,
+            )
+            return
+
+        total_synced = 0
+        seen_team_ids: set[int] = set()
+        seen_league_ids: set[int] = set()
+
+        # ✅ 시즌 모드: league + season 전체 fixtures만 재동기화
+        if target_season is not None:
+            for lid in live_leagues:
+                try:
+                    fixtures = fetch_fixtures_for_season(int(lid), int(target_season))
+                    print(f"  - only_fixtures season={target_season} league {lid}: fixtures={len(fixtures)}")
+
+                    for fx in fixtures:
+                        basic = _extract_fixture_basic(fx)
+                        if basic is None:
+                            continue
+
+                        fixture_id = basic["fixture_id"]
+                        season = basic.get("season") or int(target_season)
+                        if season is None:
+                            continue
+
+                        if basic.get("league_id") is not None:
+                            seen_league_ids.add(int(basic["league_id"]))
+                        else:
+                            seen_league_ids.add(int(lid))
+
+                        if basic.get("home_id") is not None:
+                            seen_team_ids.add(int(basic["home_id"]))
+                        if basic.get("away_id") is not None:
+                            seen_team_ids.add(int(basic["away_id"]))
+
+                        try:
+                            upsert_match_fixtures_raw(fixture_id, fx, now_utc())
+                        except Exception as raw_e:
+                            print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+
+                        upsert_fixture_row(fx, int(lid), int(season))
+                        upsert_match_row(fx, int(lid), int(season))
+                        total_synced += 1
+
+                except Exception as e:
+                    print(f"  ! only_fixtures season={target_season} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+        # ✅ 날짜 모드: 기존 날짜 범위의 fixtures만 재동기화
+        else:
+            for target_date in target_dates:
+                for lid in live_leagues:
+                    try:
+                        season_guess = pick_season_for_date(int(lid), target_date)
+                        fixtures = fetch_fixtures_from_api(int(lid), target_date, season_guess)
+
+                        print(
+                            f"  - only_fixtures date={target_date} league {lid}: "
+                            f"season_guess={season_guess} fixtures={len(fixtures)}"
+                        )
+
+                        for fx in fixtures:
+                            basic = _extract_fixture_basic(fx)
+                            if basic is None:
+                                continue
+
+                            fixture_id = basic["fixture_id"]
+                            season = basic.get("season") or season_guess
+                            if season is None:
+                                continue
+
+                            if basic.get("league_id") is not None:
+                                seen_league_ids.add(int(basic["league_id"]))
+                            else:
+                                seen_league_ids.add(int(lid))
+
+                            if basic.get("home_id") is not None:
+                                seen_team_ids.add(int(basic["home_id"]))
+                            if basic.get("away_id") is not None:
+                                seen_team_ids.add(int(basic["away_id"]))
+
+                            try:
+                                upsert_match_fixtures_raw(fixture_id, fx, now_utc())
+                            except Exception as raw_e:
+                                print(f"    ! fixture {fixture_id}: match_fixtures_raw 저장 실패: {raw_e}", file=sys.stderr)
+
+                            upsert_fixture_row(fx, int(lid), int(season))
+                            upsert_match_row(fx, int(lid), int(season))
+                            total_synced += 1
+
+                    except Exception as e:
+                        print(f"  ! only_fixtures date={target_date} league {lid} 처리 중 에러: {e}", file=sys.stderr)
+
+        # ✅ meta backfill (teams/leagues)
+        try:
+            if seen_league_ids:
+                backfill_leagues_meta(sorted(seen_league_ids))
+            if seen_team_ids:
+                backfill_teams_meta(sorted(seen_team_ids))
+                backfill_teams_meta_single(sorted(seen_team_ids))
+        except Exception as me:
+            print(f"[meta] backfill failed: {me}", file=sys.stderr)
+
+        print(f"[postmatch_backfill] ONLY_FIXTURES 완료. synced={total_synced}")
+        return
 
     # ─────────────────────────────────────
     #  ✅ A안: standings만 채우기 (fixtures/events/... DB 오염 방지)
@@ -1743,24 +2537,45 @@ def main() -> None:
             if skey in fetched_standings_keys:
                 continue
 
-            need_st = force or (not has_standings(int(lid), int(sy)))
-            if not need_st:
-                fetched_standings_keys.add(skey)
-                skip += 1
-                continue
-
             try:
-                st_rows = fetch_standings_from_api(int(lid), int(sy))
-                if st_rows:
+                fetched_at = now_utc()
+
+                league_meta_bundle = fetch_league_season_meta_from_api(int(lid), int(sy))
+                standings_bundle = fetch_standings_bundle_from_api(int(lid), int(sy))
+                rounds_bundle = fetch_rounds_from_api(int(lid), int(sy))
+
+                sync_info = sync_competition_reference_from_api(
+                    int(lid),
+                    int(sy),
+                    fetched_at,
+                    league_meta_bundle=league_meta_bundle,
+                    standings_bundle=standings_bundle,
+                    rounds_bundle=rounds_bundle,
+                )
+
+                st_rows = standings_bundle.get("rows") or []
+                rounds_list = rounds_bundle.get("rounds") or []
+
+                need_st = force or (not has_standings(int(lid), int(sy)))
+                if st_rows and need_st:
                     upsert_standings_rows(int(lid), int(sy), st_rows)
                     ok += 1
-                    print(f"    * standings league={lid} season={sy}: rows={len(st_rows)}")
-                    seen_league_ids.add(int(lid))
-                    seen_team_ids |= _collect_team_ids_from_standings(st_rows)
-                else:
+                elif not st_rows:
                     print(f"    ! standings league={lid} season={sy}: empty response", file=sys.stderr)
+                else:
+                    skip += 1
+
+                print(
+                    f"    * competition_sync league={lid} season={sy}: "
+                    f"standings_rows={len(st_rows)} rounds={len(rounds_list)} "
+                    f"format={sync_info.get('format_hint')}"
+                )
+
+                seen_league_ids.add(int(lid))
+                seen_team_ids |= _collect_team_ids_from_standings(st_rows)
+
             except Exception as se:
-                print(f"    ! standings league={lid} season={sy} 에러: {se}", file=sys.stderr)
+                print(f"    ! standings/meta league={lid} season={sy} 에러: {se}", file=sys.stderr)
             finally:
                 fetched_standings_keys.add(skey)
 
@@ -1799,20 +2614,45 @@ def main() -> None:
     if target_season is not None:
         for lid in live_leagues:
             try:
-                # standings (league+season)
+                # standings / leagues / rounds raw + meta (league+season)
                 skey = (int(lid), int(target_season))
-                need_st = force or (not has_standings(int(lid), int(target_season)))
-                if need_st and skey not in fetched_standings_keys:
+                if skey not in fetched_standings_keys:
                     try:
-                        st_rows = fetch_standings_from_api(int(lid), int(target_season))
-                        if st_rows:
+                        fetched_at = now_utc()
+
+                        league_meta_bundle = fetch_league_season_meta_from_api(int(lid), int(target_season))
+                        standings_bundle = fetch_standings_bundle_from_api(int(lid), int(target_season))
+                        rounds_bundle = fetch_rounds_from_api(int(lid), int(target_season))
+
+                        sync_info = sync_competition_reference_from_api(
+                            int(lid),
+                            int(target_season),
+                            fetched_at,
+                            league_meta_bundle=league_meta_bundle,
+                            standings_bundle=standings_bundle,
+                            rounds_bundle=rounds_bundle,
+                        )
+
+                        st_rows = standings_bundle.get("rows") or []
+                        rounds_list = rounds_bundle.get("rounds") or []
+
+                        need_st = force or (not has_standings(int(lid), int(target_season)))
+                        if st_rows and need_st:
                             upsert_standings_rows(int(lid), int(target_season), st_rows)
-                            fetched_standings_keys.add(skey)
-                            print(f"    * standings league={lid} season={target_season}: rows={len(st_rows)}")
-                        else:
-                            print(f"    ! standings league={lid} season={target_season}: empty response", file=sys.stderr)
+
+                        print(
+                            f"    * competition_sync league={lid} season={target_season}: "
+                            f"standings_rows={len(st_rows)} rounds={len(rounds_list)} "
+                            f"format={sync_info.get('format_hint')}"
+                        )
+
+                        seen_league_ids.add(int(lid))
+                        seen_team_ids |= _collect_team_ids_from_standings(st_rows)
+
                     except Exception as se:
-                        print(f"    ! standings league={lid} season={target_season} 에러: {se}", file=sys.stderr)
+                        print(f"    ! standings/meta league={lid} season={target_season} 에러: {se}", file=sys.stderr)
+                    finally:
+                        fetched_standings_keys.add(skey)
 
                 fixtures = fetch_fixtures_for_season(int(lid), int(target_season))
                 print(f"  - season={target_season} league {lid}: fixtures={len(fixtures)}")
@@ -1851,7 +2691,7 @@ def main() -> None:
                     if sg != "FINISHED":
                         continue
 
-                    # ✅ 브라켓/스탠딩 워커 동일화용: FT 트리거 기록
+                    # ✅ standings 후속 처리용: FT 트리거 기록
                     try:
                         enqueue_ft_trigger(fixture_id, int(lid), int(season))
                     except Exception:
@@ -1967,30 +2807,56 @@ def main() -> None:
                 else:
                     season_primary = int(season_guess) if season_guess is not None else None
 
-                # standings fetch (league+season) — primary만 시도(오염 방지)
+                # standings / leagues / rounds raw + meta (league+season) — primary만 시도(오염 방지)
                 if season_primary is not None:
                     skey = (int(lid), int(season_primary))
 
                     if skey not in fetched_standings_keys:
-                        need_st = force or (not has_standings(int(lid), int(season_primary)))
-                        if need_st:
-                            try:
-                                st_rows = fetch_standings_from_api(int(lid), int(season_primary))
-                                if st_rows:
-                                    upsert_standings_rows(int(lid), int(season_primary), st_rows)
-                                    print(f"    * standings league={lid} season={season_primary}: rows={len(st_rows)}")
-                                else:
-                                    print(
-                                        f"    ! standings league={lid} season={season_primary}: empty response",
-                                        file=sys.stderr,
-                                    )
-                            except Exception as se:
+                        try:
+                            fetched_at = now_utc()
+
+                            league_meta_bundle = fetch_league_season_meta_from_api(int(lid), int(season_primary))
+                            standings_bundle = fetch_standings_bundle_from_api(int(lid), int(season_primary))
+                            rounds_bundle = fetch_rounds_from_api(int(lid), int(season_primary))
+
+                            sync_info = sync_competition_reference_from_api(
+                                int(lid),
+                                int(season_primary),
+                                fetched_at,
+                                league_meta_bundle=league_meta_bundle,
+                                standings_bundle=standings_bundle,
+                                rounds_bundle=rounds_bundle,
+                            )
+
+                            st_rows = standings_bundle.get("rows") or []
+                            rounds_list = rounds_bundle.get("rounds") or []
+
+                            need_st = force or (not has_standings(int(lid), int(season_primary)))
+                            if st_rows and need_st:
+                                upsert_standings_rows(int(lid), int(season_primary), st_rows)
+                            elif not st_rows:
                                 print(
-                                    f"    ! standings league={lid} season={season_primary} 에러: {se}",
+                                    f"    ! standings league={lid} season={season_primary}: empty response",
                                     file=sys.stderr,
                                 )
-                        # ✅ 성공/실패와 무관하게 '이번 실행에서 더 이상 같은 키로 과호출' 방지
-                        fetched_standings_keys.add(skey)
+
+                            print(
+                                f"    * competition_sync league={lid} season={season_primary}: "
+                                f"standings_rows={len(st_rows)} rounds={len(rounds_list)} "
+                                f"format={sync_info.get('format_hint')}"
+                            )
+
+                            seen_league_ids.add(int(lid))
+                            seen_team_ids |= _collect_team_ids_from_standings(st_rows)
+
+                        except Exception as se:
+                            print(
+                                f"    ! standings/meta league={lid} season={season_primary} 에러: {se}",
+                                file=sys.stderr,
+                            )
+                        finally:
+                            # ✅ 성공/실패와 무관하게 '이번 실행에서 더 이상 같은 키로 과호출' 방지
+                            fetched_standings_keys.add(skey)
 
                 for fx in fixtures:
                     basic = _extract_fixture_basic(fx)
@@ -2027,7 +2893,7 @@ def main() -> None:
                     if sg != "FINISHED":
                         continue
 
-                    # ✅ 브라켓/스탠딩 워커 동일화용: FT 트리거 기록
+                    # ✅ standings 후속 처리용: FT 트리거 기록
                     try:
                         enqueue_ft_trigger(fixture_id, int(lid), int(season))
                     except Exception:
