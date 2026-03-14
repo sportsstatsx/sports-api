@@ -944,6 +944,7 @@ def build_standings_block(
     )
 
     stage_round_options: List[str] = []
+    selected_table_stage_label: Optional[str] = None
 
     is_bracket_candidate = format_hint in {
         "knockout_only",
@@ -1037,6 +1038,9 @@ def build_standings_block(
                 selected_round_label = stage_round_options[0]
                 if table_stage_label and selected_round_label.strip().lower() == table_stage_label.strip().lower():
                     selected_is_table_stage = True
+
+            if selected_is_table_stage and selected_round_label:
+                selected_table_stage_label = selected_round_label
 
             if not selected_is_table_stage and selected_round_label:
                 def _match_is_finished(m: Dict[str, Any]) -> bool:
@@ -1470,7 +1474,7 @@ def build_standings_block(
             "rows": [],
             "bracket": None,
             "bracket_round_options": stage_round_options,
-            "selected_bracket_round": table_stage_label if stage_round_options else None,
+            "selected_bracket_round": selected_table_stage_label,
             "context_options": {"conferences": [], "groups": []},
             "message": message,
             "source": source_name,
@@ -1491,7 +1495,7 @@ def build_standings_block(
             "rows": [],
             "bracket": None,
             "bracket_round_options": stage_round_options,
-            "selected_bracket_round": table_stage_label if stage_round_options else None,
+            "selected_bracket_round": selected_table_stage_label,
             "context_options": {"conferences": [], "groups": []},
             "message": "Standings are not available for this competition stage.\nPlease check back later.",
             "source": "league_cup_heuristic_block",
@@ -1532,7 +1536,7 @@ def build_standings_block(
                 "rows": [],
                 "bracket": None,
                 "bracket_round_options": stage_round_options,
-                "selected_bracket_round": table_stage_label if stage_round_options else None,
+                "selected_bracket_round": selected_table_stage_label,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
                 "source": source,
@@ -1577,7 +1581,7 @@ def build_standings_block(
                 "rows": [],
                 "bracket": None,
                 "bracket_round_options": stage_round_options,
-                "selected_bracket_round": table_stage_label if stage_round_options else None,
+                "selected_bracket_round": selected_table_stage_label,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
                 "source": source,
@@ -1693,7 +1697,7 @@ def build_standings_block(
                 "rows": [],
                 "bracket": None,
                 "bracket_round_options": stage_round_options,
-                "selected_bracket_round": table_stage_label if stage_round_options else None,
+                "selected_bracket_round": selected_table_stage_label,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
                 "source": source,
@@ -1721,7 +1725,7 @@ def build_standings_block(
                 "rows": [],
                 "bracket": None,
                 "bracket_round_options": stage_round_options,
-                "selected_bracket_round": table_stage_label if stage_round_options else None,
+                "selected_bracket_round": selected_table_stage_label,
                 "context_options": {"conferences": [], "groups": []},
                 "message": "Standings are not available yet.\nPlease check back later.",
                 "source": "standings_table",
@@ -1889,7 +1893,7 @@ def build_standings_block(
         "mode": "TABLE",
         "bracket": None,
         "bracket_round_options": stage_round_options,
-        "selected_bracket_round": table_stage_label if stage_round_options else None,
+        "selected_bracket_round": selected_table_stage_label,
         "source": source,
     }
 
