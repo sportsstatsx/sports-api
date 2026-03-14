@@ -98,7 +98,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                   AND season = %s
                   AND NOT (
                     lower(coalesce(status_group,'')) = 'finished'
-                    OR coalesce(status,'') IN ('FT','AET','PEN')
+                    OR coalesce(status,'') IN ('FT','AET','PEN','CANC','ABD','AWD','WO')
                   )
                 """,
                 (league_id, season_value),
@@ -115,7 +115,7 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 WHERE league_id = %s
                   AND season = %s
                   AND NOT (
-                    coalesce(status,'') IN ('FT','AET','PEN')
+                    coalesce(status,'') IN ('FT','AET','PEN','CANC','ABD','AWD','WO')
                   )
                 """,
                 (league_id, season_value),
