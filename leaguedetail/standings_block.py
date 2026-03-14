@@ -260,24 +260,29 @@ def _effective_group_name(
     raw_group_name: Any,
     description: Any,
 ) -> Optional[str]:
+    """
+    rows의 raw group_name을 최대한 그대로 유지한다.
+
+    원칙:
+    - DB에 이미 의미 있는 group_name이 있으면 그대로 사용
+      예: Group A, East/West, Championship Round, Relegation Round,
+          Bundesliga: Regular Season
+    - group_name이 비어 있거나 정말 의미 없는 경우에만
+      description 기반으로 Championship/Relegation 보정
+    """
     g = raw_group_name.strip() if isinstance(raw_group_name, str) else ""
     d = description.strip().lower() if isinstance(description, str) else ""
 
     gl = g.lower()
     if gl:
-        if ("champ" in gl and "round" in gl) or ("releg" in gl and "round" in gl):
-            return g
-        if gl.startswith("group "):
-            return g
-        if "east" in gl or "west" in gl:
-            return g
+        return g
 
     if "champ" in d and "round" in d:
         return "Championship Round"
     if "releg" in d and "round" in d:
         return "Relegation Round"
 
-    return g if g else None
+    return None
 
 
 def _build_context_options_from_rows(
@@ -1769,12 +1774,7 @@ def build_standings_block(
         tid = _coalesce_int(r.get("team_id"), 0)
         if tid == 0:
             continue
-        gkey = _norm_group(
-            _effective_group_name(
-                raw_group_name=r.get("group_name"),
-                description=r.get("description"),
-            )
-        )
+        gkey = _norm_group(r.get("group_name"))
         key = (tid, gkey)
 
         prev = rows_by_key.get(key)
@@ -1822,16 +1822,7 @@ def build_standings_block(
             }
         )
 
-    context_rows: List[Dict[str, Any]] = []
-    for r in dedup_rows:
-        rr = dict(r)
-        rr["group_name"] = _effective_group_name(
-            raw_group_name=r.get("group_name"),
-            description=r.get("description"),
-        )
-        context_rows.append(rr)
-
-    context_options = _build_context_options_from_rows(context_rows)
+    context_options = _build_context_options_from_rows(dedup_rows)
 
     try:
         meta_group_names = _get_group_meta_names(league_id, season_resolved)
