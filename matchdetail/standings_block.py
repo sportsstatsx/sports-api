@@ -1079,6 +1079,7 @@ Match Detail용 Standings 블록 (TABLE 전용)
             is_bracket_candidate = True
 
     stage_round_options: List[str] = []
+    selected_table_stage_label: Optional[str] = None
 
     if is_bracket_candidate or table_stage_label:
         try:
@@ -1182,6 +1183,9 @@ Match Detail용 Standings 블록 (TABLE 전용)
                 selected_round_label = stage_round_options[0]
                 if table_stage_label and selected_round_label.strip().lower() == table_stage_label.strip().lower():
                     selected_is_table_stage = True
+
+            if selected_is_table_stage and selected_round_label:
+                selected_table_stage_label = selected_round_label
 
             if not selected_is_table_stage and selected_round_label:
                 def _match_is_finished(m: Dict[str, Any]) -> bool:
@@ -2008,8 +2012,8 @@ Match Detail용 Standings 블록 (TABLE 전용)
         "mode": "TABLE",
         "rows": table,
         "bracket": None,
-        "bracket_round_options": [],
-        "selected_bracket_round": None,
+        "bracket_round_options": stage_round_options,
+        "selected_bracket_round": selected_table_stage_label,
         "context_options": context_options,
         "source": source,
     }
