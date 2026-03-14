@@ -31,17 +31,24 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
     }
 
     # ② 플레이오프 우승 = 챔피언
+    # ✅ 실제로 "최종 챔피언"이 플레이오프/그랜드파이널 우승팀인 리그만 포함
     PLAYOFFS_CHAMPION = {
         188, 253,
         190, 254,  # A-League Women, NWSL Women
     }
 
     # ③ 정규시즌 챔프 + 플레이오프 챔프 (2개 존재)
-    REGULAR_AND_PLAYOFFS = {218, 144, 345, 119, 292}
+    # ✅ 현재 지원 라이브리그 기준에서는 없음
+    REGULAR_AND_PLAYOFFS = set()
 
-    # ④ 플레이오프/스플릿이 있어도 “챔피언은 정규시즌 1위”
-    # (너가 준 분류 기준)
-    PLAYOFFS_BUT_REGULAR_IS_CHAMPION = {179}
+    # ④ 플레이오프/스플릿이 있어도 “최종 챔피언은 standings 계열에서 결정”
+    # - Scotland Premiership: split only
+    # - Austria/Belgium/Czech/Denmark/K League 1: split + conference/europe/relegation playoff는 있어도
+    #   그 playoff winner가 리그 챔피언은 아님
+    PLAYOFFS_BUT_REGULAR_IS_CHAMPION = {
+        179,
+        218, 144, 345, 119, 292,
+    }
 
     # ⑤ 토너먼트 (정규시즌 개념 없음) = 최종 우승
     KNOCKOUT_TOURNAMENT = {
@@ -147,16 +154,31 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
         return str(v or "").strip().lower()
 
     def _candidate_bucket(group_name: str, description: str) -> str:
-        x = f"{group_name} {description}".strip().lower()
+        g = str(group_name or "").strip().lower()
+        d = str(description or "").strip().lower()
+        x = f"{g} {d}".strip()
 
         if "releg" in x:
             return "relegation"
 
+        # ✅ group_name 기반 split/final stage
+        # 예: Championship Round, Championship Group, Playoff Round
         if (
-            "champ" in x
-            or "championship" in x
-            or "playoff" in x
-            or "play-off" in x
+            "championship round" in g
+            or "championship group" in g
+            or "playoff" in g
+            or "play-off" in g
+        ):
+            return "playoff"
+
+        # ✅ description 은 "Champions League" 같은 진출권 문구가 많아서
+        #    generic "champ" 매칭을 하면 EPL 1위 같은 것도 잘못 playoff로 분류됨
+        #    따라서 round/stage 성격이 명확할 때만 playoff 취급
+        if (
+            "championship round" in d
+            or "championship group" in d
+            or "playoff" in d
+            or "play-off" in d
         ):
             return "playoff"
 
@@ -465,9 +487,13 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
             candidates_by_season.setdefault(s_int, []).append(r)
 
         for s_int, items in candidates_by_season.items():
+            # ✅ 최종 챔피언용 standings 후보:
+            # - split 리그에서는 Championship Round 1위를 우선
+            # - 없으면 Regular / Overall / 일반 단일테이블 1위
+            # - Relegation 은 제외
             regular_best = _pick_best_candidate(
                 items,
-                ["regular", "general", "playoff"],
+                ["playoff", "regular", "general"],
             )
             if regular_best:
                 standings_regular_map[s_int] = {
@@ -480,10 +506,13 @@ def build_seasons_block(league_id: int) -> Dict[str, Any]:
                 }
 
             playoff_best = _pick_best_candidate(
-                [r for r in items if _candidate_bucket(
-                    str(r.get("group_name") or ""),
-                    str(r.get("description") or ""),
-                ) == "playoff"],
+                [
+                    r for r in items
+                    if _candidate_bucket(
+                        str(r.get("group_name") or ""),
+                        str(r.get("description") or ""),
+                    ) == "playoff"
+                ],
                 ["playoff"],
             )
             if playoff_best:
