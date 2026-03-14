@@ -115,7 +115,7 @@ def main() -> None:
 
     # 전날 09:00 ~ +7일 09:00
     start_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) - dt.timedelta(days=1)
-    end_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) + dt.timedelta(days=7)
+    end_kst = now_kst.replace(hour=9, minute=0, second=0, microsecond=0) + dt.timedelta(days=30)
 
     dates = _date_range_kst(start_kst, end_kst)
     print(f"[schedule_sync] leagues={leagues}")
