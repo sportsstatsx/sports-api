@@ -870,23 +870,6 @@ def _norm_lower(v: Any) -> str:
         return ""
 
 
-def _infer_group_kind(group_name: Optional[str]) -> str:
-    g = _norm_lower(group_name)
-    if not g or g == "overall":
-        return "overall"
-    if "league stage" in g:
-        return "league_phase"
-    if "regular season" in g:
-        return "regular_season"
-    if "championship round" in g:
-        return "championship_round"
-    if "relegation round" in g:
-        return "relegation_round"
-    if "eastern conference" in g or g.startswith("east"):
-        return "conference_east"
-    if "western conference" in g or g.startswith("west"):
-        return "conference_west"
-    return "group"
 
 
 def _infer_round_kind(round_name: Optional[str]) -> str:
@@ -1085,27 +1068,24 @@ def replace_standings_group_meta(
     for idx, grp in enumerate(groups or [], start=1):
         group_name = (safe_text(grp.get("group_name")) or f"Group {idx}").strip()
         group_rows = grp.get("rows") or []
-        group_kind = _infer_group_kind(group_name)
+        group_order = safe_int(grp.get("group_order")) or idx
+
         prepared.append(
             {
                 "group_name": group_name,
-                "group_order": idx,
-                "group_kind": group_kind,
+                "group_order": group_order,
+                "group_kind": None,
+                "is_primary": 0,
                 "table_rows": len(group_rows),
                 "description_summary": _group_description_summary(group_rows),
                 "raw_json": _json_compact(group_rows),
             }
         )
 
-    has_primary = any(x["group_kind"] in ("overall", "regular_season", "league_phase") for x in prepared)
     updated_utc = iso_utc(updated_at)
 
     n = 0
-    for idx, item in enumerate(prepared, start=1):
-        is_primary = 1 if item["group_kind"] in ("overall", "regular_season", "league_phase") else 0
-        if not has_primary and idx == 1:
-            is_primary = 1
-
+    for item in prepared:
         execute(
             """
             INSERT INTO standings_group_meta (
@@ -1120,7 +1100,7 @@ def replace_standings_group_meta(
                 item["group_name"],
                 int(item["group_order"]),
                 item["group_kind"],
-                int(is_primary),
+                int(item["is_primary"]),
                 int(item["table_rows"]),
                 item["description_summary"],
                 item["raw_json"],
