@@ -1,4 +1,4 @@
-# postmatch_backfill.py
+# src/football/workers/postmatch_backfill.py
 #
 # 역할:
 # - 특정 날짜(date=YYYY-MM-DD)의 FINISHED 경기들에 대해 "한 번만" 무거운 데이터 전체 백필
