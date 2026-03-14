@@ -12,6 +12,8 @@ import sys
 import datetime as dt
 from typing import Any, Dict, List, Optional, Set
 
+print("[schedule_sync] module import start", flush=True)
+
 # 기존 postmatch_backfill의 함수 재사용
 from football.workers.postmatch_backfill import (
     fetch_fixtures_from_api,
@@ -25,6 +27,8 @@ from football.workers.postmatch_backfill import (
     _upsert_team_from_api,
     parse_live_leagues,
 )
+
+print("[schedule_sync] module import done", flush=True)
 
 # 레이스 방지 정책 공유
 os.environ.setdefault("LIVE_WORKER_ROLE", "backfill")
@@ -105,9 +109,13 @@ def _backfill_missing_teams_single(ids: Set[int]) -> None:
 
 
 def main() -> None:
+    print("[schedule_sync] main enter", flush=True)
+
     leagues = _get_schedule_leagues()
+    print(f"[schedule_sync] leagues parsed count={len(leagues)}", flush=True)
+
     if not leagues:
-        print("[schedule_sync] no leagues (set SCHEDULE_LEAGUES or LIVE_LEAGUES)", file=sys.stderr)
+        print("[schedule_sync] no leagues (set SCHEDULE_LEAGUES or LIVE_LEAGUES)", file=sys.stderr, flush=True)
         return
 
     # 실행 기준 시간(보통 KST 09:00 크론)
@@ -241,7 +249,7 @@ def main() -> None:
     try:
         _backfill_missing_teams_single(seen_team_ids)
     except Exception as e:
-        print(f"[schedule_sync][meta] failed: {e}", file=sys.stderr)
+        print(f"[schedule_sync][meta] failed: {e}", file=sys.stderr, flush=True)
 
     print(
         f"[schedule_sync] done total_fixtures_seen={total_fixtures} total_upserts={total_upserts}",
@@ -258,4 +266,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    print("[schedule_sync] __main__ start", flush=True)
     main()
