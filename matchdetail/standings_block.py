@@ -366,6 +366,63 @@ def _parse_utc_dt(s: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _fetch_pair_round_matches(
+    *,
+    league_id: int,
+    season: int,
+    round_label: str,
+    team_a_id: int,
+    team_b_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    같은 league/season/round 안에서 동일 팀쌍(홈/원정 뒤바뀜 포함)의 경기들을
+    날짜순으로 다시 조회한다.
+
+    목적:
+    - 현재 round_matches 묶음 외에도 DB에 이미 들어와 있는 2차전(NS 포함)이 있으면
+      two-leg tie 로 판정하기 위함
+    """
+    if not round_label or team_a_id <= 0 or team_b_id <= 0:
+        return []
+
+    try:
+        rows = fetch_all(
+            """
+            SELECT
+                m.fixture_id,
+                m.league_round,
+                m.date_utc,
+                m.home_id,
+                m.away_id,
+                m.home_ft,
+                m.away_ft,
+                m.status,
+                m.status_group,
+                th.name AS home_name,
+                ta.name AS away_name,
+                th.logo AS home_logo,
+                ta.logo AS away_logo
+            FROM matches m
+            LEFT JOIN teams th ON th.id = m.home_id
+            LEFT JOIN teams ta ON ta.id = m.away_id
+            WHERE m.league_id = %s
+              AND m.season = %s
+              AND m.league_round = %s
+              AND (
+                    (m.home_id = %s AND m.away_id = %s)
+                 OR (m.home_id = %s AND m.away_id = %s)
+              )
+            ORDER BY
+                m.date_utc ASC,
+                m.fixture_id ASC
+            """,
+            (league_id, season, round_label, team_a_id, team_b_id, team_b_id, team_a_id),
+        )
+        return rows or []
+    except Exception:
+        return []
+
+
 def _is_knockout_round_name(round_name: Any) -> bool:
     if not isinstance(round_name, str):
         return False
@@ -937,114 +994,182 @@ Match Detail용 Standings 블록 (TABLE 전용)
                         if h > 0 and a > 0:
                             grouped.setdefault(_unordered_pair_key(m), []).append(m)
 
-                    ties: List[Dict[str, Any]] = []
-                    used_fixture_ids: set[int] = set()
-                    order_hint = 1
-
-                    for _, pair_matches in grouped.items():
-                        pair_matches = sorted(
-                            pair_matches,
+                    def _sort_matches(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                        return sorted(
+                            items,
                             key=lambda x: (
                                 str(x.get("date_utc") or ""),
                                 _coalesce_int(x.get("fixture_id"), 0),
                             ),
                         )
 
-                        # 왕복전 묶음: 동일 두 팀이 정확히 2경기일 때 우선 2leg tie 처리
-                        if len(pair_matches) == 2:
-                            m1 = pair_matches[0]
-                            m2 = pair_matches[1]
+                    def _build_two_leg_tie_from_matches(
+                        pair_items: List[Dict[str, Any]],
+                        order_value: int,
+                    ) -> Optional[Dict[str, Any]]:
+                        pair_items = _sort_matches(pair_items)
+                        if len(pair_items) < 2:
+                            return None
 
-                            used_fixture_ids.add(_coalesce_int(m1.get("fixture_id"), 0))
-                            used_fixture_ids.add(_coalesce_int(m2.get("fixture_id"), 0))
+                        m1 = pair_items[0]
+                        m2 = pair_items[1]
 
-                            leg1 = _leg_payload(m1, 1)
-                            leg2 = _leg_payload(m2, 2)
+                        leg1 = _leg_payload(m1, 1)
+                        leg2 = _leg_payload(m2, 2)
 
-                            home_anchor_id = leg1["home_id"]
-                            away_anchor_id = leg1["away_id"]
+                        home_anchor_id = leg1["home_id"]
+                        away_anchor_id = leg1["away_id"]
 
-                            agg_home: Optional[int] = None
-                            agg_away: Optional[int] = None
+                        agg_home: Optional[int] = None
+                        agg_away: Optional[int] = None
 
-                            if _match_is_finished(m1) and _match_is_finished(m2):
-                                s1h, s1a = _agg_score_for_leg(leg1, m1)
-                                s2h, s2a = _agg_score_for_leg(leg2, m2)
+                        if _match_is_finished(m1) and _match_is_finished(m2):
+                            s1h, s1a = _agg_score_for_leg(leg1, m1)
+                            s2h, s2a = _agg_score_for_leg(leg2, m2)
 
-                                if None not in (s1h, s1a, s2h, s2a):
-                                    h_sum = 0
-                                    a_sum = 0
+                            if None not in (s1h, s1a, s2h, s2a):
+                                h_sum = 0
+                                a_sum = 0
 
-                                    # leg1
-                                    if leg1["home_id"] == home_anchor_id:
-                                        h_sum += int(s1h)
-                                    elif leg1["home_id"] == away_anchor_id:
-                                        a_sum += int(s1h)
+                                # leg1
+                                if leg1["home_id"] == home_anchor_id:
+                                    h_sum += int(s1h)
+                                elif leg1["home_id"] == away_anchor_id:
+                                    a_sum += int(s1h)
 
-                                    if leg1["away_id"] == home_anchor_id:
-                                        h_sum += int(s1a)
-                                    elif leg1["away_id"] == away_anchor_id:
-                                        a_sum += int(s1a)
+                                if leg1["away_id"] == home_anchor_id:
+                                    h_sum += int(s1a)
+                                elif leg1["away_id"] == away_anchor_id:
+                                    a_sum += int(s1a)
 
-                                    # leg2
-                                    if leg2["home_id"] == home_anchor_id:
-                                        h_sum += int(s2h)
-                                    elif leg2["home_id"] == away_anchor_id:
-                                        a_sum += int(s2h)
+                                # leg2
+                                if leg2["home_id"] == home_anchor_id:
+                                    h_sum += int(s2h)
+                                elif leg2["home_id"] == away_anchor_id:
+                                    a_sum += int(s2h)
 
-                                    if leg2["away_id"] == home_anchor_id:
-                                        h_sum += int(s2a)
-                                    elif leg2["away_id"] == away_anchor_id:
-                                        a_sum += int(s2a)
+                                if leg2["away_id"] == home_anchor_id:
+                                    h_sum += int(s2a)
+                                elif leg2["away_id"] == away_anchor_id:
+                                    a_sum += int(s2a)
 
-                                    agg_home = h_sum
-                                    agg_away = a_sum
+                                agg_home = h_sum
+                                agg_away = a_sum
 
-                            winner_team_id, winner_reason = _winner_from_two_leg_tie(
-                                leg1=leg1,
-                                leg2=leg2,
-                                m2=m2,
-                                agg_home=agg_home,
-                                agg_away=agg_away,
-                            )
+                        winner_team_id, winner_reason = _winner_from_two_leg_tie(
+                            leg1=leg1,
+                            leg2=leg2,
+                            m2=m2,
+                            agg_home=agg_home,
+                            agg_away=agg_away,
+                        )
 
-                            ties.append(
-                                {
-                                    "round_label": round_label,
-                                    "order_hint": order_hint,
-                                    "agg_home": agg_home,
-                                    "agg_away": agg_away,
-                                    "winner_team_id": winner_team_id,
-                                    "winner_reason": winner_reason,
-                                    "legs": [leg1, leg2],
-                                }
-                            )
-                            order_hint += 1
+                        legs_completed = 0
+                        if _match_is_finished(m1):
+                            legs_completed += 1
+                        if _match_is_finished(m2):
+                            legs_completed += 1
 
-                    # 나머지 단판 경기
+                        return {
+                            "round_label": round_label,
+                            "order_hint": order_value,
+                            "tie_format": "two_leg",
+                            "legs_expected": 2,
+                            "legs_scheduled": max(2, len(pair_items)),
+                            "legs_completed": legs_completed,
+                            "agg_home": agg_home,
+                            "agg_away": agg_away,
+                            "winner_team_id": winner_team_id,
+                            "winner_reason": winner_reason,
+                            "legs": [leg1, leg2],
+                        }
+
+                    ties: List[Dict[str, Any]] = []
+                    used_fixture_ids: set[int] = set()
+                    order_hint = 1
+
+                    for _, pair_matches in grouped.items():
+                        pair_matches = _sort_matches(pair_matches)
+
+                        sample = pair_matches[0]
+                        team_a_id = _coalesce_int(sample.get("home_id"), 0)
+                        team_b_id = _coalesce_int(sample.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id_int,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches) if scheduled_pair_matches else pair_matches
+
+                        # 원칙:
+                        # - 같은 라운드 / 같은 팀쌍에 2차전 스케줄이 존재하면 two-leg tie
+                        # - two-leg 는 두 경기 모두 finished 되기 전까지 winner_team_id 를 확정하지 않음
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+
+                    # 나머지 경기:
+                    # - reverse fixture(2차전) 스케줄이 있으면 single-leg winner 계산 금지
+                    # - reverse fixture가 없을 때만 single-leg tie 로 간주
                     remaining_matches = [
                         m for m in round_matches
                         if _coalesce_int(m.get("fixture_id"), 0) not in used_fixture_ids
                     ]
 
-                    remaining_matches = sorted(
-                        remaining_matches,
-                        key=lambda x: (
-                            str(x.get("date_utc") or ""),
-                            _coalesce_int(x.get("fixture_id"), 0),
-                        ),
-                    )
+                    remaining_matches = _sort_matches(remaining_matches)
 
                     for m in remaining_matches:
-                        used_fixture_ids.add(_coalesce_int(m.get("fixture_id"), 0))
+                        fixture_id_int = _coalesce_int(m.get("fixture_id"), 0)
+                        if fixture_id_int in used_fixture_ids:
+                            continue
+
+                        team_a_id = _coalesce_int(m.get("home_id"), 0)
+                        team_b_id = _coalesce_int(m.get("away_id"), 0)
+
+                        scheduled_pair_matches = _fetch_pair_round_matches(
+                            league_id=league_id_int,
+                            season=season_resolved,
+                            round_label=round_label,
+                            team_a_id=team_a_id,
+                            team_b_id=team_b_id,
+                        )
+                        scheduled_pair_matches = _sort_matches(scheduled_pair_matches)
+
+                        # 혹시 grouped 단계에서 놓쳤더라도,
+                        # DB 상 같은 팀쌍의 2leg 스케줄이 존재하면 여기서 two-leg 로 강제 보정
+                        if len(scheduled_pair_matches) >= 2:
+                            tie_obj = _build_two_leg_tie_from_matches(scheduled_pair_matches, order_hint)
+                            if tie_obj is not None:
+                                for pm in scheduled_pair_matches[:2]:
+                                    used_fixture_ids.add(_coalesce_int(pm.get("fixture_id"), 0))
+                                ties.append(tie_obj)
+                                order_hint += 1
+                            continue
+
+                        used_fixture_ids.add(fixture_id_int)
 
                         leg = _leg_payload(m, None)
-                        winner_team_id, winner_reason = _winner_from_single_match(m)
+
+                        winner_team_id: Optional[int] = None
+                        winner_reason: Optional[str] = None
+                        if _match_is_finished(m):
+                            winner_team_id, winner_reason = _winner_from_single_match(m)
 
                         ties.append(
                             {
                                 "round_label": round_label,
                                 "order_hint": order_hint,
+                                "tie_format": "single_leg",
+                                "legs_expected": 1,
+                                "legs_scheduled": 1,
+                                "legs_completed": 1 if _match_is_finished(m) else 0,
                                 "agg_home": None,
                                 "agg_away": None,
                                 "winner_team_id": winner_team_id,
