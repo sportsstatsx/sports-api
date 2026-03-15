@@ -5,73 +5,301 @@ from typing import Any, Dict, List, Optional, Tuple
 from db import fetch_all, fetch_one
 from hockey.hockey_db import hockey_fetch_all, hockey_fetch_one
 
-from leaguedetail.seasons_block import resolve_season_for_league
-from hockey.leaguedetail.hockey_seasons_block import resolve_season_for_league as hockey_resolve_season_for_league
+
+# ─────────────────────────────────────────
+# 공통 유틸
+# ─────────────────────────────────────────
+
+def _norm_query(q: str) -> str:
+    return (q or "").strip()
 
 
-MAX_SUGGESTIONS = 100
-MAX_EXPANDED_LEAGUES = 8
+def _norm_lower(q: str) -> str:
+    return _norm_query(q).lower()
 
 
-def _norm_sport(sport: str) -> str:
-    s = (sport or "").strip().lower()
-    return s if s in ("all", "football", "hockey") else "all"
+def _like_prefix(q: str) -> str:
+    return f"{_norm_lower(q)}%"
 
 
-def _coalesce_int(v: Any, default: int = 0) -> int:
+def _like_contains(q: str) -> str:
+    return f"%{_norm_lower(q)}%"
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except Exception:
         return default
 
 
 def _dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: set[Tuple[str, str, int]] = set()
     out: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
 
-    for item in items:
-        kind = str(item.get("kind") or "").strip().lower()
-        sport = str(item.get("sport") or "").strip().lower()
-
-        raw_id = (
-            item.get("team_id")
-            if kind == "team"
-            else item.get("league_id")
+    for x in items:
+        key = (
+            x.get("kind"),
+            x.get("sport"),
+            x.get("league_id"),
+            x.get("team_id"),
+            x.get("season"),
+            (x.get("label") or "").strip().lower(),
         )
-        try:
-            obj_id = int(raw_id)
-        except Exception:
-            continue
-
-        key = (kind, sport, obj_id)
         if key in seen:
             continue
         seen.add(key)
-        out.append(item)
-
+        out.append(x)
     return out
 
 
-def _prefix_contains_order_sql(field_name: str = "name") -> str:
-    return f"""
-        CASE
-            WHEN LOWER({field_name}) = LOWER(%s) THEN 300
-            WHEN LOWER({field_name}) LIKE LOWER(%s) THEN 200
-            WHEN LOWER({field_name}) LIKE LOWER(%s) THEN 100
-            ELSE 0
-        END
+def _dedupe_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
+
+    for x in cards:
+        key = (
+            x.get("type"),
+            x.get("sport"),
+            x.get("league_id"),
+            x.get("team_id"),
+            x.get("season"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+    return out
+
+
+# ─────────────────────────────────────────
+# 축구: 시즌 / 대표 진입점
+# ─────────────────────────────────────────
+
+def _football_latest_league_season(league_id: int) -> Optional[int]:
+    row = fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    season = _safe_int((row or {}).get("season"), 0)
+    return season if season > 0 else None
+
+
+def _football_team_latest_season(team_id: int) -> Optional[int]:
+    row = fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM team_season_stats
+        WHERE team_id = %s
+          AND name = 'full_json'
+        """,
+        (team_id,),
+    )
+    season = _safe_int((row or {}).get("season"), 0)
+    if season > 0:
+        return season
+
+    row2 = fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM matches
+        WHERE home_id = %s OR away_id = %s
+        """,
+        (team_id, team_id),
+    )
+    season2 = _safe_int((row2 or {}).get("season"), 0)
+    return season2 if season2 > 0 else None
+
+
+def _football_resolve_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
     """
+    축구 팀카드에서 상세 진입용 대표 league_id / season 결정:
+    1) team_season_stats 최신 시즌
+    2) 그 시즌의 domestic(country 일치) 리그 중 played 최대
+    3) domestic이 없으면 played 최대
+    4) 그래도 없으면 matches 최신 시즌에서 경기수 최대 league
+    """
+    season = _football_team_latest_season(team_id)
+    if not season:
+        return None
+
+    rows = fetch_all(
+        """
+        SELECT
+          tss.league_id,
+          COALESCE(l.name, '') AS league_name,
+          COALESCE(l.country, '') AS league_country,
+          COALESCE(
+            (tss.value::jsonb #>> '{fixtures,played,total}')::int,
+            0
+          ) AS played,
+          COALESCE(t.country, '') AS team_country
+        FROM team_season_stats tss
+        JOIN leagues l
+          ON l.id = tss.league_id
+        JOIN teams t
+          ON t.id = tss.team_id
+        WHERE tss.team_id = %s
+          AND tss.season = %s
+          AND tss.name = 'full_json'
+        ORDER BY played DESC, tss.league_id ASC
+        """,
+        (team_id, season),
+    )
+
+    if rows:
+        domestic_rows: List[Dict[str, Any]] = []
+        other_rows: List[Dict[str, Any]] = []
+
+        for r in rows:
+            league_id = _safe_int(r.get("league_id"), 0)
+            if league_id <= 0:
+                continue
+
+            team_country = (r.get("team_country") or "").strip()
+            league_country = (r.get("league_country") or "").strip()
+
+            if team_country and league_country and team_country == league_country:
+                domestic_rows.append(r)
+            else:
+                other_rows.append(r)
+
+        picked = None
+        if domestic_rows:
+            picked = sorted(
+                domestic_rows,
+                key=lambda x: (-_safe_int(x.get("played"), 0), _safe_int(x.get("league_id"), 0)),
+            )[0]
+        elif other_rows:
+            picked = sorted(
+                other_rows,
+                key=lambda x: (-_safe_int(x.get("played"), 0), _safe_int(x.get("league_id"), 0)),
+            )[0]
+
+        if picked:
+            return {
+                "league_id": _safe_int(picked.get("league_id"), 0),
+                "league_name": (picked.get("league_name") or "").strip(),
+                "season": season,
+            }
+
+    row2 = fetch_one(
+        """
+        SELECT
+          league_id,
+          COUNT(*) AS played
+        FROM matches
+        WHERE season = %s
+          AND (home_id = %s OR away_id = %s)
+        GROUP BY league_id
+        ORDER BY played DESC, league_id ASC
+        LIMIT 1
+        """,
+        (season, team_id, team_id),
+    )
+    if row2:
+        league_id = _safe_int(row2.get("league_id"), 0)
+        if league_id > 0:
+            league_row = fetch_one(
+                """
+                SELECT name
+                FROM leagues
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (league_id,),
+            )
+            return {
+                "league_id": league_id,
+                "league_name": (league_row or {}).get("name") or "",
+                "season": season,
+            }
+
+    return None
 
 
 # ─────────────────────────────────────────
-# Football: season / cards / suggestions
+# 하키: 시즌 / 대표 진입점
 # ─────────────────────────────────────────
 
-def _resolve_football_league_season(league_id: int) -> Optional[int]:
-    return resolve_season_for_league(league_id=league_id, season=None)
+def _hockey_latest_league_season(league_id: int) -> Optional[int]:
+    row = hockey_fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM hockey_games
+        WHERE league_id = %s
+        """,
+        (league_id,),
+    )
+    season = _safe_int((row or {}).get("season"), 0)
+    return season if season > 0 else None
 
 
-def _build_football_league_card(league_id: int) -> Optional[Dict[str, Any]]:
+def _hockey_resolve_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
+    """
+    하키 팀카드 대표 league_id / season:
+    - hockey_games 기준 최신 시즌
+    - 그 시즌에서 경기 수가 가장 많은 league_id
+    """
+    row = hockey_fetch_one(
+        """
+        SELECT MAX(season) AS season
+        FROM hockey_games
+        WHERE home_team_id = %s OR away_team_id = %s
+        """,
+        (team_id, team_id),
+    )
+    season = _safe_int((row or {}).get("season"), 0)
+    if season <= 0:
+        return None
+
+    row2 = hockey_fetch_one(
+        """
+        SELECT
+          league_id,
+          COUNT(*) AS played
+        FROM hockey_games
+        WHERE season = %s
+          AND (home_team_id = %s OR away_team_id = %s)
+        GROUP BY league_id
+        ORDER BY played DESC, league_id ASC
+        LIMIT 1
+        """,
+        (season, team_id, team_id),
+    )
+    if not row2:
+        return None
+
+    league_id = _safe_int((row2 or {}).get("league_id"), 0)
+    if league_id <= 0:
+        return None
+
+    league_row = hockey_fetch_one(
+        """
+        SELECT name
+        FROM hockey_leagues
+        WHERE id = %s
+        LIMIT 1
+        """,
+        (league_id,),
+    )
+
+    return {
+        "league_id": league_id,
+        "league_name": (league_row or {}).get("name") or "",
+        "season": season,
+    }
+
+
+# ─────────────────────────────────────────
+# 카드 빌더
+# ─────────────────────────────────────────
+
+def _build_football_league_card(league_id: int, season: Optional[int] = None) -> Optional[Dict[str, Any]]:
     row = fetch_one(
         """
         SELECT id, name, country, logo
@@ -84,21 +312,22 @@ def _build_football_league_card(league_id: int) -> Optional[Dict[str, Any]]:
     if not row:
         return None
 
-    season = _resolve_football_league_season(league_id)
+    resolved_season = season or _football_latest_league_season(league_id)
+
     return {
         "type": "league",
         "sport": "football",
-        "league_id": int(row["id"]),
-        "season": season,
-        "name": row.get("name") or "",
+        "league_id": _safe_int(row.get("id"), 0),
+        "season": resolved_season,
+        "name": (row.get("name") or "").strip(),
         "logo": row.get("logo"),
-        "country": row.get("country") or "",
-        "subtitle": row.get("country") or "",
+        "country": (row.get("country") or "").strip(),
+        "subtitle": (row.get("country") or "").strip(),
     }
 
 
-def _resolve_football_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
-    team = fetch_one(
+def _build_football_team_card(team_id: int, league_id: Optional[int] = None, season: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    team_row = fetch_one(
         """
         SELECT id, name, country, logo
         FROM teams
@@ -107,316 +336,45 @@ def _resolve_football_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
         """,
         (team_id,),
     )
-    if not team:
+    if not team_row:
         return None
 
-    team_country = (team.get("country") or "").strip()
-
-    rows = fetch_all(
-        """
-        SELECT
-            m.season,
-            m.league_id,
-            l.name AS league_name,
-            l.country AS league_country,
-            l.logo AS league_logo,
-            COUNT(*) AS played
-        FROM matches m
-        JOIN leagues l
-          ON l.id = m.league_id
-        WHERE (m.home_id = %s OR m.away_id = %s)
-        GROUP BY
-            m.season,
-            m.league_id,
-            l.name,
-            l.country,
-            l.logo
-        ORDER BY
-            m.season DESC,
-            COUNT(*) DESC,
-            m.league_id ASC
-        """,
-        (team_id, team_id),
-    )
-
-    if not rows:
-        return None
-
-    best_row = None
-    best_key = None
-
-    for r in rows:
-        season = _coalesce_int(r.get("season"), 0)
-        league_id = _coalesce_int(r.get("league_id"), 0)
-        played = _coalesce_int(r.get("played"), 0)
-        league_country = (r.get("league_country") or "").strip()
-
-        domestic = 1 if team_country and league_country and (team_country == league_country) else 0
-
-        sort_key = (
-            season,
-            domestic,
-            played,
-            -league_id,
+    entry = None
+    if league_id and season:
+        league_row = fetch_one(
+            """
+            SELECT name
+            FROM leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (league_id,),
         )
-        if best_row is None or sort_key > best_key:
-            best_row = r
-            best_key = sort_key
+        entry = {
+            "league_id": league_id,
+            "league_name": (league_row or {}).get("name") or "",
+            "season": season,
+        }
+    else:
+        entry = _football_resolve_team_entry(team_id)
 
-    if not best_row:
-        return None
-
-    season = _coalesce_int(best_row.get("season"), 0) or None
-    league_id = _coalesce_int(best_row.get("league_id"), 0) or None
-    league_name = best_row.get("league_name") or ""
-    league_country = best_row.get("league_country") or ""
-    league_logo = best_row.get("league_logo")
-
-    return {
-        "team_id": int(team["id"]),
-        "team_name": team.get("name") or "",
-        "team_logo": team.get("logo"),
-        "team_country": team.get("country") or "",
-        "league_id": league_id,
-        "league_name": league_name,
-        "league_logo": league_logo,
-        "league_country": league_country,
-        "season": season,
-    }
-
-
-def _build_football_team_card(
-    team_id: int,
-    *,
-    forced_league_id: Optional[int] = None,
-    forced_season: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
-    entry = _resolve_football_team_entry(team_id)
     if not entry:
         return None
-
-    league_id = forced_league_id if forced_league_id else entry.get("league_id")
-    season = forced_season if forced_season else entry.get("season")
-
-    if not league_id:
-        return None
-
-    if season is None:
-        season = _resolve_football_league_season(int(league_id))
-
-    subtitle_parts: List[str] = []
-    if entry.get("team_country"):
-        subtitle_parts.append(str(entry.get("team_country")))
-    if entry.get("league_name"):
-        subtitle_parts.append(str(entry.get("league_name")))
 
     return {
         "type": "team",
         "sport": "football",
-        "team_id": int(entry["team_id"]),
-        "league_id": int(league_id),
-        "season": season,
-        "name": entry.get("team_name") or "",
-        "logo": entry.get("team_logo"),
-        "country": entry.get("team_country") or "",
-        "subtitle": " • ".join([x for x in subtitle_parts if x]),
+        "team_id": _safe_int(team_row.get("id"), 0),
+        "league_id": _safe_int(entry.get("league_id"), 0),
+        "season": _safe_int(entry.get("season"), 0),
+        "name": (team_row.get("name") or "").strip(),
+        "logo": team_row.get("logo"),
+        "country": (team_row.get("country") or "").strip(),
+        "subtitle": (entry.get("league_name") or "").strip(),
     }
 
 
-def _search_football_league_suggestions(q: str) -> List[Dict[str, Any]]:
-    qq = (q or "").strip()
-    if not qq:
-        return []
-
-    like_prefix = f"{qq}%"
-    like_contains = f"%{qq}%"
-
-    score_sql = _prefix_contains_order_sql("name")
-
-    rows = fetch_all(
-        f"""
-        SELECT
-            id,
-            name,
-            country,
-            logo,
-            {score_sql} AS score
-        FROM leagues
-        WHERE LOWER(name) LIKE LOWER(%s)
-           OR LOWER(name) LIKE LOWER(%s)
-        ORDER BY
-            score DESC,
-            LENGTH(name) ASC,
-            name ASC
-        LIMIT %s
-        """,
-        (qq, like_prefix, like_contains, like_prefix, like_contains, MAX_SUGGESTIONS),
-    )
-
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        out.append(
-            {
-                "kind": "league",
-                "sport": "football",
-                "league_id": int(r["id"]),
-                "label": r.get("name") or "",
-                "sublabel": r.get("country") or "",
-            }
-        )
-    return out
-
-
-def _search_football_team_suggestions(q: str) -> List[Dict[str, Any]]:
-    qq = (q or "").strip()
-    if not qq:
-        return []
-
-    like_prefix = f"{qq}%"
-    like_contains = f"%{qq}%"
-
-    score_sql = _prefix_contains_order_sql("name")
-
-    rows = fetch_all(
-        f"""
-        SELECT
-            id,
-            name,
-            country,
-            logo,
-            {score_sql} AS score
-        FROM teams
-        WHERE LOWER(name) LIKE LOWER(%s)
-           OR LOWER(name) LIKE LOWER(%s)
-        ORDER BY
-            score DESC,
-            LENGTH(name) ASC,
-            name ASC
-        LIMIT %s
-        """,
-        (qq, like_prefix, like_contains, like_prefix, like_contains, MAX_SUGGESTIONS),
-    )
-
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        out.append(
-            {
-                "kind": "team",
-                "sport": "football",
-                "team_id": int(r["id"]),
-                "label": r.get("name") or "",
-                "sublabel": r.get("country") or "",
-            }
-        )
-    return out
-
-
-def _football_expand_team_suggestions_from_leagues(league_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-
-    for item in league_items[:MAX_EXPANDED_LEAGUES]:
-        league_id = _coalesce_int(item.get("league_id"), 0)
-        if league_id <= 0:
-            continue
-
-        season = _resolve_football_league_season(league_id)
-        if season is None:
-            continue
-
-        rows = fetch_all(
-            """
-            SELECT DISTINCT
-                t.id,
-                t.name,
-                t.country
-            FROM (
-                SELECT home_id AS team_id
-                FROM matches
-                WHERE league_id = %s
-                  AND season = %s
-                UNION
-                SELECT away_id AS team_id
-                FROM matches
-                WHERE league_id = %s
-                  AND season = %s
-            ) x
-            JOIN teams t
-              ON t.id = x.team_id
-            ORDER BY t.name ASC
-            """,
-            (league_id, season, league_id, season),
-        )
-
-        league_label = item.get("label") or ""
-
-        for r in rows:
-            out.append(
-                {
-                    "kind": "team",
-                    "sport": "football",
-                    "team_id": int(r["id"]),
-                    "label": r.get("name") or "",
-                    "sublabel": league_label,
-                }
-            )
-
-    return out
-
-
-def _football_league_team_cards(league_id: int) -> List[Dict[str, Any]]:
-    season = _resolve_football_league_season(league_id)
-    if season is None:
-        return []
-
-    rows = fetch_all(
-        """
-        SELECT DISTINCT
-            t.id
-        FROM (
-            SELECT home_id AS team_id
-            FROM matches
-            WHERE league_id = %s
-              AND season = %s
-            UNION
-            SELECT away_id AS team_id
-            FROM matches
-            WHERE league_id = %s
-              AND season = %s
-        ) x
-        JOIN teams t
-          ON t.id = x.team_id
-        ORDER BY t.id ASC
-        """,
-        (league_id, season, league_id, season),
-    )
-
-    cards: List[Dict[str, Any]] = []
-    for r in rows:
-        team_id = _coalesce_int(r.get("id"), 0)
-        if team_id <= 0:
-            continue
-
-        card = _build_football_team_card(
-            team_id,
-            forced_league_id=league_id,
-            forced_season=season,
-        )
-        if card:
-            cards.append(card)
-
-    cards.sort(key=lambda x: str(x.get("name") or "").lower())
-    return cards
-
-
-# ─────────────────────────────────────────
-# Hockey: season / cards / suggestions
-# ─────────────────────────────────────────
-
-def _resolve_hockey_league_season(league_id: int) -> Optional[int]:
-    return hockey_resolve_season_for_league(league_id=league_id, season=None)
-
-
-def _build_hockey_league_card(league_id: int) -> Optional[Dict[str, Any]]:
+def _build_hockey_league_card(league_id: int, season: Optional[int] = None) -> Optional[Dict[str, Any]]:
     row = hockey_fetch_one(
         """
         SELECT id, name, logo
@@ -429,21 +387,22 @@ def _build_hockey_league_card(league_id: int) -> Optional[Dict[str, Any]]:
     if not row:
         return None
 
-    season = _resolve_hockey_league_season(league_id)
+    resolved_season = season or _hockey_latest_league_season(league_id)
+
     return {
         "type": "league",
         "sport": "hockey",
-        "league_id": int(row["id"]),
-        "season": season,
-        "name": row.get("name") or "",
+        "league_id": _safe_int(row.get("id"), 0),
+        "season": resolved_season,
+        "name": (row.get("name") or "").strip(),
         "logo": row.get("logo"),
         "country": "",
-        "subtitle": "",
+        "subtitle": "Hockey",
     }
 
 
-def _resolve_hockey_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
-    team = hockey_fetch_one(
+def _build_hockey_team_card(team_id: int, league_id: Optional[int] = None, season: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    team_row = hockey_fetch_one(
         """
         SELECT id, name, logo
         FROM hockey_teams
@@ -452,424 +411,507 @@ def _resolve_hockey_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
         """,
         (team_id,),
     )
-    if not team:
+    if not team_row:
         return None
 
-    rows = hockey_fetch_all(
-        """
-        SELECT
-            g.season,
-            g.league_id,
-            l.name AS league_name,
-            l.logo AS league_logo,
-            COUNT(*) AS played
-        FROM hockey_games g
-        JOIN hockey_leagues l
-          ON l.id = g.league_id
-        WHERE (g.home_team_id = %s OR g.away_team_id = %s)
-        GROUP BY
-            g.season,
-            g.league_id,
-            l.name,
-            l.logo
-        ORDER BY
-            g.season DESC,
-            COUNT(*) DESC,
-            g.league_id ASC
-        """,
-        (team_id, team_id),
-    )
-
-    if not rows:
-        return None
-
-    best_row = None
-    best_key = None
-
-    for r in rows:
-        season = _coalesce_int(r.get("season"), 0)
-        league_id = _coalesce_int(r.get("league_id"), 0)
-        played = _coalesce_int(r.get("played"), 0)
-
-        sort_key = (
-            season,
-            played,
-            -league_id,
+    entry = None
+    if league_id and season:
+        league_row = hockey_fetch_one(
+            """
+            SELECT name
+            FROM hockey_leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (league_id,),
         )
-        if best_row is None or sort_key > best_key:
-            best_row = r
-            best_key = sort_key
+        entry = {
+            "league_id": league_id,
+            "league_name": (league_row or {}).get("name") or "",
+            "season": season,
+        }
+    else:
+        entry = _hockey_resolve_team_entry(team_id)
 
-    if not best_row:
-        return None
-
-    return {
-        "team_id": int(team["id"]),
-        "team_name": team.get("name") or "",
-        "team_logo": team.get("logo"),
-        "league_id": _coalesce_int(best_row.get("league_id"), 0) or None,
-        "league_name": best_row.get("league_name") or "",
-        "league_logo": best_row.get("league_logo"),
-        "season": _coalesce_int(best_row.get("season"), 0) or None,
-    }
-
-
-def _build_hockey_team_card(
-    team_id: int,
-    *,
-    forced_league_id: Optional[int] = None,
-    forced_season: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
-    entry = _resolve_hockey_team_entry(team_id)
     if not entry:
         return None
-
-    league_id = forced_league_id if forced_league_id else entry.get("league_id")
-    season = forced_season if forced_season else entry.get("season")
-
-    if not league_id:
-        return None
-
-    if season is None:
-        season = _resolve_hockey_league_season(int(league_id))
-
-    subtitle_parts: List[str] = []
-    if entry.get("league_name"):
-        subtitle_parts.append(str(entry.get("league_name")))
-    if season is not None:
-        subtitle_parts.append(str(season))
 
     return {
         "type": "team",
         "sport": "hockey",
-        "team_id": int(entry["team_id"]),
-        "league_id": int(league_id),
-        "season": season,
-        "name": entry.get("team_name") or "",
-        "logo": entry.get("team_logo"),
+        "team_id": _safe_int(team_row.get("id"), 0),
+        "league_id": _safe_int(entry.get("league_id"), 0),
+        "season": _safe_int(entry.get("season"), 0),
+        "name": (team_row.get("name") or "").strip(),
+        "logo": team_row.get("logo"),
         "country": "",
-        "subtitle": " • ".join([x for x in subtitle_parts if x]),
+        "subtitle": (entry.get("league_name") or "").strip(),
     }
 
 
-def _search_hockey_league_suggestions(q: str) -> List[Dict[str, Any]]:
-    qq = (q or "").strip()
-    if not qq:
-        return []
+# ─────────────────────────────────────────
+# 후보(suggest) 생성
+# ─────────────────────────────────────────
 
-    like_prefix = f"{qq}%"
-    like_contains = f"%{qq}%"
-
-    score_sql = _prefix_contains_order_sql("name")
-
-    rows = hockey_fetch_all(
-        f"""
+def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
         SELECT
-            id,
-            name,
-            logo,
-            {score_sql} AS score
-        FROM hockey_leagues
-        WHERE LOWER(name) LIKE LOWER(%s)
-           OR LOWER(name) LIKE LOWER(%s)
+          id,
+          name,
+          country
+        FROM leagues
+        WHERE LOWER(name) LIKE %s
+           OR LOWER(name) LIKE %s
         ORDER BY
-            score DESC,
-            LENGTH(name) ASC,
-            name ASC
-        LIMIT %s
+          CASE
+            WHEN LOWER(name) = %s THEN 0
+            WHEN LOWER(name) LIKE %s THEN 1
+            ELSE 2
+          END,
+          LENGTH(name) ASC,
+          name ASC
         """,
-        (qq, like_prefix, like_contains, like_prefix, like_contains, MAX_SUGGESTIONS),
+        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
     )
 
     out: List[Dict[str, Any]] = []
     for r in rows:
+        league_id = _safe_int(r.get("id"), 0)
+        if league_id <= 0:
+            continue
+        season = _football_latest_league_season(league_id)
         out.append(
             {
                 "kind": "league",
-                "sport": "hockey",
-                "league_id": int(r["id"]),
-                "label": r.get("name") or "",
-                "sublabel": "",
+                "sport": "football",
+                "league_id": league_id,
+                "season": season,
+                "label": (r.get("name") or "").strip(),
+                "subLabel": (r.get("country") or "").strip(),
             }
         )
     return out
 
 
-def _search_hockey_team_suggestions(q: str) -> List[Dict[str, Any]]:
-    qq = (q or "").strip()
-    if not qq:
-        return []
-
-    like_prefix = f"{qq}%"
-    like_contains = f"%{qq}%"
-
-    score_sql = _prefix_contains_order_sql("name")
-
-    rows = hockey_fetch_all(
-        f"""
+def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
         SELECT
-            id,
-            name,
-            logo,
-            {score_sql} AS score
-        FROM hockey_teams
-        WHERE LOWER(name) LIKE LOWER(%s)
-           OR LOWER(name) LIKE LOWER(%s)
+          id,
+          name
+        FROM teams
+        WHERE LOWER(name) LIKE %s
+           OR LOWER(name) LIKE %s
         ORDER BY
-            score DESC,
-            LENGTH(name) ASC,
-            name ASC
-        LIMIT %s
+          CASE
+            WHEN LOWER(name) = %s THEN 0
+            WHEN LOWER(name) LIKE %s THEN 1
+            ELSE 2
+          END,
+          LENGTH(name) ASC,
+          name ASC
         """,
-        (qq, like_prefix, like_contains, like_prefix, like_contains, MAX_SUGGESTIONS),
+        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
     )
 
     out: List[Dict[str, Any]] = []
     for r in rows:
+        team_id = _safe_int(r.get("id"), 0)
+        if team_id <= 0:
+            continue
+        entry = _football_resolve_team_entry(team_id)
+        if not entry:
+            continue
+
         out.append(
             {
                 "kind": "team",
-                "sport": "hockey",
-                "team_id": int(r["id"]),
-                "label": r.get("name") or "",
-                "sublabel": "",
+                "sport": "football",
+                "team_id": team_id,
+                "league_id": _safe_int(entry.get("league_id"), 0),
+                "season": _safe_int(entry.get("season"), 0),
+                "label": (r.get("name") or "").strip(),
+                "subLabel": (entry.get("league_name") or "").strip(),
             }
         )
     return out
 
 
-def _hockey_expand_team_suggestions_from_leagues(league_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _football_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
 
-    for item in league_items[:MAX_EXPANDED_LEAGUES]:
-        league_id = _coalesce_int(item.get("league_id"), 0)
-        if league_id <= 0:
+    for lg in leagues:
+        league_id = _safe_int(lg.get("league_id"), 0)
+        season = _safe_int(lg.get("season"), 0)
+        league_name = (lg.get("label") or "").strip()
+
+        if league_id <= 0 or season <= 0:
             continue
 
-        season = _resolve_hockey_league_season(league_id)
-        if season is None:
-            continue
-
-        rows = hockey_fetch_all(
+        rows = fetch_all(
             """
             SELECT DISTINCT
-                t.id,
-                t.name
-            FROM (
-                SELECT home_team_id AS team_id
-                FROM hockey_games
-                WHERE league_id = %s
-                  AND season = %s
-                UNION
-                SELECT away_team_id AS team_id
-                FROM hockey_games
-                WHERE league_id = %s
-                  AND season = %s
-            ) x
-            JOIN hockey_teams t
-              ON t.id = x.team_id
+              t.id AS team_id,
+              t.name AS team_name
+            FROM matches m
+            JOIN teams t
+              ON t.id = m.home_id OR t.id = m.away_id
+            WHERE m.league_id = %s
+              AND m.season = %s
             ORDER BY t.name ASC
             """,
-            (league_id, season, league_id, season),
+            (league_id, season),
         )
 
-        league_label = item.get("label") or ""
-
         for r in rows:
+            team_id = _safe_int(r.get("team_id"), 0)
+            if team_id <= 0:
+                continue
+
             out.append(
                 {
                     "kind": "team",
-                    "sport": "hockey",
-                    "team_id": int(r["id"]),
-                    "label": r.get("name") or "",
-                    "sublabel": league_label,
+                    "sport": "football",
+                    "team_id": team_id,
+                    "league_id": league_id,
+                    "season": season,
+                    "label": (r.get("team_name") or "").strip(),
+                    "subLabel": league_name,
                 }
             )
 
     return out
 
 
-def _hockey_league_team_cards(league_id: int) -> List[Dict[str, Any]]:
-    season = _resolve_hockey_league_season(league_id)
-    if season is None:
-        return []
-
+def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
         """
-        SELECT DISTINCT
-            t.id
-        FROM (
-            SELECT home_team_id AS team_id
-            FROM hockey_games
-            WHERE league_id = %s
-              AND season = %s
-            UNION
-            SELECT away_team_id AS team_id
-            FROM hockey_games
-            WHERE league_id = %s
-              AND season = %s
-        ) x
-        JOIN hockey_teams t
-          ON t.id = x.team_id
-        ORDER BY t.id ASC
+        SELECT
+          id,
+          name
+        FROM hockey_leagues
+        WHERE LOWER(name) LIKE %s
+           OR LOWER(name) LIKE %s
+        ORDER BY
+          CASE
+            WHEN LOWER(name) = %s THEN 0
+            WHEN LOWER(name) LIKE %s THEN 1
+            ELSE 2
+          END,
+          LENGTH(name) ASC,
+          name ASC
         """,
-        (league_id, season, league_id, season),
+        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
     )
 
-    cards: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
-        team_id = _coalesce_int(r.get("id"), 0)
+        league_id = _safe_int(r.get("id"), 0)
+        if league_id <= 0:
+            continue
+        season = _hockey_latest_league_season(league_id)
+        out.append(
+            {
+                "kind": "league",
+                "sport": "hockey",
+                "league_id": league_id,
+                "season": season,
+                "label": (r.get("name") or "").strip(),
+                "subLabel": "Hockey",
+            }
+        )
+    return out
+
+
+def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
+    rows = hockey_fetch_all(
+        """
+        SELECT
+          id,
+          name
+        FROM hockey_teams
+        WHERE LOWER(name) LIKE %s
+           OR LOWER(name) LIKE %s
+        ORDER BY
+          CASE
+            WHEN LOWER(name) = %s THEN 0
+            WHEN LOWER(name) LIKE %s THEN 1
+            ELSE 2
+          END,
+          LENGTH(name) ASC,
+          name ASC
+        """,
+        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
+    )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        team_id = _safe_int(r.get("id"), 0)
         if team_id <= 0:
             continue
+        entry = _hockey_resolve_team_entry(team_id)
+        if not entry:
+            continue
 
-        card = _build_hockey_team_card(
-            team_id,
-            forced_league_id=league_id,
-            forced_season=season,
+        out.append(
+            {
+                "kind": "team",
+                "sport": "hockey",
+                "team_id": team_id,
+                "league_id": _safe_int(entry.get("league_id"), 0),
+                "season": _safe_int(entry.get("season"), 0),
+                "label": (r.get("name") or "").strip(),
+                "subLabel": (entry.get("league_name") or "").strip(),
+            }
         )
-        if card:
-            cards.append(card)
-
-    cards.sort(key=lambda x: str(x.get("name") or "").lower())
-    return cards
+    return out
 
 
-# ─────────────────────────────────────────
-# Public services
-# ─────────────────────────────────────────
+def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
 
-def search_suggestions(q: str, sport: str) -> Dict[str, Any]:
-    qq = (q or "").strip()
-    ss = _norm_sport(sport)
+    for lg in leagues:
+        league_id = _safe_int(lg.get("league_id"), 0)
+        season = _safe_int(lg.get("season"), 0)
+        league_name = (lg.get("label") or "").strip()
 
-    if not qq:
+        if league_id <= 0 or season <= 0:
+            continue
+
+        rows = hockey_fetch_all(
+            """
+            SELECT DISTINCT
+              t.id AS team_id,
+              t.name AS team_name
+            FROM hockey_games g
+            JOIN hockey_teams t
+              ON t.id = g.home_team_id OR t.id = g.away_team_id
+            WHERE g.league_id = %s
+              AND g.season = %s
+            ORDER BY t.name ASC
+            """,
+            (league_id, season),
+        )
+
+        for r in rows:
+            team_id = _safe_int(r.get("team_id"), 0)
+            if team_id <= 0:
+                continue
+
+            out.append(
+                {
+                    "kind": "team",
+                    "sport": "hockey",
+                    "team_id": team_id,
+                    "league_id": league_id,
+                    "season": season,
+                    "label": (r.get("team_name") or "").strip(),
+                    "subLabel": league_name,
+                }
+            )
+
+    return out
+
+
+def search_suggest(q: str, sport: str = "all") -> Dict[str, Any]:
+    query = _norm_query(q)
+    sport_norm = (sport or "all").strip().lower()
+
+    if not query:
         return {
-            "query": "",
-            "sport": ss,
+            "query": query,
+            "sport": sport_norm,
             "items": [],
         }
 
     items: List[Dict[str, Any]] = []
 
-    if ss in ("all", "football"):
-        football_leagues = _search_football_league_suggestions(qq)
-        football_teams = _search_football_team_suggestions(qq)
-        football_expanded_teams = _football_expand_team_suggestions_from_leagues(football_leagues)
+    if sport_norm in ("all", "football"):
+        football_leagues = _football_suggest_leagues(query)
+        football_direct_teams = _football_suggest_direct_teams(query)
+        football_teams_by_league = _football_suggest_teams_by_leagues(football_leagues)
 
         items.extend(football_leagues)
-        items.extend(football_teams)
-        items.extend(football_expanded_teams)
+        items.extend(football_direct_teams)
+        items.extend(football_teams_by_league)
 
-    if ss in ("all", "hockey"):
-        hockey_leagues = _search_hockey_league_suggestions(qq)
-        hockey_teams = _search_hockey_team_suggestions(qq)
-        hockey_expanded_teams = _hockey_expand_team_suggestions_from_leagues(hockey_leagues)
+    if sport_norm in ("all", "hockey"):
+        hockey_leagues = _hockey_suggest_leagues(query)
+        hockey_direct_teams = _hockey_suggest_direct_teams(query)
+        hockey_teams_by_league = _hockey_suggest_teams_by_leagues(hockey_leagues)
 
         items.extend(hockey_leagues)
-        items.extend(hockey_teams)
-        items.extend(hockey_expanded_teams)
+        items.extend(hockey_direct_teams)
+        items.extend(hockey_teams_by_league)
 
     items = _dedupe_items(items)
 
+    def _sort_key(x: Dict[str, Any]) -> Tuple[int, int, str, str]:
+        kind = (x.get("kind") or "").strip().lower()
+        label = (x.get("label") or "").strip().lower()
+        ql = _norm_lower(query)
+
+        if label == ql:
+            score = 0
+        elif label.startswith(ql):
+            score = 1
+        else:
+            score = 2
+
+        kind_score = 0 if kind == "league" else 1
+        sub = (x.get("subLabel") or "").strip().lower()
+        return (score, kind_score, label, sub)
+
+    items = sorted(items, key=_sort_key)
+
     return {
-        "query": qq,
-        "sport": ss,
+        "query": query,
+        "sport": sport_norm,
         "items": items,
     }
 
 
-def search_selection_result(
+# ─────────────────────────────────────────
+# 후보 선택(resolve) → 카드 생성
+# ─────────────────────────────────────────
+
+def _football_league_team_cards(league_id: int, season: int) -> List[Dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT DISTINCT
+          t.id AS team_id
+        FROM matches m
+        JOIN teams t
+          ON t.id = m.home_id OR t.id = m.away_id
+        WHERE m.league_id = %s
+          AND m.season = %s
+        ORDER BY t.id ASC
+        """,
+        (league_id, season),
+    )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        team_id = _safe_int(r.get("team_id"), 0)
+        if team_id <= 0:
+            continue
+
+        card = _build_football_team_card(team_id=team_id, league_id=league_id, season=season)
+        if card:
+            out.append(card)
+
+    out = sorted(out, key=lambda x: (x.get("name") or "").lower())
+    return out
+
+
+def _hockey_league_team_cards(league_id: int, season: int) -> List[Dict[str, Any]]:
+    rows = hockey_fetch_all(
+        """
+        SELECT DISTINCT
+          t.id AS team_id
+        FROM hockey_games g
+        JOIN hockey_teams t
+          ON t.id = g.home_team_id OR t.id = g.away_team_id
+        WHERE g.league_id = %s
+          AND g.season = %s
+        ORDER BY t.id ASC
+        """,
+        (league_id, season),
+    )
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        team_id = _safe_int(r.get("team_id"), 0)
+        if team_id <= 0:
+            continue
+
+        card = _build_hockey_team_card(team_id=team_id, league_id=league_id, season=season)
+        if card:
+            out.append(card)
+
+    out = sorted(out, key=lambda x: (x.get("name") or "").lower())
+    return out
+
+
+def search_resolve(
     *,
     kind: str,
     sport: str,
     league_id: Optional[int] = None,
     team_id: Optional[int] = None,
+    season: Optional[int] = None,
 ) -> Dict[str, Any]:
-    kk = (kind or "").strip().lower()
-    ss = (sport or "").strip().lower()
+    kind_norm = (kind or "").strip().lower()
+    sport_norm = (sport or "").strip().lower()
 
-    if ss == "football":
-        if kk == "league":
+    selected: Dict[str, Any] = {
+        "kind": kind_norm,
+        "sport": sport_norm,
+        "league_id": league_id,
+        "team_id": team_id,
+        "season": season,
+    }
+
+    cards: List[Dict[str, Any]] = []
+
+    if sport_norm == "football":
+        if kind_norm == "league":
             if not league_id:
-                raise ValueError("league_id is required")
+                return {"selected": selected, "cards": []}
 
-            league_card = _build_football_league_card(int(league_id))
-            if not league_card:
-                return {
-                    "selected": {
-                        "kind": "league",
-                        "sport": "football",
-                        "league_id": league_id,
-                    },
-                    "league_card": None,
-                    "team_cards": [],
-                }
+            resolved_season = season or _football_latest_league_season(league_id)
+            if not resolved_season:
+                return {"selected": selected, "cards": []}
 
-            team_cards = _football_league_team_cards(int(league_id))
-            return {
-                "selected": {
-                    "kind": "league",
-                    "sport": "football",
-                    "league_id": int(league_id),
-                },
-                "league_card": league_card,
-                "team_cards": team_cards,
-            }
+            selected["season"] = resolved_season
 
-        if kk == "team":
+            league_card = _build_football_league_card(league_id=league_id, season=resolved_season)
+            if league_card:
+                cards.append(league_card)
+
+            cards.extend(_football_league_team_cards(league_id=league_id, season=resolved_season))
+
+        elif kind_norm == "team":
             if not team_id:
-                raise ValueError("team_id is required")
+                return {"selected": selected, "cards": []}
 
-            team_card = _build_football_team_card(int(team_id))
-            return {
-                "selected": {
-                    "kind": "team",
-                    "sport": "football",
-                    "team_id": int(team_id),
-                },
-                "team_cards": [team_card] if team_card else [],
-            }
+            team_card = _build_football_team_card(team_id=team_id, league_id=league_id, season=season)
+            if team_card:
+                selected["league_id"] = team_card.get("league_id")
+                selected["season"] = team_card.get("season")
+                cards.append(team_card)
 
-    if ss == "hockey":
-        if kk == "league":
+    elif sport_norm == "hockey":
+        if kind_norm == "league":
             if not league_id:
-                raise ValueError("league_id is required")
+                return {"selected": selected, "cards": []}
 
-            league_card = _build_hockey_league_card(int(league_id))
-            if not league_card:
-                return {
-                    "selected": {
-                        "kind": "league",
-                        "sport": "hockey",
-                        "league_id": league_id,
-                    },
-                    "league_card": None,
-                    "team_cards": [],
-                }
+            resolved_season = season or _hockey_latest_league_season(league_id)
+            if not resolved_season:
+                return {"selected": selected, "cards": []}
 
-            team_cards = _hockey_league_team_cards(int(league_id))
-            return {
-                "selected": {
-                    "kind": "league",
-                    "sport": "hockey",
-                    "league_id": int(league_id),
-                },
-                "league_card": league_card,
-                "team_cards": team_cards,
-            }
+            selected["season"] = resolved_season
 
-        if kk == "team":
+            league_card = _build_hockey_league_card(league_id=league_id, season=resolved_season)
+            if league_card:
+                cards.append(league_card)
+
+            cards.extend(_hockey_league_team_cards(league_id=league_id, season=resolved_season))
+
+        elif kind_norm == "team":
             if not team_id:
-                raise ValueError("team_id is required")
+                return {"selected": selected, "cards": []}
 
-            team_card = _build_hockey_team_card(int(team_id))
-            return {
-                "selected": {
-                    "kind": "team",
-                    "sport": "hockey",
-                    "team_id": int(team_id),
-                },
-                "team_cards": [team_card] if team_card else [],
-            }
+            team_card = _build_hockey_team_card(team_id=team_id, league_id=league_id, season=season)
+            if team_card:
+                selected["league_id"] = team_card.get("league_id")
+                selected["season"] = team_card.get("season")
+                cards.append(team_card)
 
-    raise ValueError("unsupported selection")
+    cards = _dedupe_cards(cards)
+
+    return {
+        "selected": selected,
+        "cards": cards,
+    }
