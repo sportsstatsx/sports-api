@@ -50,13 +50,20 @@ class FCMClient:
         _init_firebase_app()
 
     @staticmethod
-    def _build_data(data: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    def _build_data(
+        title: str,
+        body: str,
+        data: Optional[Dict[str, Any]],
+    ) -> Dict[str, str]:
         """
+        Android 앱이 항상 onMessageReceived() 에서 직접 노티를 만들 수 있게
+        title/body 도 data payload 로 넣는다.
         data payload 는 모두 문자열이어야 하므로 str() 변환.
         """
-        if not data:
-            return {}
-        return {str(k): str(v) for k, v in data.items()}
+        payload: Dict[str, Any] = dict(data or {})
+        payload["title"] = title
+        payload["body"] = body
+        return {str(k): str(v) for k, v in payload.items()}
 
     def send_to_tokens(
         self,
@@ -68,30 +75,29 @@ class FCMClient:
         """
         여러 FCM 토큰으로 알림을 전송한다.
 
-        firebase_admin 의 send_multicast 를 쓰지 않는 이유는:
-        - Render 환경 Firebase Admin 버전이 낮아 지원이 불안정
-        - 개별 메시지 전송으로 안정성 확보
+        핵심:
+        - Android 에서는 notification payload 를 제거하고 data-only 로 보낸다.
+        - 이렇게 해야 백그라운드에서도 앱의 FirebaseMessagingService 가
+          일관되게 직접 알림을 생성할 수 있다.
         """
 
         if not tokens:
             return {"success_count": 0, "failure_count": 0, "results": []}
 
         _init_firebase_app()
-        payload_data = self._build_data(data)
+        payload_data = self._build_data(title=title, body=body, data=data)
 
         success_count = 0
         failure_count = 0
         results: List[Dict[str, Any]] = []
 
-        # 개별 토큰에 대해 메시지 전송
         for token in tokens:
             msg = messaging.Message(
                 token=token,
-                notification=messaging.Notification(
-                    title=title,  # match_event_worker 쪽에서 이미 완성된 제목
-                    body=body     # match_event_worker 쪽에서 이미 완성된 본문
+                data=payload_data,
+                android=messaging.AndroidConfig(
+                    priority="high",
                 ),
-                data=payload_data,  # match_id, event_type 등
             )
 
             try:
