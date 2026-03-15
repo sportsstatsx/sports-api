@@ -37,15 +37,11 @@ def _suggest_bucket(x: Dict[str, Any], query: str) -> Tuple[int, int, str, str, 
     자동완성 정렬 규칙
 
     우선순위:
-    0) 리그명 prefix
-    1) 팀명 prefix
-    2) 나라명 prefix + 리그
-    3) 나라명 prefix + 팀
-    4) 리그명 contains
-    5) 팀명 contains
-    6) 나라명 contains + 리그
-    7) 나라명 contains + 팀
-    8) 기타
+    0) 리그명 exact/prefix
+    1) 팀명 exact/prefix
+    2) 리그명 contains
+    3) 팀명 contains
+    4) 기타
 
     같은 bucket 안에서는 label A~Z → country A~Z → subLabel A~Z
     """
@@ -60,38 +56,19 @@ def _suggest_bucket(x: Dict[str, Any], query: str) -> Tuple[int, int, str, str, 
     is_team = kind == "team"
 
     label_eq = label == ql
-    country_eq = country == ql
     label_prefix = label.startswith(ql)
-    country_prefix = country.startswith(ql)
     label_contains = ql in label if ql else False
-    country_contains = ql in country if ql else False
 
-    if is_league and label_eq:
+    if is_league and (label_eq or label_prefix):
         bucket = 0
-    elif is_team and label_eq:
+    elif is_team and (label_eq or label_prefix):
         bucket = 1
-    elif is_league and country_eq:
-        bucket = 2
-    elif is_team and country_eq:
-        bucket = 3
-    elif is_league and label_prefix:
-        bucket = 0
-    elif is_team and label_prefix:
-        bucket = 1
-    elif is_league and country_prefix:
-        bucket = 2
-    elif is_team and country_prefix:
-        bucket = 3
     elif is_league and label_contains:
-        bucket = 4
+        bucket = 2
     elif is_team and label_contains:
-        bucket = 5
-    elif is_league and country_contains:
-        bucket = 6
-    elif is_team and country_contains:
-        bucket = 7
+        bucket = 3
     else:
-        bucket = 8
+        bucket = 4
 
     return (bucket, 0 if is_league else 1, label, country, sub)
 
@@ -556,16 +533,13 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           country,
           logo
         FROM leagues
-        WHERE
-          LOWER(name) LIKE %s
-          OR LOWER(COALESCE(country, '')) LIKE %s
+        WHERE LOWER(name) LIKE %s
         ORDER BY
           name ASC,
           country ASC,
           id ASC
         """,
         (
-            _like_prefix(q),
             _like_prefix(q),
         ),
     )
@@ -607,16 +581,13 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
           country,
           logo
         FROM teams
-        WHERE
-          LOWER(name) LIKE %s
-          OR LOWER(COALESCE(country, '')) LIKE %s
+        WHERE LOWER(name) LIKE %s
         ORDER BY
           name ASC,
           country ASC,
           id ASC
         """,
         (
-            _like_prefix(q),
             _like_prefix(q),
         ),
     )
@@ -722,16 +693,13 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
         FROM hockey_leagues l
         LEFT JOIN hockey_countries c
           ON c.id = l.country_id
-        WHERE
-          LOWER(l.name) LIKE %s
-          OR LOWER(COALESCE(c.name, '')) LIKE %s
+        WHERE LOWER(l.name) LIKE %s
         ORDER BY
           l.name ASC,
           country ASC,
           l.id ASC
         """,
         (
-            _like_prefix(q),
             _like_prefix(q),
         ),
     )
@@ -766,30 +734,17 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
 def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
         """
-        SELECT DISTINCT
+        SELECT
           t.id,
           t.name,
           t.logo
         FROM hockey_teams t
-        WHERE
-          LOWER(t.name) LIKE %s
-          OR EXISTS (
-            SELECT 1
-            FROM hockey_games g
-            JOIN hockey_leagues l
-              ON l.id = g.league_id
-            LEFT JOIN hockey_countries c
-              ON c.id = l.country_id
-            WHERE
-              (g.home_team_id = t.id OR g.away_team_id = t.id)
-              AND LOWER(COALESCE(c.name, '')) LIKE %s
-          )
+        WHERE LOWER(t.name) LIKE %s
         ORDER BY
           t.name ASC,
           t.id ASC
         """,
         (
-            _like_prefix(q),
             _like_prefix(q),
         ),
     )
