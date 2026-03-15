@@ -415,6 +415,7 @@ def _build_hockey_league_card(league_id: int, season: Optional[int] = None) -> O
         return None
 
     resolved_season = season or _hockey_latest_league_season(league_id)
+    country = _hockey_league_country(league_id)
 
     return {
         "type": "league",
@@ -423,8 +424,8 @@ def _build_hockey_league_card(league_id: int, season: Optional[int] = None) -> O
         "season": resolved_season,
         "name": (row.get("name") or "").strip(),
         "logo": row.get("logo"),
-        "country": "",
-        "subtitle": "Hockey",
+        "country": country,
+        "subtitle": country or "Hockey",
     }
 
 
@@ -463,15 +464,18 @@ def _build_hockey_team_card(team_id: int, league_id: Optional[int] = None, seaso
     if not entry:
         return None
 
+    resolved_league_id = _safe_int(entry.get("league_id"), 0)
+    country = _hockey_league_country(resolved_league_id)
+
     return {
         "type": "team",
         "sport": "hockey",
         "team_id": _safe_int(team_row.get("id"), 0),
-        "league_id": _safe_int(entry.get("league_id"), 0),
+        "league_id": resolved_league_id,
         "season": _safe_int(entry.get("season"), 0),
         "name": (team_row.get("name") or "").strip(),
         "logo": team_row.get("logo"),
-        "country": "",
+        "country": country,
         "subtitle": (entry.get("league_name") or "").strip(),
     }
 
