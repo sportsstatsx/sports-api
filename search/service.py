@@ -459,7 +459,8 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
         SELECT
           id,
           name,
-          country
+          country,
+          logo
         FROM leagues
         WHERE LOWER(name) LIKE %s
         ORDER BY
@@ -478,15 +479,24 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
         league_id = _safe_int(r.get("id"), 0)
         if league_id <= 0:
             continue
+
+        league_name = (r.get("name") or "").strip()
+        country = (r.get("country") or "").strip()
         season = _football_latest_league_season(league_id)
+
         out.append(
             {
                 "kind": "league",
                 "sport": "football",
                 "league_id": league_id,
                 "season": season,
-                "label": (r.get("name") or "").strip(),
-                "subLabel": (r.get("country") or "").strip(),
+                "label": league_name,
+                "subLabel": country,
+                "logo": r.get("logo"),
+                "country": country,
+                "league_name": league_name,
+                "display_text": league_name,
+                "display_subtext": f"{country} : {league_name}" if country else league_name,
             }
         )
     return out
@@ -497,7 +507,9 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
         """
         SELECT
           id,
-          name
+          name,
+          country,
+          logo
         FROM teams
         WHERE LOWER(name) LIKE %s
         ORDER BY
@@ -516,9 +528,14 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
         team_id = _safe_int(r.get("id"), 0)
         if team_id <= 0:
             continue
+
         entry = _football_resolve_team_entry(team_id)
         if not entry:
             continue
+
+        team_name = (r.get("name") or "").strip()
+        country = (r.get("country") or "").strip()
+        league_name = (entry.get("league_name") or "").strip()
 
         out.append(
             {
@@ -527,8 +544,13 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
                 "team_id": team_id,
                 "league_id": _safe_int(entry.get("league_id"), 0),
                 "season": _safe_int(entry.get("season"), 0),
-                "label": (r.get("name") or "").strip(),
-                "subLabel": (entry.get("league_name") or "").strip(),
+                "label": team_name,
+                "subLabel": league_name,
+                "logo": r.get("logo"),
+                "country": country,
+                "league_name": league_name,
+                "display_text": team_name,
+                "display_subtext": f"{country} : {league_name}" if country and league_name else (league_name or country),
             }
         )
     return out
@@ -540,7 +562,8 @@ def _football_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Di
     for lg in leagues:
         league_id = _safe_int(lg.get("league_id"), 0)
         season = _safe_int(lg.get("season"), 0)
-        league_name = (lg.get("label") or "").strip()
+        league_name = (lg.get("league_name") or lg.get("label") or "").strip()
+        country = (lg.get("country") or "").strip()
 
         if league_id <= 0 or season <= 0:
             continue
@@ -549,7 +572,9 @@ def _football_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Di
             """
             SELECT DISTINCT
               t.id AS team_id,
-              t.name AS team_name
+              t.name AS team_name,
+              t.country AS team_country,
+              t.logo AS team_logo
             FROM matches m
             JOIN teams t
               ON t.id = m.home_id OR t.id = m.away_id
@@ -565,6 +590,9 @@ def _football_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Di
             if team_id <= 0:
                 continue
 
+            team_name = (r.get("team_name") or "").strip()
+            team_country = (r.get("team_country") or "").strip() or country
+
             out.append(
                 {
                     "kind": "team",
@@ -572,8 +600,13 @@ def _football_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Di
                     "team_id": team_id,
                     "league_id": league_id,
                     "season": season,
-                    "label": (r.get("team_name") or "").strip(),
+                    "label": team_name,
                     "subLabel": league_name,
+                    "logo": r.get("team_logo"),
+                    "country": team_country,
+                    "league_name": league_name,
+                    "display_text": team_name,
+                    "display_subtext": f"{team_country} : {league_name}" if team_country and league_name else (league_name or team_country),
                 }
             )
 
@@ -585,7 +618,8 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
         """
         SELECT
           id,
-          name
+          name,
+          logo
         FROM hockey_leagues
         WHERE LOWER(name) LIKE %s
         ORDER BY
@@ -604,15 +638,23 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
         league_id = _safe_int(r.get("id"), 0)
         if league_id <= 0:
             continue
+
+        league_name = (r.get("name") or "").strip()
         season = _hockey_latest_league_season(league_id)
+
         out.append(
             {
                 "kind": "league",
                 "sport": "hockey",
                 "league_id": league_id,
                 "season": season,
-                "label": (r.get("name") or "").strip(),
+                "label": league_name,
                 "subLabel": "Hockey",
+                "logo": r.get("logo"),
+                "country": "",
+                "league_name": league_name,
+                "display_text": league_name,
+                "display_subtext": league_name,
             }
         )
     return out
@@ -623,7 +665,8 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
         """
         SELECT
           id,
-          name
+          name,
+          logo
         FROM hockey_teams
         WHERE LOWER(name) LIKE %s
         ORDER BY
@@ -642,9 +685,13 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
         team_id = _safe_int(r.get("id"), 0)
         if team_id <= 0:
             continue
+
         entry = _hockey_resolve_team_entry(team_id)
         if not entry:
             continue
+
+        team_name = (r.get("name") or "").strip()
+        league_name = (entry.get("league_name") or "").strip()
 
         out.append(
             {
@@ -653,8 +700,13 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
                 "team_id": team_id,
                 "league_id": _safe_int(entry.get("league_id"), 0),
                 "season": _safe_int(entry.get("season"), 0),
-                "label": (r.get("name") or "").strip(),
-                "subLabel": (entry.get("league_name") or "").strip(),
+                "label": team_name,
+                "subLabel": league_name,
+                "logo": r.get("logo"),
+                "country": "",
+                "league_name": league_name,
+                "display_text": team_name,
+                "display_subtext": league_name,
             }
         )
     return out
@@ -666,7 +718,7 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
     for lg in leagues:
         league_id = _safe_int(lg.get("league_id"), 0)
         season = _safe_int(lg.get("season"), 0)
-        league_name = (lg.get("label") or "").strip()
+        league_name = (lg.get("league_name") or lg.get("label") or "").strip()
 
         if league_id <= 0 or season <= 0:
             continue
@@ -675,7 +727,8 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
             """
             SELECT DISTINCT
               t.id AS team_id,
-              t.name AS team_name
+              t.name AS team_name,
+              t.logo AS team_logo
             FROM hockey_games g
             JOIN hockey_teams t
               ON t.id = g.home_team_id OR t.id = g.away_team_id
@@ -691,6 +744,8 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
             if team_id <= 0:
                 continue
 
+            team_name = (r.get("team_name") or "").strip()
+
             out.append(
                 {
                     "kind": "team",
@@ -698,8 +753,13 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
                     "team_id": team_id,
                     "league_id": league_id,
                     "season": season,
-                    "label": (r.get("team_name") or "").strip(),
+                    "label": team_name,
                     "subLabel": league_name,
+                    "logo": r.get("team_logo"),
+                    "country": "",
+                    "league_name": league_name,
+                    "display_text": team_name,
+                    "display_subtext": league_name,
                 }
             )
 
