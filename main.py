@@ -64,6 +64,7 @@ from leaguedetail.routes import leaguedetail_bp
 from notifications.routes import notifications_bp
 from routers.vip_routes import vip_bp
 from routers.version_router import version_bp
+from search.routes import search_bp
 
 from hockey.routers.hockey_games_router import hockey_games_bp
 from hockey.routers.hockey_fixtures_router import hockey_fixtures_bp
@@ -104,6 +105,7 @@ app.register_blueprint(leaguedetail_bp)
 app.register_blueprint(notifications_bp)
 app.register_blueprint(vip_bp)
 app.register_blueprint(version_bp)
+app.register_blueprint(search_bp)
 
 app.register_blueprint(hockey_games_bp)
 app.register_blueprint(hockey_fixtures_bp)
