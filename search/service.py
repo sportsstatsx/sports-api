@@ -462,17 +462,15 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           country
         FROM leagues
         WHERE LOWER(name) LIKE %s
-           OR LOWER(name) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(name) LIKE %s THEN 1
-            ELSE 2
+            ELSE 1
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
+        (_like_prefix(q), _norm_lower(q)),
     )
 
     out: List[Dict[str, Any]] = []
@@ -502,17 +500,15 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
           name
         FROM teams
         WHERE LOWER(name) LIKE %s
-           OR LOWER(name) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(name) LIKE %s THEN 1
-            ELSE 2
+            ELSE 1
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
+        (_like_prefix(q), _norm_lower(q)),
     )
 
     out: List[Dict[str, Any]] = []
@@ -592,17 +588,15 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           name
         FROM hockey_leagues
         WHERE LOWER(name) LIKE %s
-           OR LOWER(name) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(name) LIKE %s THEN 1
-            ELSE 2
+            ELSE 1
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
+        (_like_prefix(q), _norm_lower(q)),
     )
 
     out: List[Dict[str, Any]] = []
@@ -632,17 +626,15 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
           name
         FROM hockey_teams
         WHERE LOWER(name) LIKE %s
-           OR LOWER(name) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(name) LIKE %s THEN 1
-            ELSE 2
+            ELSE 1
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _like_contains(q), _norm_lower(q), _like_prefix(q)),
+        (_like_prefix(q), _norm_lower(q)),
     )
 
     out: List[Dict[str, Any]] = []
