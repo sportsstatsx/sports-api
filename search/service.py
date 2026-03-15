@@ -32,6 +32,69 @@ def _safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+def _suggest_bucket(x: Dict[str, Any], query: str) -> Tuple[int, int, str, str, str]:
+    """
+    자동완성 정렬 규칙
+
+    우선순위:
+    0) 리그명 prefix
+    1) 팀명 prefix
+    2) 나라명 prefix + 리그
+    3) 나라명 prefix + 팀
+    4) 리그명 contains
+    5) 팀명 contains
+    6) 나라명 contains + 리그
+    7) 나라명 contains + 팀
+    8) 기타
+
+    같은 bucket 안에서는 label A~Z → country A~Z → subLabel A~Z
+    """
+    ql = _norm_lower(query)
+
+    kind = (x.get("kind") or "").strip().lower()
+    label = (x.get("label") or "").strip().lower()
+    country = (x.get("country") or "").strip().lower()
+    sub = (x.get("subLabel") or "").strip().lower()
+
+    is_league = kind == "league"
+    is_team = kind == "team"
+
+    label_eq = label == ql
+    country_eq = country == ql
+    label_prefix = label.startswith(ql)
+    country_prefix = country.startswith(ql)
+    label_contains = ql in label if ql else False
+    country_contains = ql in country if ql else False
+
+    if is_league and label_eq:
+        bucket = 0
+    elif is_team and label_eq:
+        bucket = 1
+    elif is_league and country_eq:
+        bucket = 2
+    elif is_team and country_eq:
+        bucket = 3
+    elif is_league and label_prefix:
+        bucket = 0
+    elif is_team and label_prefix:
+        bucket = 1
+    elif is_league and country_prefix:
+        bucket = 2
+    elif is_team and country_prefix:
+        bucket = 3
+    elif is_league and label_contains:
+        bucket = 4
+    elif is_team and label_contains:
+        bucket = 5
+    elif is_league and country_contains:
+        bucket = 6
+    elif is_team and country_contains:
+        bucket = 7
+    else:
+        bucket = 8
+
+    return (bucket, 0 if is_league else 1, label, country, sub)
+
 
 def _dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -497,21 +560,11 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           LOWER(name) LIKE %s
           OR LOWER(COALESCE(country, '')) LIKE %s
         ORDER BY
-          CASE
-            WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(COALESCE(country, '')) = %s THEN 1
-            WHEN LOWER(name) LIKE %s THEN 2
-            WHEN LOWER(COALESCE(country, '')) LIKE %s THEN 3
-            ELSE 4
-          END,
-          LENGTH(name) ASC,
-          name ASC
+          name ASC,
+          country ASC,
+          id ASC
         """,
         (
-            _like_prefix(q),
-            _like_prefix(q),
-            _norm_lower(q),
-            _norm_lower(q),
             _like_prefix(q),
             _like_prefix(q),
         ),
@@ -558,21 +611,11 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
           LOWER(name) LIKE %s
           OR LOWER(COALESCE(country, '')) LIKE %s
         ORDER BY
-          CASE
-            WHEN LOWER(name) = %s THEN 0
-            WHEN LOWER(COALESCE(country, '')) = %s THEN 1
-            WHEN LOWER(name) LIKE %s THEN 2
-            WHEN LOWER(COALESCE(country, '')) LIKE %s THEN 3
-            ELSE 4
-          END,
-          LENGTH(name) ASC,
-          name ASC
+          name ASC,
+          country ASC,
+          id ASC
         """,
         (
-            _like_prefix(q),
-            _like_prefix(q),
-            _norm_lower(q),
-            _norm_lower(q),
             _like_prefix(q),
             _like_prefix(q),
         ),
@@ -683,21 +726,11 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           LOWER(l.name) LIKE %s
           OR LOWER(COALESCE(c.name, '')) LIKE %s
         ORDER BY
-          CASE
-            WHEN LOWER(l.name) = %s THEN 0
-            WHEN LOWER(COALESCE(c.name, '')) = %s THEN 1
-            WHEN LOWER(l.name) LIKE %s THEN 2
-            WHEN LOWER(COALESCE(c.name, '')) LIKE %s THEN 3
-            ELSE 4
-          END,
-          LENGTH(l.name) ASC,
-          l.name ASC
+          l.name ASC,
+          country ASC,
+          l.id ASC
         """,
         (
-            _like_prefix(q),
-            _like_prefix(q),
-            _norm_lower(q),
-            _norm_lower(q),
             _like_prefix(q),
             _like_prefix(q),
         ),
@@ -752,18 +785,11 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
               AND LOWER(COALESCE(c.name, '')) LIKE %s
           )
         ORDER BY
-          CASE
-            WHEN LOWER(t.name) = %s THEN 0
-            WHEN LOWER(t.name) LIKE %s THEN 1
-            ELSE 2
-          END,
-          LENGTH(t.name) ASC,
-          t.name ASC
+          t.name ASC,
+          t.id ASC
         """,
         (
             _like_prefix(q),
-            _like_prefix(q),
-            _norm_lower(q),
             _like_prefix(q),
         ),
     )
@@ -890,28 +916,7 @@ def search_suggest(q: str, sport: str = "all") -> Dict[str, Any]:
 
     items = _dedupe_items(items)
 
-    def _sort_key(x: Dict[str, Any]) -> Tuple[int, int, str, str, str]:
-        kind = (x.get("kind") or "").strip().lower()
-        label = (x.get("label") or "").strip().lower()
-        country = (x.get("country") or "").strip().lower()
-        sub = (x.get("subLabel") or "").strip().lower()
-        ql = _norm_lower(query)
-
-        if label == ql:
-            score = 0
-        elif country == ql:
-            score = 1
-        elif label.startswith(ql):
-            score = 2
-        elif country.startswith(ql):
-            score = 3
-        else:
-            score = 4
-
-        kind_score = 0 if kind == "league" else 1
-        return (score, kind_score, label, country, sub)
-
-    items = sorted(items, key=_sort_key)
+    items = sorted(items, key=lambda x: _suggest_bucket(x, query))
 
     return {
         "query": query,
