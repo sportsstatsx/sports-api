@@ -239,6 +239,48 @@ def _hockey_latest_league_season(league_id: int) -> Optional[int]:
     return season if season > 0 else None
 
 
+def _hockey_league_country(league_id: int) -> str:
+    """
+    hockey_leagues.country 컬럼이 있을 수도 있고,
+    없으면 raw_json 안에 있을 수도 있어서 안전하게 fallback.
+    """
+    try:
+        row = hockey_fetch_one(
+            """
+            SELECT
+              COALESCE(NULLIF(TRIM(country), ''), NULL) AS country
+            FROM hockey_leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (league_id,),
+        )
+        country = (row or {}).get("country")
+        if country:
+            return str(country).strip()
+    except Exception:
+        pass
+
+    try:
+        row = hockey_fetch_one(
+            """
+            SELECT
+              COALESCE(NULLIF(TRIM(raw_json->>'country'), ''), NULL) AS country
+            FROM hockey_leagues
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (league_id,),
+        )
+        country = (row or {}).get("country")
+        if country:
+            return str(country).strip()
+    except Exception:
+        pass
+
+    return ""
+
+
 def _hockey_resolve_team_entry(team_id: int) -> Optional[Dict[str, Any]]:
     """
     하키 팀카드 대표 league_id / season:
@@ -641,6 +683,7 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
 
         league_name = (r.get("name") or "").strip()
         season = _hockey_latest_league_season(league_id)
+        country = _hockey_league_country(league_id)
 
         out.append(
             {
@@ -649,16 +692,15 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
                 "league_id": league_id,
                 "season": season,
                 "label": league_name,
-                "subLabel": "Hockey",
+                "subLabel": country or "Hockey",
                 "logo": r.get("logo"),
-                "country": "",
+                "country": country,
                 "league_name": league_name,
                 "display_text": league_name,
-                "display_subtext": league_name,
+                "display_subtext": f"{country} : {league_name}" if country else league_name,
             }
         )
     return out
-
 
 def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
@@ -692,21 +734,23 @@ def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
 
         team_name = (r.get("name") or "").strip()
         league_name = (entry.get("league_name") or "").strip()
+        league_id = _safe_int(entry.get("league_id"), 0)
+        country = _hockey_league_country(league_id)
 
         out.append(
             {
                 "kind": "team",
                 "sport": "hockey",
                 "team_id": team_id,
-                "league_id": _safe_int(entry.get("league_id"), 0),
+                "league_id": league_id,
                 "season": _safe_int(entry.get("season"), 0),
                 "label": team_name,
                 "subLabel": league_name,
                 "logo": r.get("logo"),
-                "country": "",
+                "country": country,
                 "league_name": league_name,
                 "display_text": team_name,
-                "display_subtext": league_name,
+                "display_subtext": f"{country} : {league_name}" if country and league_name else league_name,
             }
         )
     return out
@@ -719,6 +763,7 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
         league_id = _safe_int(lg.get("league_id"), 0)
         season = _safe_int(lg.get("season"), 0)
         league_name = (lg.get("league_name") or lg.get("label") or "").strip()
+        country = (lg.get("country") or "").strip() or _hockey_league_country(league_id)
 
         if league_id <= 0 or season <= 0:
             continue
@@ -756,10 +801,10 @@ def _hockey_suggest_teams_by_leagues(leagues: List[Dict[str, Any]]) -> List[Dict
                     "label": team_name,
                     "subLabel": league_name,
                     "logo": r.get("team_logo"),
-                    "country": "",
+                    "country": country,
                     "league_name": league_name,
                     "display_text": team_name,
-                    "display_subtext": league_name,
+                    "display_subtext": f"{country} : {league_name}" if country and league_name else league_name,
                 }
             )
 
