@@ -241,33 +241,18 @@ def _hockey_latest_league_season(league_id: int) -> Optional[int]:
 
 def _hockey_league_country(league_id: int) -> str:
     """
-    hockey_leagues.country 컬럼이 있을 수도 있고,
-    없으면 raw_json 안에 있을 수도 있어서 안전하게 fallback.
+    하키 리그의 국가명:
+    - hockey_leagues.country_id -> hockey_countries.name
     """
     try:
         row = hockey_fetch_one(
             """
             SELECT
-              COALESCE(NULLIF(TRIM(country), ''), NULL) AS country
-            FROM hockey_leagues
-            WHERE id = %s
-            LIMIT 1
-            """,
-            (league_id,),
-        )
-        country = (row or {}).get("country")
-        if country:
-            return str(country).strip()
-    except Exception:
-        pass
-
-    try:
-        row = hockey_fetch_one(
-            """
-            SELECT
-              COALESCE(NULLIF(TRIM(raw_json->>'country'), ''), NULL) AS country
-            FROM hockey_leagues
-            WHERE id = %s
+              COALESCE(NULLIF(TRIM(c.name), ''), NULL) AS country
+            FROM hockey_leagues l
+            LEFT JOIN hockey_countries c
+              ON c.id = l.country_id
+            WHERE l.id = %s
             LIMIT 1
             """,
             (league_id,),
