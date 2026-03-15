@@ -493,16 +493,28 @@ def _football_suggest_leagues(q: str) -> List[Dict[str, Any]]:
           country,
           logo
         FROM leagues
-        WHERE LOWER(name) LIKE %s
+        WHERE
+          LOWER(name) LIKE %s
+          OR LOWER(COALESCE(country, '')) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            ELSE 1
+            WHEN LOWER(COALESCE(country, '')) = %s THEN 1
+            WHEN LOWER(name) LIKE %s THEN 2
+            WHEN LOWER(COALESCE(country, '')) LIKE %s THEN 3
+            ELSE 4
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _norm_lower(q)),
+        (
+            _like_prefix(q),
+            _like_prefix(q),
+            _norm_lower(q),
+            _norm_lower(q),
+            _like_prefix(q),
+            _like_prefix(q),
+        ),
     )
 
     out: List[Dict[str, Any]] = []
@@ -542,16 +554,28 @@ def _football_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
           country,
           logo
         FROM teams
-        WHERE LOWER(name) LIKE %s
+        WHERE
+          LOWER(name) LIKE %s
+          OR LOWER(COALESCE(country, '')) LIKE %s
         ORDER BY
           CASE
             WHEN LOWER(name) = %s THEN 0
-            ELSE 1
+            WHEN LOWER(COALESCE(country, '')) = %s THEN 1
+            WHEN LOWER(name) LIKE %s THEN 2
+            WHEN LOWER(COALESCE(country, '')) LIKE %s THEN 3
+            ELSE 4
           END,
           LENGTH(name) ASC,
           name ASC
         """,
-        (_like_prefix(q), _norm_lower(q)),
+        (
+            _like_prefix(q),
+            _like_prefix(q),
+            _norm_lower(q),
+            _norm_lower(q),
+            _like_prefix(q),
+            _like_prefix(q),
+        ),
     )
 
     out: List[Dict[str, Any]] = []
@@ -648,20 +672,35 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
         """
         SELECT
-          id,
-          name,
-          logo
-        FROM hockey_leagues
-        WHERE LOWER(name) LIKE %s
+          l.id,
+          l.name,
+          l.logo,
+          COALESCE(NULLIF(TRIM(c.name), ''), '') AS country
+        FROM hockey_leagues l
+        LEFT JOIN hockey_countries c
+          ON c.id = l.country_id
+        WHERE
+          LOWER(l.name) LIKE %s
+          OR LOWER(COALESCE(c.name, '')) LIKE %s
         ORDER BY
           CASE
-            WHEN LOWER(name) = %s THEN 0
-            ELSE 1
+            WHEN LOWER(l.name) = %s THEN 0
+            WHEN LOWER(COALESCE(c.name, '')) = %s THEN 1
+            WHEN LOWER(l.name) LIKE %s THEN 2
+            WHEN LOWER(COALESCE(c.name, '')) LIKE %s THEN 3
+            ELSE 4
           END,
-          LENGTH(name) ASC,
-          name ASC
+          LENGTH(l.name) ASC,
+          l.name ASC
         """,
-        (_like_prefix(q), _norm_lower(q)),
+        (
+            _like_prefix(q),
+            _like_prefix(q),
+            _norm_lower(q),
+            _norm_lower(q),
+            _like_prefix(q),
+            _like_prefix(q),
+        ),
     )
 
     out: List[Dict[str, Any]] = []
@@ -672,7 +711,7 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
 
         league_name = (r.get("name") or "").strip()
         season = _hockey_latest_league_season(league_id)
-        country = _hockey_league_country(league_id)
+        country = (r.get("country") or "").strip()
 
         out.append(
             {
@@ -694,21 +733,39 @@ def _hockey_suggest_leagues(q: str) -> List[Dict[str, Any]]:
 def _hockey_suggest_direct_teams(q: str) -> List[Dict[str, Any]]:
     rows = hockey_fetch_all(
         """
-        SELECT
-          id,
-          name,
-          logo
-        FROM hockey_teams
-        WHERE LOWER(name) LIKE %s
+        SELECT DISTINCT
+          t.id,
+          t.name,
+          t.logo
+        FROM hockey_teams t
+        WHERE
+          LOWER(t.name) LIKE %s
+          OR EXISTS (
+            SELECT 1
+            FROM hockey_games g
+            JOIN hockey_leagues l
+              ON l.id = g.league_id
+            LEFT JOIN hockey_countries c
+              ON c.id = l.country_id
+            WHERE
+              (g.home_team_id = t.id OR g.away_team_id = t.id)
+              AND LOWER(COALESCE(c.name, '')) LIKE %s
+          )
         ORDER BY
           CASE
-            WHEN LOWER(name) = %s THEN 0
-            ELSE 1
+            WHEN LOWER(t.name) = %s THEN 0
+            WHEN LOWER(t.name) LIKE %s THEN 1
+            ELSE 2
           END,
-          LENGTH(name) ASC,
-          name ASC
+          LENGTH(t.name) ASC,
+          t.name ASC
         """,
-        (_like_prefix(q), _norm_lower(q)),
+        (
+            _like_prefix(q),
+            _like_prefix(q),
+            _norm_lower(q),
+            _like_prefix(q),
+        ),
     )
 
     out: List[Dict[str, Any]] = []
@@ -833,21 +890,26 @@ def search_suggest(q: str, sport: str = "all") -> Dict[str, Any]:
 
     items = _dedupe_items(items)
 
-    def _sort_key(x: Dict[str, Any]) -> Tuple[int, int, str, str]:
+    def _sort_key(x: Dict[str, Any]) -> Tuple[int, int, str, str, str]:
         kind = (x.get("kind") or "").strip().lower()
         label = (x.get("label") or "").strip().lower()
+        country = (x.get("country") or "").strip().lower()
+        sub = (x.get("subLabel") or "").strip().lower()
         ql = _norm_lower(query)
 
         if label == ql:
             score = 0
-        elif label.startswith(ql):
+        elif country == ql:
             score = 1
-        else:
+        elif label.startswith(ql):
             score = 2
+        elif country.startswith(ql):
+            score = 3
+        else:
+            score = 4
 
         kind_score = 0 if kind == "league" else 1
-        sub = (x.get("subLabel") or "").strip().lower()
-        return (score, kind_score, label, sub)
+        return (score, kind_score, label, country, sub)
 
     items = sorted(items, key=_sort_key)
 
