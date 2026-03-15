@@ -137,12 +137,53 @@ def _detect_red_team_id(
     return None
 
 
-def load_latest_goal_minute_str(match_id: int, team_id: int | None = None) -> str | None:
+def load_goal_minute_str_for_score(
+    match_id: int,
+    team_id: int | None,
+    expected_goal_number: int,
+) -> str | None:
     """
-    방금 반영된 득점 알림용 minute 문자열을 match_events에서 찾는다.
-    - 추가시간은 minute + extra 조합으로 만든다. (예: 45+3')
-    - team_id가 주어지면 그 팀의 가장 최근 Goal 이벤트를 우선 사용
+    현재 반영된 스코어 기준으로 "그 팀의 n번째 골" minute 문자열을 찾는다.
+
+    예:
+    - 홈이 2번째 골을 넣어 2:1이 됐다면 -> 홈팀의 2번째 Goal 이벤트를 찾음
+    - 원정이 3번째 골을 넣어 1:3이 됐다면 -> 원정팀의 3번째 Goal 이벤트를 찾음
+
+    중요:
+    - 단순히 최신 Goal 1개를 읽으면, score는 이미 올라갔지만 match_events 적재가 늦은 순간
+      예전 골 minute(예: 6')를 다시 보내는 버그가 생긴다.
+    - 따라서 expected_goal_number 번째 Goal 이벤트가 실제로 존재할 때만 그 minute를 사용하고,
+      아직 없으면 None 을 반환해서 elapsed fallback 으로 넘긴다.
     """
+    try:
+        expected_n = int(expected_goal_number)
+    except Exception:
+        return None
+
+    if expected_n <= 0:
+        return None
+
+    count_row = fetch_one(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM match_events
+        WHERE fixture_id = %s
+          AND LOWER(COALESCE(type, '')) = 'goal'
+          AND (%s IS NULL OR team_id = %s)
+        """,
+        (match_id, team_id, team_id),
+    )
+
+    try:
+        current_count = int(count_row.get("cnt") or 0) if count_row else 0
+    except Exception:
+        current_count = 0
+
+    # 아직 그 팀의 n번째 골 이벤트가 DB에 안 들어온 상태
+    # -> stale minute 사용 금지, elapsed fallback 하도록 None 반환
+    if current_count < expected_n:
+        return None
+
     row = fetch_one(
         """
         SELECT
@@ -152,13 +193,15 @@ def load_latest_goal_minute_str(match_id: int, team_id: int | None = None) -> st
         WHERE fixture_id = %s
           AND LOWER(COALESCE(type, '')) = 'goal'
           AND (%s IS NULL OR team_id = %s)
-        ORDER BY id DESC
+        ORDER BY id ASC
+        OFFSET %s
         LIMIT 1
         """,
-        (match_id, team_id, team_id),
+        (match_id, team_id, team_id, expected_n - 1),
     )
     if not row:
         return None
+
     return _format_minute_with_extra(row.get("minute"), row.get("extra"))
 
 
@@ -1005,20 +1048,37 @@ def process_match(fcm: FCMClient, match_id: int) -> None:
             old_home = int(extra.get("old_home", current.home_goals))
             old_away = int(extra.get("old_away", current.away_goals))
 
+            home_id = labels.get("home_id")
+            away_id = labels.get("away_id")
+
             scoring_team_id = _detect_scoring_team_id(
                 old_home=old_home,
                 old_away=old_away,
                 new_home=current.home_goals,
                 new_away=current.away_goals,
-                home_id=labels.get("home_id"),
-                away_id=labels.get("away_id"),
+                home_id=home_id,
+                away_id=away_id,
             )
 
-            goal_minute_str = load_latest_goal_minute_str(match_id, scoring_team_id)
+            expected_goal_number: int | None = None
+            if scoring_team_id is not None:
+                if home_id is not None and scoring_team_id == home_id:
+                    expected_goal_number = int(current.home_goals)
+                elif away_id is not None and scoring_team_id == away_id:
+                    expected_goal_number = int(current.away_goals)
+
+            goal_minute_str = None
+            if expected_goal_number is not None and expected_goal_number > 0:
+                goal_minute_str = load_goal_minute_str_for_score(
+                    match_id=match_id,
+                    team_id=scoring_team_id,
+                    expected_goal_number=expected_goal_number,
+                )
 
             if goal_minute_str:
                 extra["goal_minute_str"] = goal_minute_str
             elif elapsed is not None and elapsed > 0:
+                # match_events 적재가 아직 안 따라온 경우 stale minute 대신 현재 elapsed 사용
                 extra["goal_minute_str"] = f"{int(elapsed)}'"
 
         if event_type == "redcard":
@@ -1243,4 +1303,3 @@ if __name__ == "__main__":
         run_forever(seconds)
     else:
         run_once()
-
